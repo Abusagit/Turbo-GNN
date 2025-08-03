@@ -5,7 +5,7 @@ from statistics import mean, stdev, median
 import dgl.function as fn
 
 from data import generate_random_graph
-from cusparse_spmm import csr_SPMM
+from cusparse_spmm import csr_SPMM, find_best_algorithm
 
 
 
@@ -60,7 +60,7 @@ def benchmark_dgl_message_passing(dgl_graph, node_features, num_iters=100):
         elapsed = starter.elapsed_time(ender)  # milliseconds
         timings.append(elapsed)
 
-    avg_time_ms = median(timings)
+    avg_time_ms = mean(timings)
     std_time_ms = stdev(timings)
     print(f"DGL timings: {timings}")
     return avg_time_ms, std_time_ms, out
@@ -74,17 +74,21 @@ def benchmark_cusparse_spmm(indptr, indices, feats, num_iters=100):
     starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     timings = []
 
+    best_alg_id = find_best_algorithm(indptr, indices, feats)
+
+    print(f"Best algo fir this setup is {best_alg_id}")
+
     for _ in range(10):
-        out = csr_SPMM(indptr, indices, feats)
+        out = csr_SPMM(indptr, indices, feats, algorithm=best_alg_id)
 
     for _ in range(num_iters):
         starter.record()
-        out = csr_SPMM(indptr, indices, feats)
+        out = csr_SPMM(indptr, indices, feats, algorithm=best_alg_id)
         ender.record()
         torch.cuda.synchronize()
         timings.append(starter.elapsed_time(ender))
 
-    avg_time_ms = median(timings)
+    avg_time_ms = mean(timings)
     std_time_ms = stdev(timings)
     print(f"cusparse timings: {timings}")
 
@@ -104,9 +108,9 @@ if __name__ == "__main__":
     g, indptr, indices, feats = generate_random_graph(num_nodes, avg_degree, feature_dim, device)
 
     avg_time, std_time, out_feats_1 = benchmark_dgl_message_passing(g, feats)
-    print(f"DGL GraphConv message passing median time: {avg_time:.3f} +- {std_time:.3f} ms")
+    print(f"DGL GraphConv message passing mean time: {avg_time:.3f} +- {std_time:.3f} ms")
 
     avg_time, std_time, out_feats_2 = benchmark_cusparse_spmm(indptr, indices, feats)
-    print(f"cuSPARSE SpMM message passing median time: {avg_time:.3f} +- {std_time:.3f} ms")
+    print(f"cuSPARSE SpMM message passing mean time: {avg_time:.3f} +- {std_time:.3f} ms")
 
     torch.testing.assert_close(out_feats_1, out_feats_2)
