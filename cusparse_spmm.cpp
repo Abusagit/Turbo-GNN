@@ -74,6 +74,7 @@ torch::Tensor csr_SPMM(const torch::Tensor &indptr,
     float alpha = 1.0f;
     float beta = 0.0f;
 
+
     // Pre-allocate output
     auto out = torch::empty({m, n}, features.options());
 
