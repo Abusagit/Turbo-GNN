@@ -20,11 +20,12 @@ cuda_kernels = load(name="cuda_kernels", extra_cflags=["-O3"], extra_cuda_cflags
                     # sources="",
                     verbose=True)
 
-def csr_SPMM(indptr, indices, features):
-    print(f"{indptr.shape=} {indices.shape=} {features.shape=}")
-    out = torch.empty_like(features)
 
-    cuda_kernels.csr_SPMM(out, indptr, indices, features)
+def csr_SPMM(indptr, indices, features):
+
+    print(f"{indptr.shape=} {indices.shape=} {features.shape=}")
+
+    out = cuda_kernels.csr_SPMM(indptr, indices, features)
     torch.cuda.synchronize()
 
     print("AFTER", features.shape, out.shape)
