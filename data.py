@@ -37,13 +37,23 @@ def generate_random_graph(num_nodes, avg_degree, feature_dim, device='cuda'):
     adj = sp.random(num_nodes, num_nodes, density=p, format='csr', dtype='float32', data_rvs=lambda n: torch.ones(n).numpy())
 
     # Extract CSR arrays (row_ptr and col_ind)
-    indptr = torch.from_numpy(adj.indptr).int().cuda()
-    indices = torch.from_numpy(adj.indices).int().cuda()
+
 
     # Build DGL graph from scipy adjacency
     dgl_graph: dgl.DGLGraph = dgl.from_scipy(adj)
         # Generate random node features
     node_features = torch.randn(num_nodes, feature_dim, device=device)
+
+    src, dst = dgl_graph.edges()
+
+    adj_transposed = sp.csr_matrix(
+        (torch.ones(len(src)).numpy(), (dst.cpu().numpy(), src.cpu().numpy())),
+        shape=(num_nodes, num_nodes)
+    )
+
+    indptr = torch.from_numpy(adj_transposed.indptr).int().cuda()
+    indices = torch.from_numpy(adj_transposed.indices).int().cuda()
+
 
     return dgl_graph, indptr, indices, node_features
 
