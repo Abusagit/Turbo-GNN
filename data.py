@@ -1,14 +1,17 @@
 import torch
 import scipy.sparse as sp
 import dgl
-from enum import Enum, auto
+from enum import Enum
+
+from dgl.data import CoraGraphDataset, CiteseerGraphDataset, PubmedGraphDataset
+from ogb.nodeproppred import DglNodePropPredDataset
 
 class DatasetName(Enum):
-    CORA = auto()
-    CITESEER = auto()
-    PUBMED = auto()
-    OGB_ARXIV = auto()
-    OGB_PRODUCTS = auto()
+    CORA = "Cora"
+    CITESEER = "Citeseer"
+    PUBMED = "PubMed"
+    OGB_ARXIV = "Arxiv"
+    OGB_PRODUCTS = "Products"
 
 
 def generate_random_graph(num_nodes, avg_degree, feature_dim, device='cuda'):
@@ -38,6 +41,7 @@ def generate_random_graph(num_nodes, avg_degree, feature_dim, device='cuda'):
 
     # Extract CSR arrays (row_ptr and col_ind)
 
+    
 
     # Build DGL graph from scipy adjacency
     dgl_graph: dgl.DGLGraph = dgl.from_scipy(adj)
@@ -59,9 +63,34 @@ def generate_random_graph(num_nodes, avg_degree, feature_dim, device='cuda'):
 
 
 
-def get_real_graph(dataset: DatasetName):
-    raise NotImplementedError
+def get_real_graph(dataset: DatasetName, hidden_dim: int = 64):
+    if dataset is DatasetName.CITESEER:
+        graph: dgl.DGLGraph = CiteseerGraphDataset(verbose=False)[0]
+    elif dataset is DatasetName.PUBMED:
+        graph = PubmedGraphDataset(verbose=False)[0]
+    elif dataset is DatasetName.CORA:
+        graph = CoraGraphDataset(verbose=False)[0]
+    elif dataset is DatasetName.OGB_ARXIV:
+        graph = DglNodePropPredDataset(name="ogbn-arxiv")[0][0]
+    elif dataset is DatasetName.OGB_PRODUCTS:
+        graph = DglNodePropPredDataset(name="ogbn-products")[0][0]
+    else:
+        raise NotImplementedError
 
+
+    features = torch.randn((graph.num_nodes(), hidden_dim)).cuda()
+    
+    src, dst = graph.edges()
+
+    adj_transposed = sp.csr_matrix(
+        (torch.ones(len(src)).numpy(), (dst.cpu().numpy(), src.cpu().numpy())),
+        shape=(graph.num_nodes(), graph.num_nodes())
+    )
+
+    indptr = torch.from_numpy(adj_transposed.indptr).int().cuda()
+    indices = torch.from_numpy(adj_transposed.indices).int().cuda()
+
+    return graph, indptr, indices, features
 
 
 if __name__ == "__main__":
