@@ -41,12 +41,11 @@ def generate_random_graph(num_nodes, avg_degree, feature_dim, device='cuda'):
 
     # Extract CSR arrays (row_ptr and col_ind)
 
-    
-
-    # Build DGL graph from scipy adjacency
+        # Build DGL graph from scipy adjacency
     dgl_graph: dgl.DGLGraph = dgl.from_scipy(adj)
         # Generate random node features
     node_features = torch.randn(num_nodes, feature_dim, device=device)
+    dgl_graph = dgl.add_self_loop(dgl_graph)
 
     src, dst = dgl_graph.edges()
 
@@ -79,7 +78,7 @@ def get_real_graph(dataset: DatasetName, hidden_dim: int = 64):
 
 
     features = torch.randn((graph.num_nodes(), hidden_dim)).cuda()
-    
+    graph = dgl.add_self_loop(graph)
     src, dst = graph.edges()
 
     adj_transposed = sp.csr_matrix(
@@ -90,16 +89,6 @@ def get_real_graph(dataset: DatasetName, hidden_dim: int = 64):
     indptr = torch.from_numpy(adj_transposed.indptr).int().cuda()
     indices = torch.from_numpy(adj_transposed.indices).int().cuda()
 
+    # breakpoint()
+
     return graph, indptr, indices, features
-
-
-if __name__ == "__main__":
-    num_nodes = 10000
-    avg_degree = 20
-    feature_dim = 64
-    device = 'cuda'
-
-    g, indptr, indices, feats = generate_random_graph(num_nodes, avg_degree, feature_dim, device)
-    print(f"Generated graph with {g.number_of_nodes()} nodes and {g.number_of_edges()} edges")
-    print(f"CSR row_ptr shape: {indptr.shape}, CSR col_ind shape: {indices.shape}")
-    print(f"Node features shape: {feats.shape}, device: {feats.device}")

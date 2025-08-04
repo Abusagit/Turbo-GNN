@@ -5,7 +5,7 @@ import pandas as pd
 import dgl.function as fn
 
 from data import generate_random_graph, DatasetName, get_real_graph
-from cusparse_spmm import csr_SPMM, find_best_algorithm, clear_cache
+from cusparse_spmm import csr_SPMM_normalized, csr_SPMM, find_best_algorithm, clear_cache, find_best_algorithm_normalized
 
 from itertools import product
 import argparse
@@ -81,16 +81,16 @@ def benchmark_cusparse_spmm(indptr, indices, feats, num_iters=100, norm=None):
     timings = []
 
     # best_alg_id = 2 # find_best_algorithm(indptr, indices, feats)
-    best_alg_id = find_best_algorithm(indptr, indices, feats)
+    best_alg_id = find_best_algorithm_normalized(indptr, indices, feats, norm=norm)
 
     # print(f"Best algo fir this setup is {best_alg_id}")
 
     for _ in range(10):
-        out = csr_SPMM(indptr, indices, feats, algorithm=best_alg_id, use_cache=True)
+        out = csr_SPMM_normalized(indptr, indices, feats, algorithm=best_alg_id, use_cache=True, norm=norm)
 
     for _ in range(num_iters):
         starter.record()
-        out = csr_SPMM(indptr, indices, feats, algorithm=best_alg_id, use_cache=True)
+        out = csr_SPMM_normalized(indptr, indices, feats, algorithm=best_alg_id, use_cache=True, norm=norm)
         ender.record()
         torch.cuda.synchronize()
         timings.append(starter.elapsed_time(ender))
@@ -115,17 +115,17 @@ def _benchmark(g, indptr, indices, feats, num_iters=200, norm=None):
     for run in range(3):
         print(f"\nRun {run+1}/3:")
         
-        avg_time_dgl, std_time_dgl, out_dgl = benchmark_dgl_message_passing(g, feats, num_iters)
+        avg_time_dgl, std_time_dgl, out_dgl = benchmark_dgl_message_passing(g, feats, num_iters, norm=norm)
         print(f"  DGL: {avg_time_dgl:.4f} ± {std_time_dgl:.4f} ms")
         dgl_times.append(avg_time_dgl)
         
-        avg_time_csr, std_time_csr, out_csr = benchmark_cusparse_spmm(indptr, indices, feats, num_iters)
+        avg_time_csr, std_time_csr, out_csr = benchmark_cusparse_spmm(indptr, indices, feats, num_iters, norm=norm)
         print(f"  cuSPARSE: {avg_time_csr:.4f} ± {std_time_csr:.4f} ms")
         cusparse_times.append(avg_time_csr)
         
         # Verify correctness
         # torch.testing.assert_close(out_dgl, out_csr, atol=1e-4, rtol=1e-4)
-        diff = (torch.abs(out_dgl - out_csr) / torch.maximum(out_dgl.abs(), out_csr.abs()) + 1e-8).max()
+        diff = torch.abs(out_dgl - out_csr).max().item()
         max_diff = max(diff, max_diff)
         clear_cache()
     
@@ -152,12 +152,13 @@ if __name__ == "__main__":
 
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--norm", default=None)
+    parser.add_argument("--norm", default="none")
     parser.add_argument("--iters", default=200, type=int)
 
     args = parser.parse_args()
     
     print(f"CUDA version: {torch.version.cuda}. CUDA is available: {torch.cuda.is_available()}. Device is: {torch.cuda.get_device_name(0)}")       # CUDA version PyTorch was built with
+    norm = args.norm or "none"
 
 
     df = []
@@ -166,17 +167,17 @@ if __name__ == "__main__":
         # (250000, 2, 1024),    # Higher degree * larger dim
         # (250000, 10, 1024),    # Higher degree * larger dim
 
-        # (100000, 5, 32),    
+        (100000, 5, 32),    
         # (100000, 5, 64),    # Higher degree * larger dim
-        # (100000, 5, 128),    # Higher degree * larger dim
+        (100000, 5, 128),    # Higher degree * larger dim
         # (100000, 3, 1024),    # Higher degree * larger dim
         # (100000, 20, 1024),    # Higher degree * larger dim
 
-        # (10000, 3, 64),    # Original
-        # (10000, 3, 128),   # More features
-        # (10000, 5, 1024),   # even More features
-        # (10000, 10, 1024),   # even More features
-        # (10000, 20, 1024),   # even More features
+        (10000, 3, 64),    # Original
+        (10000, 3, 128),   # More features
+        (10000, 5, 1024),   # even More features
+        (10000, 10, 1024),   # even More features
+        (10000, 20, 1024),   # even More features
 
     ]
     
@@ -188,7 +189,7 @@ if __name__ == "__main__":
         
         results = _benchmark(g, indptr, indices, feats, args.iters, args.norm)
 
-        df.append(dict(num_nodes=num_nodes, avg_degree=avg_degree, feature_dim=feature_dim, graph="synthetic") | results)
+        df.append(dict(num_nodes=num_nodes, avg_degree=avg_degree, feature_dim=feature_dim, graph="synthetic", norm=norm) | results)
 
     real_datasets_configs = product(
         [DatasetName.CORA, DatasetName.CITESEER, DatasetName.PUBMED, DatasetName.OGB_ARXIV, DatasetName.OGB_PRODUCTS],
@@ -204,11 +205,10 @@ if __name__ == "__main__":
         # Run benchmarks multiple times and take best
         results = _benchmark(g, indptr, indices, feats, args.iters, args.norm)
 
-        df.append(dict(num_nodes=n_nodes, avg_degree=avg_degree, feature_dim=hidden_dim, graph=dataset.value) | results)
+        df.append(dict(num_nodes=n_nodes, avg_degree=avg_degree, feature_dim=hidden_dim, graph=dataset.value, norm=norm) | results)
 
 
     df = pd.DataFrame(df)
-    norm = args.norm or "none"
     df.to_csv(f"benchmark_results_norm_{norm}_{args.iters}_iters.csv")
 
     print(df)

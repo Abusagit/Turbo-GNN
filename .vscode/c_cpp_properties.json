@@ -8,7 +8,8 @@
                 "${env:CONDA_PREFIX}/lib/python3.10/site-packages/torch/include",
                 "${env:CONDA_PREFIX}/lib/python3.11/site-packages/torch/include",
                 "${env:HOME}/.local/lib/python3.10/site-packages/torch/include",
-                "${env:HOME}/.local/lib/python3.11/site-packages/torch/include"
+                "${env:HOME}/.local/lib/python3.11/site-packages/torch/include",
+                "/home/fvelikon/.local/lib/python3.10/site-packages/torch/include/torch/csrc/api/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",

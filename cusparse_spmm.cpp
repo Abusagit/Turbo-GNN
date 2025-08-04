@@ -5,6 +5,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <mutex>
+#include <cmath>
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -20,14 +21,38 @@
         }                                                                      \
     }
 
+// Enumeration for normalization types
+enum class NormType {
+    NONE = 0,
+    RIGHT = 1,
+    LEFT = 2,
+    BOTH = 3
+};
+
+
+// Forward declarations for CUDA kernel wrappers
+void launch_compute_degrees(const torch::Tensor& indptr, const torch::Tensor& indices,
+                           torch::Tensor& in_degrees, torch::Tensor& out_degrees);
+
+void launch_compute_normalized_weights(const torch::Tensor& indptr, const torch::Tensor& indices,
+                                      const torch::Tensor& edge_weights, torch::Tensor& normalized_weights,
+                                      const torch::Tensor& in_degrees, const torch::Tensor& out_degrees,
+                                      NormType norm);
+
+
+
 // Cache for graph structures and preprocessed data
 struct GraphCache {
     cusparseSpMatDescr_t matA = nullptr;
     void* workspace = nullptr;
     size_t workspace_size = 0;
-    torch::Tensor ones_values;
+    torch::Tensor edge_values;  // Stores normalized edge weights
+    torch::Tensor in_degrees;   // Cache in-degrees
+    torch::Tensor out_degrees;  // Cache out-degrees
     int32_t m, n, nnz;
     cusparseSpMMAlg_t best_alg = CUSPARSE_SPMM_ALG_DEFAULT;
+    NormType cached_norm = NormType::NONE;
+    bool has_edge_weights = false;
     
     ~GraphCache() {
         if (matA) cusparseDestroySpMat(matA);
@@ -39,31 +64,47 @@ struct GraphCache {
 static std::unordered_map<size_t, std::unique_ptr<GraphCache>> graph_cache;
 static std::mutex cache_mutex;
 
-// Static buffer for ones (when not using cache)
-static torch::Tensor global_ones_buffer;
-static int64_t global_ones_buffer_size = 0;
-static std::mutex ones_buffer_mutex;
-
-// Hash function for graph structure
-size_t hash_graph(const torch::Tensor& indptr, const torch::Tensor& indices) {
+// Hash function for graph structure (including normalization type)
+size_t hash_graph(const torch::Tensor& indptr, const torch::Tensor& indices, 
+                  NormType norm, bool has_edge_weights) {
     size_t h1 = std::hash<int64_t>{}(indptr.size(0));
     size_t h2 = std::hash<int64_t>{}(indices.size(0));
     size_t h3 = std::hash<void*>{}(indptr.data_ptr());
     size_t h4 = std::hash<void*>{}(indices.data_ptr());
-    return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
+    size_t h5 = std::hash<int>{}(static_cast<int>(norm));
+    size_t h6 = std::hash<bool>{}(has_edge_weights);
+    return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
 }
 
-torch::Tensor csr_SPMM(const torch::Tensor &indptr,
-                       const torch::Tensor &indices, 
-                       const torch::Tensor &features,
-                       int algorithm,
-                       bool use_cache) {
+torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
+                                 const torch::Tensor &indices, 
+                                 const torch::Tensor &features,
+                                 const torch::Tensor &edge_weights,
+                                 const std::string &norm_str,
+                                 int algorithm,
+                                 bool use_cache) {
     CHECK_INPUT(indptr);
     CHECK_INPUT(indices);
     CHECK_INPUT(features);
 
+    // Convert normalization string to enum
+    NormType norm;
+    if (norm_str == "none") norm = NormType::NONE;
+    else if (norm_str == "right") norm = NormType::RIGHT;
+    else if (norm_str == "left") norm = NormType::LEFT;
+    else if (norm_str == "both") norm = NormType::BOTH;
+    else {
+        TORCH_CHECK(false, "Invalid normalization type. Must be one of: 'none', 'right', 'left', 'both'");
+    }
+
+    bool has_edge_weights = edge_weights.numel() > 0;
+    if (has_edge_weights) {
+        CHECK_INPUT(edge_weights);
+        TORCH_CHECK(edge_weights.size(0) == indices.size(0), "Edge weights must have same length as indices");
+    }
+
     auto handle = at::cuda::getCurrentCUDASparseHandle();
-    
+
     int32_t m = indptr.size(0) - 1;
     int32_t n = features.size(1);
     int32_t k = features.size(0);
@@ -73,7 +114,6 @@ torch::Tensor csr_SPMM(const torch::Tensor &indptr,
 
     float alpha = 1.0f;
     float beta = 0.0f;
-
 
     // Pre-allocate output
     auto out = torch::empty({m, n}, features.options());
@@ -93,7 +133,7 @@ torch::Tensor csr_SPMM(const torch::Tensor &indptr,
     size_t graph_hash = 0;
     
     if (use_cache) {
-        graph_hash = hash_graph(indptr, indices);
+        graph_hash = hash_graph(indptr, indices, norm, has_edge_weights);
         std::lock_guard<std::mutex> lock(cache_mutex);
         
         auto it = graph_cache.find(graph_hash);
@@ -111,16 +151,27 @@ torch::Tensor csr_SPMM(const torch::Tensor &indptr,
             cache->n = n;
             cache->nnz = nnz;
             cache->best_alg = alg;
+            cache->cached_norm = norm;
+            cache->has_edge_weights = has_edge_weights;
             
-            // Pre-allocate ones buffer for this graph
-            cache->ones_values = torch::ones({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
+            // Allocate degree tensors
+            cache->in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+            cache->out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+            
+            // Compute degrees
+            launch_compute_degrees(indptr, indices, cache->in_degrees, cache->out_degrees);
+            
+            // Allocate and compute normalized edge weights
+            cache->edge_values = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
+            launch_compute_normalized_weights(indptr, indices, edge_weights, cache->edge_values,
+                                     cache->in_degrees, cache->out_degrees, norm);
             
             // Create sparse matrix descriptor
             CHECK_CUSPARSE(cusparseCreateCsr(
                 &cache->matA, m, m, nnz, 
                 indptr.data_ptr<int32_t>(),
                 indices.data_ptr<int32_t>(), 
-                cache->ones_values.data_ptr<float>(), 
+                cache->edge_values.data_ptr<float>(), 
                 CUSPARSE_INDEX_32I,
                 CUSPARSE_INDEX_32I, 
                 CUSPARSE_INDEX_BASE_ZERO, 
@@ -131,26 +182,26 @@ torch::Tensor csr_SPMM(const torch::Tensor &indptr,
     // Create descriptors
     cusparseSpMatDescr_t matA = nullptr;
     cusparseDnMatDescr_t matB = nullptr, matC = nullptr;
-    torch::Tensor ones_buffer;
+    torch::Tensor normalized_weights;
     
     if (cache && use_cache) {
         matA = cache->matA;
     } else {
-        // Use global ones buffer when not caching
-        {
-            std::lock_guard<std::mutex> lock(ones_buffer_mutex);
-            if (global_ones_buffer_size < nnz) {
-                global_ones_buffer = torch::ones({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
-                global_ones_buffer_size = nnz;
-            }
-            ones_buffer = global_ones_buffer;
-        }
+        // Compute normalized weights on-the-fly
+        torch::Tensor in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+        torch::Tensor out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+        
+        launch_compute_degrees(indptr, indices, in_degrees, out_degrees);
+        
+        normalized_weights = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
+        launch_compute_normalized_weights(indptr, indices, edge_weights, normalized_weights,
+                                 in_degrees, out_degrees, norm);
         
         CHECK_CUSPARSE(cusparseCreateCsr(
             &matA, m, m, nnz, 
             indptr.data_ptr<int32_t>(),
             indices.data_ptr<int32_t>(), 
-            ones_buffer.data_ptr<float>(), 
+            normalized_weights.data_ptr<float>(), 
             CUSPARSE_INDEX_32I,
             CUSPARSE_INDEX_32I, 
             CUSPARSE_INDEX_BASE_ZERO, 
@@ -217,11 +268,33 @@ torch::Tensor csr_SPMM(const torch::Tensor &indptr,
     return out;
 }
 
-// Function to find best algorithm for a given graph
-int find_best_algorithm(const torch::Tensor &indptr,
-                        const torch::Tensor &indices, 
-                        const torch::Tensor &features) {
+// Keep the original function for backward compatibility
+torch::Tensor csr_SPMM(const torch::Tensor &indptr,
+                       const torch::Tensor &indices, 
+                       const torch::Tensor &features,
+                       int algorithm,
+                       bool use_cache) {
+    torch::Tensor empty_weights = torch::empty({0}, features.options());
+    return csr_SPMM_normalized(indptr, indices, features, empty_weights, "none", algorithm, use_cache);
+}
+
+// Function to find best algorithm for a given graph (updated for normalization)
+int find_best_algorithm_normalized(const torch::Tensor &indptr,
+                                  const torch::Tensor &indices, 
+                                  const torch::Tensor &features,
+                                  const torch::Tensor &edge_weights,
+                                  const std::string &norm_str) {
     auto handle = at::cuda::getCurrentCUDASparseHandle();
+    
+    // Convert normalization string to enum
+    NormType norm;
+    if (norm_str == "none") norm = NormType::NONE;
+    else if (norm_str == "right") norm = NormType::RIGHT;
+    else if (norm_str == "left") norm = NormType::LEFT;
+    else if (norm_str == "both") norm = NormType::BOTH;
+    else {
+        TORCH_CHECK(false, "Invalid normalization type. Must be one of: 'none', 'right', 'left', 'both'");
+    }
     
     int32_t m = indptr.size(0) - 1;
     int32_t n = features.size(1);
@@ -230,7 +303,14 @@ int find_best_algorithm(const torch::Tensor &indptr,
     float alpha = 1.0f;
     float beta = 0.0f;
     
-    auto ones = torch::ones({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
+    // Compute normalized weights
+    torch::Tensor in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+    torch::Tensor out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+    launch_compute_degrees(indptr, indices, in_degrees, out_degrees);
+
+    torch::Tensor normalized_weights = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
+    launch_compute_normalized_weights(indptr, indices, edge_weights, normalized_weights, in_degrees, out_degrees, norm);
+    
     auto out = torch::empty({m, n}, features.options());
     
     cusparseSpMatDescr_t matA;
@@ -240,7 +320,7 @@ int find_best_algorithm(const torch::Tensor &indptr,
         &matA, m, m, nnz, 
         indptr.data_ptr<int32_t>(),
         indices.data_ptr<int32_t>(), 
-        ones.data_ptr<float>(), 
+        normalized_weights.data_ptr<float>(), 
         CUSPARSE_INDEX_32I,
         CUSPARSE_INDEX_32I, 
         CUSPARSE_INDEX_BASE_ZERO, 
@@ -318,15 +398,35 @@ int find_best_algorithm(const torch::Tensor &indptr,
     return best_alg_id;
 }
 
+
+// Keep original function for backward compatibility
+int find_best_algorithm(const torch::Tensor &indptr,
+                        const torch::Tensor &indices, 
+                        const torch::Tensor &features) {
+    torch::Tensor empty_weights = torch::empty({0}, features.options());
+    return find_best_algorithm_normalized(indptr, indices, features, empty_weights, "none");
+}
+
 void clear_graph_cache() {
     std::lock_guard<std::mutex> lock(cache_mutex);
     graph_cache.clear();
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("csr_SPMM", &csr_SPMM, "Optimized and cached csr_SPMM",
+    m.def("csr_SPMM", &csr_SPMM, "Optimized and cached csr_SPMM (backward compatibility)",
           py::arg("indptr"), py::arg("indices"), py::arg("features"), 
           py::arg("algorithm") = -1, py::arg("use_cache") = true);
-    m.def("find_best_algorithm", &find_best_algorithm, "Find best cuSPARSE algorithm for given graph");
+    
+    m.def("csr_SPMM_normalized", &csr_SPMM_normalized, "Optimized and cached csr_SPMM with normalization",
+          py::arg("indptr"), py::arg("indices"), py::arg("features"), py::arg("edge_weights"),
+          py::arg("norm") = "none", py::arg("algorithm") = -1, py::arg("use_cache") = true);
+
+    m.def("find_best_algorithm", &find_best_algorithm, "Find best cuSPARSE algorithm for given graph (backward compatibility)");
+    
+    m.def("find_best_algorithm_normalized", &find_best_algorithm_normalized, 
+          "Find best cuSPARSE algorithm for given graph with normalization",
+          py::arg("indptr"), py::arg("indices"), py::arg("features"), py::arg("edge_weights"),
+          py::arg("norm") = "none");
+
     m.def("clear_graph_cache", &clear_graph_cache, "Clear graph cache");
 }
