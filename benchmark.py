@@ -103,7 +103,9 @@ def benchmark_cusparse_spmm(indptr, indices, feats, num_iters=100, norm=None):
     return mean(timings), stdev(timings), out
 
 
-
+def benchmark_torch_matmul(indptr, indices, feats, num_iters=100, norm=None):
+    # create sparse matrix
+    pass
 
 
 def _benchmark(g, indptr, indices, feats, num_iters=200, norm=None):
@@ -132,7 +134,7 @@ def _benchmark(g, indptr, indices, feats, num_iters=200, norm=None):
     best_dgl = min(dgl_times)
     best_cusparse = min(cusparse_times)
 
-    print(f"\nBest times:")
+    print( "\nBest times:")
     print(f"  DGL: {best_dgl:.4f} ms")
     print(f"  cuSPARSE: {best_cusparse:.4f} ms")
     print(f"  Speedup: {best_dgl/best_cusparse:.2f}x")
@@ -209,6 +211,6 @@ if __name__ == "__main__":
 
 
     df = pd.DataFrame(df)
-    df.to_csv(f"benchmark_results_norm_{norm}_{args.iters}_iters.csv")
+    df.to_csv(f"data/benchmark_results_norm_{norm}_{args.iters}_iters.csv")
 
     print(df)

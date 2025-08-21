@@ -21,7 +21,7 @@
         }                                                                      \
     }
 
-// Enumeration for normalization types
+
 enum class NormType {
     NONE = 0,
     RIGHT = 1,
@@ -30,7 +30,7 @@ enum class NormType {
 };
 
 
-// Forward declarations for CUDA kernel wrappers
+
 void launch_compute_degrees(const torch::Tensor& indptr, const torch::Tensor& indices,
                            torch::Tensor& in_degrees, torch::Tensor& out_degrees);
 
@@ -76,6 +76,10 @@ size_t hash_graph(const torch::Tensor& indptr, const torch::Tensor& indices,
     return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
 }
 
+
+
+
+
 torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
                                  const torch::Tensor &indices, 
                                  const torch::Tensor &features,
@@ -87,7 +91,6 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
     CHECK_INPUT(indices);
     CHECK_INPUT(features);
 
-    // Convert normalization string to enum
     NormType norm;
     if (norm_str == "none") norm = NormType::NONE;
     else if (norm_str == "right") norm = NormType::RIGHT;
@@ -115,10 +118,8 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    // Pre-allocate output
     auto out = torch::empty({m, n}, features.options());
 
-    // Determine which algorithm to use
     cusparseSpMMAlg_t alg;
     switch (algorithm) {
         case 0: alg = CUSPARSE_SPMM_ALG_DEFAULT; break;
@@ -128,23 +129,22 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
         default: alg = CUSPARSE_SPMM_ALG_DEFAULT;
     }
 
-    // Try to use cached graph structure
     GraphCache* cache = nullptr;
     size_t graph_hash = 0;
-    
+
     if (use_cache) {
         graph_hash = hash_graph(indptr, indices, norm, has_edge_weights);
         std::lock_guard<std::mutex> lock(cache_mutex);
-        
+
         auto it = graph_cache.find(graph_hash);
         if (it != graph_cache.end()) {
             cache = it->second.get();
-            // Use cached best algorithm if no specific algorithm requested
+
             if (algorithm == -1) {
                 alg = cache->best_alg;
             }
         } else {
-            // Create new cache entry
+
             graph_cache[graph_hash] = std::make_unique<GraphCache>();
             cache = graph_cache[graph_hash].get();
             cache->m = m;
@@ -154,19 +154,19 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
             cache->cached_norm = norm;
             cache->has_edge_weights = has_edge_weights;
             
-            // Allocate degree tensors
+
             cache->in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
             cache->out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
             
-            // Compute degrees
+
             launch_compute_degrees(indptr, indices, cache->in_degrees, cache->out_degrees);
             
-            // Allocate and compute normalized edge weights
+
             cache->edge_values = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
             launch_compute_normalized_weights(indptr, indices, edge_weights, cache->edge_values,
                                      cache->in_degrees, cache->out_degrees, norm);
             
-            // Create sparse matrix descriptor
+
             CHECK_CUSPARSE(cusparseCreateCsr(
                 &cache->matA, m, m, nnz, 
                 indptr.data_ptr<int32_t>(),
@@ -268,17 +268,7 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
     return out;
 }
 
-// Keep the original function for backward compatibility
-torch::Tensor csr_SPMM(const torch::Tensor &indptr,
-                       const torch::Tensor &indices, 
-                       const torch::Tensor &features,
-                       int algorithm,
-                       bool use_cache) {
-    torch::Tensor empty_weights = torch::empty({0}, features.options());
-    return csr_SPMM_normalized(indptr, indices, features, empty_weights, "none", algorithm, use_cache);
-}
 
-// Function to find best algorithm for a given graph (updated for normalization)
 int find_best_algorithm_normalized(const torch::Tensor &indptr,
                                   const torch::Tensor &indices, 
                                   const torch::Tensor &features,
@@ -286,7 +276,7 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
                                   const std::string &norm_str) {
     auto handle = at::cuda::getCurrentCUDASparseHandle();
     
-    // Convert normalization string to enum
+
     NormType norm;
     if (norm_str == "none") norm = NormType::NONE;
     else if (norm_str == "right") norm = NormType::RIGHT;
@@ -399,13 +389,26 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
 }
 
 
-// Keep original function for backward compatibility
+// ************************* BACKWARD COMPATIBILITY STARTS *************************
 int find_best_algorithm(const torch::Tensor &indptr,
                         const torch::Tensor &indices, 
                         const torch::Tensor &features) {
     torch::Tensor empty_weights = torch::empty({0}, features.options());
     return find_best_algorithm_normalized(indptr, indices, features, empty_weights, "none");
 }
+
+
+torch::Tensor csr_SPMM(const torch::Tensor &indptr,
+                       const torch::Tensor &indices, 
+                       const torch::Tensor &features,
+                       int algorithm,
+                       bool use_cache) {
+    torch::Tensor empty_weights = torch::empty({0}, features.options());
+    return csr_SPMM_normalized(indptr, indices, features, empty_weights, "none", algorithm, use_cache);
+}
+
+// ************************* BACKWARD COMPATIBILITY ENDS *************************
+
 
 void clear_graph_cache() {
     std::lock_guard<std::mutex> lock(cache_mutex);
