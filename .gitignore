@@ -3,3 +3,7 @@ __examples
 **/__pycache__
 
 dataset/*
+
+.vscode/
+
+data/

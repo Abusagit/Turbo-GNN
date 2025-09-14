@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <torch/torch.h>
 #include <cmath>
+
 
 constexpr int BLOCK_DIM = 256;
 

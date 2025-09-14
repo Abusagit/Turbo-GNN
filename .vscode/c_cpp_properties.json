@@ -12,7 +12,7 @@
                 "/home/fvelikon/.local/lib/python3.10/site-packages/torch/include/torch/csrc/api/include"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/gcc",
+            "compilerPath": "/usr/bin/g++",
             "cStandard": "${default}",
             "cppStandard": "${default}",
             "intelliSenseMode": "linux-gcc-x64"

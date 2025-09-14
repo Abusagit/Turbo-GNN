@@ -4,7 +4,7 @@ import os
 
 path = __file__.replace('cusparse_spmm.py', '')
 
-sources = ["cusparse_spmm.cpp", "edge_norm_kernels.cu.cu"]
+sources = ["cusparse_spmm.cpp", "edge_norm_kernels.cu"]
 
 cuda_kernels = load(name="cuda_kernels", extra_cflags=["-O3"], extra_cuda_cflags=[
                     "-O3", "--use_fast_math", "-arch=sm_80", "--generate-line-info", "-lcusparse"],

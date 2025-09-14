@@ -124,7 +124,7 @@ def _benchmark(g, indptr, indices, feats, num_iters=200, norm=None):
         avg_time_csr, std_time_csr, out_csr = benchmark_cusparse_spmm(indptr, indices, feats, num_iters, norm=norm)
         print(f"  cuSPARSE: {avg_time_csr:.4f} ± {std_time_csr:.4f} ms")
         cusparse_times.append(avg_time_csr)
-        
+
         # Verify correctness
         # torch.testing.assert_close(out_dgl, out_csr, atol=1e-4, rtol=1e-4)
         diff = torch.abs(out_dgl - out_csr).max().item()
@@ -169,17 +169,17 @@ if __name__ == "__main__":
         # (250000, 2, 1024),    # Higher degree * larger dim
         # (250000, 10, 1024),    # Higher degree * larger dim
 
-        (100000, 5, 32),    
-        # (100000, 5, 64),    # Higher degree * larger dim
-        (100000, 5, 128),    # Higher degree * larger dim
-        # (100000, 3, 1024),    # Higher degree * larger dim
-        # (100000, 20, 1024),    # Higher degree * larger dim
+        # (100000, 5, 32),    
+        # # (100000, 5, 64),    # Higher degree * larger dim
+        # (100000, 5, 128),    # Higher degree * larger dim
+        # # (100000, 3, 1024),    # Higher degree * larger dim
+        # # (100000, 20, 1024),    # Higher degree * larger dim
 
-        (10000, 3, 64),    # Original
-        (10000, 3, 128),   # More features
-        (10000, 5, 1024),   # even More features
-        (10000, 10, 1024),   # even More features
-        (10000, 20, 1024),   # even More features
+        # (10000, 3, 64),    # Original
+        # (10000, 3, 128),   # More features
+        # (10000, 5, 1024),   # even More features
+        # (10000, 10, 1024),   # even More features
+        # (10000, 20, 1024),   # even More features
 
     ]
     
