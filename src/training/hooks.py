@@ -6,14 +6,35 @@ pipeline for monitoring, profiling, checkpointing, and other extensions.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, Union, Literal, List
 import torch
 import torch.nn as nn
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import _LRScheduler, ReduceLROnPlateau
 from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
 import logging
 
 from pathlib import Path
 import time
+
+from ..benchmarking.memory import reset_cuda_peak_memory, capture_cuda_snapshot, current_process_rss_bytes, human_bytes
+
+
+# # local import from benchmarking utilities (relative to `training/`)
+# try:
+#     from ..benchmarking.memory import (
+#         reset_cuda_peak_memory,
+#         capture_cuda_snapshot,
+#         current_process_rss_bytes,
+#         human_bytes,
+#     )
+# except Exception as _mem_import_err:
+#     reset_cuda_peak_memory = None  # type: ignore[assignment]
+#     capture_cuda_snapshot = None   # type: ignore[assignment]
+#     current_process_rss_bytes = None  # type: ignore[assignment]
+#     human_bytes = None  # type: ignore[assignment]
+
 
 __doc__ = """
 Training hooks module for GNN benchmarking.
@@ -26,6 +47,7 @@ for extensible monitoring and control. Hooks can be used for:
 - Custom logging
 - Early stopping
 - Learning rate scheduling
+- Other stuff you come up with ;)
 
 The hook system follows an event-driven pattern where hooks respond to
 specific training events.
@@ -143,6 +165,127 @@ class Hook(ABC):
             metrics: Metrics of the best model
         """
         pass
+
+
+Mode = Literal["batch", "epoch", "plateau"]
+SchedulerLike = Union[_LRScheduler, ReduceLROnPlateau]
+
+class LRSchedulerStepHook(Hook):
+    """Drive LR scheduling using hook events (batch/epoch/plateau).
+
+    This hook advances the LR scheduler at the correct time *without*
+    modifying the trainer. Supports:
+      - mode="batch": step after each *optimizer update* (i.e., at the grad
+        accumulation boundary).
+      - mode="epoch": step once at the end of each epoch.
+
+    AMP & Accumulation:
+        With gradient accumulation, the hook steps only when
+        (batch_idx + 1) % accumulate_steps == 0 (i.e., when you'd call
+        optimizer.step()). If AMP overflows *skip* an optimizer step, this
+        hook cannot detect that without a signal from the trainer.
+        # TODO if needed, add such a signal later
+
+    Args:
+        scheduler (SchedulerLike): torch scheduler.
+        mode (Literal["batch","epoch"]): Step timing.
+        accumulate_steps (Optional[int]): Grad accumulation steps; if None, read
+            from config.accumulation_steps on training start (defaults to 1).
+        log_every (int): If > 0, prints current LR every N batches (batch mode)
+            or at every epoch end (epoch/plateau modes).
+    """
+
+    def __init__(
+        self,
+        scheduler: SchedulerLike,
+        *,
+        mode: Mode = "epoch",
+        accumulate_steps: Optional[int] = None,
+        log_every: int = 0,
+    ) -> None:
+        self.scheduler = scheduler
+        self.mode = mode
+        self.accumulate_steps = int(accumulate_steps) if accumulate_steps is not None else None
+        self.log_every = int(log_every)
+
+        # Internal state
+        self._model: Optional[nn.Module] = None
+        self._config: Any = None
+        self._batch_counter: int = 0
+        self._epoch_counter: int = 0
+
+    # ---------------- Hook API ----------------
+
+    def on_training_start(self, model: nn.Module, config: Any) -> None:
+        """Cache references and finalize accumulation steps."""
+        self._model = model
+        self._config = config
+        if self.accumulate_steps is None and hasattr(config, "accumulation_steps"):
+            try:
+                self.accumulate_steps = int(getattr(config, "accumulation_steps"))
+            except Exception:
+                self.accumulate_steps = 1
+        if not self.accumulate_steps or self.accumulate_steps < 1:
+            self.accumulate_steps = 1
+        self._batch_counter = 0
+        self._epoch_counter = 0
+
+    def on_batch_end(self, loss: torch.Tensor, batch_idx: int) -> None:
+        """In 'batch' mode, step after accumulation boundary."""
+        if self.mode == "batch":
+            self._batch_counter += 1
+            if (batch_idx + 1) % self.accumulate_steps == 0:
+                self._safe_step()
+                if self.log_every and (self._batch_counter % self.log_every == 0):
+                    self._log_lr(prefix=f"[batch {batch_idx+1}]")
+
+    def on_epoch_end(
+        self,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+    ) -> None:
+        """In 'epoch' modes, step once per epoch."""
+        self._epoch_counter += 1
+
+        if self.mode == "epoch":
+            self._safe_step()
+            if self.log_every:
+                self._log_lr(prefix=f"[epoch {epoch}]")
+
+    def on_training_end(self, history: Dict[str, List[float]]) -> None:
+        """Optionally log final LR on training end."""
+        if self.log_every:
+            self._log_lr(prefix="[training end]")
+
+    # ---------------- Internals ----------------
+
+    def _safe_step(self) -> None:
+        """Step _LRScheduler instances (not Plateau)."""
+        try:
+            self.scheduler.step()
+        except Exception:
+            # Never fail training because of scheduler hiccups
+            pass
+
+    def _last_lr_list(self) -> Optional[List[float]]:
+        """Return last LR list for logging, robust to scheduler variants."""
+        try:
+            if hasattr(self.scheduler, "get_last_lr"):
+                return list(self.scheduler.get_last_lr())
+        except Exception:
+            pass
+        try:
+            opt: Optimizer = self.scheduler.optimizer  # type: ignore[attr-defined]
+            return [pg.get("lr", None) for pg in opt.param_groups]
+        except Exception:
+            return None
+
+    def _log_lr(self, prefix: str = "") -> None:
+        """Log learning rate(s) with a minimal dependency footprint."""
+        lrs = self._last_lr_list()
+        if lrs is not None:
+            print(f"{prefix} lr=" + ", ".join(f"{lr:.6g}" for lr in lrs if lr is not None))
 
 
 class ProfilerHook(Hook):
@@ -274,7 +417,7 @@ class MetricHook(Hook):
         log_dir: str = "./logs",
         log_interval: int = 10,
         use_wandb: bool = False,
-        wandb_project: str = "gnn-benchmark"
+        wandb_project: str = "gnn-benchmark", # TODO move from wandb
     ) -> None:
         """Initialize the metric hook.
 
@@ -359,7 +502,6 @@ class MetricHook(Hook):
         
         self.metrics.setdefault("epoch_time", []).append(epoch_time)
         
-        # Log to W&B
         if self.use_wandb:
             log_dict = {
                 "epoch": epoch,
@@ -369,7 +511,6 @@ class MetricHook(Hook):
             }
             self.wandb.log(log_dict)
         
-        # Log to console
         if epoch % self.log_interval == 0:
             logger.info(f"Epoch {epoch} completed in {epoch_time:.2f}s")
     
@@ -385,7 +526,6 @@ class MetricHook(Hook):
         total_time = time.time() - self.start_time if self.start_time else 0
         logger.info(f"Training completed in {total_time:.2f}s")
         
-        # Save metrics to file
         import json
         metrics_file = self.log_dir / "metrics.json"
         with open(metrics_file, 'w') as f:
@@ -501,76 +641,176 @@ class CheckpointHook(Hook):
                 logger.info(f"Removed old checkpoint: {old_checkpoint}")
 
 
-class EarlyStoppingHook(Hook):
-    """Hook for early stopping based on validation metrics.
-    
-    This hook monitors validation metrics and triggers early stopping
-    when no improvement is observed for a specified number of epochs.
-    
-    Attributes:
-        patience: Number of epochs to wait before stopping
-        min_delta: Minimum change to qualify as improvement
-        mode: Whether to maximize or minimize the metric
-        best_score: Best score observed so far
-        counter: Counter for patience
-        stopped: Whether early stopping was triggered
+class MemoryHook(Hook):
+    """Measure CUDA peak memory per batch and summarize per epoch.
+
+    This hook resets CUDA peak memory at batch start and reads peak stats at the
+    end of the batch, giving an accurate *per-batch* peak (forward+backward+opt).
+    It aggregates epoch-level stats (max/avg) and injects them into train_metrics.
+
+    CPU-only environments are supported: if `psutil` is installed, the hook will
+    record process RSS deltas; CUDA stats will be zeros.
+
+    Args:
+        measure_every (int): Measure every N batches (default: 1 = every batch).
+        sample_batches (Optional[int]): If set, only the first K measured batches
+            per epoch are recorded (useful to limit overhead).
+        log_every (int): If > 0, print memory after every N *measured* batches.
+        track_cpu_rss (bool): If True, record RSS deltas per measured batch.
+        sync_cuda (bool): If True, synchronize before snapshot at batch end.
     """
-    
+
     def __init__(
         self,
-        patience: int = 20,
-        min_delta: float = 0.0,
-        mode: str = 'max',
-        metric_key: str = 'accuracy'
+        *,
+        measure_every: int = 1,
+        sample_batches: Optional[int] = None,
+        log_every: int = 0,
+        track_cpu_rss: bool = True,
+        sync_cuda: bool = True,
     ) -> None:
-        """Initialize the early stopping hook.
+        self.measure_every = max(1, int(measure_every))
+        self.sample_batches = None if sample_batches is None else max(1, int(sample_batches))
+        self.log_every = max(0, int(log_every))
+        self.track_cpu_rss = bool(track_cpu_rss)
+        self.sync_cuda = bool(sync_cuda)
 
-        Args:
-            patience: Number of epochs to wait before stopping
-            min_delta: Minimum change to qualify as improvement
-            mode: 'min' or 'max' for the metric
-            metric_key: Key of the metric to monitor
-        """
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.metric_key = metric_key
-        self.best_score: Optional[float] = None
-        self.counter: int = 0
-        self.stopped: bool = False
-    
-    def on_epoch_end(
-        self, 
-        epoch: int, 
-        train_metrics: Dict[str, float], 
-        val_metrics: Dict[str, float]
-    ) -> None:
-        """Check for early stopping at epoch end.
+        # State
+        self._epoch_measured: int = 0
+        self._batch_idx_in_epoch: int = 0
+        self._cuda_available: bool = torch.cuda.is_available()
+        self._rss_start: Optional[int] = None
 
-        Args:
-            epoch: Current epoch number
-            train_metrics: Training metrics for the epoch
-            val_metrics: Validation metrics for the epoch
-        """
-        if self.metric_key not in val_metrics:
+        # Accumulators (per epoch)
+        self._peaks_alloc: List[int] = []
+        self._peaks_reserved: List[int] = []
+        self._rss_deltas: List[int] = []
+
+    # ---------------- Hook API ----------------
+
+    def on_training_start(self, model: nn.Module, config: Any) -> None:
+        """Initialize availability flags; no heavy work needed."""
+        self._cuda_available = torch.cuda.is_available()
+        logger.info(
+            f"MemoryHook initialized (cuda={self._cuda_available}, "
+            f"measure_every={self.measure_every}, sample_batches={self.sample_batches}, "
+            f"log_every={self.log_every})"
+        )
+
+    def on_epoch_start(self, epoch: int) -> None:
+        """Reset per-epoch accumulators."""
+        self._epoch_measured = 0
+        self._batch_idx_in_epoch = 0
+        self._peaks_alloc.clear()
+        self._peaks_reserved.clear()
+        self._rss_deltas.clear()
+
+    def on_batch_start(self, batch: Any, batch_idx: int) -> None:
+        """Reset CUDA peak stats and (optionally) capture starting RSS."""
+        self._batch_idx_in_epoch = batch_idx
+        if not self._should_measure_this_batch(batch_idx):
             return
-        
-        current_score = val_metrics[self.metric_key]
-        
-        if self.best_score is None:
-            self.best_score = current_score
+
+        if self._cuda_available and reset_cuda_peak_memory is not None:
+            try:
+                reset_cuda_peak_memory()
+            except Exception:
+                pass
+
+        if self.track_cpu_rss and current_process_rss_bytes is not None:
+            self._rss_start = current_process_rss_bytes()
         else:
-            if self.mode == 'max':
-                improved = current_score > self.best_score + self.min_delta
+            self._rss_start = None
+
+    def on_batch_end(self, loss: torch.Tensor, batch_idx: int) -> None:
+        """Read peak CUDA stats for this batch and aggregate."""
+        if not self._should_measure_this_batch(batch_idx):
+            return
+
+        peak_alloc = 0
+        peak_reserved = 0
+
+        if self._cuda_available and capture_cuda_snapshot is not None:
+            try:
+                if self.sync_cuda:
+                    torch.cuda.synchronize()
+                snap = capture_cuda_snapshot()
+                peak_alloc = int(getattr(snap, "max_allocated_bytes", 0))
+                peak_reserved = int(getattr(snap, "max_reserved_bytes", 0))
+            except Exception:
+                pass
+
+        self._peaks_alloc.append(peak_alloc)
+        self._peaks_reserved.append(peak_reserved)
+
+        if self.track_cpu_rss and current_process_rss_bytes is not None:
+            try:
+                end_rss = current_process_rss_bytes()
+                if end_rss is not None and self._rss_start is not None:
+                    self._rss_deltas.append(max(0, int(end_rss) - int(self._rss_start)))
+            except Exception:
+                pass
+
+        self._epoch_measured += 1
+
+        if self.log_every > 0 and (self._epoch_measured % self.log_every == 0):
+            if human_bytes is not None:
+                a = human_bytes(peak_alloc, binary=True)
+                r = human_bytes(peak_reserved, binary=True)
+                msg = f"[batch {batch_idx}] CUDA peak alloc={a}, reserved={r}"
+                if self._rss_deltas:
+                    msg += f", RSS Δ={human_bytes(self._rss_deltas[-1], binary=True)}"
+                logger.info(msg)
             else:
-                improved = current_score < self.best_score - self.min_delta
-            
-            if improved:
-                self.best_score = current_score
-                self.counter = 0
-            else:
-                self.counter += 1
-                
-                if self.counter >= self.patience:
-                    self.stopped = True
-                    logger.info(f"Early stopping triggered at epoch {epoch}")
+                logger.info(f"[batch {batch_idx}] CUDA peak alloc={peak_alloc}B, reserved={peak_reserved}B")
+
+    def on_epoch_end(self, epoch: int, train_metrics: Dict[str, float], val_metrics: Dict[str, float]) -> None:
+        """Summarize per-epoch stats and inject into train_metrics."""
+        if not self._peaks_alloc and not self._peaks_reserved and not self._rss_deltas:
+            return
+
+        def _to_mb(x: int) -> float:
+            return float(x) / (1024.0 ** 2)
+
+        peak_alloc_max = max(self._peaks_alloc) if self._peaks_alloc else 0
+        peak_reserved_max = max(self._peaks_reserved) if self._peaks_reserved else 0
+        peak_alloc_avg = int(sum(self._peaks_alloc) / max(1, len(self._peaks_alloc))) if self._peaks_alloc else 0
+        peak_reserved_avg = int(sum(self._peaks_reserved) / max(1, len(self._peaks_reserved))) if self._peaks_reserved else 0
+
+        rss_delta_max = max(self._rss_deltas) if self._rss_deltas else 0
+        rss_delta_avg = int(sum(self._rss_deltas) / max(1, len(self._rss_deltas))) if self._rss_deltas else 0
+
+        # inject into train_metrics (so other hooks / logs can pick it up)
+        train_metrics["cuda_peak_alloc_mb_max"] = _to_mb(peak_alloc_max)
+        train_metrics["cuda_peak_alloc_mb_avg"] = _to_mb(peak_alloc_avg)
+        train_metrics["cuda_peak_reserved_mb_max"] = _to_mb(peak_reserved_max)
+        train_metrics["cuda_peak_reserved_mb_avg"] = _to_mb(peak_reserved_avg)
+        if self._rss_deltas:
+            train_metrics["cpu_rss_delta_mb_max"] = _to_mb(rss_delta_max)
+            train_metrics["cpu_rss_delta_mb_avg"] = _to_mb(rss_delta_avg)
+
+        if human_bytes is not None:
+            msg = (
+                f"[epoch {epoch}] CUDA peak alloc: max={human_bytes(peak_alloc_max, binary=True)}, "
+                f"avg={human_bytes(peak_alloc_avg, binary=True)}; "
+                f"reserved: max={human_bytes(peak_reserved_max, binary=True)}, "
+                f"avg={human_bytes(peak_reserved_avg, binary=True)}"
+            )
+            if self._rss_deltas:
+                msg += (
+                    f"; RSS Δ: max={human_bytes(rss_delta_max, binary=True)}, "
+                    f"avg={human_bytes(rss_delta_avg, binary=True)}"
+                )
+            logger.info(msg)
+        else:
+            logger.info(
+                f"[epoch {epoch}] CUDA peak alloc: max={peak_alloc_max}B avg={peak_alloc_avg}B; "
+                f"reserved: max={peak_reserved_max}B avg={peak_reserved_avg}B; "
+                f"RSS Δ: max={rss_delta_max}B avg={rss_delta_avg}B"
+            )
+
+    def _should_measure_this_batch(self, batch_idx: int) -> bool:
+        """Return True if this batch should be measured."""
+        if self.sample_batches is not None and self._epoch_measured >= self.sample_batches:
+            return False
+        return (batch_idx % self.measure_every) == 0

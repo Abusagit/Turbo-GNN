@@ -1,0 +1,36 @@
+training:
+  # Trainer (maps to TrainingConfig)
+  epochs: 200
+  learning_rate: 0.01          # initial LR (also mirrored in optimizer.lr below)
+  weight_decay: 0.0005
+  batch_size: 1                 # single-graph datasets → batch=1
+  accumulation_steps: 1
+  use_amp: false                # trainer uses autocast(dtype=bfloat16)
+  clip_grad_norm: null
+  patience: 100
+  device: cuda
+  num_workers: 0
+  pin_memory: true
+  log_interval: 10
+  checkpoint_interval: 10
+  profile: false
+
+optimizer:
+  name: adamw
+  lr: 0.01
+  weight_decay: 0.0005
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  momentum: 0.9
+  nesterov: false
+  amsgrad: false
+  foreach: null
+  fused: null
+  no_decay_norm_bias: true
+
+scheduler:
+  name: cosine_warmup        # options: none|step|multistep|exponential|cosine|cosine_warmup|warm_restarts|onecycle
+  warmup_epochs: 5
+  T_max: 200                 # cosine period (epochs)
+  eta_min: 0.0
+  step_on_batch: false       # trainer calls .step() per epoch

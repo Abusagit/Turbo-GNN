@@ -164,7 +164,40 @@ class GNNTrainer:
         for hook in self.hooks:
             if hasattr(hook, event):
                 getattr(hook, event)(*args, **kwargs)
-    
+
+    def _backward(self, loss: torch.Tensor, batch_idx: int) -> None:
+        """Performs backward pass
+
+        Args:
+            loss (torch.Tensor): loss tensor with backward graph
+            batch_idx (int): batch index to trach gradient accumulation
+        """
+        if self.scaler:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        # grad accumulation
+        if (batch_idx + 1) % self.config.accumulation_steps == 0:
+            # grad clipping
+            if self.config.clip_grad_norm:
+                if self.scaler:
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.clip_grad_norm
+                )
+            
+            # optimizer step
+            if self.scaler:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            
+            self.optimizer.zero_grad()
+            self.global_step += 1
+
     def train_epoch(
         self, 
         dataloader: Any
@@ -181,15 +214,13 @@ class GNNTrainer:
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        
+
         progress_bar = tqdm(dataloader, desc=f"Epoch {self.current_epoch}")
 
-        # TODO add logic for full-batch training
         for batch_idx, batch in enumerate(progress_bar):
-            # Fire batch start event
+            # fier batch start event
             self.fire_event('on_batch_start', batch, batch_idx)
             
-            # Move batch to device
             batch = self._batch_to_device(batch)
             
             # Forward pass with optional AMP
@@ -197,49 +228,24 @@ class GNNTrainer:
                 output = self.model(batch['features'], batch['graph'])
                 loss = self.criterion(output[batch['mask']], batch['labels'][batch['mask']])
                 
-                # Scale loss for gradient accumulation
+                # scale loss for gradient accumulation
                 loss = loss / self.config.accumulation_steps
             
-            # Fire forward end event
+            # fire forward end event
             self.fire_event('on_forward_end', output, loss)
-            
-            # Backward pass
-            if self.scaler:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            
-            # Gradient accumulation
-            if (batch_idx + 1) % self.config.accumulation_steps == 0:
-                # Gradient clipping
-                if self.config.clip_grad_norm:
-                    if self.scaler:
-                        self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 
-                        self.config.clip_grad_norm
-                    )
-                
-                # Optimizer step
-                if self.scaler:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-                
-                self.optimizer.zero_grad()
-                self.global_step += 1
-            
-            # Fire batch end event
+
+            self._backward(loss, batch_idx)    
+        
+            # fire batch end event
             self.fire_event('on_batch_end', loss, batch_idx)
             
-            # Update metrics
+            # update metrics
             total_loss += loss.item() * self.config.accumulation_steps
             pred = output[batch['mask']].argmax(dim=-1)
             total_correct += (pred == batch['labels'][batch['mask']]).sum().item()
             total_samples += batch['mask'].sum().item()
             
-            # Update progress bar
+            # update progress bar
             if batch_idx % self.config.log_interval == 0:
                 progress_bar.set_postfix({
                     'loss': total_loss / (batch_idx + 1),
@@ -312,28 +318,28 @@ class GNNTrainer:
             'val_acc': []
         }
         
-        # Fire training start event
+        # fire training start event
         self.fire_event('on_training_start', self.model, self.config)
         
         for epoch in range(self.config.epochs):
             self.current_epoch = epoch
             
-            # Fire epoch start event
+            # fire epoch start event
             self.fire_event('on_epoch_start', epoch)
             
-            # Training
+            # training
             train_metrics = self.train_epoch(train_loader)
             history['train_loss'].append(train_metrics['loss'])
             history['train_acc'].append(train_metrics['accuracy'])
             
-            # Validation
+            # validation
             val_metrics = {}
             if val_loader:
                 val_metrics = self.validate(val_loader)
                 history['val_loss'].append(val_metrics['loss'])
                 history['val_acc'].append(val_metrics['accuracy'])
                 
-                # Early stopping
+                # early stopping
                 if val_metrics['accuracy'] > self.best_val_score:
                     self.best_val_score = val_metrics['accuracy']
                     self.early_stopping_counter = 0
@@ -344,14 +350,14 @@ class GNNTrainer:
                         logger.info(f"Early stopping at epoch {epoch}")
                         break
             
-            # Learning rate scheduling
+            # learning rate scheduling
             if self.scheduler:
                 self.scheduler.step()
             
-            # Fire epoch end event
+            # fire epoch end event
             self.fire_event('on_epoch_end', epoch, train_metrics, val_metrics)
             
-            # Logging
+            # logging
             logger.info(f"Epoch {epoch}: "
                        f"Train Loss: {train_metrics['loss']:.4f}, "
                        f"Train Acc: {train_metrics['accuracy']:.4f}")
@@ -359,10 +365,10 @@ class GNNTrainer:
                 logger.info(f"Val Loss: {val_metrics['loss']:.4f}, "
                            f"Val Acc: {val_metrics['accuracy']:.4f}")
         
-        # Fire training end event
+        # fire training end event
         self.fire_event('on_training_end', history)
         
-        # Test evaluation
+        # test evaluation
         if test_loader:
             test_metrics = self.validate(test_loader)
             history['test_loss'] = test_metrics['loss']
@@ -383,6 +389,9 @@ class GNNTrainer:
         """
         device_batch = {}
         for key, value in batch.items():
+            if value.device == self.device:
+                continue
+
             if isinstance(value, torch.Tensor):
                 device_batch[key] = value.to(self.device, non_blocking=True)
             else:

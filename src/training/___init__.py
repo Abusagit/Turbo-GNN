@@ -17,7 +17,6 @@ This module implements a flexible training pipeline with:
 - Automatic mixed precision support
 - Profiling and monitoring capabilities
 - Metric tracking and checkpointing
-- Distributed training support
 """
 
 __all__ = [
