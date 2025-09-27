@@ -108,10 +108,7 @@ class BackendRegistry:
         
         backend_class = cls._backends[name]
         backend = backend_class(**kwargs)
-        
-        if not backend.check_availability():
-            raise RuntimeError(f"Backend '{name}' is not available on this system")
-        
+
         return backend
     
     @classmethod
@@ -139,8 +136,8 @@ class BackendRegistry:
         if conv_type not in cls._convolutions[backend]:
             available = ", ".join(cls._convolutions[backend].keys())
             raise ValueError(f"Convolution '{conv_type}' not available for {backend}. "
-                           f"Available: {available}")
-        
+                             f"Available: {available}")
+
         conv_class = cls._convolutions[backend][conv_type]
         return conv_class(**kwargs)
     

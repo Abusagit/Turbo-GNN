@@ -53,8 +53,6 @@ class BaseBackend(ABC):
     Attributes:
         device: The torch device to use for computations
         dtype: The data type for tensors
-        _cache: Internal cache for storing intermediate results
-        _profiling_enabled: Flag to enable/disable profiling
     """
     
     def __init__(
@@ -70,57 +68,6 @@ class BaseBackend(ABC):
         """
         self.device = torch.device(device)
         self.dtype = dtype
-        self._cache: Dict[str, Any] = {}
-        self._profiling_enabled: bool = False
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Get the name of the backend.
-
-        Returns:
-            Name identifier for the backend
-        """
-        pass
-
-    @property
-    @abstractmethod
-    def supported_formats(self) -> List[GraphFormat]:
-        """Get list of supported graph formats.
-
-        Returns:
-            List of GraphFormat enums that this backend supports
-        """
-        pass
-
-    @abstractmethod
-    def check_availability(self) -> bool:
-        """Check if the backend is available on the current system.
-
-        Returns:
-            True if backend is available, False otherwise
-        """
-        pass
-
-    def enable_profiling(self) -> None:
-        """Enable profiling hooks for performance monitoring."""
-        self._profiling_enabled = True
-
-    def disable_profiling(self) -> None:
-        """Disable profiling hooks."""
-        self._profiling_enabled = False
-
-    def clear_cache(self) -> None:
-        """Clear all internal caches to free memory."""
-        self._cache.clear()
-
-    def get_cache_size(self) -> int:
-        """Get the current size of the internal cache.
-
-        Returns:
-            Number of items in the cache
-        """
-        return len(self._cache)
 
 
 class BaseConvolution(nn.Module):
@@ -137,7 +84,6 @@ class BaseConvolution(nn.Module):
         normalize: Whether to apply normalization
         weight: Learnable weight matrix
         bias: Learnable bias vector (optional)
-        _cached_result: Cached computation results
     """
     
     def __init__(
@@ -145,8 +91,6 @@ class BaseConvolution(nn.Module):
         in_channels: int,
         out_channels: int,
         bias: bool = True,
-        cached: bool = False,
-        normalize: bool = True,
         dropout: float = 0.0,
         **kwargs: Any
     ) -> None:
@@ -156,8 +100,6 @@ class BaseConvolution(nn.Module):
             in_channels: Number of input feature channels
             out_channels: Number of output feature channels
             bias: Whether to add a learnable bias term
-            cached: Whether to cache normalized graph structure
-            normalize: Whether to apply symmetric normalization
             dropout: Dropout probability (default: 0.0)
             **kwargs: Additional backend-specific arguments
         """
@@ -165,8 +107,6 @@ class BaseConvolution(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.use_bias = bias
-        self.cached = cached
-        self.normalize = normalize
         self.dropout = dropout
         
         # Initialize parameters
@@ -177,7 +117,6 @@ class BaseConvolution(nn.Module):
             self.register_parameter('bias', None)
         
         self.reset_parameters()
-        self._cached_result: Optional[Any] = None
     
     def reset_parameters(self) -> None:
         """Initialize layer parameters using Xavier uniform initialization."""
@@ -203,10 +142,6 @@ class BaseConvolution(nn.Module):
             Output node features of shape [num_nodes, out_channels]
         """
         pass
-    
-    def reset_cache(self) -> None:
-        """Reset cached computations to free memory."""
-        self._cached_result = None
     
     def extra_repr(self) -> str:
         """Get extra representation string for printing.
