@@ -27,7 +27,7 @@ class _PygGCNConv(BaseConvolution):
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
 
-        self._conv = GCNConv(in_channels, out_channels, bias=bias, **kwargs)
+        self._conv = GCNConv(in_channels, out_channels, bias=bias, add_self_loops=True, **kwargs)
 
     def forward(
         self,

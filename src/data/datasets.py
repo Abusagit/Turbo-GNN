@@ -175,9 +175,9 @@ def _masks_from_indices(num_nodes: int, splits: Dict[str, torch.Tensor]) -> Tupl
     train_mask = torch.zeros(num_nodes, dtype=torch.bool)
     val_mask = torch.zeros_like(train_mask)
     test_mask = torch.zeros_like(train_mask)
-    train_mask[train_idx.long()] = True
-    val_mask[val_idx.long()] = True
-    test_mask[test_idx.long()] = True
+    train_mask[train_idx] = True
+    val_mask[val_idx] = True
+    test_mask[test_idx] = True
     return train_mask, val_mask, test_mask
 
 

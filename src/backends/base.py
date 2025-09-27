@@ -6,7 +6,7 @@ implementations and convolution layers in the benchmarking framework.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, List
+from typing import Any
 import torch
 import torch.nn as nn
 from enum import Enum
@@ -108,21 +108,6 @@ class BaseConvolution(nn.Module):
         self.out_channels = out_channels
         self.use_bias = bias
         self.dropout = dropout
-        
-        # Initialize parameters
-        self.weight = nn.Parameter(torch.empty(in_channels, out_channels))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_channels))
-        else:
-            self.register_parameter('bias', None)
-        
-        self.reset_parameters()
-    
-    def reset_parameters(self) -> None:
-        """Initialize layer parameters using Xavier uniform initialization."""
-        nn.init.xavier_uniform_(self.weight)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
     
     @abstractmethod
     def forward(

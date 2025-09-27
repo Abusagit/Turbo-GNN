@@ -1,0 +1,64 @@
+# environment.yml - Conda environment for GNN benchmarking
+# Usage: conda env create -f environment.yml
+
+name: gnn_bench
+channels:
+  - pytorch
+  - pyg
+  - dglteam/label/cu124
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.11
+  
+  # PyTorch with CUDA
+  - pytorch<2.5
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4  # Change to 11.8 if using CUDA 11.8
+  
+  # PyTorch Geometric
+  - pyg>=2.3.0
+  - pytorch-scatter
+  - pytorch-sparse
+  - pytorch-cluster
+  - pytorch-spline-conv
+  
+  # DGL
+  - dgl>=1.0.0
+  
+  # Scientific computing
+  - numpy<2.0
+  - scipy>=1.7.0
+  - pandas>=1.5.0
+  - scikit-learn>=1.0.0
+  
+  # Visualization
+  - matplotlib>=3.5.0
+  - seaborn>=0.12.0
+  - plotly>=5.0.0
+  
+  # Utilities
+  - pyyaml>=6.0
+  - tqdm>=4.65.0
+  - tensorboard>=2.10.0
+  - psutil>=5.9.0
+  - jupyterlab>=3.0.0
+  - ipywidgets>=7.6.0
+  
+  # Development tools
+  - pytest>=7.0.0
+  - black>=22.0.0
+  - pylint>=2.15.0
+  - mypy>=0.990
+  
+  # Pip dependencies
+  - pip
+  - pip:
+    - ogb>=1.3.0
+    # - wandb>=0.15.0
+    - triton>=2.0.0  # For Triton kernels
+    - torchdata==0.9.0

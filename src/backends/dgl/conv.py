@@ -1,7 +1,7 @@
 from typing import Any, Optional
 
 import torch
-from dgl.pytorch.nn import GraphConv
+from dgl.nn.pytorch import GraphConv
 
 
 from ..base import BaseBackend, BaseConvolution
@@ -27,7 +27,7 @@ class _DglGCNConv(BaseConvolution):
             **kwargs (Any): DGL GraphConv kwargs (norm, weight, ...).
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-        self._conv = GraphConv(in_channels, out_channels, bias=bias, **kwargs)
+        self._conv = GraphConv(in_channels, out_channels, bias=bias, allow_zero_in_degree=True, **kwargs)
 
     def forward(
         self,
