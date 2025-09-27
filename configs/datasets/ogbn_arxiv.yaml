@@ -1,0 +1,4 @@
+dataset:
+  source: ogbn
+  name: ogbn-arxiv
+  root: data
