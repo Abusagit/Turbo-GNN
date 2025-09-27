@@ -1,0 +1,11 @@
+microbench:
+  layer: gcn                 # gcn|gat|sage|gin
+  backends: [pyg, dgl, torch_native]
+  feature_dims: [64, 128, 256, 512]
+  num_nodes: [5_000, 20_000, 100_000]
+  avg_degree: 10
+  sparse_rate: null          # optional alternative to avg_degree
+  iters: 100
+  warmup: 20
+  amp_dtype: bf16            # null|bf16|fp16
+  seed: 17
