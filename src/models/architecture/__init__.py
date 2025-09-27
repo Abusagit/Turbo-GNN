@@ -1,3 +1,5 @@
+from . import classifier
+from . import encoder
 from .encoder import GNNEncoder
 from .classifier import NodeClassifier
 

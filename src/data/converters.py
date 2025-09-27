@@ -1,6 +1,7 @@
 from typing import Any, Optional, Tuple
 
 import torch
+from torch_geometric.data import Data
 
 doc = """
 Graph format converters among edge list, CSR, and optional framework objects.
@@ -94,10 +95,6 @@ def to_pyg_data(
     Raises:
         ImportError: If PyG is not installed.
     """
-    try:
-        from torch_geometric.data import Data
-    except Exception as exc:
-        raise ImportError("PyTorch Geometric is required for to_pyg_data()") from exc
     return Data(x=x, edge_index=edge_index, y=y, edge_weight=edge_weight)
 
 

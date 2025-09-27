@@ -66,7 +66,7 @@ def _is_norm_module(module: nn.Module) -> bool:
         nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
         nn.LayerNorm, nn.GroupNorm, nn.InstanceNorm1d,
         nn.InstanceNorm2d, nn.InstanceNorm3d, nn.LocalResponseNorm,
-        nn.RMSNorm,
+        # nn.RMSNorm, # BUG wasn't added in pytorch 2.4
     )
     return isinstance(module, norm_types)
 

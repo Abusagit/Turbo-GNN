@@ -570,7 +570,10 @@ class CheckpointHook(Hook):
         self.save_best_only = save_best_only
         self.best_model_path: Optional[Path] = None
         self.checkpoints: List[Path] = []
-    
+
+    def on_training_start(self, model: nn.Module, config: Any) -> None:
+        return super().on_training_start(model, config)
+
     def on_epoch_end(
         self, 
         epoch: int, 

@@ -2,9 +2,8 @@ import argparse
 
 import torch
 
-from scripts._common import ensure_outdir  # reserved for future outputs if needed
+from scripts._common import create_split_datasets_from_yaml, ensure_outdir  # reserved for future outputs if needed
 
-from src.data.datasets import create_split_datasets_from_yaml
 from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml
 from src.training.trainer import GNNTrainer, TrainingConfig

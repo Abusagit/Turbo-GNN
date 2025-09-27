@@ -26,9 +26,9 @@ def test_backend_registration():
 
     # Import backend modules to trigger registration
     try:
-        import src.backends.pyg  # noqa: F401
-        import src.backends.dgl  # noqa: F401
-        import src.backends.torch_native  # noqa: F401
+        import src.backends.pyg_backend  # noqa: F401
+        import src.backends.dgl_backend  # noqa: F401
+        import src.backends.torch_native_backend  # noqa: F401
         print("✓ Backend modules imported successfully")
     except Exception as e:
         msg = f"✗ Failed to import backends: {e}"

@@ -12,9 +12,6 @@ from ogb.nodeproppred import NodePropPredDataset
 
 import dgl.data as dgl_data
 
-# from .config_utils import load_yaml_config
-
-
 
 doc = """
 Single-graph dataset loaders that normalize OGB (ogbn-*), PyG, and DGL datasets
@@ -415,43 +412,3 @@ def create_split_datasets(cfg: DatasetConfig) -> Tuple[SingleGraphDataset, Singl
         SingleGraphDataset(sample, split="val"),
         SingleGraphDataset(sample, split="test"),
     )
-
-
-def create_split_datasets_from_config_dict(cfg: Dict[str, Any]) -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
-    """Load dataset per config dict and return split datasets.
-
-    Expected dict keys:
-        - dataset: { source: 'ogbn'|'pyg'|'dgl'|'auto', name: str, root: str }
-        - transforms: {...}   # optional (see `apply_transforms_from_config_dict`)
-    """
-    ds_cfg = cfg.get("dataset") or {}
-    source = str(ds_cfg.get("source", "auto"))
-    name = str(ds_cfg.get("name"))
-    root = str(ds_cfg.get("root", "data"))
-
-    sample = load_single_graph(DatasetConfig(source=source, name=name, root=root))
-
-    return (
-        SingleGraphDataset(sample, split="train"),
-        SingleGraphDataset(sample, split="val"),
-        SingleGraphDataset(sample, split="test"),
-    )
-
-
-def create_split_datasets_from_yaml(path: str) -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
-    """Load a YAML config file (dataset + transforms), apply transforms once, and return split datasets.
-
-    Args:
-        path (str): Path to YAML file. See `src/data/config_utils.py` docstring for schema.
-
-    Returns:
-        Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
-            (train_ds, val_ds, test_ds)
-    """
-    import yaml
-    
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-
-    return create_split_datasets_from_config_dict(cfg)
-# ==============================================================================

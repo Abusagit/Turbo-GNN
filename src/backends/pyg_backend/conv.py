@@ -194,6 +194,7 @@ class PygBackend(BaseBackend):
             BaseConvolution: An instance of the requested PyG conv.
         """
         ct = conv_type.lower()
+
         if ct == "gcn":
             return _PygGCNConv(in_channels, out_channels, **kwargs)
         if ct == "gat":

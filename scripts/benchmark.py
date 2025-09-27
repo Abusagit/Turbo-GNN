@@ -91,7 +91,11 @@ def main() -> int:
 
     # conv
     backend = BackendRegistry.get_backend(args.backend)
-    conv = backend.create_conv(args.layer, args.in_ch, args.out_ch, heads=args.heads if args.layer == "gat" else 1)
+    if args.layer != "gat":
+        conv = backend.create_conv(args.layer, args.in_ch, args.out_ch)
+    else:
+        conv = backend.create_conv(args.layer, args.in_ch, args.out_ch, heads=args.heads)
+
     conv = conv.to(device)
 
     # measure function

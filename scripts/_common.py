@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Union, Tuple
 
 import json
 import os
@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import yaml
 
+from src.data.datasets import load_single_graph, DatasetConfig, SingleGraphDataset
+
 doc = """
 Common utilities for training/validation/benchmark scripts:
 - YAML loading and deep-merge
@@ -17,6 +19,7 @@ Common utilities for training/validation/benchmark scripts:
 - Output directory utilities
 - JSON saving
 """
+
 
 
 PathLike = Union[str, Path]
@@ -129,3 +132,43 @@ def save_json(path: PathLike, payload: Dict[str, Any]) -> None:
         None
     """
     Path(path).write_text(json.dumps(payload, indent=4))
+
+
+def create_split_datasets_from_config_dict(cfg: Dict[str, Any]) -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
+    """Load dataset per config dict and return split datasets.
+
+    Expected dict keys:
+        - dataset: { source: 'ogbn'|'pyg'|'dgl'|'auto', name: str, root: str }
+        - transforms: {...}   # optional (see `apply_transforms_from_config_dict`)
+    """
+    ds_cfg = cfg.get("dataset") or {}
+    source = str(ds_cfg.get("source", "auto"))
+    name = str(ds_cfg.get("name"))
+    root = str(ds_cfg.get("root", "data"))
+
+    sample = load_single_graph(DatasetConfig(source=source, name=name, root=root))
+
+    return (
+        SingleGraphDataset(sample, split="train"),
+        SingleGraphDataset(sample, split="val"),
+        SingleGraphDataset(sample, split="test"),
+    )
+
+
+def create_split_datasets_from_yaml(path: str) -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
+    """Load a YAML config file (dataset + transforms), apply transforms once, and return split datasets.
+
+    Args:
+        path (str): Path to YAML file. See `src/data/config_utils.py` docstring for schema.
+
+    Returns:
+        Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
+            (train_ds, val_ds, test_ds)
+    """
+    import yaml
+    
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    return create_split_datasets_from_config_dict(cfg)
+# ==============================================================================

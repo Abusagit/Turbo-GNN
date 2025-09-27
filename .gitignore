@@ -7,3 +7,5 @@ dataset/*
 .vscode/
 
 /data/
+
+runs/

@@ -126,7 +126,7 @@ class GNNTrainer:
         
         # Setup AMP if enabled
         self.scaler = GradScaler() if config.use_amp else None
-        self.autocast_context = autocast(enabled=config.use_amp, dtype=torch.bfloat16) if config.use_amp else nullcontext
+        self.autocast_context = autocast(enabled=config.use_amp, dtype=torch.bfloat16) if config.use_amp else nullcontext()
 
         # Training state
         self.best_val_score: float = 0.0
@@ -225,6 +225,7 @@ class GNNTrainer:
             
             # Forward pass with optional AMP
             with self.autocast_context:
+
                 output = self.model(batch['features'], batch['graph'])
                 loss = self.criterion(output[batch['mask']], batch['labels'][batch['mask']])
                 
@@ -388,12 +389,19 @@ class GNNTrainer:
             Batch dictionary with tensors moved to device
         """
         device_batch = {}
-        for key, value in batch.items():
-            if value.device == self.device:
-                continue
+        device_batch["features"] = batch["features"].to(self.device)
+        device_batch["labels"] = batch["labels"].to(self.device)
+        device_batch["mask"] = batch["mask"].to(self.device)
+        
+        device_batch["features"] = batch["features"].to(self.device)
 
-            if isinstance(value, torch.Tensor):
-                device_batch[key] = value.to(self.device, non_blocking=True)
-            else:
-                device_batch[key] = value
+        # transfer edgelist to gpu:
+
+        graph = [None, None]
+        graph[0] = batch["graph"][0].to(self.device)
+
+        # transfer weights if present to gpu:
+        if isinstance(batch["graph"][1], torch.Tensor):
+            graph["graph"][1] = batch["graph"][1].to(self.device)
+        device_batch["graph"] = graph
         return device_batch

@@ -1,3 +1,4 @@
+from typing import List, Dict, Any
 from dataclasses import dataclass
 from torch.utils.data import DataLoader, Dataset
 
@@ -29,6 +30,10 @@ class LoaderConfig:
     drop_last: bool = False
     shuffle: bool = False
 
+def unwrap_singleton_list(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Unwraps singleton list and returns its contents
+    """
+    return batch[0]
 
 def build_dataloader(ds: Dataset, cfg: LoaderConfig) -> DataLoader:
     """Build a DataLoader with sensible defaults for GNNs.
@@ -49,4 +54,5 @@ def build_dataloader(ds: Dataset, cfg: LoaderConfig) -> DataLoader:
         persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         drop_last=cfg.drop_last,
+        collate_fn=unwrap_singleton_list,
     )
