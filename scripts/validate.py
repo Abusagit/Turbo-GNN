@@ -49,6 +49,10 @@ def main() -> int:
     args = parse_args()
     logger = get_logger()
 
+    tcfg = TrainingConfig(epochs=1, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
+    device = tcfg.device
+    torch.set_default_device(device)
+
     graph_backend = infer_graph_backend(args.model)
     train_ds, val_ds, test_ds = create_split_datasets_from_yaml(args.dataset, graph_backend=graph_backend)
     in_dim = train_ds.sample.num_features
@@ -63,7 +67,7 @@ def main() -> int:
     state_dict = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state_dict, strict=False)
 
-    tcfg = TrainingConfig(epochs=1, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
+
     trainer = GNNTrainer(model=model, config=tcfg)
 
     logger.info("Evaluating on validation set...")

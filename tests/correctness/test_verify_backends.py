@@ -99,7 +99,7 @@ def test_backend_convolutions():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Testing on device: {device}")
-
+    torch.set_default_device(device)
     # Generate random graph
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     x = torch.randn(num_nodes, in_channels, device=device, requires_grad=True)
@@ -292,6 +292,7 @@ def test_model_building():
         # Test forward pass
         x = torch.randn(100, 128)
         edge_index = torch.randint(0, 100, (2, 500))
+        torch.set_default_device(x.device)
 
         graph = GraphSample(backend=MODEL_BACKEND_TO_GRAPH_REPR["pyg"], x=x, y=torch.zeros(len(x)), edge_index=edge_index).graph_repr
         logits = model(x, graph)

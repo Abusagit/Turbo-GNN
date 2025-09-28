@@ -66,6 +66,7 @@ def main() -> int:
     device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
 
     # graph + features
+    torch.set_default_device(device)
     edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
 
     x = torch.randn(args.num_nodes, args.in_ch, device=device)

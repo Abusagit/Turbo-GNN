@@ -221,8 +221,6 @@ class GNNTrainer:
             # fier batch start event
             self.fire_event('on_batch_start', batch, batch_idx)
             
-            batch = self._batch_to_device(batch)
-            
             # Forward pass with optional AMP
             with self.autocast_context:
 
@@ -279,7 +277,6 @@ class GNNTrainer:
         total_samples = 0
         
         for batch in tqdm(dataloader, desc="Validation"):
-            batch = self._batch_to_device(batch)
             
             output = self.model(batch['features'], batch['graph'])
             loss = self.criterion(output[batch['mask']], batch['labels'][batch['mask']])
@@ -384,24 +381,9 @@ class GNNTrainer:
 
         Args:
             batch: Batch dictionary containing tensors
+            graph is already on GPU, move features, labels & masks
 
         Returns:
             Batch dictionary with tensors moved to device
         """
-        device_batch = {}
-        device_batch["features"] = batch["features"].to(self.device)
-        device_batch["labels"] = batch["labels"].to(self.device)
-        device_batch["mask"] = batch["mask"].to(self.device)
-        
-        device_batch["features"] = batch["features"].to(self.device)
-
-        # transfer edgelist to gpu:
-
-        graph = [None, None]
-        graph[0] = batch["graph"][0].to(self.device)
-
-        # transfer weights if present to gpu:
-        if isinstance(batch["graph"][1], torch.Tensor):
-            graph["graph"][1] = batch["graph"][1].to(self.device)
-        device_batch["graph"] = graph
-        return device_batch
+        return batch  # NOTE the code is legacy, everything is put on device during the dataset cunstruction

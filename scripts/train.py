@@ -169,6 +169,7 @@ def build_trainer(
     """
     tcfg_dict = _extract_training_cfg(merged_cfg)
     tcfg = TrainingConfig(**tcfg_dict) if tcfg_dict else TrainingConfig()
+
     return GNNTrainer(model=model, config=tcfg)
 
 
@@ -220,6 +221,8 @@ def main() -> int:
     batch_size = int(tcfg.get("batch_size", 1))
     num_workers = int(tcfg.get("num_workers", 0))
     pin_memory = bool(tcfg.get("pin_memory", True))
+
+    torch.set_default_device(tcfg["device"])
 
     graph_backend = infer_graph_backend(model_config_path=args.model)
     train_loader, val_loader, test_loader, in_dim, num_classes = build_data(

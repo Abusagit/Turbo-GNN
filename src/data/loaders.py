@@ -50,7 +50,7 @@ def build_dataloader(ds: Dataset, cfg: LoaderConfig) -> DataLoader:
         batch_size=cfg.batch_size,
         shuffle=cfg.shuffle,
         num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
+        pin_memory=False,  # NOTE legacy, we don't use oin memory as we already place tensors on GPU
         persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         drop_last=cfg.drop_last,

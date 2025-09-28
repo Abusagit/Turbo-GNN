@@ -72,17 +72,21 @@ class GraphSample:
     _graph_repr: Any = None
 
     def __post_init__(self):
-        """Store graph representation in _graph_repr field --> it will be used in the convolutions
+        """
+            1) Store graph representation in _graph_repr field --> it will be used in the convolutions
+            2) Place everything on a default device -- defined in scripts
         """
         graph = None
         if self.backend == "pyg":  # pyg eats standard edge index & weight
-            graph = (self.edge_index, self.edge_weight)
+            graph = (self._to_default_device(self.edge_index), self._to_default_device(self.edge_weight))
         elif self.backend == "dgl":
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             if self.edge_weight is not None:
                 graph.edata["w"] = self.edge_weight
+            graph = self._to_default_device(graph)
         elif self.backend == "normalized_adj_mat_gcn":
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=False)
+            graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
             ...
         elif self.backend == "coo":
@@ -93,11 +97,23 @@ class GraphSample:
             ... # TODO
         elif self.backend == "edge_list":
             edge_list = self.edge_index.T
-            graph = (edge_list, self.edge_weight)
+            graph = (self._to_default_device(edge_list), self._to_default_device(self.edge_weight))
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"
 
+        # place features, labels, masks on default device
+        self.x = self._to_default_device(self.x)
+        self.y = self._to_default_device(self.y)
+        self.train_mask = self._to_default_device(self.train_mask)
+        self.val_mask = self._to_default_device(self.val_mask)
+        self.test_mask = self._to_default_device(self.test_mask)
+
+    def _to_default_device(self, item: Any) -> Any:
+        """If tensor, place on device"""
+        if isinstance(item, torch.Tensor):
+            return item.to(torch.get_default_device())
+        return item
 
     @property
     def num_nodes(self) -> int:

@@ -10,7 +10,7 @@ training:
   patience: 100
   device: cuda
   num_workers: 0
-  pin_memory: true
+  pin_memory: false
   log_interval: 10
   checkpoint_interval: 10
   profile: false
