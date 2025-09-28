@@ -2,7 +2,7 @@ import argparse
 
 import torch
 
-from scripts._common import create_split_datasets_from_yaml, ensure_outdir  # reserved for future outputs if needed
+from scripts._common import create_split_datasets_from_yaml, ensure_outdir, infer_graph_backend  # reserved for future outputs if needed
 
 from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml
@@ -49,7 +49,8 @@ def main() -> int:
     args = parse_args()
     logger = get_logger()
 
-    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(args.dataset)
+    graph_backend = infer_graph_backend(args.model)
+    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(args.dataset, graph_backend=graph_backend)
     in_dim = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
     lc = LoaderConfig(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
@@ -65,11 +66,11 @@ def main() -> int:
     tcfg = TrainingConfig(epochs=1, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
     trainer = GNNTrainer(model=model, config=tcfg)
 
-    logger.info("Evaluating on validation set…")
+    logger.info("Evaluating on validation set...")
     val_metrics = trainer.validate(val_loader)
     logger.info(f"val: {val_metrics}")
 
-    logger.info("Evaluating on test set…")
+    logger.info("Evaluating on test set...")
     test_metrics = trainer.validate(test_loader)
     logger.info(f"test: {test_metrics}")
     return 0

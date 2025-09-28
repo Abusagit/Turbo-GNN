@@ -9,10 +9,12 @@ from scripts._common import (
     merge_yaml_files,
     ensure_outdir,
     save_json,
-    create_split_datasets_from_yaml
+    create_split_datasets_from_yaml,
+    infer_graph_backend,
 )
 
 from src.data.loaders import LoaderConfig, build_dataloader
+from src.data.datasets import GraphBackendOption
 from src.models.config import build_model_from_yaml
 from src.training.trainer import GNNTrainer, TrainingConfig
 from src.training.optimizer import OptimizerConfig, build_optimizer
@@ -78,6 +80,7 @@ def build_data(
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
+    graph_backend: GraphBackendOption,
 ) -> Tuple[Any, Any, Any, int, int]:
     """Create train/val/test loaders and infer dataset dimensions.
 
@@ -86,12 +89,12 @@ def build_data(
         batch_size (int): DataLoader batch size.
         num_workers (int): Number of DataLoader workers.
         pin_memory (bool): Whether to enable pinned memory.
-
+        graph_backend (GraphBackendOption): infered graph representation type
     Returns:
         Tuple[Any, Any, Any, int, int]: Tuple of
             (train_loader, val_loader, test_loader, num_features, num_classes).
     """
-    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(str(dataset_yaml))
+    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(str(dataset_yaml), graph_backend=graph_backend)
     num_features = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
 
@@ -198,7 +201,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Entry point: YAML merge → data/model → trainer/opt/sched → train.
+    """Entry point: YAML merge -> data/model -> trainer/opt/sched -> train.
 
     Args:
         None
@@ -217,8 +220,11 @@ def main() -> int:
     batch_size = int(tcfg.get("batch_size", 1))
     num_workers = int(tcfg.get("num_workers", 0))
     pin_memory = bool(tcfg.get("pin_memory", True))
+
+    graph_backend = infer_graph_backend(model_config_path=args.model)
     train_loader, val_loader, test_loader, in_dim, num_classes = build_data(
-        args.dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory
+        args.dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory,
+        graph_backend=graph_backend,
     )
 
     # build model
@@ -227,12 +233,15 @@ def main() -> int:
     # build trainer
     trainer = build_trainer(model, merged_cfg)
 
+    logger.info(f"Built data with graph representation: {graph_backend}\tBuilt Trainer\tBuild model")
+
     # Optimizer + Scheduler
     steps_per_epoch = len(train_loader)
     total_epochs = int(tcfg.get("epochs", 1))
     optimizer, scheduler = build_opt_and_sched(model, merged_cfg, steps_per_epoch=steps_per_epoch, total_epochs=total_epochs)
     trainer.optimizer = optimizer
     trainer.scheduler = scheduler
+    logger.info("Built Optimizer & Schedulers")
 
     # hooks
     outdir = ensure_outdir(args.out)

@@ -1,8 +1,7 @@
-from pathlib import Path
 import argparse
 from typing import Any, Dict
 
-from scripts._common import read_yaml, ensure_outdir, create_split_datasets_from_yaml
+from scripts._common import read_yaml, ensure_outdir, create_split_datasets_from_yaml, infer_graph_backend
 
 from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml
@@ -59,7 +58,7 @@ def main() -> int:
     prof_cfg: Dict[str, Any] = read_yaml(args.profile).get("profiler", {})
 
     # Data
-    train_ds, val_ds, _ = create_split_datasets_from_yaml(args.dataset)
+    train_ds, val_ds, _ = create_split_datasets_from_yaml(args.dataset, graph_backend=infer_graph_backend(args.model))
     in_dim = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
     lc = LoaderConfig(batch_size=int(training_cfg.get("batch_size", 1)),

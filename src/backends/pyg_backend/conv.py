@@ -7,7 +7,6 @@ from torch_geometric.nn import GCNConv, GATv2Conv as _GAT, SAGEConv, GINConv
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-from .utils import extract_edge_index
 
 doc = """
 PyG backend: wraps torch_geometric.nn layers and exposes them via BaseBackend.
@@ -27,7 +26,7 @@ class _PygGCNConv(BaseConvolution):
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
 
-        self._conv = GCNConv(in_channels, out_channels, bias=bias, add_self_loops=True, **kwargs)
+        self._conv = GCNConv(in_channels, out_channels, bias=bias, **kwargs)
 
     def forward(
         self,
@@ -48,8 +47,8 @@ class _PygGCNConv(BaseConvolution):
         Returns:
             torch.Tensor: Output features [N, Fout].
         """
-        edge_index, ew = extract_edge_index(graph)
-        return self._conv(x, edge_index, edge_weight=edge_weight if edge_weight is not None else ew)
+        edge_index, edge_weight = graph
+        return self._conv(x, edge_index, edge_weight=edge_weight)
 
 
 class _PygGATConv(BaseConvolution):
@@ -87,7 +86,7 @@ class _PygGATConv(BaseConvolution):
         Returns:
             torch.Tensor: Output features [N, Fout] (aggregated per PyG behavior).
         """
-        edge_index, _ = extract_edge_index(graph)
+        edge_index, edge_weight = graph
         return self._conv(x, edge_index)
 
 
@@ -125,7 +124,7 @@ class _PygSAGEConv(BaseConvolution):
         Returns:
             torch.Tensor: Output features [N, Fout].
         """
-        edge_index, _ = extract_edge_index(graph)
+        edge_index, edge_weight = graph
         return self._conv(x, edge_index)
 
 
@@ -168,7 +167,7 @@ class _PygGINConv(BaseConvolution):
         Returns:
             torch.Tensor: Output features [N, Fout].
         """
-        edge_index, _ = extract_edge_index(graph)
+        edge_index, edge_weight = graph
         return self._conv(x, edge_index)
 
 

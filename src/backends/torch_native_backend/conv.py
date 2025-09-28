@@ -5,7 +5,6 @@ import torch.nn as nn
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-from .utils import normalize_adj
 
 doc = """
 Torch-native backend: reference implementations using PyTorch sparse/dense ops.
@@ -45,19 +44,12 @@ class _TorchNativeGCNConv(BaseConvolution):
         Returns:
             torch.Tensor: Output features [N, Fout].
         """
-        if isinstance(graph, (tuple, list)):
-            edge_index = graph[0]
-            num_nodes = graph[2] if len(graph) > 2 else int(edge_index.max().item()) + 1
-        else:
-            # assume dict-like or object with attributes
-            edge_index = getattr(graph, "edge_index")
-            num_nodes = getattr(graph, "num_nodes", int(edge_index.max().item()) + 1)
-        a_hat = normalize_adj(edge_index.long(), int(num_nodes), how="both")
+        normalized_adgacency = graph
         out = self.lin(x)
-        return torch.sparse.mm(a_hat, out)
+        return torch.sparse.mm(normalized_adgacency, out)
 
 
-@BackendRegistry.register_backend("torch_native")
+@BackendRegistry.register_backend("torch_native_gcn")
 class TorchNativeBackend(BaseBackend):
     """Backend instantiating simple Torch-native GNN convs."""
     def create_conv(
@@ -78,7 +70,5 @@ class TorchNativeBackend(BaseBackend):
         Returns:
             BaseConvolution: Torch-native convolution layer.
         """
-        ct = conv_type.lower()
-        if ct == "gcn":
-            return _TorchNativeGCNConv(in_channels, out_channels, **kwargs)
-        raise KeyError(f"Unsupported conv_type for torch_native backend: {conv_type}")
+        return _TorchNativeGCNConv(in_channels, out_channels, **kwargs)
+        raise KeyError(f"Unsupported conv_type for torch_native backend: {conv_type}") # TODO for now we can create additional torch backend for other normalizations, it will be easier

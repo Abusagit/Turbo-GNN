@@ -9,13 +9,15 @@ import torch
 import traceback
 from pathlib import Path
 
+import yaml
+
 # pytest: keep imports identical; we only add assertions so failures fail
 # (no deletions or large refactors)
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, "./")
 
 from src.backends.registry import BackendRegistry
-from src.data.datasets import load_single_graph, DatasetConfig
+from src.data.datasets import load_single_graph, DatasetConfig, GraphSample, MODEL_BACKEND_TO_GRAPH_REPR
 
 
 def test_backend_registration():
@@ -40,7 +42,7 @@ def test_backend_registration():
     backends = BackendRegistry.list_backends()
     print(f"Registered backends: {backends}")
 
-    expected = {"pyg", "dgl", "torch_native"}
+    expected = {"pyg", "dgl", "torch_native_gcn"}
     missing = expected - set(backends)
     if missing:
         msg = f"✗ Missing backends: {missing}"
@@ -60,9 +62,9 @@ def test_dataset_loading():
     print("="*60)
 
     test_configs = [
-        DatasetConfig(source="pyg", name="Cora", root="data"),
-        DatasetConfig(source="dgl", name="cora", root="data"),
-        DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data"),  # Large dataset
+        DatasetConfig(source="pyg", name="Cora", root="data", graph_backend="pyg"),
+        DatasetConfig(source="dgl", name="cora", root="data", graph_backend="pyg"),
+        DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data", graph_backend="pyg"),  # Large dataset
     ]
 
     for cfg in test_configs:
@@ -102,8 +104,9 @@ def test_backend_convolutions():
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     x = torch.randn(num_nodes, in_channels, device=device, requires_grad=True)
 
-    backends_to_test = ["pyg", "dgl", "torch_native"]
-    conv_types = ["gcn"]  # Start with GCN, can add ["gat", "sage", "gin"] later
+    backends_to_test = ["pyg", "dgl", "torch_native_gcn"]
+    conv_types = ["gcn"]
+
 
     results = {}
 
@@ -122,15 +125,7 @@ def test_backend_convolutions():
                         bias=True
                     ).to(device)
 
-                    # Prepare graph for backend
-                    if backend_name == "pyg":
-                        from torch_geometric.data import Data
-                        graph = Data(edge_index=edge_index, num_nodes=num_nodes)
-                    elif backend_name == "dgl":
-                        import dgl
-                        graph = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
-                    else:  # torch_native
-                        graph = (edge_index, None, num_nodes)
+                    graph = GraphSample(backend=MODEL_BACKEND_TO_GRAPH_REPR[backend_name], x=x, y=torch.zeros_like(x), edge_index=edge_index).graph_repr
 
                     # Forward pass
                     out = conv(x, graph)
@@ -297,9 +292,8 @@ def test_model_building():
         # Test forward pass
         x = torch.randn(100, 128)
         edge_index = torch.randint(0, 100, (2, 500))
-        from torch_geometric.data import Data
-        graph = Data(edge_index=edge_index)
 
+        graph = GraphSample(backend=MODEL_BACKEND_TO_GRAPH_REPR["pyg"], x=x, y=torch.zeros(len(x)), edge_index=edge_index).graph_repr
         logits = model(x, graph)
         assert logits.shape == (100, 7), f"Wrong output shape: {logits.shape}"
         print(f"✓ Forward pass successful: output shape {logits.shape}")

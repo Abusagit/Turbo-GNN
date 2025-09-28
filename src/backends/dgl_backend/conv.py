@@ -6,8 +6,6 @@ from dgl.nn.pytorch import GraphConv
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-from .utils import extract_graph_edges
-
 
 
 doc = """
@@ -48,20 +46,7 @@ class _DglGCNConv(BaseConvolution):
         Returns:
             torch.Tensor: Output features [N, Fout].
         """
-        try:
-            import dgl
-        except Exception as exc:
-            raise ImportError("DGL is required at runtime for DGL backend") from exc
-
-        if hasattr(graph, "num_nodes"):
-            g = graph
-            ew = edge_weight if edge_weight is not None else (g.edata["w"] if "w" in g.edata else None)
-        else:
-            edge_index, ew, num_nodes = extract_graph_edges(graph)
-            g = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
-            if ew is not None:
-                g.edata["w"] = ew
-        return self._conv(g, x, edge_weight=ew if edge_weight is None else edge_weight)
+        return self._conv(graph, x, edge_weight=graph.edata.get("w"))
 
 
 @BackendRegistry.register_backend("dgl")

@@ -19,7 +19,7 @@ measuring runtime and picking the best-performing config.
 """
 
 # TODO add autotune for datasets
-
+# TODO add other backends here
 
 def _read_yaml(path: str) -> Dict[str, Any]:
     """Read YAML to dict.
@@ -89,7 +89,8 @@ def main() -> int:
         graph = to_pyg_data(edge_index, args.num_nodes, edge_weight)
     elif args.backend == "dgl":
         graph = to_dgl_graph(edge_index, args.num_nodes, edge_weight)
-
+    else:
+        raise NotImplementedError(f"Backend {args.backend} is not supported")
     x = torch.randn(args.num_nodes, args.in_ch, device=device)
 
     # conv to tune

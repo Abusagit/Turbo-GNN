@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import yaml
 
-from src.data.datasets import load_single_graph, DatasetConfig, SingleGraphDataset
+from src.data.datasets import load_single_graph, DatasetConfig, SingleGraphDataset, GraphBackendOption, MODEL_BACKEND_TO_GRAPH_REPR
 
 doc = """
 Common utilities for training/validation/benchmark scripts:
@@ -139,14 +139,13 @@ def create_split_datasets_from_config_dict(cfg: Dict[str, Any]) -> Tuple[SingleG
 
     Expected dict keys:
         - dataset: { source: 'ogbn'|'pyg'|'dgl'|'auto', name: str, root: str }
-        - transforms: {...}   # optional (see `apply_transforms_from_config_dict`)
     """
     ds_cfg = cfg.get("dataset") or {}
     source = str(ds_cfg.get("source", "auto"))
     name = str(ds_cfg.get("name"))
     root = str(ds_cfg.get("root", "data"))
 
-    sample = load_single_graph(DatasetConfig(source=source, name=name, root=root))
+    sample = load_single_graph(DatasetConfig(source=source, name=name, root=root, graph_backend=cfg.get("graph_backend", "edge_index")))
 
     return (
         SingleGraphDataset(sample, split="train"),
@@ -155,11 +154,12 @@ def create_split_datasets_from_config_dict(cfg: Dict[str, Any]) -> Tuple[SingleG
     )
 
 
-def create_split_datasets_from_yaml(path: str) -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
-    """Load a YAML config file (dataset + transforms), apply transforms once, and return split datasets.
+def create_split_datasets_from_yaml(path: str, graph_backend: GraphBackendOption = 'egde_index') -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
+    """Load a YAML config file (dataset) and return split datasets.
 
     Args:
-        path (str): Path to YAML file. See `src/data/config_utils.py` docstring for schema.
+        path (str): Path to YAML file.
+        graph_backend (GraphBackendOption): Graph backend option.
 
     Returns:
         Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
@@ -169,6 +169,40 @@ def create_split_datasets_from_yaml(path: str) -> Tuple[SingleGraphDataset, Sing
     
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-
+    cfg['graph_backend'] = graph_backend
     return create_split_datasets_from_config_dict(cfg)
-# ==============================================================================
+
+
+def infer_graph_backend(model_config_path: str) -> GraphBackendOption:
+    """Infer graph representation from used backend in the model. 
+    Traverses model config, tries to find layers description containing backend information
+
+    Args:
+        model_config_path (str): path to model concig
+
+    Raises:
+        ValueError: If couldn't find graph representation for the backend
+        RuntimeError: If couldn't find backend description
+
+    Returns:
+        GraphBackendOption: Description for graph representation
+    """
+
+    with open(model_config_path) as f:
+        model_config_raw = yaml.safe_load(f)
+
+    # search for the 'layers' key on the second level - its entries describe the layer backend
+    # NOTE currently only a single backend is supported
+    for value in model_config_raw.values():
+        if isinstance(value, dict) and 'layers' in value:
+            layers = value["layers"]
+            
+            backends = [layer["backend"] for layer in layers]
+            assert all(backends[i - 1] == backends[i] for i in range(1, len(backends))), f"So far single backend per run is supported, got multiple backends: {backends}"
+
+            graph_representation_backend = MODEL_BACKEND_TO_GRAPH_REPR.get(backends[0])
+            if graph_representation_backend is None:
+                raise ValueError(f"Couldn't infer suitable graph representation for backend {graph_representation_backend}. Current supporting mapping is: {MODEL_BACKEND_TO_GRAPH_REPR}")
+            return graph_representation_backend
+
+    raise RuntimeError(f"Couldnt infer suitable graph representation from the model spec: {model_config_raw}")

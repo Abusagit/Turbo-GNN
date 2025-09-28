@@ -14,14 +14,14 @@ python -W ignore scripts/train.py \
 
 # Test 2: Benchmark different backends on same dataset
 echo -e "\n[TEST 2] Benchmarking GCN layer across backends"
-for backend in pyg dgl torch_native; do
+for backend in pyg dgl torch_native_gcn; do
     echo "Testing $backend..."
     python -W ignore scripts/benchmark.py \
         --layer gcn \
         --backend $backend \
-        --num-nodes 1000 \
-        --avg-degree 10 \
-        --in-ch 128 \
+        --num-nodes 100000 \
+        --avg-degree 20 \
+        --in-ch 512 \
         --out-ch 64 \
         --mode forward \
         --iters 100 \

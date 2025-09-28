@@ -6,6 +6,7 @@ import torch
 from src.benchmarking.microbench import time_callable, MicrobenchResult
 from src.backends.registry import BackendRegistry
 from src.data.converters import to_pyg_data, to_dgl_graph
+from src.data.datasets import GraphSample, MODEL_BACKEND_TO_GRAPH_REPR
 
 doc = """
 Layer microbenchmark launcher.
@@ -33,26 +34,6 @@ def _make_random_graph(num_nodes: int, avg_degree: int, *, device: torch.device)
     return edge_index, None
 
 
-def _make_graph_for_backend(backend: str, edge_index: torch.Tensor, edge_weight: Optional[torch.Tensor], num_nodes: int):
-    """Convert (edge_index, edge_weight) to backend graph container.
-
-    Args:
-        backend (str): Backend name.
-        edge_index (torch.Tensor): Edge index [2,E].
-        edge_weight (Optional[torch.Tensor]): Edge weight [E] or None.
-        num_nodes (int): Number of nodes.
-
-    Returns:
-        Any: Backend-native graph container or tuple accepted by backend conv.
-    """
-    if backend == "pyg":
-        return to_pyg_data(edge_index, num_nodes, edge_weight)
-    if backend == "dgl":
-        return to_dgl_graph(edge_index, num_nodes, edge_weight)
-    # many backends accept the (edge_index, edge_weight) tuple directly
-    return (edge_index, edge_weight)
-
-
 def parse_args() -> argparse.Namespace:
     """Parse CLI args.
 
@@ -61,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="Microbenchmark graph conv layers.")
     p.add_argument("--layer", type=str, required=True, choices=["gcn", "gat", "sage", "gin"])
-    p.add_argument("--backend", type=str, required=True, help="Backend name (pyg|dgl|torch_native|cuda|cusparse|triton|cublas).")
+    p.add_argument("--backend", type=str, required=True, help="Backend name (pyg|dgl|...).")
     p.add_argument("--num-nodes", type=int, default=20000)
     p.add_argument("--avg-degree", type=int, default=10)
     p.add_argument("--in-ch", type=int, default=128)
@@ -86,9 +67,9 @@ def main() -> int:
 
     # graph + features
     edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
-    graph = _make_graph_for_backend(args.backend, edge_index, edge_weight, args.num_nodes)
-    x = torch.randn(args.num_nodes, args.in_ch, device=device)
 
+    x = torch.randn(args.num_nodes, args.in_ch, device=device)
+    graph = GraphSample(backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend], x=x, y=torch.zeros(len(x)),edge_index=edge_index, edge_weight=edge_weight).graph_repr
     # conv
     backend = BackendRegistry.get_backend(args.backend)
     if args.layer != "gat":

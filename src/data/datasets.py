@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Literal, Mapping
 
 import torch
 from torch.utils.data import Dataset
@@ -10,7 +10,19 @@ import torch_geometric.datasets as pyg_datasets
 
 from ogb.nodeproppred import NodePropPredDataset
 
+from dgl import graph as dgl_graph
 import dgl.data as dgl_data
+
+GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat"] # NOTE we can define cached formalizations via this option
+
+
+# NOTE place representations here when you add new backend
+MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this dict contains mapping for suitable graph representation for each convolution backend
+    "pyg": "pyg",
+    "dgl": "dgl",
+    "torch_native_gcn": "normalized_adj_mat_gcn",
+    "torch_native_adj_mat": "adj_mat"
+}
 
 
 doc = """
@@ -21,7 +33,7 @@ Batch contract (used in src/training/trainer.py):
     {
         'features': torch.Tensor [N, F],
         'labels' : torch.Tensor [N] or [N, C],
-        'graph'  : (edge_index [2, E], edge_weight [E] or None),
+        'graph'  : backend-specific graph representation (see `GraphSample.__post_init__`),
         'mask'   : torch.BoolTensor [N],
     }
 
@@ -40,6 +52,7 @@ class GraphSample:
     """Holds a single large-graph sample in canonical tensor form.
 
     Attributes:
+        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions
         x (torch.Tensor): Node features [N, F].
         y (torch.Tensor): Node labels [N] or [N, C].
         edge_index (torch.Tensor): Long tensor [2, E] with (row, col) edges.
@@ -48,6 +61,7 @@ class GraphSample:
         val_mask (Optional[torch.BoolTensor]): Validation mask [N].
         test_mask (Optional[torch.BoolTensor]): Test mask [N].
     """
+    backend: GraphBackendOption
     x: torch.Tensor
     y: torch.Tensor
     edge_index: torch.Tensor
@@ -55,6 +69,35 @@ class GraphSample:
     train_mask: Optional[torch.BoolTensor] = None
     val_mask: Optional[torch.BoolTensor] = None
     test_mask: Optional[torch.BoolTensor] = None
+    _graph_repr: Any = None
+
+    def __post_init__(self):
+        """Store graph representation in _graph_repr field --> it will be used in the convolutions
+        """
+        graph = None
+        if self.backend == "pyg":  # pyg eats standard edge index & weight
+            graph = (self.edge_index, self.edge_weight)
+        elif self.backend == "dgl":
+            graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
+            if self.edge_weight is not None:
+                graph.edata["w"] = self.edge_weight
+        elif self.backend == "normalized_adj_mat_gcn":
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=False)
+        elif self.backend == "adj_mat":
+            ...
+        elif self.backend == "coo":
+            ... # TODO
+        elif self.backend == "csr":
+            ... # TODO
+        elif self.backend == "csc":
+            ... # TODO
+        elif self.backend == "edge_list":
+            edge_list = self.edge_index.T
+            graph = (edge_list, self.edge_weight)
+
+        self._graph_repr = graph
+        assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"
+
 
     @property
     def num_nodes(self) -> int:
@@ -75,6 +118,11 @@ class GraphSample:
         if self.y.ndim == 2:
             return self.y.shape[1]
         return None
+
+    @property
+    def graph_repr(self) -> Any:
+        """Returns the representation of a graph with specified backend"""
+        return self._graph_repr
 
     def graph_tuple(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Canonical graph tuple used by the trainer/model: (edge_index, edge_weight)."""
@@ -137,8 +185,8 @@ class SingleGraphDataset(Dataset):
             Dict[str, Any]: A batch dict with 'features', 'labels', 'graph', 'mask'.
         """
 
-        # canonical 'graph' for all backends is a tuple (edge_index, edge_weight)
-        graph = self.sample.graph_tuple()
+        # backend-specific graph representation
+        graph = self.sample.graph_repr
         return {
             "features": self.sample.x,
             "labels": self.sample.y,
@@ -180,11 +228,12 @@ def _masks_from_indices(num_nodes: int, splits: Dict[str, torch.Tensor]) -> Tupl
 
 # ------------------------------- OGBN loaders -------------------------------- #
 
-def load_ogbn(name: str, root: str = "data") -> GraphSample:
+def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
     """Load an ogbn-* node property prediction dataset as a single-graph sample.
 
     Args:
         name (str): OGBN dataset name (e.g., 'ogbn-arxiv', 'ogbn-products').
+        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
         root (str): Download/cache directory.
 
     Returns:
@@ -215,12 +264,13 @@ def load_ogbn(name: str, root: str = "data") -> GraphSample:
         train_mask=train_mask,
         val_mask=val_mask,
         test_mask=test_mask,
+        backend=graph_backend,
     )
 
 
 # ------------------------------- PyG loaders --------------------------------- #
 
-def load_pyg_single_graph(name: str, root: str = "data") -> GraphSample:
+def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
     """Load a single-graph dataset from PyTorch Geometric.
 
     Supported (common) names:
@@ -231,6 +281,7 @@ def load_pyg_single_graph(name: str, root: str = "data") -> GraphSample:
 
     Args:
         name (str): Dataset name.
+        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
         root (str): Download/cache directory.
 
     Returns:
@@ -282,12 +333,13 @@ def load_pyg_single_graph(name: str, root: str = "data") -> GraphSample:
         train_mask=train_mask.bool(),
         val_mask=val_mask.bool(),
         test_mask=test_mask.bool(),
+        backend=graph_backend,
     )
 
 
 # -------------------------------- DGL loaders -------------------------------- #
 
-def load_dgl_single_graph(name: str, root: str = "data") -> GraphSample:
+def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
     """Load a single-graph dataset from DGL.
 
     Supported (common) names:
@@ -296,6 +348,7 @@ def load_dgl_single_graph(name: str, root: str = "data") -> GraphSample:
 
     Args:
         name (str): Dataset name (case-insensitive for common names).
+        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
         root (str): Download/cache directory.
 
     Returns:
@@ -346,6 +399,7 @@ def load_dgl_single_graph(name: str, root: str = "data") -> GraphSample:
         train_mask=train_mask.bool(),
         val_mask=val_mask.bool(),
         test_mask=test_mask.bool(),
+        backend=graph_backend,
     )
 
 
@@ -358,10 +412,12 @@ class DatasetConfig:
     Attributes:
         source (str): 'ogbn' | 'pyg' | 'dgl' | 'auto'
         name (str): Dataset name (e.g., 'ogbn-arxiv', 'Cora', 'reddit').
+        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
         root (str): Download/cache directory.
     """
     source: str
     name: str
+    graph_backend: GraphBackendOption
     root: str = "data"
 
 
@@ -379,36 +435,60 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     """
     s = cfg.source.lower()
     if s == "ogbn":
-        return load_ogbn(cfg.name, root=cfg.root)
+        return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
     if s == "pyg":
-        return load_pyg_single_graph(cfg.name, root=cfg.root)
+        return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
     if s == "dgl":
-        return load_dgl_single_graph(cfg.name, root=cfg.root)
+        return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
     if s == "auto":
 
         # ogbn-* -> OGBN; else try PyG; then DGL.
         if cfg.name.lower().startswith("ogbn-"):
-            return load_ogbn(cfg.name, root=cfg.root)
+            return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
         try:
-            return load_pyg_single_graph(cfg.name, root=cfg.root)
+            return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
         except Exception:
-            return load_dgl_single_graph(cfg.name, root=cfg.root)
+            return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
     raise KeyError(f"Unsupported dataset source '{cfg.source}'")
 
 
-def create_split_datasets(cfg: DatasetConfig) -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
-    """Convenience to construct per-split datasets for trainer.
+def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left", "right", "both", "none"],
+                  add_self_loops: bool = True) -> torch.Tensor:
+    """Compute symmetric normalized adjacency (A_hat) as sparse COO.
 
     Args:
-        cfg (DatasetConfig): Dataset selection/configuration.
+        edge_index (torch.Tensor): [2, E] long tensor.
+        num_nodes (int): Number of nodes.
 
     Returns:
-        Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
-            (train_ds, val_ds, test_ds)
+        torch.Tensor: Sparse COO adjacency with added self-loops and:
+            - D^{-1/2} A D^{-1/2} normalization if `how` == "both".
+            - ...
+            - ...
     """
-    sample = load_single_graph(cfg)
-    return (
-        SingleGraphDataset(sample, split="train"),
-        SingleGraphDataset(sample, split="val"),
-        SingleGraphDataset(sample, split="test"),
-    )
+    device = edge_index.device
+    idx = edge_index
+
+    if add_self_loops:
+        self_loops = torch.arange(num_nodes, device=device)
+        loop_idx = torch.stack([self_loops, self_loops], dim=0)
+        idx = torch.cat([idx, loop_idx], dim=1)
+
+    if how == "both":
+        # add self loops
+        values = torch.ones(idx.size(1), device=device)
+        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes))
+
+        deg = torch.sparse.sum(adj, dim=1).to_dense()
+        deg_inv_sqrt = torch.pow(deg.clamp(min=1.0), -0.5)
+        D_inv_sqrt = deg_inv_sqrt
+        row, col = idx
+        norm_vals = D_inv_sqrt[row] * values * D_inv_sqrt[col]
+    elif how == "left":
+        raise NotImplementedError()
+    elif how == "right":
+        raise NotImplementedError()
+    elif how == "none":
+        raise NotImplementedError()
+
+    return torch.sparse_coo_tensor(idx, norm_vals, (num_nodes, num_nodes)).coalesce()
