@@ -133,6 +133,7 @@ class GNNTrainer:
         self.current_epoch: int = 0
         self.global_step: int = 0
         self.early_stopping_counter: int = 0
+
     
     def add_hook(self, hook: Any) -> None:
         """Add a training hook.
@@ -200,25 +201,27 @@ class GNNTrainer:
 
     def train_epoch(
         self, 
-        dataloader: Any
+        dataloader: Any,
+        progress_bar_ctx: Any,
     ) -> Dict[str, float]:
         """Train for one epoch.
 
         Args:
             dataloader: Dataloader for training data
+            progress_bar_ctx: tqdm progress bar handle
 
         Returns:
             Dictionary containing training metrics for the epoch
         """
+
         self.model.train()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
 
-        progress_bar = tqdm(dataloader, desc=f"Epoch {self.current_epoch}")
-
-        for batch_idx, batch in enumerate(progress_bar):
+        for batch in dataloader:
             # fier batch start event
+            batch_idx = progress_bar_ctx.n
             self.fire_event('on_batch_start', batch, batch_idx)
             
             # Forward pass with optional AMP
@@ -246,10 +249,11 @@ class GNNTrainer:
             
             # update progress bar
             if batch_idx % self.config.log_interval == 0:
-                progress_bar.set_postfix({
-                    'loss': total_loss / (batch_idx + 1),
-                    'acc': total_correct / total_samples if total_samples > 0 else 0
+                progress_bar_ctx.set_postfix({
+                    'train_loss': round(total_loss / (batch_idx + 1), 4),
+                    'train_acc': round(total_correct / total_samples if total_samples > 0 else 0, 4)
                 })
+            progress_bar_ctx.update()
         
         metrics = {
             'loss': total_loss / len(dataloader),
@@ -275,9 +279,8 @@ class GNNTrainer:
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        
-        for batch in tqdm(dataloader, desc="Validation"):
-            
+
+        for batch in dataloader:            
             output = self.model(batch['features'], batch['graph'])
             loss = self.criterion(output[batch['mask']], batch['labels'][batch['mask']])
             
@@ -318,50 +321,57 @@ class GNNTrainer:
         
         # fire training start event
         self.fire_event('on_training_start', self.model, self.config)
-        
-        for epoch in range(self.config.epochs):
-            self.current_epoch = epoch
-            
-            # fire epoch start event
-            self.fire_event('on_epoch_start', epoch)
-            
-            # training
-            train_metrics = self.train_epoch(train_loader)
-            history['train_loss'].append(train_metrics['loss'])
-            history['train_acc'].append(train_metrics['accuracy'])
-            
-            # validation
-            val_metrics = {}
-            if val_loader:
-                val_metrics = self.validate(val_loader)
-                history['val_loss'].append(val_metrics['loss'])
-                history['val_acc'].append(val_metrics['accuracy'])
+        n_steps = len(train_loader) * self.config.epochs
+
+        self.progress_bar = tqdm(total=n_steps, desc='Training...')
+
+        with self.progress_bar as progress_bar_ctx:
+            for epoch in range(self.config.epochs):
+                self.current_epoch = epoch
                 
-                # early stopping
-                if val_metrics['accuracy'] > self.best_val_score:
-                    self.best_val_score = val_metrics['accuracy']
-                    self.early_stopping_counter = 0
-                    self.fire_event('on_best_model', self.model, val_metrics)
-                else:
-                    self.early_stopping_counter += 1
-                    if self.early_stopping_counter >= self.config.patience:
-                        logger.info(f"Early stopping at epoch {epoch}")
-                        break
-            
-            # learning rate scheduling
-            if self.scheduler:
-                self.scheduler.step()
-            
-            # fire epoch end event
-            self.fire_event('on_epoch_end', epoch, train_metrics, val_metrics)
-            
-            # logging
-            logger.info(f"Epoch {epoch}: "
-                       f"Train Loss: {train_metrics['loss']:.4f}, "
-                       f"Train Acc: {train_metrics['accuracy']:.4f}")
-            if val_metrics:
-                logger.info(f"Val Loss: {val_metrics['loss']:.4f}, "
-                           f"Val Acc: {val_metrics['accuracy']:.4f}")
+                # fire epoch start event
+                self.fire_event('on_epoch_start', epoch)
+
+                # training
+                train_metrics = self.train_epoch(train_loader, progress_bar_ctx)
+                history['train_loss'].append(train_metrics['loss'])
+                history['train_acc'].append(train_metrics['accuracy'])
+
+                # validation
+                val_metrics = {}
+                if val_loader and progress_bar_ctx.n % 20 == 0:  # validation every 20 steps 
+                    val_metrics = self.validate(val_loader)
+                    history['val_loss'].append(val_metrics['loss'])
+                    history['val_acc'].append(val_metrics['accuracy'])
+                    progress_bar_ctx.set_postfix({
+                        'val_loss': round(val_metrics['loss'], 4),
+                        'val_acc': round(val_metrics['accuracy'], 4)
+                    })
+                    # early stopping
+                    if val_metrics['accuracy'] > self.best_val_score:
+                        self.best_val_score = val_metrics['accuracy']
+                        self.early_stopping_counter = 0
+                        self.fire_event('on_best_model', self.model, val_metrics)
+                    else:
+                        self.early_stopping_counter += 1
+                        if self.early_stopping_counter >= self.config.patience:
+                            logger.info(f"Early stopping at epoch {epoch}")
+                            break
+                
+                # learning rate scheduling
+                if self.scheduler:
+                    self.scheduler.step()
+                
+                # fire epoch end event
+                self.fire_event('on_epoch_end', epoch, train_metrics, val_metrics)
+                
+                # logging
+                logger.info(f"Epoch {epoch}: "
+                        f"Train Loss: {train_metrics['loss']:.4f}, "
+                        f"Train Acc: {train_metrics['accuracy']:.4f}")
+                if val_metrics:
+                    logger.info(f"Val Loss: {val_metrics['loss']:.4f}, "
+                            f"Val Acc: {val_metrics['accuracy']:.4f}")
         
         # fire training end event
         self.fire_event('on_training_end', history)
