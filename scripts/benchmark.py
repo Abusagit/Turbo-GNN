@@ -3,6 +3,10 @@ import json
 from typing import Optional, Tuple
 from pathlib import Path
 import torch
+
+import sys
+sys.path.append("./")
+
 from src.benchmarking.microbench import time_callable, MicrobenchResult
 from src.backends.registry import BackendRegistry
 from src.data.converters import to_pyg_data, to_dgl_graph

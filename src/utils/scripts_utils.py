@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import yaml
 
-from src.data.datasets import load_single_graph, DatasetConfig, SingleGraphDataset, GraphBackendOption, MODEL_BACKEND_TO_GRAPH_REPR
+from ..data.datasets import load_single_graph, DatasetConfig, SingleGraphDataset, GraphBackendOption, MODEL_BACKEND_TO_GRAPH_REPR
 
 doc = """
 Common utilities for training/validation/benchmark scripts:

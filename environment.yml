@@ -5,7 +5,7 @@ name: gnn_bench
 channels:
   - pytorch
   - pyg
-  - dglteam/label/cu124
+  - dglteam/label/th24_cu124
   - nvidia
   - conda-forge
   - defaults
@@ -15,7 +15,6 @@ dependencies:
   - python=3.11
   
   # PyTorch with CUDA
-  - pytorch<2.5
   - torchvision
   - torchaudio
   - pytorch-cuda=12.4  # Change to 11.8 if using CUDA 11.8
@@ -28,7 +27,7 @@ dependencies:
   - pytorch-spline-conv
   
   # DGL
-  - dgl>=1.0.0
+  - dgl
   
   # Scientific computing
   - numpy<2.0

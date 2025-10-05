@@ -1,8 +1,8 @@
 profiler:
   output_dir: runs/profiler
-  wait: 1
+  wait: 2
   warmup: 1
-  active: 3
+  active: 5
   repeat: 1
   with_stack: true
   profile_memory: true

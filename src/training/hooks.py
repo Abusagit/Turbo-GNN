@@ -364,8 +364,11 @@ class ProfilerHook(Hook):
             on_trace_ready=tensorboard_trace_handler(str(self.output_dir)),
             record_shapes=True,
             profile_memory=self.profile_memory,
-            with_stack=self.with_stack
+            with_stack=self.with_stack,
+            with_flops=True,
+            with_modules=True,
         )
+
         self.profiler.__enter__()
         logger.info(f"Profiler started, writing to {self.output_dir}")
     

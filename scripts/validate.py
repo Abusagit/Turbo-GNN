@@ -2,7 +2,10 @@ import argparse
 
 import torch
 
-from scripts._common import create_split_datasets_from_yaml, ensure_outdir, infer_graph_backend  # reserved for future outputs if needed
+import sys
+sys.path.append("./")
+
+from src.utils.scripts_utils import create_split_datasets_from_yaml, ensure_outdir, infer_graph_backend  # reserved for future outputs if needed
 
 from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml

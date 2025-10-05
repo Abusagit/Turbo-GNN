@@ -7,6 +7,9 @@ from typing import Any, Dict
 import torch
 import yaml
 
+import sys
+sys.path.append("./")
+
 from src.benchmarking.autotuner import grid_autotune, TuningResult
 from src.backends.registry import BackendRegistry
 from src.data.converters import to_pyg_data, to_dgl_graph

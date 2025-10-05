@@ -4,7 +4,10 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from scripts._common import (
+import sys
+sys.path.append("./")
+
+from src.utils.scripts_utils import (
     read_yaml,
     merge_yaml_files,
     ensure_outdir,

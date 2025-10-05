@@ -1,8 +1,10 @@
 import argparse
 from typing import Any, Dict
 
-from scripts._common import read_yaml, ensure_outdir, create_split_datasets_from_yaml, infer_graph_backend
+import sys
+sys.path.append("./")
 
+from src.utils.scripts_utils import read_yaml, ensure_outdir, create_split_datasets_from_yaml, infer_graph_backend
 from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml
 from src.training.trainer import GNNTrainer, TrainingConfig
