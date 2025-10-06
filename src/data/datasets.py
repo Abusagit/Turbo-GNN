@@ -8,6 +8,8 @@ from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.data import Data
 import torch_geometric.datasets as pyg_datasets
 
+from functools import wraps
+
 from ogb.nodeproppred import NodePropPredDataset
 
 from dgl import graph as dgl_graph
@@ -44,6 +46,26 @@ Notes:
 """
 
 # NOTE the last one can be optimized -- graph tensors can be placed on GPU once during the training
+
+def ensure_cpu_device(func):
+    """Wrap a function to ensure that default device is CPU.
+    Returns back default device after the execution
+    
+    Some functions (e.g. Pytorch Geometric's ones) load tensors,
+    and torch.load stores them on the default device
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+
+        prev_default_device = torch.get_default_device()
+        torch.set_default_device("cpu")
+        res = func(*args, **kwargs)
+        torch.set_default_device(prev_default_device)
+
+        return res
+
+    return wrapper
 
 # ------------------------- Canonical sample container ------------------------- #
 
@@ -436,7 +458,7 @@ class DatasetConfig:
     graph_backend: GraphBackendOption
     root: str = "data"
 
-
+# @ensure_cpu_device
 def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     """Load a canonical single-graph sample according to config.
 
@@ -465,6 +487,7 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
             return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
         except Exception:
             return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+
     raise KeyError(f"Unsupported dataset source '{cfg.source}'")
 
 
