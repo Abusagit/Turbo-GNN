@@ -62,7 +62,6 @@ def ensure_cpu_device(func):
         torch.set_default_device("cpu")
         res = func(*args, **kwargs)
         torch.set_default_device(prev_default_device)
-
         return res
 
     return wrapper
@@ -280,8 +279,11 @@ def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") 
     Raises:
         ImportError: If OGB is not installed.
     """
+    @ensure_cpu_device
+    def _load_oggn_cpu():
+        return NodePropPredDataset(name=name, root=root)
 
-    dset = NodePropPredDataset(name=name, root=root)
+    dset = _load_oggn_cpu()
     split_idx = dset.get_idx_split()
     graph, labels = dset[0]
 
@@ -329,23 +331,28 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         ImportError: If PyG is not installed.
         ValueError: If dataset cannot be loaded as a single graph.
     """
-    n = name.lower()
-    if n in ("cora", "citeseer", "pubmed"):
-        dset = Planetoid(root=root, name=name)
-        data: Data = dset[0]
-    elif n in ("reddit",):
-        dset = Reddit(root=root)
-        data: Data = dset[0]
-    else:
-        # try dynamic import by attribute name (PascalCase/Exact)
-        if hasattr(pyg_datasets, name):
-            D = getattr(pyg_datasets, name)
-            dset = D(root=root)
-            if len(dset) != 1:
-                raise ValueError(f"Expected a single-graph dataset for '{name}', got {len(dset)} graphs")
+    @ensure_cpu_device
+    def _load_pyg_cpu():
+        if n in ("cora", "citeseer", "pubmed"):
+            dset = Planetoid(root=root, name=name)
+            data: Data = dset[0]
+        elif n in ("reddit",):
+            dset = Reddit(root=root)
             data: Data = dset[0]
         else:
-            raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
+            # try dynamic import by attribute name (PascalCase/Exact)
+            if hasattr(pyg_datasets, name):
+                D = getattr(pyg_datasets, name)
+                dset = D(root=root)
+                if len(dset) != 1:
+                    raise ValueError(f"Expected a single-graph dataset for '{name}', got {len(dset)} graphs")
+                data: Data = dset[0]
+            else:
+                raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
+        return data
+
+    n = name.lower()
+    data = _load_pyg_cpu()
 
     x = data.x.float()
     y = data.y
@@ -397,18 +404,22 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         ValueError: If dataset is unknown or lacks standard masks.
     """
 
-    n = name.lower()
-    if n == "cora":
-        dset = dgl_data.CoraGraphDataset(raw_dir=root)
-    elif n == "citeseer":
-        dset = dgl_data.CiteseerGraphDataset(raw_dir=root)
-    elif n == "pubmed":
-        dset = dgl_data.PubmedGraphDataset(raw_dir=root)
-    elif n == "reddit":
-        dset = dgl_data.RedditDataset(raw_dir=root)
-    else:
-        raise ValueError(f"Unknown DGL dataset '{name}'. Supported: cora/citeseer/pubmed/reddit.")
+    @ensure_cpu_device
+    def _load_dgl_cpu():
+        if n == "cora":
+            dset = dgl_data.CoraGraphDataset(raw_dir=root)
+        elif n == "citeseer":
+            dset = dgl_data.CiteseerGraphDataset(raw_dir=root)
+        elif n == "pubmed":
+            dset = dgl_data.PubmedGraphDataset(raw_dir=root)
+        elif n == "reddit":
+            dset = dgl_data.RedditDataset(raw_dir=root)
+        else:
+            raise ValueError(f"Unknown DGL dataset '{name}'. Supported: cora/citeseer/pubmed/reddit.")
+        return dset
 
+    n = name.lower()
+    dset = _load_dgl_cpu()
     g = dset[0]
 
     x = g.ndata["feat"].float()
@@ -458,7 +469,6 @@ class DatasetConfig:
     graph_backend: GraphBackendOption
     root: str = "data"
 
-# @ensure_cpu_device
 def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     """Load a canonical single-graph sample according to config.
 
