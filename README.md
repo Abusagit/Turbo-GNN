@@ -10,9 +10,6 @@ A comprehensive framework for benchmarking and accelerating Graph Neural Network
     - [Key Features](#key-features)
   - [Project Structure](#project-structure)
   - [Installation](#installation)
-    - [Prerequisites](#prerequisites)
-    - [Using Conda (Recommended)](#using-conda-recommended)
-    - [Manual Installation](#manual-installation)
   - [Quick Start](#quick-start)
     - [1. Train a GCN on Cora](#1-train-a-gcn-on-cora)
     - [2. Benchmark GCN Layer Across Backends](#2-benchmark-gcn-layer-across-backends)
@@ -126,33 +123,16 @@ This framework addresses the critical challenge of accelerating Graph Neural Net
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.11+
-- CUDA 12.4+ (for GPU acceleration)
-- PyTorch 2.4.0
-- DGL 1.0.0+
-- PyTorch Geometric 2.3.0+
-
-### Using Conda (Recommended)
 
 ```bash
 # Create environment
 conda env create -f environment.yml
 conda activate gnn_bench
 
-# Optional: Install custom backends
+
+### TODO
+# Optional: Install custom backends 
 python setup.py develop
-```
-
-### Manual Installation
-
-```bash
-pip install torch==2.4.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install dgl -f https://data.dgl.ai/wheels/cu124/repo.html
-pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cu124.html
-pip install torch-geometric ogb pyyaml tqdm pandas matplotlib seaborn
-pip install triton  # For Triton backend
 ```
 
 ---
@@ -418,14 +398,6 @@ python scripts/train.py \
     --out runs/experiment
 ```
 
-**Multi-Config Training (override defaults):**
-```bash
-python scripts/train.py \
-    --dataset configs/datasets/ogbn_arxiv.yaml \
-    --model configs/models/gat.yaml \
-    --config configs/training/base.yaml configs/training/amp.yaml \
-    --out runs/gat_arxiv
-```
 
 **Training Output:**
 ```
@@ -453,10 +425,10 @@ python scripts/benchmark.py \
     --avg-degree 20 \
     --in-ch 512 \
     --out-ch 512 \
-    --mode train \           # 'forward' or 'train' (includes backward)
+    --mode train \
     --iters 100 \
     --warmup 20 \
-    --amp bf16 \             # 'none', 'bf16', 'fp16'
+    --amp bf16 \
     --json-out results.json
 ```
 
@@ -464,7 +436,7 @@ python scripts/benchmark.py \
 ```json
 {
   "iters": 100,
-  "ms_per_iter": 12.34,
+  "ms_per_iter": XY.ZW,
   "device": "cuda"
 }
 ```
@@ -496,6 +468,8 @@ python scripts/run_profile.py \
 tensorboard --logdir runs/profile/profiler
 ```
 
+Or open it in [Perfetto UI](https://ui.perfetto.dev)
+
 **Available Hooks:**
 - `ProfilerHook`: PyTorch profiler integration
 - `MetricHook`: Track and log metrics
@@ -516,6 +490,9 @@ python scripts/validate.py \
 ### Autotuning
 
 **Autotune Backend Parameters:**
+
+If you have custom backend named `my_custom_backend`, you can launch its autotuning:
+
 ```bash
 python scripts/autotune.py \
     --layer gcn \

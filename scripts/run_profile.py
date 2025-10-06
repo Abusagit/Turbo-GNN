@@ -55,6 +55,8 @@ def main() -> int:
     logger = get_logger()
 
     training_cfg: Dict[str, Any] = read_yaml(args.training).get("training", {})
+    tcfg = TrainingConfig(**training_cfg) if training_cfg else TrainingConfig()
+
     opt_cfg_d: Dict[str, Any] = read_yaml(args.training).get("optimizer", {})
     sch_cfg_d: Dict[str, Any] = read_yaml(args.training).get("scheduler", {})
     prof_cfg: Dict[str, Any] = read_yaml(args.profile).get("profiler", {})
@@ -73,7 +75,6 @@ def main() -> int:
     model = build_model_from_yaml(args.model, input_dim=in_dim, override_num_classes=num_classes)
 
     # Trainer/Opt/Sched
-    tcfg = TrainingConfig(**training_cfg) if training_cfg else TrainingConfig()
     trainer = GNNTrainer(model=model, config=tcfg)
 
     ocfg = OptimizerConfig(**opt_cfg_d) if opt_cfg_d else OptimizerConfig()
@@ -97,7 +98,7 @@ def main() -> int:
         with_stack=bool(prof_cfg.get("with_stack", True)),
     ))
 
-    logger.info("Profiling run…")
+    logger.info("Profiling run...")
     trainer.train(train_loader, val_loader, test_loader=None)
     logger.info("Done.")
     return 0

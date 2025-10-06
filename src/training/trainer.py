@@ -66,6 +66,8 @@ class TrainingConfig:
     checkpoint_interval: int = 10
     profile: bool = False
 
+    def __post_init__(self):
+        torch.set_default_device(torch.device(self.device))
 
 class GNNTrainer:
     """Trainer class for graph neural networks.

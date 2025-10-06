@@ -9,7 +9,6 @@ sys.path.append("./")
 
 from src.benchmarking.microbench import time_callable, MicrobenchResult
 from src.backends.registry import BackendRegistry
-from src.data.converters import to_pyg_data, to_dgl_graph
 from src.data.datasets import GraphSample, MODEL_BACKEND_TO_GRAPH_REPR
 
 doc = """
