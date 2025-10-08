@@ -15,7 +15,7 @@ from ogb.nodeproppred import NodePropPredDataset
 from dgl import graph as dgl_graph
 import dgl.data as dgl_data
 
-GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat"] # NOTE we can define cached formalizations via this option
+GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat", "adj_mat_in_degree_normalized_transposed"] # NOTE we can define cached formalizations via this option
 
 
 # NOTE place representations here when you add new backend
@@ -23,7 +23,8 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "pyg": "pyg",
     "dgl": "dgl",
     "torch_native_gcn": "normalized_adj_mat_gcn",
-    "torch_native_adj_mat": "adj_mat"
+    "torch_native_adj_mat": "adj_mat",
+    "torch_native_meanaggr": "adj_mat_in_degree_normalized_transposed"
 }
 
 
@@ -107,6 +108,9 @@ class GraphSample:
             graph = self._to_default_device(graph)
         elif self.backend == "normalized_adj_mat_gcn":
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=False)
+            graph = self._to_default_device(graph)
+        elif self.backend == "adj_mat_in_degree_normalized_transposed":
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=False)
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
             ...
@@ -533,11 +537,50 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
         D_inv_sqrt = deg_inv_sqrt
         row, col = idx
         norm_vals = D_inv_sqrt[row] * values * D_inv_sqrt[col]
+        return torch.sparse_coo_tensor(idx, norm_vals, (num_nodes, num_nodes)).coalesce()
     elif how == "left":
         raise NotImplementedError()
     elif how == "right":
-        raise NotImplementedError()
+        """
+            Computes A^T (transposed adjacency) and D_in^{-1} (inverse in-degree diagonal).
+            This matches DGL's copy_u_mean operation.
+        """
+        device = edge_index.device
+        src, dst = edge_index[0], edge_index[1]
+
+        values = torch.ones(edge_index.size(1), device=device)
+        adj = torch.sparse_coo_tensor(
+            torch.stack([src, dst], dim=0),
+            values,
+            (num_nodes, num_nodes)
+        ).coalesce()
+
+        adj_t_indices = torch.stack([dst, src], dim=0)
+        adj_t = torch.sparse_coo_tensor(
+            adj_t_indices,
+            values,
+            (num_nodes, num_nodes)
+        ).coalesce()
+
+        in_degrees = torch.zeros(num_nodes, device=device)
+        in_degrees.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
+
+        # handle isolated nodes (in_degree = 0) by setting to 1 to avoid division by zero
+        in_degrees = in_degrees.clamp(min=1.0)
+
+        in_degree_inv = 1.0 / in_degrees
+        diag_indices = torch.arange(num_nodes, device=device).unsqueeze(0).repeat(2, 1)
+        in_degree_inv_diag = torch.sparse_coo_tensor(
+            diag_indices,
+            in_degree_inv,
+            (num_nodes, num_nodes)
+        ).coalesce()
+
+        adj_t_normalized = in_degree_inv_diag @ adj_t
+        return adj_t_normalized
+
     elif how == "none":
         raise NotImplementedError()
 
-    return torch.sparse_coo_tensor(idx, norm_vals, (num_nodes, num_nodes)).coalesce()
+    else:
+        raise ValueError(f"Normalization type {how} is inappropriate")
