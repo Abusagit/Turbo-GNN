@@ -182,6 +182,7 @@ def _parse_layer_dict(d: Dict[str, Any]) -> LayerSpec:
         if k not in d:
             raise KeyError(f"Layer is missing required key '{k}'")
 
+    layer_type = str(d["layer_type"]).lower()
     conv_type = str(d["conv_type"]).lower()
     backend = str(d["backend"])
     out_channels = int(d["out_channels"])
@@ -203,6 +204,7 @@ def _parse_layer_dict(d: Dict[str, Any]) -> LayerSpec:
     conv_kwargs = dict(d.get("conv_kwargs", {}))
 
     return LayerSpec(
+        layer_type=layer_type,
         conv_type=conv_type,
         backend=backend,
         in_channels=in_channels,

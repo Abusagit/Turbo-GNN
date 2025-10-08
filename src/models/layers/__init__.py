@@ -1,9 +1,5 @@
-from .gcn import GCNBlock
-from .gat import GATBlock
-from .sage import SAGEBlock
-from .gin import GINBlock
-
+from .blocks import ResidualBlock
 
 doc = """
-Layer blocks wrapping backend convolutions with norm/activation/dropout/residual.
+Layer blocks wrapping backend convolutions with norm/activation/dropout/residual. Other configurations can be added
 """

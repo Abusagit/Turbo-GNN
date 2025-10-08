@@ -19,6 +19,7 @@ class LayerSpec:
     """Configuration for a single GNN layer/block.
 
     Attributes:
+        layer_type (Literal['residual_block']): Type of encoder block
         conv_type (Literal['gcn','gat','sage','gin']): Convolution type.
         backend (str): Backend name ('pyg','dgl','torch_native', ...).
         in_channels (int): Input feature size.
@@ -31,6 +32,7 @@ class LayerSpec:
         residual (bool): Add residual connection when in_channels==out_channels.
         conv_kwargs (Dict[str, Any]): Extra kwargs passed to the backend conv.
     """
+    layer_type: Literal["redisual_block"]
     conv_type: Literal["gcn", "gat", "sage", "gin"]
     backend: str
     in_channels: int

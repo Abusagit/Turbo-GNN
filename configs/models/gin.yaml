@@ -4,7 +4,8 @@ dropout: 0.5
 
 encoder:
   layers:
-    - conv_type: gin
+    - layer_type: residual_block
+      conv_type: gin
       backend: pyg
       in_channels: auto
       out_channels: 64
@@ -16,7 +17,8 @@ encoder:
         # PyG GINConv expects an NN (MLP) internally; backend wrapper should handle it.
         eps: 0.0
         train_eps: true
-    - conv_type: gin
+    - layer_type: residual_block
+      conv_type: gin
       backend: pyg
       in_channels: auto
       out_channels: 64

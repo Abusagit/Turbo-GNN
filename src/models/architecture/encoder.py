@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from ..base import EncoderSpec
-from ..layers import GCNBlock, GATBlock, SAGEBlock, GINBlock
+from ..layers import ResidualBlock
 
 doc = """
 GNNEncoder: stacks typed layer blocks (GCN/GAT/SAGE/GIN) per EncoderSpec.
@@ -12,10 +12,7 @@ GNNEncoder: stacks typed layer blocks (GCN/GAT/SAGE/GIN) per EncoderSpec.
 
 
 _BLOCKS = {
-    "gcn": GCNBlock,
-    "gat": GATBlock,
-    "sage": SAGEBlock,
-    "gin": GINBlock,
+    "residual_block": ResidualBlock,
 }
 
 
@@ -35,9 +32,10 @@ class GNNEncoder(nn.Module):
         self.spec = spec
         blocks: List[nn.Module] = []
         for layer in spec.layers:
-            cls = _BLOCKS[layer.conv_type]
+            cls = _BLOCKS[layer.layer_type]
             blocks.append(
                 cls(
+                    conv_type=layer.conv_type,
                     backend=layer.backend,
                     in_channels=layer.in_channels,
                     out_channels=layer.out_channels,
