@@ -4,7 +4,8 @@ dropout: 0.5
 
 encoder:
   layers:
-    - conv_type: sage
+    - layer_type: residual_block
+      conv_type: sage
       backend: pyg
       in_channels: auto
       out_channels: 128
@@ -14,7 +15,8 @@ encoder:
       residual: false
       conv_kwargs:
         aggr: mean         # 'mean' | 'sum' | 'max'
-    - conv_type: sage
+    - layer_type: residual_block
+      conv_type: sage
       backend: pyg
       in_channels: auto
       out_channels: 128

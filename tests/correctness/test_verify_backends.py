@@ -255,6 +255,7 @@ def test_model_building():
         "encoder": {
             "layers": [
                 {
+                    "layer_type": "residual_block",
                     "conv_type": "gcn",
                     "backend": "pyg",
                     "in_channels": 128,
@@ -266,6 +267,7 @@ def test_model_building():
                     "conv_kwargs": {"cached": True}
                 },
                 {
+                    "layer_type": "residual_block",
                     "conv_type": "gcn",
                     "backend": "pyg",
                     "in_channels": 64,

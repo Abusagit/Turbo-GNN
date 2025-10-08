@@ -5,7 +5,8 @@ dropout: 0.5
 
 encoder:
   layers:
-    - conv_type: gat
+    - layer_type: residual_block
+      conv_type: gat
       backend: pyg
       in_channels: auto
       out_channels: 16
@@ -17,7 +18,8 @@ encoder:
       conv_kwargs:
         concat: true       # PyG GAT default is concat=True for hidden layers
         dropout: 0.6
-    - conv_type: gat
+    - layer_type: residual_block
+      conv_type: gat
       backend: pyg
       in_channels: auto
       out_channels: 7
