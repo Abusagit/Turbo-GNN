@@ -1,4 +1,4 @@
-.PHONY: install install-dev install-full clean test format
+.PHONY: install install-dev install-full clean test format check run-hooks update-hooks
 
 # get path to current makefile
 MKFILE_PATH := $(realpath $(lastword $(MAKEFILE_LIST)))
@@ -77,10 +77,15 @@ clean:
 
 help:
 	@echo "Available targets:"
-	@echo "  install          - Install base dependencies"
-	@echo "  install-dev      - Install with dev dependencies"
-	@echo "  install-full     - Install everything (default: cu124)"
-	@echo "  test             - Run all tests"
-	@echo "  test-correctness - Run correctness tests"
-	@echo "  setup-hooks      - Setup pre-commit hooks"
-	@echo "  clean            - Clean build artifacts"
+	@echo "  install           - Install base dependencies"
+	@echo "  install-dev       - Install with dev dependencies"
+	@echo "  install-full      - Install everything (default: cu124)"
+	@echo "  test              - Run all tests"
+	@echo "  setup-hooks       - Setup pre-commit hooks"
+	@echo "  run-hooks         - Run pre-commit hooks"
+	@echo "  update-hooks      - Update pre-commit hooks"
+	@echo "  format            - Run ruff format"
+	@echo "  lint              - Run ruff linting"
+	@echo "  lint-fix          - Run ruff linting with fixes if applicable"
+	@echo "  check             - Run ruff format check + linting"
+	@echo "  clean             - Clean build artifacts"
