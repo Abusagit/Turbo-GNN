@@ -1,9 +1,10 @@
 .PHONY: install install-dev install-full clean test format
 
-
+# get path to current makefile
 MKFILE_PATH := $(realpath $(lastword $(MAKEFILE_LIST)))
 MKFILE_DIR  := $(dir $(MKFILE_PATH))
 
+# NOTE ONLY WORKS WITH .venv
 VENV_DIR   := $(MKFILE_DIR).venv
 PYTHON     := $(VENV_DIR)/bin/python3
 PIP        := $(VENV_DIR)/bin/pip3

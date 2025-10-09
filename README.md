@@ -130,12 +130,15 @@ This framework addresses the critical challenge of accelerating Graph Neural Net
 You need python>=3.11 to install everything. Run these commands - they install everything you need to `.venv` local folder & install pre-commit hooks:
 
 ```bash
-
-
+python3.11 -m venv .venv && source .venv/bin/activate && python -m pip install -U pip && make install-full # full installation
 ```
 
+For other types of installation, see `Makefile` & `pyproject.toml`
 
 ### Conda installation (Error-prone)
+
+**NOTE!!!** - this version doesn't support `make tests` options and pre-commits via VS-Code (@mightyneighbor is working on it)
+
 ```bash
 # Create environment
 conda env create -f environment.yml
