@@ -10,9 +10,6 @@ PYTHON     := $(VENV_DIR)/bin/python3
 PIP        := $(VENV_DIR)/bin/pip3
 
 
-# PYTHON ?= $(if $(CURDIR)/.venv/bin,$(CURDIR)/.venv/bin/python3,python3)
-# PIP     = $(PYTHON) -m pip
-
 CUDA_VERSION ?= cu124
 TORCH_VERSION := 2.4.1
 
