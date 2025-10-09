@@ -209,6 +209,7 @@ def parse_args() -> argparse.Namespace:
         "--profile", type=str, default=None, help="Optional profiler YAML (configs/benchmarks/profile.yaml)."
     )
     p.add_argument("--out", type=str, default="runs/train", help="Output directory.")
+    p.add_argument("--no-record-snapshots", action="store_true", help="Flag to NOT record memory snapshots")
     return p.parse_args()
 
 
@@ -226,6 +227,18 @@ def main() -> int:
 
     # merge training YAMLs (later overrides earlier)
     merged_cfg: dict[str, Any] = merge_yaml_files(args.config)
+    outdir = ensure_outdir(args.out)
+
+    # NOTE initialize memory hook as early as possible to collect ALL traces
+    memory_hook = MemoryHook(
+        measure_every=1,
+        sample_batches=None,
+        log_every=5,
+        track_cpu_rss=True,
+        sync_cuda=True,
+        record_snapshots=args.no_record_snapshots,
+        snapshot_dir=str(outdir / "memory_snahphots"),
+    )
 
     # build data
     tcfg = _extract_training_cfg(merged_cfg)
@@ -262,8 +275,6 @@ def main() -> int:
     trainer.scheduler = scheduler
     logger.info("Built Optimizer & Schedulers")
 
-    # hooks
-    outdir = ensure_outdir(args.out)
     trainer.add_hook(MetricHook(log_dir=str(outdir / "logs"), log_interval=int(tcfg.get("log_interval", 10))))
     trainer.add_hook(
         CheckpointHook(
@@ -273,7 +284,9 @@ def main() -> int:
             save_best_only=False,
         )
     )
-    trainer.add_hook(MemoryHook(measure_every=1, sample_batches=None, log_every=0, track_cpu_rss=True, sync_cuda=True))
+
+    trainer.add_hook(memory_hook)
+
     # trainer.add_hook(LRSchedulerStepHook(scheduler=...)) # TODO add LR scheduler
     if args.profile:
         prof_cfg = read_yaml(args.profile).get("profiler", {})
