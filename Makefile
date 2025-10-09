@@ -1,8 +1,17 @@
 .PHONY: install install-dev install-full clean test format
 
 
-PYTHON := python
-PIP := pip
+MKFILE_PATH := $(realpath $(lastword $(MAKEFILE_LIST)))
+MKFILE_DIR  := $(dir $(MKFILE_PATH))
+
+VENV_DIR   := $(MKFILE_DIR).venv
+PYTHON     := $(VENV_DIR)/bin/python3
+PIP        := $(VENV_DIR)/bin/pip3
+
+
+# PYTHON ?= $(if $(CURDIR)/.venv/bin,$(CURDIR)/.venv/bin/python3,python3)
+# PIP     = $(PYTHON) -m pip
+
 CUDA_VERSION ?= cu124
 TORCH_VERSION := 2.4.1
 
@@ -27,10 +36,7 @@ _install-full:
 	$(PIP) install -e ".[full]" $(FIND_LINKS)
 
 test:
-	pytest tests/ -v
-
-test-correctness:
-	pytest tests/correctness/ -v
+	$(PYTHON) -m pytest tests/ -v
 
 format:
 	ruff format src/ scripts/ tests/

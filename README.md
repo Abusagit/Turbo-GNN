@@ -10,6 +10,8 @@ A comprehensive framework for benchmarking and accelerating Graph Neural Network
     - [Key Features](#key-features)
   - [Project Structure](#project-structure)
   - [Installation](#installation)
+    - [Via Makefile (RECOMMENDED)](#via-makefile-recommended)
+    - [Conda installation (Error-prone)](#conda-installation-error-prone)
   - [Quick Start](#quick-start)
     - [1. Train a GCN on Cora](#1-train-a-gcn-on-cora)
     - [2. Benchmark GCN Layer Across Backends](#2-benchmark-gcn-layer-across-backends)
@@ -58,7 +60,7 @@ This framework addresses the critical challenge of accelerating Graph Neural Net
 - **Comprehensive Benchmarking**: Microbenchmarking, profiling, and memory tracking
 - **Flexible Architecture**: YAML-based configuration for models, datasets, and training
 - **Multiple Graph Representations**: Seamless support for edge lists, adjacency matrices, CSR/COO formats, DGL graphs, and PyG Data objects
-- **Hook System**: Extensible training pipeline with hooks for profiling, checkpointing, and metrics
+- **Hook System**: Extensible training pipeline with hooks for profiling, checkpointing, metrics and more
 - **Autotuning**: Grid-search optimization for custom backend parameters
 
 ---
@@ -123,7 +125,17 @@ This framework addresses the critical challenge of accelerating Graph Neural Net
 
 ## Installation
 
+### Via Makefile (RECOMMENDED)
 
+You need python>=3.11 to install everything. Run these commands - they install everything you need to `.venv` local folder & install pre-commit hooks:
+
+```bash
+
+
+```
+
+
+### Conda installation (Error-prone)
 ```bash
 # Create environment
 conda env create -f environment.yml

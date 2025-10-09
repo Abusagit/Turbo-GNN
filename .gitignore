@@ -10,5 +10,6 @@ dataset/*
 
 runs/
 
+.venv/*
 
 *.egg-info
