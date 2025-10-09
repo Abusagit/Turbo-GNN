@@ -110,9 +110,9 @@ class TestAggregationCorrectness:
         print(f"  Mean relative error:      {relative_error:.8e}")
 
         # Assert numerical equivalence
-        assert torch.allclose(our_output, dgl_output, atol=1e-6, rtol=1e-5), (
-            f"Output doesn't match DGL: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
-        )
+        assert torch.allclose(
+            our_output, dgl_output, atol=1e-6, rtol=1e-5
+        ), f"Output doesn't match DGL: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
 
     def test_isolated_nodes_produce_zero(self, create_graph_sample, create_conv_layer, device):
         """
@@ -141,19 +141,19 @@ class TestAggregationCorrectness:
         output = conv(features, graph_sample.graph_repr)
 
         # Node 0 and 4 have no incoming edges -> should be zero
-        assert torch.allclose(output[0], torch.zeros_like(output[0]), atol=1e-6), (
-            "Node 0 (no incoming edges) should have zero output"
-        )
+        assert torch.allclose(
+            output[0], torch.zeros_like(output[0]), atol=1e-6
+        ), "Node 0 (no incoming edges) should have zero output"
 
-        assert torch.allclose(output[4], torch.zeros_like(output[4]), atol=1e-6), (
-            "Node 4 (isolated) should have zero output"
-        )
+        assert torch.allclose(
+            output[4], torch.zeros_like(output[4]), atol=1e-6
+        ), "Node 4 (isolated) should have zero output"
 
         # Nodes 1, 2, 3 should have non-zero output (they have incoming edges)
         for node_id in [1, 2, 3]:
-            assert output[node_id].abs().sum() > 1e-6, (
-                f"Node {node_id} (has incoming edges) should have non-zero output"
-            )
+            assert (
+                output[node_id].abs().sum() > 1e-6
+            ), f"Node {node_id} (has incoming edges) should have non-zero output"
 
 
 class TestGradientFlow:
@@ -317,18 +317,18 @@ class TestGradientFlow:
         # Source nodes should have non-zero gradients
         for src_node in source_nodes:
             grad_norm = features.grad[src_node].abs().sum().item()
-            assert grad_norm > 1e-6, (
-                f"Source node {src_node} should have non-zero gradient (contributes to node {target_node})"
-            )
+            assert (
+                grad_norm > 1e-6
+            ), f"Source node {src_node} should have non-zero gradient (contributes to node {target_node})"
             print(f"  Node {src_node}: gradient norm = {grad_norm:.6f}")
 
         # Nodes that don't connect to target should have zero gradients
         non_source_nodes = set(range(data["num_nodes"])) - set(source_nodes.tolist()) - {target_node}
         for node_id in list(non_source_nodes)[:5]:  # Check a few
             grad_norm = features.grad[node_id].abs().sum().item()
-            assert grad_norm < 1e-6, (
-                f"Non-source node {node_id} should have zero gradient (doesn't contribute to node {target_node})"
-            )
+            assert (
+                grad_norm < 1e-6
+            ), f"Non-source node {node_id} should have zero gradient (doesn't contribute to node {target_node})"
 
     def test_second_order_gradients(self, karate_like_club_graph, create_graph_sample, create_conv_layer):
         """
@@ -445,9 +445,9 @@ class TestEdgeCases:
         # Each node receives mean of all features
         expected_mean = features.mean(dim=0, keepdim=True).expand(num_nodes, -1)
 
-        assert torch.allclose(output, expected_mean, atol=1e-5), (
-            "In complete graph, all nodes should receive global mean"
-        )
+        assert torch.allclose(
+            output, expected_mean, atol=1e-5
+        ), "In complete graph, all nodes should receive global mean"
 
 
 if __name__ == "__main__":

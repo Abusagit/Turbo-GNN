@@ -116,7 +116,7 @@ class WarmupScheduler(_LRScheduler):
             return list(self.wrapped.get_last_lr())
         return list(self.base_lrs)
 
-    def step(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+    def step(self, *args: Any, **kwargs: Any) -> None:
         """Advance scheduler by one step.
 
         Args:

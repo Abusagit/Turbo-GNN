@@ -128,7 +128,7 @@ def classifier_spec_from_config(
     _infer_in_channels(layers, input_dim=input_dim)
 
     enc_spec = EncoderSpec(layers=layers)
-    num_classes = int(override_num_classes) if override_num_classes is not None else int(cfg.get("num_classes"))
+    num_classes = int(override_num_classes) if override_num_classes is not None else int(cfg.get("num_classes"))  # type: ignore[arg-type]
     dropout = float(cfg.get("dropout", 0.0))
     return ClassifierSpec(encoder=enc_spec, num_classes=num_classes, dropout=dropout)
 
@@ -208,8 +208,8 @@ def _parse_layer_dict(d: dict[str, Any]) -> LayerSpec:
     conv_kwargs = dict(d.get("conv_kwargs", {}))
 
     return LayerSpec(
-        layer_type=layer_type,
-        conv_type=conv_type,
+        layer_type=layer_type,  # type: ignore[arg-type]
+        conv_type=conv_type,  # type: ignore[arg-type]
         backend=backend,
         in_channels=in_channels,
         out_channels=out_channels,

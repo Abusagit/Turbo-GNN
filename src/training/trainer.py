@@ -308,7 +308,7 @@ class GNNTrainer:
         Returns:
             Dictionary containing training history
         """
-        history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+        history: dict[str, list[float]] = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
         # fire training start event
         self.fire_event("on_training_start", self.model, self.config)

@@ -8,6 +8,7 @@ import sys
 import traceback
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
 
@@ -34,10 +35,7 @@ def test_backend_registration():
 
         print("✓ Backend modules imported successfully")
     except Exception as e:
-        msg = f"✗ Failed to import backends: {e}"
-        print(msg)
-        assert False, msg  # <-- pytest: fail test
-        return False
+        pytest.fail(f"Failed to import backends: {e}")
 
     # Check registered backends
     backends = BackendRegistry.list_backends()
@@ -46,14 +44,7 @@ def test_backend_registration():
     expected = {"pyg", "dgl", "torch_native_gcn"}
     missing = expected - set(backends)
     if missing:
-        msg = f"✗ Missing backends: {missing}"
-        print(msg)
-        assert False, msg  # <-- pytest: fail test
-        return False
-
-    print("✓ All expected backends registered")
-    assert True
-    return True
+        pytest.fail(f"Missing backends: {missing}")
 
 
 def test_dataset_loading():
@@ -77,13 +68,7 @@ def test_dataset_loading():
             print(f"    Edges: {sample.edge_index.shape}")
             print(f"    Train mask: {sample.train_mask.sum().item()} nodes")
         except Exception as e:
-            msg = f"  ✗ Failed: {e}"
-            print(msg)
-            assert False, msg  # <-- pytest: fail test
-            return False
-
-    assert True
-    return True
+            pytest.fail(f"Failed: {e}")
 
 
 def test_backend_convolutions():
@@ -164,14 +149,11 @@ def test_backend_convolutions():
     print("Summary:")
     for key, status in results.items():
         symbol = "✓" if status == "PASSED" else "✗" if "FAILED" in status else "⚠"
-        print(f"  {symbol} {key}: {status}")
 
     ok = all(v in ("PASSED", "NOT_IMPLEMENTED") for v in results.values())
     if not ok:
         failed = {k: v for k, v in results.items() if v not in ("PASSED", "NOT_IMPLEMENTED")}
-        assert False, f"Backend convolution failures: {failed}"  # <-- pytest: fail test
-
-    return ok
+        pytest.fail(f"Backend convolution failures: {failed}")
 
 
 def test_microbenchmarking():
@@ -190,14 +172,8 @@ def test_microbenchmarking():
 
     try:
         result = time_callable(test_fn, warmup=5, iters=10)
-        print(f"✓ Microbench completed: {result.ms_per_iter:.3f} ms/iter on {result.device}")
-        assert True
-        return True
     except Exception as e:
-        msg = f"✗ Microbench failed: {e}"
-        print(msg)
-        assert False, msg  # <-- pytest: fail test
-        return False
+        pytest.fail(f"Microbench failed: {e}")
 
 
 def test_memory_profiling():
@@ -220,17 +196,9 @@ def test_memory_profiling():
             f"Current memory - Allocated: {human_bytes(snapshot.allocated_bytes, binary=True)}, "
             f"Reserved: {human_bytes(snapshot.reserved_bytes, binary=True)}"
         )
-
-        # Test peak measurement
         result = measure_peak_cuda_memory_during(memory_test)
-        print(f"✓ Peak memory during operation: {human_bytes(result.peak_allocated, binary=True)}")
-        assert True
-        return True
     except Exception as e:
-        print(f"✗ Memory profiling failed: {e}")
-        traceback.print_exc()
-        assert False, f"Memory profiling failed: {e}"  # <-- pytest: fail test
-        return False
+        pytest.fail(f"Memory profiling failed: {e}")
 
 
 def test_model_building():
@@ -301,57 +269,6 @@ def test_model_building():
 
         logits.sum().backward()
 
-        assert True
-        return True
     except Exception as e:
-        print(f"✗ Model building failed: {e}")
         traceback.print_exc()
-        assert False, f"Model building failed: {e}"  # <-- pytest: fail test
-        return False
-
-
-def main():
-    """Run all tests."""
-    print("\n" + "=" * 60)
-    print("GNN BENCHMARKING REPOSITORY VERIFICATION")
-    print("=" * 60)
-
-    tests = [
-        ("Backend Registration", test_backend_registration),
-        ("Dataset Loading", test_dataset_loading),
-        ("Backend Convolutions", test_backend_convolutions),
-        ("Microbenchmarking", test_microbenchmarking),
-        ("Memory Profiling", test_memory_profiling),
-        ("Model Building", test_model_building),
-    ]
-
-    results = []
-    for name, test_fn in tests:
-        try:
-            passed = test_fn()
-            results.append((name, passed))
-        except Exception as e:
-            print(f"\n✗ {name} crashed: {e}")
-            traceback.print_exc()
-            results.append((name, False))
-
-    # Final summary
-    print("\n" + "=" * 60)
-    print("FINAL RESULTS")
-    print("=" * 60)
-
-    for name, passed in results:
-        status = "✓ PASSED" if passed else "✗ FAILED"
-        print(f"{status}: {name}")
-
-    all_passed = all(p for _, p in results)
-    if all_passed:
-        print("\n🎉 All tests passed!")
-    else:
-        print(f"\n⚠️  {sum(not p for _, p in results)} tests failed")
-
-    return 0 if all_passed else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        pytest.fail(f"Model building failed: {e}")

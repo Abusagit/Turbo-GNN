@@ -13,33 +13,33 @@ channels:
 dependencies:
   # Python
   - python=3.11
-  
+
   # PyTorch with CUDA
   - torchvision
   - torchaudio
   - pytorch-cuda=12.4  # Change to 11.8 if using CUDA 11.8
-  
+
   # PyTorch Geometric
   - pyg>=2.3.0
   - pytorch-scatter
   - pytorch-sparse
   - pytorch-cluster
   - pytorch-spline-conv
-  
+
   # DGL
   - dgl
-  
+
   # Scientific computing
   - numpy<2.0
   - scipy>=1.7.0
   - pandas>=1.5.0
   - scikit-learn>=1.0.0
-  
+
   # Visualization
   - matplotlib>=3.5.0
   - seaborn>=0.12.0
   - plotly>=5.0.0
-  
+
   # Utilities
   - pyyaml>=6.0
   - tqdm>=4.65.0
@@ -47,13 +47,13 @@ dependencies:
   - psutil>=5.9.0
   - jupyterlab>=3.0.0
   - ipywidgets>=7.6.0
-  
+
   # Development tools
   - pytest>=7.0.0
   - black>=22.0.0
   - pylint>=2.15.0
   - mypy>=0.990
-  
+
   # Pip dependencies
   - pip
   - pip:

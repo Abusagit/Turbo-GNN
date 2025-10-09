@@ -164,7 +164,7 @@ def create_split_datasets_from_config_dict(
 
 
 def create_split_datasets_from_yaml(
-    path: str, graph_backend: GraphBackendOption = "egde_index"
+    path: str, graph_backend: GraphBackendOption = "pyg"
 ) -> tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
     """Load a YAML config file (dataset) and return split datasets.
 
@@ -209,9 +209,9 @@ def infer_graph_backend(model_config_path: str) -> GraphBackendOption:
             layers = value["layers"]
 
             backends = [layer["backend"] for layer in layers]
-            assert all(backends[i - 1] == backends[i] for i in range(1, len(backends))), (
-                f"So far single backend per run is supported, got multiple backends: {backends}"
-            )
+            assert all(
+                backends[i - 1] == backends[i] for i in range(1, len(backends))
+            ), f"So far single backend per run is supported, got multiple backends: {backends}"
 
             graph_representation_backend = MODEL_BACKEND_TO_GRAPH_REPR.get(backends[0])
             if graph_representation_backend is None:

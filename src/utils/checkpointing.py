@@ -63,7 +63,7 @@ def load_checkpoint(
     Returns:
         Dict[str, Any]: The loaded checkpoint dictionary.
     """
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt: dict[str, Any] = torch.load(path, map_location=map_location)
     if model is not None and "model" in ckpt:
         model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt and ckpt["optimizer"] is not None:

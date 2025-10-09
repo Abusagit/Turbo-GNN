@@ -3,13 +3,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+import psutil
 import torch
-
-try:
-    import psutil  # optional, for RSS reporting
-except Exception:  # pragma: no cover - optional dep
-    psutil = None  # type: ignore[assignment]
-
 
 doc = """
 Memory benchmarking utilities (CPU + CUDA) for graph NN experiments.
@@ -209,7 +204,7 @@ def _current_device_str(device: torch.device | None = None) -> str:
         if torch.cuda.is_available():
             return f"cuda:{torch.cuda.current_device()}"
         return "cpu"
-    return f"{device.type}:{device.index}" if device.type == "cuda" else device.type
+    return f"{device.type}:{device.index}" if device.type == "cuda" else str(device.type)
 
 
 def capture_cuda_snapshot(device: torch.device | None = None) -> CudaMemorySnapshot:

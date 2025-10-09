@@ -169,7 +169,7 @@ def build_optimizer(model: nn.Module, cfg: OptimizerConfig) -> Optimizer:
         return torch.optim.Adagrad(param_groups, eps=cfg.eps, **common_kwargs)
     if name == "lion":
         try:
-            from lion_pytorch import Lion  # type: ignore
+            from lion_pytorch import Lion
 
             return Lion(param_groups, betas=cfg.betas, weight_decay=cfg.weight_decay, lr=cfg.lr)
         except Exception as exc:

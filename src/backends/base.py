@@ -67,6 +67,27 @@ class BaseBackend(ABC):
         self.device = torch.device(device)
         self.dtype = dtype
 
+    @abstractmethod
+    def create_conv(
+        self,
+        conv_type: str,
+        in_channels: int,
+        out_channels: int,
+        **kwargs: Any,
+    ):
+        """Factory for convolution layers.
+
+        Args:
+            conv_type (str): 'gcn' currently. (Extend with GAT/GIN/SAGE as needed.)
+            in_channels (int): Input feature size.
+            out_channels (int): Output feature size.
+            **kwargs (Any): Extra arguments for DGL layers.
+
+        Returns:
+            BaseConvolution: An instance of the requested DGL conv.
+        """
+        pass
+
 
 class BaseConvolution(nn.Module):
     """Abstract base class for graph convolution layers.

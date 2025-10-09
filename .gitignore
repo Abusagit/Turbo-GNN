@@ -9,3 +9,6 @@ dataset/*
 /data/
 
 runs/
+
+
+*.egg-info

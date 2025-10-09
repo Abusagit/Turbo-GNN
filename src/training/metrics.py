@@ -145,7 +145,7 @@ def compute_accuracy(predictions: torch.Tensor, labels: torch.Tensor, mask: torc
     correct = (predictions == labels).float().sum()
     total = len(labels)
 
-    return (correct / total).item() if total > 0 else 0.0
+    return (correct / total).item() if total > 0 else 0.0  # type: ignore
 
 
 def compute_f1(
@@ -172,7 +172,7 @@ def compute_f1(
     predictions = predictions.cpu().numpy()
     labels = labels.cpu().numpy()
 
-    return f1_score(labels, predictions, average=average, zero_division=0)
+    return f1_score(labels, predictions, average=average, zero_division=0)  # type: ignore
 
 
 def compute_precision(predictions: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor | None = None) -> float:
@@ -199,7 +199,7 @@ def compute_precision(predictions: torch.Tensor, labels: torch.Tensor, mask: tor
     if predicted_positives == 0:
         return 0.0
 
-    return (true_positives / predicted_positives).item()
+    return (true_positives / predicted_positives).item()  # type: ignore
 
 
 def compute_recall(predictions: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor | None = None) -> float:
@@ -226,7 +226,7 @@ def compute_recall(predictions: torch.Tensor, labels: torch.Tensor, mask: torch.
     if actual_positives == 0:
         return 0.0
 
-    return (true_positives / actual_positives).item()
+    return (true_positives / actual_positives).item()  # type: ignore
 
 
 def compute_auc(predictions: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor | None = None) -> float:
@@ -258,7 +258,7 @@ def compute_auc(predictions: torch.Tensor, labels: torch.Tensor, mask: torch.Ten
     labels = labels.cpu().numpy()
 
     try:
-        return roc_auc_score(labels, predictions)
+        return roc_auc_score(labels, predictions)  # type: ignore
     except ValueError:
         # Handle case where only one class is present
         return 0.5
@@ -287,7 +287,7 @@ def compute_multiclass_auc(predictions: torch.Tensor, labels: torch.Tensor) -> f
         auc = roc_auc_score(labels_onehot[:, i], predictions[:, i])
         auc_scores.append(auc)
 
-    return np.mean(auc_scores)
+    return np.mean(auc_scores)  # type: ignore
 
 
 def compute_mse(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None) -> float:
@@ -306,7 +306,7 @@ def compute_mse(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Te
         targets = targets[mask]
 
     mse = F.mse_loss(predictions, targets)
-    return mse.item()
+    return mse.item()  # type: ignore
 
 
 def compute_mae(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None) -> float:
@@ -325,7 +325,7 @@ def compute_mae(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Te
         targets = targets[mask]
 
     mae = F.l1_loss(predictions, targets)
-    return mae.item()
+    return mae.item()  # type: ignore
 
 
 def compute_r2_score(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None) -> float:
@@ -347,4 +347,4 @@ def compute_r2_score(predictions: torch.Tensor, targets: torch.Tensor, mask: tor
     ss_tot = ((targets - targets.mean()) ** 2).sum()
 
     r2 = 1 - (ss_res / ss_tot)
-    return r2.item()
+    return r2.item()  # type: ignore

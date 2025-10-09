@@ -51,7 +51,7 @@ Notes:
 def ensure_cpu_device(func):
     """Wrap a function to ensure that default device is CPU.
     Returns back default device after the execution
-    
+
     Some functions (e.g. Pytorch Geometric's ones) load tensors,
     and torch.load stores them on the default device
     """
@@ -104,7 +104,7 @@ class GraphSample:
         elif self.backend == "dgl":
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             if self.edge_weight is not None:
-                graph.edata["w"] = self.edge_weight
+                graph.edata["w"] = self.edge_weight  # type: ignore
             graph = self._to_default_device(graph)
         elif self.backend == "normalized_adj_mat_gcn":
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=False)
@@ -143,22 +143,22 @@ class GraphSample:
     @property
     def num_nodes(self) -> int:
         """Number of nodes N."""
-        return self.x.shape[0]
+        return self.x.shape[0] # type: ignore
 
     @property
     def num_features(self) -> int:
         """Feature dimensionality F."""
-        return self.x.shape[1]
+        return self.x.shape[1] # type: ignore
 
     @property
-    def num_classes(self) -> Optional[int]:
+    def num_classes(self) -> int:
         """Number of classes if labels are class indices or one-hot."""
         if self.y.ndim == 1 and self.y.numel() > 0:
             # class indices -> infer max+1
-            return self.y.max().item() + 1
+            return self.y.max().item() + 1 # type: ignore
         if self.y.ndim == 2:
-            return self.y.shape[1]
-        return None
+            return self.y.shape[1] # type: ignore
+        assert False, "Unreachable"
 
     @property
     def graph_repr(self) -> Any:
@@ -342,7 +342,7 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
             data: Data = dset[0]
         elif n in ("reddit",):
             dset = Reddit(root=root)
-            data: Data = dset[0]
+            data = dset[0]
         else:
             # try dynamic import by attribute name (PascalCase/Exact)
             if hasattr(pyg_datasets, name):
@@ -350,7 +350,7 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
                 dset = D(root=root)
                 if len(dset) != 1:
                     raise ValueError(f"Expected a single-graph dataset for '{name}', got {len(dset)} graphs")
-                data: Data = dset[0]
+                data = dset[0]
             else:
                 raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
         return data

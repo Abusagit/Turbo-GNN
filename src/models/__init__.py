@@ -1,4 +1,4 @@
-from .architecture import *
+from .architecture import GNNEncoder, NodeClassifier, classifier, encoder
 
 doc = """
 Models package: registries, base utilities, layers, and high-level architectures.

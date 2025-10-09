@@ -19,21 +19,6 @@ from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
 
 from ..benchmarking.memory import capture_cuda_snapshot, current_process_rss_bytes, human_bytes, reset_cuda_peak_memory
 
-# # local import from benchmarking utilities (relative to `training/`)
-# try:
-#     from ..benchmarking.memory import (
-#         reset_cuda_peak_memory,
-#         capture_cuda_snapshot,
-#         current_process_rss_bytes,
-#         human_bytes,
-#     )
-# except Exception as _mem_import_err:
-#     reset_cuda_peak_memory = None  # type: ignore[assignment]
-#     capture_cuda_snapshot = None   # type: ignore[assignment]
-#     current_process_rss_bytes = None  # type: ignore[assignment]
-#     human_bytes = None  # type: ignore[assignment]
-
-
 __doc__ = """
 Training hooks module for GNN benchmarking.
 
@@ -173,7 +158,7 @@ class LRSchedulerStepHook(Hook):
     ) -> None:
         self.scheduler = scheduler
         self.mode = mode
-        self.accumulate_steps = int(accumulate_steps) if accumulate_steps is not None else None
+        self.accumulate_steps: int = int(accumulate_steps) if accumulate_steps is not None else 1
         self.log_every = int(log_every)
 
         # Internal state
@@ -188,13 +173,6 @@ class LRSchedulerStepHook(Hook):
         """Cache references and finalize accumulation steps."""
         self._model = model
         self._config = config
-        if self.accumulate_steps is None and hasattr(config, "accumulation_steps"):
-            try:
-                self.accumulate_steps = int(config.accumulation_steps)
-            except Exception:
-                self.accumulate_steps = 1
-        if not self.accumulate_steps or self.accumulate_steps < 1:
-            self.accumulate_steps = 1
         self._batch_counter = 0
         self._epoch_counter = 0
 
@@ -244,7 +222,7 @@ class LRSchedulerStepHook(Hook):
         except Exception:
             pass
         try:
-            opt: Optimizer = self.scheduler.optimizer  # type: ignore[attr-defined]
+            opt: Optimizer = self.scheduler.optimizer
             return [pg.get("lr", None) for pg in opt.param_groups]
         except Exception:
             return None
@@ -515,7 +493,7 @@ class CheckpointHook(Hook):
         self.checkpoints: list[Path] = []
 
     def on_training_start(self, model: nn.Module, config: Any) -> None:
-        return super().on_training_start(model, config)
+        return super().on_training_start(model, config)  # type: ignore[safe-super]
 
     def on_epoch_end(self, epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
         """Save checkpoint at epoch end if needed.
@@ -679,15 +657,12 @@ class MemoryHook(Hook):
         self._epoch_measured += 1
 
         if self.log_every > 0 and (self._epoch_measured % self.log_every == 0):
-            if human_bytes is not None:
-                a = human_bytes(peak_alloc, binary=True)
-                r = human_bytes(peak_reserved, binary=True)
-                msg = f"[batch {batch_idx}] CUDA peak alloc={a}, reserved={r}"
-                if self._rss_deltas:
-                    msg += f", RSS Δ={human_bytes(self._rss_deltas[-1], binary=True)}"
-                logger.info(msg)
-            else:
-                logger.info(f"[batch {batch_idx}] CUDA peak alloc={peak_alloc}B, reserved={peak_reserved}B")
+            a = human_bytes(peak_alloc, binary=True)
+            r = human_bytes(peak_reserved, binary=True)
+            msg = f"[batch {batch_idx}] CUDA peak alloc={a}, reserved={r}"
+            if self._rss_deltas:
+                msg += f", RSS Δ={human_bytes(self._rss_deltas[-1], binary=True)}"
+            logger.info(msg)
 
     def on_epoch_end(self, epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
         """Summarize per-epoch stats and inject into train_metrics."""
@@ -716,25 +691,18 @@ class MemoryHook(Hook):
             train_metrics["cpu_rss_delta_mb_max"] = _to_mb(rss_delta_max)
             train_metrics["cpu_rss_delta_mb_avg"] = _to_mb(rss_delta_avg)
 
-        if human_bytes is not None:
-            msg = (
-                f"[epoch {epoch}] CUDA peak alloc: max={human_bytes(peak_alloc_max, binary=True)}, "
-                f"avg={human_bytes(peak_alloc_avg, binary=True)}; "
-                f"reserved: max={human_bytes(peak_reserved_max, binary=True)}, "
-                f"avg={human_bytes(peak_reserved_avg, binary=True)}"
+        msg = (
+            f"[epoch {epoch}] CUDA peak alloc: max={human_bytes(peak_alloc_max, binary=True)}, "
+            f"avg={human_bytes(peak_alloc_avg, binary=True)}; "
+            f"reserved: max={human_bytes(peak_reserved_max, binary=True)}, "
+            f"avg={human_bytes(peak_reserved_avg, binary=True)}"
+        )
+        if self._rss_deltas:
+            msg += (
+                f"; RSS Δ: max={human_bytes(rss_delta_max, binary=True)}, "
+                f"avg={human_bytes(rss_delta_avg, binary=True)}"
             )
-            if self._rss_deltas:
-                msg += (
-                    f"; RSS Δ: max={human_bytes(rss_delta_max, binary=True)}, "
-                    f"avg={human_bytes(rss_delta_avg, binary=True)}"
-                )
-            logger.info(msg)
-        else:
-            logger.info(
-                f"[epoch {epoch}] CUDA peak alloc: max={peak_alloc_max}B avg={peak_alloc_avg}B; "
-                f"reserved: max={peak_reserved_max}B avg={peak_reserved_avg}B; "
-                f"RSS Δ: max={rss_delta_max}B avg={rss_delta_avg}B"
-            )
+        logger.info(msg)
 
     def _should_measure_this_batch(self, batch_idx: int) -> bool:
         """Return True if this batch should be measured."""

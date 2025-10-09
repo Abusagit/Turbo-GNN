@@ -131,7 +131,7 @@ conda activate gnn_bench
 
 
 ### TODO
-# Optional: Install custom backends 
+# Optional: Install custom backends
 python setup.py develop
 ```
 
@@ -204,7 +204,7 @@ The framework uses a **registry pattern** to manage different backend implementa
 from src.backends.base import BaseBackend, BaseConvolution
 
 class MyBackend(BaseBackend):
-    def create_conv(self, conv_type: str, in_channels: int, 
+    def create_conv(self, conv_type: str, in_channels: int,
                     out_channels: int, **kwargs):
         # Return convolution instance
         pass
@@ -251,7 +251,7 @@ encoder:
       residual: false
       conv_kwargs:
         cached: true
-    
+
     - conv_type: gcn
       backend: pyg
       in_channels: auto  # Inferred from previous layer
@@ -530,8 +530,8 @@ from ..registry import BackendRegistry
 
 class _MyGCNConv(BaseConvolution):
     """Custom GCN implementation."""
-    
-    def __init__(self, in_channels: int, out_channels: int, 
+
+    def __init__(self, in_channels: int, out_channels: int,
                  bias: bool = True, **kwargs):
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
         # Initialize weights
@@ -539,12 +539,12 @@ class _MyGCNConv(BaseConvolution):
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
         self.reset_parameters()
-    
+
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.weight)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-    
+
     def forward(self, x: torch.Tensor, graph: Any, **kwargs) -> torch.Tensor:
         # Your custom forward implementation
         # graph is in the format specified by MODEL_BACKEND_TO_GRAPH_REPR
@@ -557,8 +557,8 @@ class _MyGCNConv(BaseConvolution):
 @BackendRegistry.register_backend("my_backend")
 class MyBackend(BaseBackend):
     """Custom backend."""
-    
-    def create_conv(self, conv_type: str, in_channels: int, 
+
+    def create_conv(self, conv_type: str, in_channels: int,
                     out_channels: int, **kwargs):
         if conv_type.lower() == "gcn":
             return _MyGCNConv(in_channels, out_channels, **kwargs)
@@ -626,7 +626,7 @@ class MyCustomModel(nn.Module):
         # Build your architecture
         self.encoder = ...
         self.head = ...
-    
+
     def forward(self, batch_or_x, graph=None):
         # Your forward pass
         pass
@@ -661,13 +661,13 @@ num_classes: 7
 Add to `src/data/datasets.py`:
 
 ```python
-def load_my_dataset(name: str, graph_backend: GraphBackendOption, 
+def load_my_dataset(name: str, graph_backend: GraphBackendOption,
                     root: str = "data") -> GraphSample:
     # Load your dataset
     x = ...  # Node features
     y = ...  # Labels
     edge_index = ...  # Graph edges
-    
+
     return GraphSample(
         x=x,
         y=y,
@@ -715,11 +715,11 @@ class MyCustomHook(Hook):
     def on_training_start(self, model, config):
         # Initialization logic
         pass
-    
+
     def on_epoch_end(self, epoch, train_metrics, val_metrics):
         # Custom logging or processing
         pass
-    
+
     # Override other hook methods as needed
 ```
 
@@ -772,21 +772,21 @@ bash tests/integration/launch_training_pipeline.sh
 def test_my_backend():
     backend = BackendRegistry.get_backend("my_backend")
     conv = backend.create_conv("gcn", in_channels=16, out_channels=32)
-    
+
     # Forward pass
     x = torch.randn(100, 16)
     edge_index = torch.randint(0, 100, (2, 500))
     graph = prepare_graph(edge_index, backend="my_backend")
     out = conv(x, graph)
-    
+
     # Check output shape
     assert out.shape == (100, 32)
     assert not torch.isnan(out).any()
-    
+
     # Backward pass
     loss = out.sum()
     loss.backward()
-    
+
     # Check gradients
     assert conv.weight.grad is not None
     assert not torch.isnan(conv.weight.grad).any()
@@ -818,4 +818,3 @@ Include:
 - Dataset and model configuration
 - Error traceback
 - Minimal reproducible example
-  
