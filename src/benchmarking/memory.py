@@ -1,6 +1,7 @@
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -30,6 +31,7 @@ or scripts. All functions are typed and robust to CPU-only environments.
 # Dataclasses
 # -----------------------------------------------------------------------------
 
+
 @dataclass
 class CudaMemorySnapshot:
     """A snapshot of CUDA memory metrics on a single device.
@@ -42,12 +44,13 @@ class CudaMemorySnapshot:
         max_reserved_bytes (int): Peak reserved bytes since last reset.
         stats (Dict[str, int]): Optional extra stats from torch.cuda.memory_stats().
     """
+
     device: str
     allocated_bytes: int
     reserved_bytes: int
     max_allocated_bytes: int
     max_reserved_bytes: int
-    stats: Dict[str, int]
+    stats: dict[str, int]
 
 
 @dataclass
@@ -66,6 +69,7 @@ class PeakMemoryResult:
         cpu_rss_start (Optional[int]): Process RSS at start, if psutil available.
         cpu_rss_end (Optional[int]): Process RSS at end, if psutil available.
     """
+
     device: str
     duration_s: float
     start_allocated: int
@@ -74,8 +78,8 @@ class PeakMemoryResult:
     start_reserved: int
     end_reserved: int
     peak_reserved: int
-    cpu_rss_start: Optional[int] = None
-    cpu_rss_end: Optional[int] = None
+    cpu_rss_start: int | None = None
+    cpu_rss_end: int | None = None
 
 
 @dataclass
@@ -89,16 +93,18 @@ class ModelMemoryBreakdown:
         activation_bytes_estimate (Optional[int]): Heuristic forward-activation size.
         total_bytes (int): Sum of known components (params + buffers + optim + activation est).
     """
+
     param_bytes: int
     buffer_bytes: int
     optimizer_state_bytes: int
-    activation_bytes_estimate: Optional[int]
+    activation_bytes_estimate: int | None
     total_bytes: int
 
 
 # -----------------------------------------------------------------------------
 # Formatting helpers
 # -----------------------------------------------------------------------------
+
 
 def human_bytes(nbytes: int, *, binary: bool = False, precision: int = 2) -> str:
     """Format bytes as a human-readable string.
@@ -137,7 +143,8 @@ def tensor_nbytes(t: torch.Tensor) -> int:
 # Model/optimizer memory accounting
 # -----------------------------------------------------------------------------
 
-def model_param_and_buffer_bytes(model: torch.nn.Module, *, trainable_only: bool = False) -> Tuple[int, int]:
+
+def model_param_and_buffer_bytes(model: torch.nn.Module, *, trainable_only: bool = False) -> tuple[int, int]:
     """Compute bytes used by parameters and buffers.
 
     Args:
@@ -195,7 +202,8 @@ def optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
 # CPU / CUDA snapshot utilities
 # -----------------------------------------------------------------------------
 
-def _current_device_str(device: Optional[torch.device] = None) -> str:
+
+def _current_device_str(device: torch.device | None = None) -> str:
     """Return a canonical device string."""
     if device is None:
         if torch.cuda.is_available():
@@ -204,7 +212,7 @@ def _current_device_str(device: Optional[torch.device] = None) -> str:
     return f"{device.type}:{device.index}" if device.type == "cuda" else device.type
 
 
-def capture_cuda_snapshot(device: Optional[torch.device] = None) -> CudaMemorySnapshot:
+def capture_cuda_snapshot(device: torch.device | None = None) -> CudaMemorySnapshot:
     """Capture a point-in-time snapshot of CUDA memory metrics.
 
     Args:
@@ -238,7 +246,7 @@ def capture_cuda_snapshot(device: Optional[torch.device] = None) -> CudaMemorySn
     )
 
 
-def reset_cuda_peak_memory(device: Optional[torch.device] = None) -> None:
+def reset_cuda_peak_memory(device: torch.device | None = None) -> None:
     """Reset CUDA peak memory statistics (allocated/reserved).
 
     Args:
@@ -252,7 +260,7 @@ def reset_cuda_peak_memory(device: Optional[torch.device] = None) -> None:
         torch.cuda.reset_peak_memory_stats(dev)
 
 
-def current_process_rss_bytes() -> Optional[int]:
+def current_process_rss_bytes() -> int | None:
     """Return current process resident set size in bytes if `psutil` is available.
 
     Args:
@@ -273,7 +281,10 @@ def current_process_rss_bytes() -> Optional[int]:
 # Peak CUDA memory measurement
 # -----------------------------------------------------------------------------
 
-def measure_peak_cuda_memory_during(fn: Callable[[], Any], *, device: Optional[torch.device] = None, sync_cuda: bool = True) -> PeakMemoryResult:
+
+def measure_peak_cuda_memory_during(
+    fn: Callable[[], Any], *, device: torch.device | None = None, sync_cuda: bool = True
+) -> PeakMemoryResult:
     """Run a callable and capture CUDA peak memory usage during its execution.
 
     Args:
@@ -339,13 +350,14 @@ def measure_peak_cuda_memory_during(fn: Callable[[], Any], *, device: Optional[t
 # Forward/backward convenience profilers
 # -----------------------------------------------------------------------------
 
+
 def measure_forward_peak_cuda_memory(
     model: torch.nn.Module,
-    inputs: Tuple[Any, ...],
+    inputs: tuple[Any, ...],
     *,
-    kwargs: Optional[Dict[str, Any]] = None,
-    amp_dtype: Optional[torch.dtype] = None,
-    device: Optional[torch.device] = None,
+    kwargs: dict[str, Any] | None = None,
+    amp_dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
 ) -> PeakMemoryResult:
     """Measure peak CUDA memory during a single forward pass.
 
@@ -360,6 +372,7 @@ def measure_forward_peak_cuda_memory(
         PeakMemoryResult: Peak memory during forward pass.
     """
     kwargs = kwargs or {}
+
     def _call() -> Any:
         model.train()  # training mode to resemble activation footprint
         if amp_dtype is not None and torch.cuda.is_available():
@@ -372,15 +385,15 @@ def measure_forward_peak_cuda_memory(
 
 def measure_train_step_peak_cuda_memory(
     model: torch.nn.Module,
-    inputs: Tuple[Any, ...],
+    inputs: tuple[Any, ...],
     loss_fn: Callable[[Any], torch.Tensor],
     *,
-    kwargs: Optional[Dict[str, Any]] = None,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    amp_dtype: Optional[torch.dtype] = None,
+    kwargs: dict[str, Any] | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    amp_dtype: torch.dtype | None = None,
     use_grad_scaler: bool = True,
     zero_grad: bool = True,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> PeakMemoryResult:
     """Measure peak CUDA memory during a single training step (fwd+loss+bwd+opt).
 
@@ -404,7 +417,9 @@ def measure_train_step_peak_cuda_memory(
     """
     kwargs = kwargs or {}
 
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(amp_dtype is not None and use_grad_scaler and torch.cuda.is_available()))
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=bool(amp_dtype is not None and use_grad_scaler and torch.cuda.is_available())
+    )
 
     def _call() -> Any:
         if zero_grad:
@@ -436,11 +451,12 @@ def measure_train_step_peak_cuda_memory(
 # Activation size heuristic (forward-time)
 # -----------------------------------------------------------------------------
 
+
 def estimate_forward_activation_bytes(
     model: torch.nn.Module,
-    inputs: Tuple[Any, ...],
+    inputs: tuple[Any, ...],
     *,
-    kwargs: Optional[Dict[str, Any]] = None,
+    kwargs: dict[str, Any] | None = None,
     include_non_float: bool = False,
 ) -> int:
     """Heuristically estimate activation bytes kept during forward.
@@ -474,9 +490,9 @@ def estimate_forward_activation_bytes(
             for v in obj.values():
                 _accumulate(v)
 
-    handles: List[torch.utils.hooks.RemovableHandle] = []
+    handles: list[torch.utils.hooks.RemovableHandle] = []
 
-    def _hook(_module: torch.nn.Module, _inp: Tuple[Any, ...], out: Any) -> None:
+    def _hook(_module: torch.nn.Module, _inp: tuple[Any, ...], out: Any) -> None:
         _accumulate(out)
 
     for m in model.modules():
@@ -500,11 +516,12 @@ def estimate_forward_activation_bytes(
 # High-level one-shot breakdown
 # -----------------------------------------------------------------------------
 
+
 def summarize_model_memory(
     model: torch.nn.Module,
     *,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    activation_estimate_bytes: Optional[int] = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    activation_estimate_bytes: int | None = None,
     trainable_only_params: bool = False,
 ) -> ModelMemoryBreakdown:
     """Summarize model memory components (params/buffers/optimizer/activations).

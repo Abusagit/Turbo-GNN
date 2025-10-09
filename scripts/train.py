@@ -1,29 +1,28 @@
-from pathlib import Path
 import argparse
+import sys
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-import sys
 sys.path.append("./")
 
-from src.utils.scripts_utils import (
-    read_yaml,
-    merge_yaml_files,
-    ensure_outdir,
-    save_json,
-    create_split_datasets_from_yaml,
-    infer_graph_backend,
-)
-
-from src.data.loaders import LoaderConfig, build_dataloader
 from src.data.datasets import GraphBackendOption
+from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml
-from src.training.trainer import GNNTrainer, TrainingConfig
+from src.training.hooks import CheckpointHook, MemoryHook, MetricHook, ProfilerHook
 from src.training.optimizer import OptimizerConfig, build_optimizer
 from src.training.scheduler import SchedulerConfig, build_scheduler
-from src.training.hooks import ProfilerHook, CheckpointHook, MetricHook, MemoryHook
+from src.training.trainer import GNNTrainer, TrainingConfig
 from src.utils.logger import get_logger
+from src.utils.scripts_utils import (
+    create_split_datasets_from_yaml,
+    ensure_outdir,
+    infer_graph_backend,
+    merge_yaml_files,
+    read_yaml,
+    save_json,
+)
 
 doc = """
 Train launcher script (updated to use scripts/_common.py).
@@ -39,7 +38,8 @@ Train launcher script (updated to use scripts/_common.py).
 
 # --------------------------- small helpers ---------------------------------- #
 
-def _extract_training_cfg(full: Dict[str, Any]) -> Dict[str, Any]:
+
+def _extract_training_cfg(full: dict[str, Any]) -> dict[str, Any]:
     """Extract the 'training' section from a merged config dict.
 
     Args:
@@ -51,7 +51,7 @@ def _extract_training_cfg(full: Dict[str, Any]) -> Dict[str, Any]:
     return dict(full.get("training", {}))
 
 
-def _extract_optimizer_cfg(full: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_optimizer_cfg(full: dict[str, Any]) -> dict[str, Any]:
     """Extract the 'optimizer' section from a merged config dict.
 
     Args:
@@ -63,7 +63,7 @@ def _extract_optimizer_cfg(full: Dict[str, Any]) -> Dict[str, Any]:
     return dict(full.get("optimizer", {}))
 
 
-def _extract_scheduler_cfg(full: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_scheduler_cfg(full: dict[str, Any]) -> dict[str, Any]:
     """Extract the 'scheduler' section from a merged config dict.
 
     Args:
@@ -77,6 +77,7 @@ def _extract_scheduler_cfg(full: Dict[str, Any]) -> Dict[str, Any]:
 
 # ------------------------------ build pipeline ------------------------------ #
 
+
 def build_data(
     dataset_yaml: str | Path,
     *,
@@ -84,7 +85,7 @@ def build_data(
     num_workers: int,
     pin_memory: bool,
     graph_backend: GraphBackendOption,
-) -> Tuple[Any, Any, Any, int, int]:
+) -> tuple[Any, Any, Any, int, int]:
     """Create train/val/test loaders and infer dataset dimensions.
 
     Args:
@@ -129,11 +130,11 @@ def build_model(
 
 def build_opt_and_sched(
     model: torch.nn.Module,
-    merged_cfg: Dict[str, Any],
+    merged_cfg: dict[str, Any],
     *,
-    steps_per_epoch: Optional[int],
+    steps_per_epoch: int | None,
     total_epochs: int,
-) -> Tuple[torch.optim.Optimizer, Optional[Any]]:
+) -> tuple[torch.optim.Optimizer, Any | None]:
     """Build optimizer and scheduler from merged config.
 
     Args:
@@ -145,7 +146,11 @@ def build_opt_and_sched(
     Returns:
         Tuple[torch.optim.Optimizer, Optional[Any]]: (optimizer, scheduler).
     """
-    opt_cfg = OptimizerConfig(**_extract_optimizer_cfg(merged_cfg)) if _extract_optimizer_cfg(merged_cfg) else OptimizerConfig()
+    opt_cfg = (
+        OptimizerConfig(**_extract_optimizer_cfg(merged_cfg))
+        if _extract_optimizer_cfg(merged_cfg)
+        else OptimizerConfig()
+    )
     optimizer = build_optimizer(model, opt_cfg)
 
     scheduler = None
@@ -159,7 +164,7 @@ def build_opt_and_sched(
 
 def build_trainer(
     model: torch.nn.Module,
-    merged_cfg: Dict[str, Any],
+    merged_cfg: dict[str, Any],
 ) -> GNNTrainer:
     """Construct `GNNTrainer` from merged training config.
 
@@ -177,6 +182,7 @@ def build_trainer(
 
 
 # ------------------------------- CLI and main -------------------------------- #
+
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for the train launcher.
@@ -199,7 +205,9 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="One or more training YAMLs to merge (e.g., base.yaml, amp.yaml, typically from `config/training` dir).",
     )
-    p.add_argument("--profile", type=str, default=None, help="Optional profiler YAML (configs/benchmarks/profile.yaml).")
+    p.add_argument(
+        "--profile", type=str, default=None, help="Optional profiler YAML (configs/benchmarks/profile.yaml)."
+    )
     p.add_argument("--out", type=str, default="runs/train", help="Output directory.")
     return p.parse_args()
 
@@ -217,7 +225,7 @@ def main() -> int:
     logger = get_logger()
 
     # merge training YAMLs (later overrides earlier)
-    merged_cfg: Dict[str, Any] = merge_yaml_files(args.config)
+    merged_cfg: dict[str, Any] = merge_yaml_files(args.config)
 
     # build data
     tcfg = _extract_training_cfg(merged_cfg)
@@ -229,7 +237,10 @@ def main() -> int:
 
     graph_backend = infer_graph_backend(model_config_path=args.model)
     train_loader, val_loader, test_loader, in_dim, num_classes = build_data(
-        args.dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory,
+        args.dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         graph_backend=graph_backend,
     )
 
@@ -244,7 +255,9 @@ def main() -> int:
     # Optimizer + Scheduler
     steps_per_epoch = len(train_loader)
     total_epochs = int(tcfg.get("epochs", 1))
-    optimizer, scheduler = build_opt_and_sched(model, merged_cfg, steps_per_epoch=steps_per_epoch, total_epochs=total_epochs)
+    optimizer, scheduler = build_opt_and_sched(
+        model, merged_cfg, steps_per_epoch=steps_per_epoch, total_epochs=total_epochs
+    )
     trainer.optimizer = optimizer
     trainer.scheduler = scheduler
     logger.info("Built Optimizer & Schedulers")
@@ -252,23 +265,29 @@ def main() -> int:
     # hooks
     outdir = ensure_outdir(args.out)
     trainer.add_hook(MetricHook(log_dir=str(outdir / "logs"), log_interval=int(tcfg.get("log_interval", 10))))
-    trainer.add_hook(CheckpointHook(checkpoint_dir=str(outdir / "ckpts"),
-                                    save_interval=int(tcfg.get("checkpoint_interval", 10)),
-                                    keep_last_n=5,
-                                    save_best_only=False))
+    trainer.add_hook(
+        CheckpointHook(
+            checkpoint_dir=str(outdir / "ckpts"),
+            save_interval=int(tcfg.get("checkpoint_interval", 10)),
+            keep_last_n=5,
+            save_best_only=False,
+        )
+    )
     trainer.add_hook(MemoryHook(measure_every=1, sample_batches=None, log_every=0, track_cpu_rss=True, sync_cuda=True))
     # trainer.add_hook(LRSchedulerStepHook(scheduler=...)) # TODO add LR scheduler
     if args.profile:
         prof_cfg = read_yaml(args.profile).get("profiler", {})
-        trainer.add_hook(ProfilerHook(
-            output_dir=str(outdir / "profiler"),
-            wait=int(prof_cfg.get("wait", 1)),
-            warmup=int(prof_cfg.get("warmup", 1)),
-            active=int(prof_cfg.get("active", 3)),
-            repeat=int(prof_cfg.get("repeat", 1)),
-            profile_memory=bool(prof_cfg.get("profile_memory", True)),
-            with_stack=bool(prof_cfg.get("with_stack", True)),
-        ))
+        trainer.add_hook(
+            ProfilerHook(
+                output_dir=str(outdir / "profiler"),
+                wait=int(prof_cfg.get("wait", 1)),
+                warmup=int(prof_cfg.get("warmup", 1)),
+                active=int(prof_cfg.get("active", 3)),
+                repeat=int(prof_cfg.get("repeat", 1)),
+                profile_memory=bool(prof_cfg.get("profile_memory", True)),
+                with_stack=bool(prof_cfg.get("with_stack", True)),
+            )
+        )
 
     # train
     logger.info("Starting training…")

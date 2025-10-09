@@ -6,10 +6,11 @@ implementations and convolution layers in the benchmarking framework.
 """
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any
+
 import torch
 import torch.nn as nn
-from enum import Enum
 
 __doc__ = """
 Base module for backend implementations.
@@ -37,11 +38,12 @@ class GraphFormat(Enum):
     NOTE can be expanded if we find something interesting and useful
 
     """
-    EDGE_INDEX = "edge_index"  
-    ADJ_MATRIX = "adj_matrix"  
-    DGL_GRAPH = "dgl_graph"    
-    CSR = "csr"                
-    COO = "coo"                
+
+    EDGE_INDEX = "edge_index"
+    ADJ_MATRIX = "adj_matrix"
+    DGL_GRAPH = "dgl_graph"
+    CSR = "csr"
+    COO = "coo"
 
 
 class BaseBackend(ABC):
@@ -54,12 +56,8 @@ class BaseBackend(ABC):
         device: The torch device to use for computations
         dtype: The data type for tensors
     """
-    
-    def __init__(
-        self, 
-        device: str = 'cuda', 
-        dtype: torch.dtype = torch.float32
-    ) -> None:
+
+    def __init__(self, device: str = "cuda", dtype: torch.dtype = torch.float32) -> None:
         """Initialize the backend.
 
         Args:
@@ -85,14 +83,9 @@ class BaseConvolution(nn.Module):
         weight: Learnable weight matrix
         bias: Learnable bias vector (optional)
     """
-    
+
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        bias: bool = True,
-        dropout: float = 0.0,
-        **kwargs: Any
+        self, in_channels: int, out_channels: int, bias: bool = True, dropout: float = 0.0, **kwargs: Any
     ) -> None:
         """Initialize the graph convolution layer.
 
@@ -108,14 +101,9 @@ class BaseConvolution(nn.Module):
         self.out_channels = out_channels
         self.use_bias = bias
         self.dropout = dropout
-    
+
     @abstractmethod
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        graph: Any, 
-        **kwargs: Any
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         """Perform forward pass of the graph convolution.
 
         Args:
@@ -127,15 +115,17 @@ class BaseConvolution(nn.Module):
             Output node features of shape [num_nodes, out_channels]
         """
         pass
-    
+
     def extra_repr(self) -> str:
         """Get extra representation string for printing.
 
         Returns:
             String representation of layer configuration
         """
-        return (f'in_channels={self.in_channels}, '
-                f'out_channels={self.out_channels}, '
-                f'bias={self.use_bias}, '
-                f'cached={self.cached}, '
-                f'normalize={self.normalize}')
+        return (
+            f"in_channels={self.in_channels}, "
+            f"out_channels={self.out_channels}, "
+            f"bias={self.use_bias}, "
+            f"cached={self.cached}, "
+            f"normalize={self.normalize}"
+        )

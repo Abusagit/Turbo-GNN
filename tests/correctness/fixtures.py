@@ -1,19 +1,17 @@
-import pytest
-import torch
 import sys
 from pathlib import Path
+
+import pytest
+import torch
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.data.datasets import GraphSample, MODEL_BACKEND_TO_GRAPH_REPR
-from src.backends.registry import BackendRegistry
-
-
-import src.backends.pyg_backend  # noqa: F401
 import src.backends.dgl_backend  # noqa: F401
+import src.backends.pyg_backend  # noqa: F401
 import src.backends.torch_native_backend  # noqa: F401
-
+from src.backends.registry import BackendRegistry
+from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, GraphSample
 
 """
 Pytest configuration and shared fixtures for GNN backend tests.
@@ -38,29 +36,29 @@ def set_default_device(device):
 def small_graph_data(device):
     """
     Create a simple star graph for testing.
-    
+
     Structure: Node 0 is the center, connected to nodes 1-9.
     This makes it easy to verify mean aggregation:
     - Node 0 should receive messages from nodes 1-9
     - Other nodes have no incoming edges (except self-loops if added)
-    
+
     Returns:
         dict: Contains num_nodes, edge_index, features, and expected results
     """
     num_nodes = 10
     in_channels = 16
-    
+
     # Star graph: nodes 1-9 -> node 0
     src = torch.arange(1, num_nodes, device=device)
     dst = torch.zeros(num_nodes - 1, dtype=torch.long, device=device)
     edge_index = torch.stack([src, dst], dim=0)
-    
+
     # Node i has feature value i everywhere (for easy verification)
     features = torch.arange(num_nodes, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
-    
+
     # Expected mean for center node (receives from nodes 1-9)
     expected_center_mean = torch.arange(1, num_nodes, device=device, dtype=torch.float32).mean()
-    
+
     return {
         "num_nodes": num_nodes,
         "edge_index": edge_index,
@@ -75,17 +73,17 @@ def small_graph_data(device):
 def random_graph_data(device):
     """
     Create a random graph for general testing.
-    
+
     Returns:
         dict: Contains num_nodes, num_edges, edge_index, and features
     """
     num_nodes = 100
     num_edges = 500
     in_channels = 32
-    
+
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     features = torch.randn(num_nodes, in_channels, device=device)
-    
+
     return {
         "num_nodes": num_nodes,
         "num_edges": num_edges,
@@ -101,55 +99,106 @@ def karate_like_club_graph(device):
     """
     Create Zachary's Karate Club graph (classic small social network).
     34 nodes, 78 edges (undirected, so 156 directed edges).
-    
+
     Returns:
         dict: Contains num_nodes, edge_index, and features
     """
     # Karate club edges (undirected)
     edges = [
-        (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7), (0, 8), (0, 10),
-        (0, 11), (0, 12), (0, 13), (0, 17), (0, 19), (0, 21), (0, 31),
-        (1, 2), (1, 3), (1, 7), (1, 13), (1, 17), (1, 19), (1, 21), (1, 30),
-        (2, 3), (2, 7), (2, 8), (2, 9), (2, 13), (2, 27), (2, 28), (2, 32),
-        (3, 7), (3, 12), (3, 13),
-        (4, 6), (4, 10),
-        (5, 6), (5, 10), (5, 16),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (0, 4),
+        (0, 5),
+        (0, 6),
+        (0, 7),
+        (0, 8),
+        (0, 10),
+        (0, 11),
+        (0, 12),
+        (0, 13),
+        (0, 17),
+        (0, 19),
+        (0, 21),
+        (0, 31),
+        (1, 2),
+        (1, 3),
+        (1, 7),
+        (1, 13),
+        (1, 17),
+        (1, 19),
+        (1, 21),
+        (1, 30),
+        (2, 3),
+        (2, 7),
+        (2, 8),
+        (2, 9),
+        (2, 13),
+        (2, 27),
+        (2, 28),
+        (2, 32),
+        (3, 7),
+        (3, 12),
+        (3, 13),
+        (4, 6),
+        (4, 10),
+        (5, 6),
+        (5, 10),
+        (5, 16),
         (6, 16),
-        (8, 30), (8, 32), (8, 33),
+        (8, 30),
+        (8, 32),
+        (8, 33),
         (9, 33),
         (13, 33),
-        (14, 32), (14, 33),
-        (15, 32), (15, 33),
-        (18, 32), (18, 33),
+        (14, 32),
+        (14, 33),
+        (15, 32),
+        (15, 33),
+        (18, 32),
+        (18, 33),
         (19, 33),
-        (20, 32), (20, 33),
-        (22, 32), (22, 33),
-        (23, 25), (23, 27), (23, 29), (23, 32), (23, 33),
-        (24, 25), (24, 27), (24, 31),
+        (20, 32),
+        (20, 33),
+        (22, 32),
+        (22, 33),
+        (23, 25),
+        (23, 27),
+        (23, 29),
+        (23, 32),
+        (23, 33),
+        (24, 25),
+        (24, 27),
+        (24, 31),
         (25, 31),
-        (26, 29), (26, 33),
+        (26, 29),
+        (26, 33),
         (27, 33),
-        (28, 31), (28, 33),
-        (29, 32), (29, 33),
-        (30, 32), (30, 33),
-        (31, 32), (31, 33),
+        (28, 31),
+        (28, 33),
+        (29, 32),
+        (29, 33),
+        (30, 32),
+        (30, 33),
+        (31, 32),
+        (31, 33),
         (32, 33),
     ]
-    
+
     # Convert to directed (both directions)
     src_list = []
     dst_list = []
     for u, v in edges:
         src_list.extend([u, v])
         dst_list.extend([v, u])
-    
+
     num_nodes = 34
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long, device=device)
-    
+
     # Random features
     in_channels = 16
     features = torch.randn(num_nodes, in_channels, device=device)
-    
+
     return {
         "num_nodes": num_nodes,
         "edge_index": edge_index,
@@ -169,7 +218,7 @@ def graph_backend(request):
 def create_graph_sample(set_default_device):
     """
     Factory fixture to create GraphSample with specified backend.
-    
+
     Usage:
         graph_sample = create_graph_sample(
             edge_index=edge_index,
@@ -177,17 +226,18 @@ def create_graph_sample(set_default_device):
             backend="mean_agg"
         )
     """
+
     def _create(edge_index, features, backend, num_nodes=None):
         if num_nodes is None:
             num_nodes = features.shape[0]
-        
+
         return GraphSample(
             backend=MODEL_BACKEND_TO_GRAPH_REPR[backend],
             x=features,
             y=torch.zeros(num_nodes, device=features.device),
             edge_index=edge_index,
         )
-    
+
     return _create
 
 
@@ -195,7 +245,7 @@ def create_graph_sample(set_default_device):
 def create_conv_layer(set_default_device):
     """
     Factory fixture to create convolution layer with specified backend.
-    
+
     Usage:
         conv = create_conv_layer(
             backend_name="torch_native_meanaggr",
@@ -204,12 +254,13 @@ def create_conv_layer(set_default_device):
             out_channels=32
         )
     """
+
     def _create(backend_name, conv_type, in_channels, out_channels, **kwargs):
         backend = BackendRegistry.get_backend(backend_name)
         conv = backend.create_conv(conv_type, in_channels, out_channels, **kwargs)
         device = torch.get_default_device()
         return conv.to(device)
-    
+
     return _create
 
 
@@ -218,7 +269,7 @@ def identity_weight_conv(create_conv_layer, set_default_device):
     """
     Factory fixture to create a convolution with identity weight matrix.
     Useful for testing pure aggregation behavior.
-    
+
     Usage:
         conv = identity_weight_conv(
             backend_name="torch_native_meanaggr",
@@ -227,25 +278,26 @@ def identity_weight_conv(create_conv_layer, set_default_device):
             out_channels=16
         )
     """
+
     def _create(backend_name, conv_type, in_channels, out_channels=None, **kwargs):
         if out_channels is None:
             out_channels = in_channels
-        
+
         conv = create_conv_layer(backend_name, conv_type, in_channels, out_channels, bias=False, **kwargs)
-        
+
         # set weight to identity (or truncated identity if dims don't match)
         device = torch.get_default_device()
         with torch.no_grad():
             identity = torch.eye(min(in_channels, out_channels), in_channels, device=device)
-            if hasattr(conv, 'lin'):
+            if hasattr(conv, "lin"):
                 conv.lin.weight.data = identity
                 conv.lin.bias.data = torch.zeros_like(conv.lin.bias.data)
-            elif hasattr(conv, '_conv') and hasattr(conv._conv, 'lin'):
+            elif hasattr(conv, "_conv") and hasattr(conv._conv, "lin"):
                 conv._conv.lin.weight.data = identity
                 conv._conv.bias.data = torch.zeros_like(conv.lin.bias.data)
 
         return conv
-    
+
     return _create
 
 
@@ -254,6 +306,7 @@ def dgl_available():
     """Check if DGL is available for comparison tests."""
     try:
         import dgl  # noqa: F401
+
         return True
     except ImportError:
         return False

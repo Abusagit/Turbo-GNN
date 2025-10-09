@@ -1,15 +1,21 @@
-from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Union, Tuple
-
 import json
 import os
 import random
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import yaml
 
-from ..data.datasets import load_single_graph, DatasetConfig, SingleGraphDataset, GraphBackendOption, MODEL_BACKEND_TO_GRAPH_REPR
+from ..data.datasets import (
+    MODEL_BACKEND_TO_GRAPH_REPR,
+    DatasetConfig,
+    GraphBackendOption,
+    SingleGraphDataset,
+    load_single_graph,
+)
 
 doc = """
 Common utilities for training/validation/benchmark scripts:
@@ -21,11 +27,10 @@ Common utilities for training/validation/benchmark scripts:
 """
 
 
-
 PathLike = Union[str, Path]
 
 
-def read_yaml(path: PathLike) -> Dict[str, Any]:
+def read_yaml(path: PathLike) -> dict[str, Any]:
     """Load a YAML file into a Python dict.
 
     Args:
@@ -34,12 +39,12 @@ def read_yaml(path: PathLike) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Parsed YAML (empty dict if file is empty).
     """
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data or {}
 
 
-def deep_update(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
+def deep_update(base: dict[str, Any], other: dict[str, Any]) -> dict[str, Any]:
     """Recursively update dictionary `base` with fields from `other`.
 
     Args:
@@ -57,7 +62,7 @@ def deep_update(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
     return base
 
 
-def merge_yaml_files(paths: Sequence[PathLike]) -> Dict[str, Any]:
+def merge_yaml_files(paths: Sequence[PathLike]) -> dict[str, Any]:
     """Load multiple YAML files and deep-merge them in order.
 
     Args:
@@ -66,14 +71,14 @@ def merge_yaml_files(paths: Sequence[PathLike]) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Merged configuration dictionary.
     """
-    merged: Dict[str, Any] = {}
+    merged: dict[str, Any] = {}
     for p in paths:
         cfg = read_yaml(p)
         deep_update(merged, cfg)
     return merged
 
 
-def set_global_seed(seed: Optional[int]) -> None:
+def set_global_seed(seed: int | None) -> None:
     """Set seeds for Python, NumPy, and PyTorch.
 
     Args:
@@ -85,7 +90,7 @@ def set_global_seed(seed: Optional[int]) -> None:
     seed = seed or 42
 
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -93,7 +98,7 @@ def set_global_seed(seed: Optional[int]) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def device_from_string(device_str: Optional[str]) -> torch.device:
+def device_from_string(device_str: str | None) -> torch.device:
     """Construct a torch.device from a string or return a sensible default.
 
     Args:
@@ -121,7 +126,7 @@ def ensure_outdir(path: PathLike) -> Path:
     return p.resolve()
 
 
-def save_json(path: PathLike, payload: Dict[str, Any]) -> None:
+def save_json(path: PathLike, payload: dict[str, Any]) -> None:
     """Save a dictionary as pretty JSON.
 
     Args:
@@ -134,7 +139,9 @@ def save_json(path: PathLike, payload: Dict[str, Any]) -> None:
     Path(path).write_text(json.dumps(payload, indent=4))
 
 
-def create_split_datasets_from_config_dict(cfg: Dict[str, Any]) -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
+def create_split_datasets_from_config_dict(
+    cfg: dict[str, Any],
+) -> tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
     """Load dataset per config dict and return split datasets.
 
     Expected dict keys:
@@ -145,7 +152,9 @@ def create_split_datasets_from_config_dict(cfg: Dict[str, Any]) -> Tuple[SingleG
     name = str(ds_cfg.get("name"))
     root = str(ds_cfg.get("root", "data"))
 
-    sample = load_single_graph(DatasetConfig(source=source, name=name, root=root, graph_backend=cfg.get("graph_backend", "edge_index")))
+    sample = load_single_graph(
+        DatasetConfig(source=source, name=name, root=root, graph_backend=cfg.get("graph_backend", "edge_index"))
+    )
 
     return (
         SingleGraphDataset(sample, split="train"),
@@ -154,7 +163,9 @@ def create_split_datasets_from_config_dict(cfg: Dict[str, Any]) -> Tuple[SingleG
     )
 
 
-def create_split_datasets_from_yaml(path: str, graph_backend: GraphBackendOption = 'egde_index') -> Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
+def create_split_datasets_from_yaml(
+    path: str, graph_backend: GraphBackendOption = "egde_index"
+) -> tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
     """Load a YAML config file (dataset) and return split datasets.
 
     Args:
@@ -166,15 +177,15 @@ def create_split_datasets_from_yaml(path: str, graph_backend: GraphBackendOption
             (train_ds, val_ds, test_ds)
     """
     import yaml
-    
-    with open(path, "r", encoding="utf-8") as f:
+
+    with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    cfg['graph_backend'] = graph_backend
+    cfg["graph_backend"] = graph_backend
     return create_split_datasets_from_config_dict(cfg)
 
 
 def infer_graph_backend(model_config_path: str) -> GraphBackendOption:
-    """Infer graph representation from used backend in the model. 
+    """Infer graph representation from used backend in the model.
     Traverses model config, tries to find layers description containing backend information
 
     Args:
@@ -194,15 +205,20 @@ def infer_graph_backend(model_config_path: str) -> GraphBackendOption:
     # search for the 'layers' key on the second level - its entries describe the layer backend
     # NOTE currently only a single backend is supported
     for value in model_config_raw.values():
-        if isinstance(value, dict) and 'layers' in value:
+        if isinstance(value, dict) and "layers" in value:
             layers = value["layers"]
-            
+
             backends = [layer["backend"] for layer in layers]
-            assert all(backends[i - 1] == backends[i] for i in range(1, len(backends))), f"So far single backend per run is supported, got multiple backends: {backends}"
+            assert all(backends[i - 1] == backends[i] for i in range(1, len(backends))), (
+                f"So far single backend per run is supported, got multiple backends: {backends}"
+            )
 
             graph_representation_backend = MODEL_BACKEND_TO_GRAPH_REPR.get(backends[0])
             if graph_representation_backend is None:
-                raise ValueError(f"Couldn't infer suitable graph representation for backend {graph_representation_backend}. Current supporting mapping is: {MODEL_BACKEND_TO_GRAPH_REPR}")
+                raise ValueError(
+                    f"Couldn't infer suitable graph representation for backend {graph_representation_backend}."
+                    "Current supporting mapping is: {MODEL_BACKEND_TO_GRAPH_REPR}"
+                )
             return graph_representation_backend
 
     raise RuntimeError(f"Couldnt infer suitable graph representation from the model spec: {model_config_raw}")

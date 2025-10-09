@@ -3,31 +3,32 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
-from .conv_dispatcher import create_conv_layer
 from ..base import activation_factory, norm_factory
+from .conv_dispatcher import create_conv_layer
+
 
 class ResidualBlock(torch.nn.Module):
-    def __init__(self,
-                 *,
-                conv_type: str,
-                backend: str,
-                in_channels: int,
-                out_channels: int,
-                heads: int = 1,
-                bias: bool = True,
-                activation: str = "relu",
-                norm: str = "none",
-                dropout: float = 0.0,
-                residual: bool = False,
-                **conv_kwargs: Any,
-        ) -> None:
-
+    def __init__(
+        self,
+        *,
+        conv_type: str,
+        backend: str,
+        in_channels: int,
+        out_channels: int,
+        heads: int = 1,
+        bias: bool = True,
+        activation: str = "relu",
+        norm: str = "none",
+        dropout: float = 0.0,
+        residual: bool = False,
+        **conv_kwargs: Any,
+    ) -> None:
         """
         Initialize residual block for GNN model. It contains:
         1) Graph Convolution with specified backend
-        2) 
+        2)
 
-        Arguments: 
+        Arguments:
             conv_type (str): Convolution type (GCN/MeanAggr/GAT/etc.)
             backend (str): Backend name.
             in_channels (int): Input feature dim.
@@ -59,7 +60,7 @@ class ResidualBlock(torch.nn.Module):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None, # edge_weight is legacy
+        edge_weight: torch.Tensor | None = None,  # edge_weight is legacy
     ) -> torch.Tensor:
         """Apply GAT block.
 

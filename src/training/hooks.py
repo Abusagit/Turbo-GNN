@@ -5,21 +5,19 @@ This module provides various hooks that can be attached to the training
 pipeline for monitoring, profiling, checkpointing, and other extensions.
 """
 
+import logging
+import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Union, Literal, List
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union
+
 import torch
 import torch.nn as nn
-
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import _LRScheduler, ReduceLROnPlateau
-from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
-import logging
+from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
+from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
 
-from pathlib import Path
-import time
-
-from ..benchmarking.memory import reset_cuda_peak_memory, capture_cuda_snapshot, current_process_rss_bytes, human_bytes
-
+from ..benchmarking.memory import capture_cuda_snapshot, current_process_rss_bytes, human_bytes, reset_cuda_peak_memory
 
 # # local import from benchmarking utilities (relative to `training/`)
 # try:
@@ -58,17 +56,13 @@ logger = logging.getLogger(__name__)
 
 class Hook(ABC):
     """Abstract base class for training hooks.
-    
+
     Hooks provide a way to extend the training pipeline with custom
     functionality without modifying the core training loop.
     """
-    
+
     @abstractmethod
-    def on_training_start(
-        self, 
-        model: nn.Module, 
-        config: Any
-    ) -> None:
+    def on_training_start(self, model: nn.Module, config: Any) -> None:
         """Called at the beginning of training.
 
         Args:
@@ -76,35 +70,24 @@ class Hook(ABC):
             config: Training configuration
         """
         pass
-    
-    def on_training_end(
-        self, 
-        history: Dict[str, List[float]]
-    ) -> None:
+
+    def on_training_end(self, history: dict[str, list[float]]) -> None:
         """Called at the end of training.
 
         Args:
             history: Dictionary containing training history
         """
         pass
-    
-    def on_epoch_start(
-        self, 
-        epoch: int
-    ) -> None:
+
+    def on_epoch_start(self, epoch: int) -> None:
         """Called at the beginning of each epoch.
 
         Args:
             epoch: Current epoch number
         """
         pass
-    
-    def on_epoch_end(
-        self, 
-        epoch: int, 
-        train_metrics: Dict[str, float], 
-        val_metrics: Dict[str, float]
-    ) -> None:
+
+    def on_epoch_end(self, epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
         """Called at the end of each epoch.
 
         Args:
@@ -113,12 +96,8 @@ class Hook(ABC):
             val_metrics: Validation metrics for the epoch
         """
         pass
-    
-    def on_batch_start(
-        self, 
-        batch: Any, 
-        batch_idx: int
-    ) -> None:
+
+    def on_batch_start(self, batch: Any, batch_idx: int) -> None:
         """Called before processing each batch.
 
         Args:
@@ -126,12 +105,8 @@ class Hook(ABC):
             batch_idx: Batch index
         """
         pass
-    
-    def on_batch_end(
-        self, 
-        loss: torch.Tensor, 
-        batch_idx: int
-    ) -> None:
+
+    def on_batch_end(self, loss: torch.Tensor, batch_idx: int) -> None:
         """Called after processing each batch.
 
         Args:
@@ -139,12 +114,8 @@ class Hook(ABC):
             batch_idx: Batch index
         """
         pass
-    
-    def on_forward_end(
-        self, 
-        output: torch.Tensor, 
-        loss: torch.Tensor
-    ) -> None:
+
+    def on_forward_end(self, output: torch.Tensor, loss: torch.Tensor) -> None:
         """Called after forward pass.
 
         Args:
@@ -152,12 +123,8 @@ class Hook(ABC):
             loss: Computed loss
         """
         pass
-    
-    def on_best_model(
-        self, 
-        model: nn.Module, 
-        metrics: Dict[str, float]
-    ) -> None:
+
+    def on_best_model(self, model: nn.Module, metrics: dict[str, float]) -> None:
         """Called when a new best model is found.
 
         Args:
@@ -169,6 +136,7 @@ class Hook(ABC):
 
 Mode = Literal["batch", "epoch", "plateau"]
 SchedulerLike = Union[_LRScheduler, ReduceLROnPlateau]
+
 
 class LRSchedulerStepHook(Hook):
     """Drive LR scheduling using hook events (batch/epoch/plateau).
@@ -200,7 +168,7 @@ class LRSchedulerStepHook(Hook):
         scheduler: SchedulerLike,
         *,
         mode: Mode = "epoch",
-        accumulate_steps: Optional[int] = None,
+        accumulate_steps: int | None = None,
         log_every: int = 0,
     ) -> None:
         self.scheduler = scheduler
@@ -209,7 +177,7 @@ class LRSchedulerStepHook(Hook):
         self.log_every = int(log_every)
 
         # Internal state
-        self._model: Optional[nn.Module] = None
+        self._model: nn.Module | None = None
         self._config: Any = None
         self._batch_counter: int = 0
         self._epoch_counter: int = 0
@@ -222,7 +190,7 @@ class LRSchedulerStepHook(Hook):
         self._config = config
         if self.accumulate_steps is None and hasattr(config, "accumulation_steps"):
             try:
-                self.accumulate_steps = int(getattr(config, "accumulation_steps"))
+                self.accumulate_steps = int(config.accumulation_steps)
             except Exception:
                 self.accumulate_steps = 1
         if not self.accumulate_steps or self.accumulate_steps < 1:
@@ -237,13 +205,13 @@ class LRSchedulerStepHook(Hook):
             if (batch_idx + 1) % self.accumulate_steps == 0:
                 self._safe_step()
                 if self.log_every and (self._batch_counter % self.log_every == 0):
-                    self._log_lr(prefix=f"[batch {batch_idx+1}]")
+                    self._log_lr(prefix=f"[batch {batch_idx + 1}]")
 
     def on_epoch_end(
         self,
         epoch: int,
-        train_metrics: Dict[str, float],
-        val_metrics: Dict[str, float],
+        train_metrics: dict[str, float],
+        val_metrics: dict[str, float],
     ) -> None:
         """In 'epoch' modes, step once per epoch."""
         self._epoch_counter += 1
@@ -253,7 +221,7 @@ class LRSchedulerStepHook(Hook):
             if self.log_every:
                 self._log_lr(prefix=f"[epoch {epoch}]")
 
-    def on_training_end(self, history: Dict[str, List[float]]) -> None:
+    def on_training_end(self, history: dict[str, list[float]]) -> None:
         """Optionally log final LR on training end."""
         if self.log_every:
             self._log_lr(prefix="[training end]")
@@ -268,7 +236,7 @@ class LRSchedulerStepHook(Hook):
             # Never fail training because of scheduler hiccups
             pass
 
-    def _last_lr_list(self) -> Optional[List[float]]:
+    def _last_lr_list(self) -> list[float] | None:
         """Return last LR list for logging, robust to scheduler variants."""
         try:
             if hasattr(self.scheduler, "get_last_lr"):
@@ -290,10 +258,10 @@ class LRSchedulerStepHook(Hook):
 
 class ProfilerHook(Hook):
     """Hook for PyTorch profiler integration.
-    
+
     This hook enables detailed performance profiling of the training
     pipeline using PyTorch's built-in profiler.
-    
+
     Attributes:
         output_dir: Directory to save profiling results
         wait: Number of steps to wait before profiling
@@ -304,7 +272,7 @@ class ProfilerHook(Hook):
         profile_memory: Whether to profile memory usage
         profiler: PyTorch profiler instance
     """
-    
+
     def __init__(
         self,
         output_dir: str = "./profiling",
@@ -313,7 +281,7 @@ class ProfilerHook(Hook):
         active: int = 3,
         repeat: int = 1,
         with_stack: bool = True,
-        profile_memory: bool = True
+        profile_memory: bool = True,
     ) -> None:
         """Initialize the profiler hook.
 
@@ -328,21 +296,17 @@ class ProfilerHook(Hook):
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.wait = wait
         self.warmup = warmup
         self.active = active
         self.repeat = repeat
         self.with_stack = with_stack
         self.profile_memory = profile_memory
-        self.profiler: Optional[Any] = None
+        self.profiler: Any | None = None
         self.step_count: int = 0
-    
-    def on_training_start(
-        self, 
-        model: nn.Module, 
-        config: Any
-    ) -> None:
+
+    def on_training_start(self, model: nn.Module, config: Any) -> None:
         """Initialize the profiler at training start.
 
         Args:
@@ -352,14 +316,11 @@ class ProfilerHook(Hook):
         activities = [ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(ProfilerActivity.CUDA)
-        
+
         self.profiler = profile(
             activities=activities,
             schedule=torch.profiler.schedule(
-                wait=self.wait,
-                warmup=self.warmup,
-                active=self.active,
-                repeat=self.repeat
+                wait=self.wait, warmup=self.warmup, active=self.active, repeat=self.repeat
             ),
             on_trace_ready=tensorboard_trace_handler(str(self.output_dir)),
             record_shapes=True,
@@ -371,12 +332,8 @@ class ProfilerHook(Hook):
 
         self.profiler.__enter__()
         logger.info(f"Profiler started, writing to {self.output_dir}")
-    
-    def on_batch_end(
-        self, 
-        loss: torch.Tensor, 
-        batch_idx: int
-    ) -> None:
+
+    def on_batch_end(self, loss: torch.Tensor, batch_idx: int) -> None:
         """Step the profiler after each batch.
 
         Args:
@@ -386,11 +343,8 @@ class ProfilerHook(Hook):
         if self.profiler:
             self.profiler.step()
             self.step_count += 1
-    
-    def on_training_end(
-        self, 
-        history: Dict[str, List[float]]
-    ) -> None:
+
+    def on_training_end(self, history: dict[str, list[float]]) -> None:
         """Finalize the profiler at training end.
 
         Args:
@@ -403,10 +357,10 @@ class ProfilerHook(Hook):
 
 class MetricHook(Hook):
     """Hook for tracking and logging metrics.
-    
+
     This hook tracks various metrics during training and provides
     logging and visualization capabilities.
-    
+
     Attributes:
         log_dir: Directory for saving metric logs
         log_interval: Interval for logging metrics
@@ -414,13 +368,13 @@ class MetricHook(Hook):
         start_time: Training start time
         epoch_start_time: Current epoch start time
     """
-    
+
     def __init__(
         self,
         log_dir: str = "./logs",
         log_interval: int = 10,
         use_wandb: bool = False,
-        wandb_project: str = "gnn-benchmark", # TODO move from wandb
+        wandb_project: str = "gnn-benchmark",  # TODO move from wandb
     ) -> None:
         """Initialize the metric hook.
 
@@ -435,24 +389,21 @@ class MetricHook(Hook):
         self.log_interval = log_interval
         self.use_wandb = use_wandb
         self.wandb_project = wandb_project
-        
-        self.metrics: Dict[str, List[float]] = {}
-        self.start_time: Optional[float] = None
-        self.epoch_start_time: Optional[float] = None
-        
+
+        self.metrics: dict[str, list[float]] = {}
+        self.start_time: float | None = None
+        self.epoch_start_time: float | None = None
+
         if use_wandb:
             try:
                 import wandb
+
                 self.wandb = wandb
             except ImportError:
                 logger.warning("wandb not installed, disabling W&B logging")
                 self.use_wandb = False
-    
-    def on_training_start(
-        self, 
-        model: nn.Module, 
-        config: Any
-    ) -> None:
+
+    def on_training_start(self, model: nn.Module, config: Any) -> None:
         """Initialize metric tracking at training start.
 
         Args:
@@ -460,33 +411,24 @@ class MetricHook(Hook):
             config: Training configuration
         """
         self.start_time = time.time()
-        
+
         if self.use_wandb:
             self.wandb.init(
-                project=self.wandb_project,
-                config=config.__dict__ if hasattr(config, '__dict__') else config
+                project=self.wandb_project, config=config.__dict__ if hasattr(config, "__dict__") else config
             )
             self.wandb.watch(model)
-        
+
         logger.info("Metric tracking initialized")
-    
-    def on_epoch_start(
-        self, 
-        epoch: int
-    ) -> None:
+
+    def on_epoch_start(self, epoch: int) -> None:
         """Record epoch start time.
 
         Args:
             epoch: Current epoch number
         """
         self.epoch_start_time = time.time()
-    
-    def on_epoch_end(
-        self, 
-        epoch: int, 
-        train_metrics: Dict[str, float], 
-        val_metrics: Dict[str, float]
-    ) -> None:
+
+    def on_epoch_end(self, epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
         """Log metrics at epoch end.
 
         Args:
@@ -495,32 +437,29 @@ class MetricHook(Hook):
             val_metrics: Validation metrics for the epoch
         """
         epoch_time = time.time() - self.epoch_start_time if self.epoch_start_time else 0
-        
+
         # Store metrics
         for key, value in train_metrics.items():
             self.metrics.setdefault(f"train_{key}", []).append(value)
-        
+
         for key, value in val_metrics.items():
             self.metrics.setdefault(f"val_{key}", []).append(value)
-        
+
         self.metrics.setdefault("epoch_time", []).append(epoch_time)
-        
+
         if self.use_wandb:
             log_dict = {
                 "epoch": epoch,
                 "epoch_time": epoch_time,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
-                **{f"val/{k}": v for k, v in val_metrics.items()}
+                **{f"val/{k}": v for k, v in val_metrics.items()},
             }
             self.wandb.log(log_dict)
-        
+
         if epoch % self.log_interval == 0:
             logger.info(f"Epoch {epoch} completed in {epoch_time:.2f}s")
-    
-    def on_training_end(
-        self, 
-        history: Dict[str, List[float]]
-    ) -> None:
+
+    def on_training_end(self, history: dict[str, list[float]]) -> None:
         """Finalize metric tracking at training end.
 
         Args:
@@ -528,35 +467,36 @@ class MetricHook(Hook):
         """
         total_time = time.time() - self.start_time if self.start_time else 0
         logger.info(f"Training completed in {total_time:.2f}s")
-        
+
         import json
+
         metrics_file = self.log_dir / "metrics.json"
-        with open(metrics_file, 'w') as f:
+        with open(metrics_file, "w") as f:
             json.dump(self.metrics, f, indent=2)
-        
+
         if self.use_wandb:
             self.wandb.finish()
 
 
 class CheckpointHook(Hook):
     """Hook for model checkpointing.
-    
+
     This hook saves model checkpoints at regular intervals and when
     new best models are found.
-    
+
     Attributes:
         checkpoint_dir: Directory for saving checkpoints
         save_interval: Interval for saving checkpoints
         keep_last_n: Number of recent checkpoints to keep
         best_model_path: Path to the best model checkpoint
     """
-    
+
     def __init__(
         self,
         checkpoint_dir: str = "./checkpoints",
         save_interval: int = 10,
         keep_last_n: int = 5,
-        save_best_only: bool = False
+        save_best_only: bool = False,
     ) -> None:
         """Initialize the checkpoint hook.
 
@@ -571,18 +511,13 @@ class CheckpointHook(Hook):
         self.save_interval = save_interval
         self.keep_last_n = keep_last_n
         self.save_best_only = save_best_only
-        self.best_model_path: Optional[Path] = None
-        self.checkpoints: List[Path] = []
+        self.best_model_path: Path | None = None
+        self.checkpoints: list[Path] = []
 
     def on_training_start(self, model: nn.Module, config: Any) -> None:
         return super().on_training_start(model, config)
 
-    def on_epoch_end(
-        self, 
-        epoch: int, 
-        train_metrics: Dict[str, float], 
-        val_metrics: Dict[str, float]
-    ) -> None:
+    def on_epoch_end(self, epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
         """Save checkpoint at epoch end if needed.
 
         Args:
@@ -592,12 +527,8 @@ class CheckpointHook(Hook):
         """
         if not self.save_best_only and epoch % self.save_interval == 0:
             self._save_checkpoint(epoch, train_metrics, val_metrics)
-    
-    def on_best_model(
-        self, 
-        model: nn.Module, 
-        metrics: Dict[str, float]
-    ) -> None:
+
+    def on_best_model(self, model: nn.Module, metrics: dict[str, float]) -> None:
         """Save the best model checkpoint.
 
         Args:
@@ -606,21 +537,13 @@ class CheckpointHook(Hook):
         """
         if self.best_model_path and self.best_model_path.exists():
             self.best_model_path.unlink()
-        
+
         self.best_model_path = self.checkpoint_dir / "best_model.pth"
-        checkpoint = {
-            'model_state_dict': model.state_dict(),
-            'metrics': metrics
-        }
+        checkpoint = {"model_state_dict": model.state_dict(), "metrics": metrics}
         torch.save(checkpoint, self.best_model_path)
         logger.info(f"Best model saved to {self.best_model_path}")
-    
-    def _save_checkpoint(
-        self,
-        epoch: int,
-        train_metrics: Dict[str, float],
-        val_metrics: Dict[str, float]
-    ) -> None:
+
+    def _save_checkpoint(self, epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
         """Save a checkpoint file.
 
         Args:
@@ -629,16 +552,12 @@ class CheckpointHook(Hook):
             val_metrics: Validation metrics
         """
         checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pth"
-        checkpoint = {
-            'epoch': epoch,
-            'train_metrics': train_metrics,
-            'val_metrics': val_metrics
-        }
-        
+        checkpoint = {"epoch": epoch, "train_metrics": train_metrics, "val_metrics": val_metrics}
+
         torch.save(checkpoint, checkpoint_path)
         self.checkpoints.append(checkpoint_path)
         logger.info(f"Checkpoint saved to {checkpoint_path}")
-        
+
         # Remove old checkpoints
         if len(self.checkpoints) > self.keep_last_n:
             old_checkpoint = self.checkpoints.pop(0)
@@ -670,7 +589,7 @@ class MemoryHook(Hook):
         self,
         *,
         measure_every: int = 1,
-        sample_batches: Optional[int] = None,
+        sample_batches: int | None = None,
         log_every: int = 0,
         track_cpu_rss: bool = True,
         sync_cuda: bool = True,
@@ -685,12 +604,12 @@ class MemoryHook(Hook):
         self._epoch_measured: int = 0
         self._batch_idx_in_epoch: int = 0
         self._cuda_available: bool = torch.cuda.is_available()
-        self._rss_start: Optional[int] = None
+        self._rss_start: int | None = None
 
         # Accumulators (per epoch)
-        self._peaks_alloc: List[int] = []
-        self._peaks_reserved: List[int] = []
-        self._rss_deltas: List[int] = []
+        self._peaks_alloc: list[int] = []
+        self._peaks_reserved: list[int] = []
+        self._rss_deltas: list[int] = []
 
     # ---------------- Hook API ----------------
 
@@ -770,18 +689,20 @@ class MemoryHook(Hook):
             else:
                 logger.info(f"[batch {batch_idx}] CUDA peak alloc={peak_alloc}B, reserved={peak_reserved}B")
 
-    def on_epoch_end(self, epoch: int, train_metrics: Dict[str, float], val_metrics: Dict[str, float]) -> None:
+    def on_epoch_end(self, epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
         """Summarize per-epoch stats and inject into train_metrics."""
         if not self._peaks_alloc and not self._peaks_reserved and not self._rss_deltas:
             return
 
         def _to_mb(x: int) -> float:
-            return float(x) / (1024.0 ** 2)
+            return float(x) / (1024.0**2)
 
         peak_alloc_max = max(self._peaks_alloc) if self._peaks_alloc else 0
         peak_reserved_max = max(self._peaks_reserved) if self._peaks_reserved else 0
         peak_alloc_avg = int(sum(self._peaks_alloc) / max(1, len(self._peaks_alloc))) if self._peaks_alloc else 0
-        peak_reserved_avg = int(sum(self._peaks_reserved) / max(1, len(self._peaks_reserved))) if self._peaks_reserved else 0
+        peak_reserved_avg = (
+            int(sum(self._peaks_reserved) / max(1, len(self._peaks_reserved))) if self._peaks_reserved else 0
+        )
 
         rss_delta_max = max(self._rss_deltas) if self._rss_deltas else 0
         rss_delta_avg = int(sum(self._rss_deltas) / max(1, len(self._rss_deltas))) if self._rss_deltas else 0

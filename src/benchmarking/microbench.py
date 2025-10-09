@@ -1,6 +1,7 @@
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -12,10 +13,11 @@ Microbenchmark helper for timing only the layer kernel (forward/backward).
 @dataclass
 class MicrobenchResult:
     """Timing result for a callable."""
+
     iters: int
     ms_per_iter: float
     device: str
-    std_ms: Optional[float] = None
+    std_ms: float | None = None
 
 
 def _sync() -> None:

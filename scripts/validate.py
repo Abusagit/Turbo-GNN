@@ -1,16 +1,19 @@
 import argparse
+import sys
 
 import torch
 
-import sys
 sys.path.append("./")
-
-from src.utils.scripts_utils import create_split_datasets_from_yaml, ensure_outdir, infer_graph_backend  # reserved for future outputs if needed
 
 from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml
 from src.training.trainer import GNNTrainer, TrainingConfig
 from src.utils.logger import get_logger
+from src.utils.scripts_utils import (
+    create_split_datasets_from_yaml,
+    ensure_outdir,
+    infer_graph_backend,
+)  # reserved for future outputs if needed
 
 doc = """
 Validation launcher script (using common helpers for consistency).
@@ -52,7 +55,9 @@ def main() -> int:
     args = parse_args()
     logger = get_logger()
 
-    tcfg = TrainingConfig(epochs=1, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
+    tcfg = TrainingConfig(
+        epochs=1, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory
+    )
     device = tcfg.device
     torch.set_default_device(device)
 
@@ -69,7 +74,6 @@ def main() -> int:
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     state_dict = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state_dict, strict=False)
-
 
     trainer = GNNTrainer(model=model, config=tcfg)
 

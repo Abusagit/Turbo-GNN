@@ -1,4 +1,6 @@
-from typing import Any, Callable, Dict
+from collections.abc import Callable
+from typing import Any, Dict
+
 import torch.nn as nn
 
 doc = """
@@ -12,7 +14,7 @@ Simple registry for model architectures.
 class ModelRegistry:
     """Registry mapping a string name to a model factory or nn.Module subclass."""
 
-    _items: Dict[str, Callable[..., nn.Module]] = {}
+    _items: dict[str, Callable[..., nn.Module]] = {}
 
     @classmethod
     def register(cls, name: str) -> Callable[[Callable[..., nn.Module]], Callable[..., nn.Module]]:
@@ -24,9 +26,11 @@ class ModelRegistry:
         Returns:
             Callable[..., nn.Module]: The same callable, after registration.
         """
+
         def deco(fn: Callable[..., nn.Module]) -> Callable[..., nn.Module]:
             cls._items[name] = fn
             return fn
+
         return deco
 
     @classmethod

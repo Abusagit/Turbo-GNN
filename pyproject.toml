@@ -1,0 +1,302 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gnn-benchmark"
+version = "0.1.0"
+description = "A comprehensive framework for benchmarking and accelerating Graph Neural Networks (GNNs) through efficient GPU utilization and backend optimization"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+]
+keywords = [
+    "graph neural networks",
+    "GNN",
+    "PyTorch",
+    "CUDA",
+    "benchmarking",
+    "deep learning",
+    "graph learning"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision",
+    "torchaudio",
+    "numpy<2.0",
+    "scipy>=1.7.0",
+    "pandas>=1.5.0",
+    "scikit-learn>=1.0.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "tensorboard>=2.10.0",
+    "psutil>=5.9.0",
+    "ogb>=1.3.0",
+    "torchdata==0.9.0",
+]
+
+[project.optional-dependencies]
+pyg = [
+    "torch-geometric>=2.3.0",
+    "torch-scatter",
+    "torch-sparse",
+    "torch-cluster",
+    "torch-spline-conv",
+]
+
+dgl = [
+    "dgl>=1.0.0",
+]
+
+triton = [
+    "triton>=2.0.0",
+]
+
+cuda = [
+    # Custom CUDA kernels - requires manual compilation
+]
+
+viz = [
+    "matplotlib>=3.5.0",
+    "seaborn>=0.12.0",
+    "plotly>=5.0.0",
+]
+
+notebook = [
+    "jupyterlab>=3.0.0",
+    "ipywidgets>=7.6.0",
+]
+
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",
+    "black>=22.0.0",
+    "pylint>=2.15.0",
+    "mypy>=0.990",
+    "isort>=5.11.0",
+    "flake8>=6.0.0",
+    "pre-commit>=3.0.0",
+]
+
+# All optional dependencies combined
+all = [
+    "gnn-benchmark[pyg,dgl,triton,viz,notebook]",
+]
+
+# Development with all features
+full = [
+    "gnn-benchmark[all,dev]",
+]
+
+[project.scripts]
+gnn-train = "scripts.train:main"
+gnn-validate = "scripts.validate:main"
+gnn-benchmark = "scripts.benchmark:main"
+gnn-profile = "scripts.run_profile:main"
+gnn-autotune = "scripts.autotune:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*"]
+exclude = ["tests*", "experiments*", "data*", "runs*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml"]
+
+# Black configuration
+[tool.black]
+line-length = 120
+target-version = ['py310', 'py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+  | data
+  | runs
+  | experiments
+)/
+'''
+
+# isort configuration
+[tool.isort]
+profile = "black"
+line_length = 120
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+skip_glob = ["data/*", "runs/*", "experiments/*"]
+
+# pytest configuration
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--showlocals",
+    "-v",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "cuda: marks tests that require CUDA",
+    "integration: marks integration tests",
+    "unit: marks unit tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# Coverage configuration
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+    "*/site-packages/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
+# MyPy configuration
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "torch_geometric.*",
+    "dgl.*",
+    "ogb.*",
+    "scipy.*",
+    "sklearn.*",
+    "matplotlib.*",
+    "seaborn.*",
+    "plotly.*",
+    "triton.*",
+]
+ignore_missing_imports = true
+
+# Pylint configuration
+[tool.pylint.main]
+py-version = "3.10"
+jobs = 0  # Auto-detect number of processors
+recursive = true
+
+[tool.pylint.messages_control]
+disable = [
+    "C0103",  # invalid-name
+    "C0114",  # missing-module-docstring
+    "C0115",  # missing-class-docstring
+    "C0116",  # missing-function-docstring
+    "R0902",  # too-many-instance-attributes
+    "R0913",  # too-many-arguments
+    "R0914",  # too-many-locals
+    "W0212",  # protected-access
+    "B011",   # false assessment
+    "F401",  # unused import
+    "F841",  # local variable is assigned to but never used
+    "F811",  # redefinition of unused "name" from line N
+]
+
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pylint.design]
+max-args = 10
+max-locals = 20
+max-returns = 8
+max-branches = 15
+max-statements = 60
+max-parents = 7
+max-attributes = 15
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "C4",  # flake8-comprehensions
+]
+ignore = [
+    "B008",  # function calls in argument defaults
+    "C901",  # too complex
+    "B011",  # false assessment,
+    "F401",  # unused import
+    "F841",  # local variable is assigned to but never used
+    "F811",  # redefinition of unused "name" from line N
+]
+
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "data",
+    "runs",
+    "experiments",
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+
+[tool.ruff.isort]
+known-first-party = ["src", "scripts"]
+

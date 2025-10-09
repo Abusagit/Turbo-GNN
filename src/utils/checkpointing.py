@@ -10,11 +10,11 @@ Model/optimizer checkpoint save/load helpers.
 def save_checkpoint(
     path: str,
     *,
-    model_state: Dict[str, Any],
-    optimizer_state: Optional[Dict[str, Any]] = None,
-    scheduler_state: Optional[Dict[str, Any]] = None,
-    scaler_state: Optional[Dict[str, Any]] = None,
-    extra: Optional[Dict[str, Any]] = None,
+    model_state: dict[str, Any],
+    optimizer_state: dict[str, Any] | None = None,
+    scheduler_state: dict[str, Any] | None = None,
+    scaler_state: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     """Save a checkpoint to disk.
 
@@ -44,12 +44,12 @@ def save_checkpoint(
 def load_checkpoint(
     path: str,
     *,
-    model: Optional[torch.nn.Module] = None,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    scheduler: Optional[Any] = None,
-    scaler: Optional[Any] = None,
+    model: torch.nn.Module | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: Any | None = None,
+    scaler: Any | None = None,
     map_location: str | torch.device | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Load checkpoint and optionally restore states.
 
     Args:

@@ -14,6 +14,7 @@ Base utilities and typed configs for building GNN models with pluggable backends
 
 # ------------------------- Typed configuration objects ------------------------ #
 
+
 @dataclass
 class LayerSpec:
     """Configuration for a single GNN layer/block.
@@ -32,6 +33,7 @@ class LayerSpec:
         residual (bool): Add residual connection when in_channels==out_channels.
         conv_kwargs (Dict[str, Any]): Extra kwargs passed to the backend conv.
     """
+
     layer_type: Literal["redisual_block"]
     conv_type: Literal["gcn", "gat", "sage", "gin"]
     backend: str
@@ -43,7 +45,7 @@ class LayerSpec:
     activation: str = "relu"
     norm: str = "none"
     residual: bool = False
-    conv_kwargs: Dict[str, Any] = field(default_factory=dict)
+    conv_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -53,7 +55,8 @@ class EncoderSpec:
     Attributes:
         layers (List[LayerSpec]): Ordered list of layer specs.
     """
-    layers: List[LayerSpec]
+
+    layers: list[LayerSpec]
 
 
 @dataclass
@@ -65,6 +68,7 @@ class ClassifierSpec:
         num_classes (int): Number of output classes.
         dropout (float): Dropout applied before the final linear head.
     """
+
     encoder: EncoderSpec
     num_classes: int
     dropout: float = 0.0
@@ -72,7 +76,8 @@ class ClassifierSpec:
 
 # --------------------------- Small factory helpers --------------------------- #
 
-def activation_factory(name: str, *, dim: Optional[int] = None) -> nn.Module:
+
+def activation_factory(name: str, *, dim: int | None = None) -> nn.Module:
     """Construct an activation module by name.
 
     Args:

@@ -5,8 +5,9 @@ This module provides a centralized registry for managing different backend
 implementations and their associated convolution layers.
 """
 
-from typing import Dict, Type, Any, List
 import logging
+from typing import Any, Dict, List, Type
+
 from .base import BaseBackend, BaseConvolution
 
 __doc__ = """
@@ -28,19 +29,19 @@ logger = logging.getLogger(__name__)
 
 class BackendRegistry:
     """Registry for managing backend implementations and convolution layers.
-    
+
     This class provides a centralized registry for all backend implementations
     and their associated convolution layers. It uses a decorator pattern for
     registration and factory pattern for instantiation.
-    
+
     Attributes:
         _backends: Dictionary mapping backend names to backend classes
         _convolutions: Nested dictionary mapping backends to convolution types
     """
-    
-    _backends: Dict[str, Type[BaseBackend]] = {}
-    _convolutions: Dict[str, Dict[str, Type[BaseConvolution]]] = {}
-    
+
+    _backends: dict[str, type[BaseBackend]] = {}
+    _convolutions: dict[str, dict[str, type[BaseConvolution]]] = {}
+
     @classmethod
     def register_backend(cls, name: str) -> Any:
         """Decorator for registering a new backend implementation.
@@ -54,15 +55,17 @@ class BackendRegistry:
         Raises:
             Warning: If a backend with the same name already exists
         """
-        def decorator(backend_class: Type[BaseBackend]) -> Type[BaseBackend]:
+
+        def decorator(backend_class: type[BaseBackend]) -> type[BaseBackend]:
             if name in cls._backends:
                 logger.warning(f"Overwriting existing backend: {name}")
             cls._backends[name] = backend_class
             cls._convolutions[name] = {}
             logger.info(f"Registered backend: {name}")
             return backend_class
+
         return decorator
-    
+
     @classmethod
     def register_convolution(cls, backend: str, conv_type: str) -> Any:
         """Decorator for registering a convolution layer for a specific backend.
@@ -77,7 +80,8 @@ class BackendRegistry:
         Raises:
             Warning: If a convolution of the same type already exists for the backend
         """
-        def decorator(conv_class: Type[BaseConvolution]) -> Type[BaseConvolution]:
+
+        def decorator(conv_class: type[BaseConvolution]) -> type[BaseConvolution]:
             if backend not in cls._convolutions:
                 cls._convolutions[backend] = {}
             if conv_type in cls._convolutions[backend]:
@@ -85,8 +89,9 @@ class BackendRegistry:
             cls._convolutions[backend][conv_type] = conv_class
             logger.info(f"Registered {conv_type} convolution for {backend}")
             return conv_class
+
         return decorator
-    
+
     @classmethod
     def get_backend(cls, name: str, **kwargs: Any) -> BaseBackend:
         """Factory method to create a backend instance.
@@ -105,19 +110,14 @@ class BackendRegistry:
         if name not in cls._backends:
             available = ", ".join(cls._backends.keys())
             raise ValueError(f"Backend '{name}' not registered. Available: {available}")
-        
+
         backend_class = cls._backends[name]
         backend = backend_class(**kwargs)
 
         return backend
-    
+
     @classmethod
-    def get_convolution(
-        cls, 
-        backend: str, 
-        conv_type: str,
-        **kwargs: Any
-    ) -> BaseConvolution:
+    def get_convolution(cls, backend: str, conv_type: str, **kwargs: Any) -> BaseConvolution:
         """Factory method to create a convolution layer for a specific backend.
 
         Args:
@@ -135,23 +135,22 @@ class BackendRegistry:
             raise ValueError(f"Backend '{backend}' not registered")
         if conv_type not in cls._convolutions[backend]:
             available = ", ".join(cls._convolutions[backend].keys())
-            raise ValueError(f"Convolution '{conv_type}' not available for {backend}. "
-                             f"Available: {available}")
+            raise ValueError(f"Convolution '{conv_type}' not available for {backend}. Available: {available}")
 
         conv_class = cls._convolutions[backend][conv_type]
         return conv_class(**kwargs)
-    
+
     @classmethod
-    def list_backends(cls) -> List[str]:
+    def list_backends(cls) -> list[str]:
         """Get list of all registered backend names.
 
         Returns:
             List of registered backend names
         """
         return list(cls._backends.keys())
-    
+
     @classmethod
-    def list_convolutions(cls, backend: str) -> List[str]:
+    def list_convolutions(cls, backend: str) -> list[str]:
         """Get list of convolution types available for a specific backend.
 
         Args:
@@ -163,9 +162,9 @@ class BackendRegistry:
         if backend not in cls._convolutions:
             return []
         return list(cls._convolutions[backend].keys())
-    
+
     @classmethod
-    def get_backend_info(cls, name: str) -> Dict[str, Any]:
+    def get_backend_info(cls, name: str) -> dict[str, Any]:
         """Get detailed information about a backend.
 
         Args:
@@ -179,17 +178,18 @@ class BackendRegistry:
         """
         if name not in cls._backends:
             raise ValueError(f"Backend '{name}' not registered")
-        
+
         backend_class = cls._backends[name]
         return {
-            'name': name,
-            'class': backend_class.__name__,
-            'module': backend_class.__module__,
-            'convolutions': cls.list_convolutions(name)
+            "name": name,
+            "class": backend_class.__name__,
+            "module": backend_class.__module__,
+            "convolutions": cls.list_convolutions(name),
         }
 
 
 # convenience functions for module-level access
+
 
 def register_backend(name: str) -> Any:
     """Register a backend implementation.
@@ -229,11 +229,7 @@ def get_backend(name: str, **kwargs: Any) -> BaseBackend:
     return BackendRegistry.get_backend(name, **kwargs)
 
 
-def get_convolution(
-    backend: str, 
-    conv_type: str, 
-    **kwargs: Any
-) -> BaseConvolution:
+def get_convolution(backend: str, conv_type: str, **kwargs: Any) -> BaseConvolution:
     """Get a convolution layer instance.
 
     Args:

@@ -3,10 +3,8 @@ from typing import Any, Optional
 import torch
 from dgl.nn.pytorch import GraphConv
 
-
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-
 
 doc = """
 DGL backend: wraps dgl.nn layers behind the BaseBackend interface.
@@ -15,6 +13,7 @@ DGL backend: wraps dgl.nn layers behind the BaseBackend interface.
 
 class _DglGCNConv(BaseConvolution):
     """DGL-backed GCNConv wrapper."""
+
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
         """Initialize a GCN layer using DGL.
 
@@ -32,7 +31,7 @@ class _DglGCNConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None,
+        edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply GraphConv.
@@ -52,6 +51,7 @@ class _DglGCNConv(BaseConvolution):
 @BackendRegistry.register_backend("dgl")
 class DglBackend(BaseBackend):
     """Backend that instantiates DGL-based convolutions."""
+
     def create_conv(
         self,
         conv_type: str,

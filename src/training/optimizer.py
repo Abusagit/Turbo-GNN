@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
-
 doc = """
 Optimizers factory for GNN training.
 
@@ -40,16 +39,17 @@ class OptimizerConfig:
         fused (Optional[bool]): Request fused CUDA implementation if available (PyTorch≥2.0).
         no_decay_norm_bias (bool): Exclude weight decay on bias and norm/embedding params.
     """
+
     name: str = "adamw"
     lr: float = 1e-3
     weight_decay: float = 0.0
-    betas: Tuple[float, float] = (0.9, 0.999)
+    betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     momentum: float = 0.9
     nesterov: bool = False
     amsgrad: bool = False
-    foreach: Optional[bool] = None
-    fused: Optional[bool] = None
+    foreach: bool | None = None
+    fused: bool | None = None
     no_decay_norm_bias: bool = True
 
 
@@ -63,15 +63,21 @@ def _is_norm_module(module: nn.Module) -> bool:
         bool: True if normalization-like module, False otherwise.
     """
     norm_types = (
-        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
-        nn.LayerNorm, nn.GroupNorm, nn.InstanceNorm1d,
-        nn.InstanceNorm2d, nn.InstanceNorm3d, nn.LocalResponseNorm,
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.LayerNorm,
+        nn.GroupNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+        nn.LocalResponseNorm,
         # nn.RMSNorm, # BUG wasn't added in pytorch 2.4
     )
     return isinstance(module, norm_types)
 
 
-def _decay_filter(name: str, param: nn.Parameter, module: Optional[nn.Module]) -> bool:
+def _decay_filter(name: str, param: nn.Parameter, module: nn.Module | None) -> bool:
     """Decide whether weight decay should be applied to a parameter.
 
     Args:
@@ -93,7 +99,9 @@ def _decay_filter(name: str, param: nn.Parameter, module: Optional[nn.Module]) -
     return True
 
 
-def create_param_groups(model: nn.Module, weight_decay: float, *, no_decay_norm_bias: bool = True) -> List[Dict[str, Any]]:
+def create_param_groups(
+    model: nn.Module, weight_decay: float, *, no_decay_norm_bias: bool = True
+) -> list[dict[str, Any]]:
     """Create parameter groups that separate decay vs no-decay params.
 
     Args:
@@ -117,7 +125,7 @@ def create_param_groups(model: nn.Module, weight_decay: float, *, no_decay_norm_
             else:
                 no_decay.append(param)
 
-    remaining = set(p for p in model.parameters() if p.requires_grad) - set(decay) - set(no_decay)
+    remaining = {p for p in model.parameters() if p.requires_grad} - set(decay) - set(no_decay)
     if remaining:
         decay.extend(list(remaining))
 
@@ -143,7 +151,7 @@ def build_optimizer(model: nn.Module, cfg: OptimizerConfig) -> Optimizer:
     """
     param_groups = create_param_groups(model, cfg.weight_decay, no_decay_norm_bias=cfg.no_decay_norm_bias)
     name = cfg.name.lower()
-    common_kwargs: Dict[str, Any] = {"lr": cfg.lr}
+    common_kwargs: dict[str, Any] = {"lr": cfg.lr}
     if cfg.foreach is not None:
         common_kwargs["foreach"] = cfg.foreach
     if cfg.fused is not None:
@@ -162,6 +170,7 @@ def build_optimizer(model: nn.Module, cfg: OptimizerConfig) -> Optimizer:
     if name == "lion":
         try:
             from lion_pytorch import Lion  # type: ignore
+
             return Lion(param_groups, betas=cfg.betas, weight_decay=cfg.weight_decay, lr=cfg.lr)
         except Exception as exc:
             raise ValueError("Lion optimizer requested but 'lion-pytorch' is not installed") from exc

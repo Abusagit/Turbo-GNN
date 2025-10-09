@@ -1,17 +1,17 @@
 import argparse
+import sys
 from typing import Any, Dict
 
-import sys
 sys.path.append("./")
 
-from src.utils.scripts_utils import read_yaml, ensure_outdir, create_split_datasets_from_yaml, infer_graph_backend
 from src.data.loaders import LoaderConfig, build_dataloader
 from src.models.config import build_model_from_yaml
-from src.training.trainer import GNNTrainer, TrainingConfig
+from src.training.hooks import ProfilerHook
 from src.training.optimizer import OptimizerConfig, build_optimizer
 from src.training.scheduler import SchedulerConfig, build_scheduler
-from src.training.hooks import ProfilerHook
+from src.training.trainer import GNNTrainer, TrainingConfig
 from src.utils.logger import get_logger
+from src.utils.scripts_utils import create_split_datasets_from_yaml, ensure_outdir, infer_graph_backend, read_yaml
 
 doc = """
 Profiling launcher script (updated to use scripts/_common.py).
@@ -54,20 +54,22 @@ def main() -> int:
     args = parse_args()
     logger = get_logger()
 
-    training_cfg: Dict[str, Any] = read_yaml(args.training).get("training", {})
+    training_cfg: dict[str, Any] = read_yaml(args.training).get("training", {})
     tcfg = TrainingConfig(**training_cfg) if training_cfg else TrainingConfig()
 
-    opt_cfg_d: Dict[str, Any] = read_yaml(args.training).get("optimizer", {})
-    sch_cfg_d: Dict[str, Any] = read_yaml(args.training).get("scheduler", {})
-    prof_cfg: Dict[str, Any] = read_yaml(args.profile).get("profiler", {})
+    opt_cfg_d: dict[str, Any] = read_yaml(args.training).get("optimizer", {})
+    sch_cfg_d: dict[str, Any] = read_yaml(args.training).get("scheduler", {})
+    prof_cfg: dict[str, Any] = read_yaml(args.profile).get("profiler", {})
 
     # Data
     train_ds, val_ds, _ = create_split_datasets_from_yaml(args.dataset, graph_backend=infer_graph_backend(args.model))
     in_dim = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
-    lc = LoaderConfig(batch_size=int(training_cfg.get("batch_size", 1)),
-                      num_workers=int(training_cfg.get("num_workers", 0)),
-                      pin_memory=bool(training_cfg.get("pin_memory", True)))
+    lc = LoaderConfig(
+        batch_size=int(training_cfg.get("batch_size", 1)),
+        num_workers=int(training_cfg.get("num_workers", 0)),
+        pin_memory=bool(training_cfg.get("pin_memory", True)),
+    )
     train_loader = build_dataloader(train_ds, lc)
     val_loader = build_dataloader(val_ds, lc)
 
@@ -83,20 +85,23 @@ def main() -> int:
 
     if sch_cfg_d and sch_cfg_d.get("name", "none") != "none":
         scfg = SchedulerConfig(**sch_cfg_d)
-        trainer.scheduler = build_scheduler(optimizer, scfg, steps_per_epoch=len(train_loader),
-                                            total_epochs=int(training_cfg.get("epochs", 1)))
+        trainer.scheduler = build_scheduler(
+            optimizer, scfg, steps_per_epoch=len(train_loader), total_epochs=int(training_cfg.get("epochs", 1))
+        )
 
     # Profiler hook
     outdir = ensure_outdir(args.out)
-    trainer.add_hook(ProfilerHook(
-        output_dir=str(outdir / "profiler"),
-        wait=int(prof_cfg.get("wait", 1)),
-        warmup=int(prof_cfg.get("warmup", 1)),
-        active=int(prof_cfg.get("active", 3)),
-        repeat=int(prof_cfg.get("repeat", 1)),
-        profile_memory=bool(prof_cfg.get("profile_memory", True)),
-        with_stack=bool(prof_cfg.get("with_stack", True)),
-    ))
+    trainer.add_hook(
+        ProfilerHook(
+            output_dir=str(outdir / "profiler"),
+            wait=int(prof_cfg.get("wait", 1)),
+            warmup=int(prof_cfg.get("warmup", 1)),
+            active=int(prof_cfg.get("active", 3)),
+            repeat=int(prof_cfg.get("repeat", 1)),
+            profile_memory=bool(prof_cfg.get("profile_memory", True)),
+            with_stack=bool(prof_cfg.get("with_stack", True)),
+        )
+    )
 
     logger.info("Profiling run...")
     trainer.train(train_loader, val_loader, test_loader=None)

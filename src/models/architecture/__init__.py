@@ -1,7 +1,6 @@
-from . import classifier
-from . import encoder
-from .encoder import GNNEncoder
+from . import classifier, encoder
 from .classifier import NodeClassifier
+from .encoder import GNNEncoder
 
 doc = """
 High-level model architectures (encoders, classifiers).

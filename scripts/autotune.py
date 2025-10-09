@@ -1,18 +1,17 @@
-from pathlib import Path
-
 import argparse
 import json
+import sys
+from pathlib import Path
 from typing import Any, Dict
 
 import torch
 import yaml
 
-import sys
 sys.path.append("./")
 
-from src.benchmarking.autotuner import grid_autotune, TuningResult
 from src.backends.registry import BackendRegistry
-from src.data.converters import to_pyg_data, to_dgl_graph
+from src.benchmarking.autotuner import TuningResult, grid_autotune
+from src.data.converters import to_dgl_graph, to_pyg_data
 
 doc = """
 Autotuning launcher.
@@ -24,7 +23,8 @@ measuring runtime and picking the best-performing config.
 # TODO add autotune for datasets
 # TODO add other backends here
 
-def _read_yaml(path: str) -> Dict[str, Any]:
+
+def _read_yaml(path: str) -> dict[str, Any]:
     """Read YAML to dict.
 
     Args:
@@ -33,7 +33,7 @@ def _read_yaml(path: str) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Parsed.
     """
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -63,7 +63,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Autotune a backend convolution.")
     p.add_argument("--layer", type=str, required=True, choices=["gcn", "gat", "sage", "gin"])
     p.add_argument("--backend", type=str, required=True)
-    p.add_argument("--param-space", type=str, required=True, help="YAML dict of lists, e.g., {'tile': [64,128], 'unroll':[1,2]}")
+    p.add_argument(
+        "--param-space", type=str, required=True, help="YAML dict of lists, e.g., {'tile': [64,128], 'unroll':[1,2]}"
+    )
     p.add_argument("--num-nodes", type=int, default=20000)
     p.add_argument("--avg-degree", type=int, default=10)
     p.add_argument("--in-ch", type=int, default=128)
@@ -97,12 +99,14 @@ def main() -> int:
     x = torch.randn(args.num_nodes, args.in_ch, device=device)
 
     # conv to tune
-    conv = backend.create_conv(args.layer, args.in_ch, args.out_ch, heads=args.heads if args.layer == "gat" else 1).to(device)
+    conv = backend.create_conv(args.layer, args.in_ch, args.out_ch, heads=args.heads if args.layer == "gat" else 1).to(
+        device
+    )
 
     # measure function
     def _measure() -> None:
         out = conv(x, graph)
-        loss = (out ** 2).sum() * 1e-6
+        loss = (out**2).sum() * 1e-6
         loss.backward()
 
     # param space
@@ -120,10 +124,7 @@ def main() -> int:
     payload = {
         "best_config": result.best_config,
         "best_ms_per_iter": result.best_result.ms_per_iter,
-        "trials": [
-            {"config": cfg, "ms_per_iter": r.ms_per_iter}
-            for cfg, r in result.trials
-        ],
+        "trials": [{"config": cfg, "ms_per_iter": r.ms_per_iter} for cfg, r in result.trials],
     }
     print(json.dumps(payload, indent=2))
 

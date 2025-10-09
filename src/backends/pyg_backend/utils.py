@@ -7,7 +7,7 @@ PyG backend utilities (edge extraction, sanity checks).
 """
 
 
-def extract_edge_index(graph: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def extract_edge_index(graph: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Extract (edge_index, edge_weight) from a variety of containers.
 
     Args:

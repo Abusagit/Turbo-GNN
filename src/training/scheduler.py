@@ -10,13 +10,13 @@ from typing import Any, List, Optional
 
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import (
-    _LRScheduler,
-    ExponentialLR,
-    StepLR,
-    MultiStepLR,
     CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
+    ExponentialLR,
+    MultiStepLR,
     OneCycleLR,
+    StepLR,
+    _LRScheduler,
 )
 
 doc = """
@@ -50,17 +50,18 @@ class SchedulerConfig:
         final_div_factor (float): Final LR divisor (OneCycleLR).
         step_on_batch (bool): If True, you must call scheduler.step() each batch.
     """
+
     name: str = "none"
     step_size: int = 30
     gamma: float = 0.1
-    milestones: Optional[List[int]] = None
+    milestones: list[int] | None = None
     eta_min: float = 0.0
-    T_max: Optional[int] = None
+    T_max: int | None = None
     T_0: int = 10
     T_mult: int = 2
     warmup_epochs: int = 0
     warmup_steps: int = 0
-    max_lr: Optional[float] = None
+    max_lr: float | None = None
     pct_start: float = 0.3
     div_factor: float = 25.0
     final_div_factor: float = 1e4
@@ -81,7 +82,7 @@ class WarmupScheduler(_LRScheduler):
         self,
         optimizer: Optimizer,
         warmup_steps: int,
-        wrapped: Optional[_LRScheduler] = None,
+        wrapped: _LRScheduler | None = None,
         last_epoch: int = -1,
     ) -> None:
         """Initialize WarmupScheduler.
@@ -99,7 +100,7 @@ class WarmupScheduler(_LRScheduler):
         self.wrapped = wrapped
         super().__init__(optimizer, last_epoch)
 
-    def get_lr(self) -> List[float]:
+    def get_lr(self) -> list[float]:
         """Compute learning rates for current step.
 
         Args:
@@ -113,7 +114,7 @@ class WarmupScheduler(_LRScheduler):
             return [base_lr * scale for base_lr in self.base_lrs]
         if self.wrapped is not None and hasattr(self.wrapped, "get_last_lr"):
             return list(self.wrapped.get_last_lr())
-        return [base_lr for base_lr in self.base_lrs]
+        return list(self.base_lrs)
 
     def step(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
         """Advance scheduler by one step.
@@ -127,7 +128,7 @@ class WarmupScheduler(_LRScheduler):
         """
         self.last_epoch += 1
         if self.last_epoch <= self.warmup_steps:
-            for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            for param_group, lr in zip(self.optimizer.param_groups, self.get_lr(), strict=False):
                 param_group["lr"] = lr
             return
         if self.wrapped is not None:
@@ -138,9 +139,9 @@ def build_scheduler(
     optimizer: Optimizer,
     cfg: SchedulerConfig,
     *,
-    total_epochs: Optional[int] = None,
-    steps_per_epoch: Optional[int] = None,
-) -> Optional[_LRScheduler]:
+    total_epochs: int | None = None,
+    steps_per_epoch: int | None = None,
+) -> _LRScheduler | None:
     """Build a learning rate scheduler for the optimizer.
 
     Args:
@@ -162,7 +163,7 @@ def build_scheduler(
     if name in ("", "none", "null"):
         return None
 
-    base: Optional[_LRScheduler] = None
+    base: _LRScheduler | None = None
 
     if name == "step":
         base = StepLR(optimizer, step_size=cfg.step_size, gamma=cfg.gamma)

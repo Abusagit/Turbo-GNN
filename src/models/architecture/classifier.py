@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 
 from ..base import ClassifierSpec
-from .encoder import GNNEncoder
 from ..registry import register
+from .encoder import GNNEncoder
 
 doc = """
 NodeClassifier: wraps a GNNEncoder and a linear classification head.
@@ -38,7 +38,7 @@ class NodeClassifier(nn.Module):
         self.dropout = nn.Dropout(p=spec.dropout) if spec.dropout and spec.dropout > 0.0 else nn.Identity()
         self.head = nn.Linear(out_dim, spec.num_classes, bias=True)
 
-    def forward(self, batch_or_x: Any, graph: Optional[Any] = None) -> torch.Tensor:
+    def forward(self, batch_or_x: Any, graph: Any | None = None) -> torch.Tensor:
         """Compute logits for node classification.
 
         Args:
@@ -58,7 +58,7 @@ class NodeClassifier(nn.Module):
         z = self.dropout(z)
         return self.head(z)
 
-    def predict(self, batch_or_x: Any, graph: Optional[Any] = None) -> torch.Tensor:
+    def predict(self, batch_or_x: Any, graph: Any | None = None) -> torch.Tensor:
         """Return predicted class indices.
 
         Args:

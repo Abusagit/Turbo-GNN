@@ -13,6 +13,7 @@ Torch-native backend: reference implementations using PyTorch sparse/dense ops.
 
 class _TorchNativeGCNConv(BaseConvolution):
     """Reference GCN using sym-normalized adjacency and sparse matmul."""
+
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
         """Initialize a Torch-native GCN.
 
@@ -30,7 +31,7 @@ class _TorchNativeGCNConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None,  # ignored for baseline
+        edge_weight: torch.Tensor | None = None,  # ignored for baseline
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply GCN: X' = A_hat @ (X W).
@@ -51,7 +52,7 @@ class _TorchNativeGCNConv(BaseConvolution):
 
 class _TorchNativeMeanConv(BaseConvolution):
     """Reference GNN convolution using mean aggregation of incoming neighbors."""
-    
+
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
         """Initialize a Torch-native mean aggregation convolution.
 
@@ -69,7 +70,7 @@ class _TorchNativeMeanConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None,
+        edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply mean aggregation convolution: X' = D_in^{-1} @ A^T @ (X @ W).
@@ -77,7 +78,8 @@ class _TorchNativeMeanConv(BaseConvolution):
         Args:
             x (torch.Tensor): Node features [N, Fin].
             graph (Any): Tuple of (adj_matrix_transposed, in_degree_inv_diag) where:
-                - adj_mat_normalized_by_in_degree_transposed: sparse COO tensor [N, N] (A^T), normalized by in-degree before transposition
+                - adj_mat_normalized_by_in_degree_transposed: sparse COO tensor [N, N] (A^T),
+                normalized by in-degree before transposition
             edge_weight (Optional[torch.Tensor]): Unused for this baseline.
             **kwargs (Any): Extra kwargs ignored.
 
@@ -85,7 +87,7 @@ class _TorchNativeMeanConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
         adj_mat_normalized_by_in_degree_transposed = graph
-        
+
         out = self.lin(x)
         out = torch.sparse.mm(adj_mat_normalized_by_in_degree_transposed, out)
 
@@ -95,6 +97,7 @@ class _TorchNativeMeanConv(BaseConvolution):
 @BackendRegistry.register_backend("torch_native_gcn")
 class TorchNativeBackend(BaseBackend):
     """Backend instantiating simple Torch-native GNN convs."""
+
     def create_conv(
         self,
         conv_type: str,
@@ -118,10 +121,11 @@ class TorchNativeBackend(BaseBackend):
             return _TorchNativeGCNConv(in_channels, out_channels, **kwargs)
         raise NotImplementedError(f"Convolution `{conv_type}` is not implemented for backend {self.__class__.__name__}")
 
+
 @BackendRegistry.register_backend("torch_native_meanaggr")
 class TorchNativeMeanBackend(BaseBackend):
     """Backend instantiating simple Torch-native mean aggregation convs."""
-    
+
     def create_conv(
         self,
         conv_type: str,

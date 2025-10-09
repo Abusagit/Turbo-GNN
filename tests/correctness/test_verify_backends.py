@@ -5,10 +5,10 @@ Run from repository root: python test_verify_backends.py
 """
 
 import sys
-import torch
 import traceback
 from pathlib import Path
 
+import torch
 import yaml
 
 # pytest: keep imports identical; we only add assertions so failures fail
@@ -17,20 +17,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, "./")
 
 from src.backends.registry import BackendRegistry
-from src.data.datasets import load_single_graph, DatasetConfig, GraphSample, MODEL_BACKEND_TO_GRAPH_REPR
+from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
 
 
 def test_backend_registration():
     """Test that backends are properly registered."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Testing Backend Registration")
-    print("="*60)
+    print("=" * 60)
 
     # Import backend modules to trigger registration
     try:
-        import src.backends.pyg_backend  # noqa: F401
         import src.backends.dgl_backend  # noqa: F401
+        import src.backends.pyg_backend  # noqa: F401
         import src.backends.torch_native_backend  # noqa: F401
+
         print("✓ Backend modules imported successfully")
     except Exception as e:
         msg = f"✗ Failed to import backends: {e}"
@@ -57,9 +58,9 @@ def test_backend_registration():
 
 def test_dataset_loading():
     """Test dataset loading from different sources."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Testing Dataset Loading")
-    print("="*60)
+    print("=" * 60)
 
     test_configs = [
         DatasetConfig(source="pyg", name="Cora", root="data", graph_backend="pyg"),
@@ -87,9 +88,9 @@ def test_dataset_loading():
 
 def test_backend_convolutions():
     """Test that each backend can create and run convolutions."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Testing Backend Convolutions")
-    print("="*60)
+    print("=" * 60)
 
     # Create small test graph
     num_nodes = 100
@@ -107,7 +108,6 @@ def test_backend_convolutions():
     backends_to_test = ["pyg", "dgl", "torch_native_gcn"]
     conv_types = ["gcn"]
 
-
     results = {}
 
     for backend_name in backends_to_test:
@@ -118,14 +118,14 @@ def test_backend_convolutions():
             for conv_type in conv_types:
                 try:
                     # Create convolution
-                    conv = backend.create_conv(
-                        conv_type,
-                        in_channels,
-                        out_channels,
-                        bias=True
-                    ).to(device)
+                    conv = backend.create_conv(conv_type, in_channels, out_channels, bias=True).to(device)
 
-                    graph = GraphSample(backend=MODEL_BACKEND_TO_GRAPH_REPR[backend_name], x=x, y=torch.zeros_like(x), edge_index=edge_index).graph_repr
+                    graph = GraphSample(
+                        backend=MODEL_BACKEND_TO_GRAPH_REPR[backend_name],
+                        x=x,
+                        y=torch.zeros_like(x),
+                        edge_index=edge_index,
+                    ).graph_repr
 
                     # Forward pass
                     out = conv(x, graph)
@@ -160,7 +160,7 @@ def test_backend_convolutions():
                 results[f"{backend_name}_{conv_type}"] = "BACKEND_FAILED"
 
     # Summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Summary:")
     for key, status in results.items():
         symbol = "✓" if status == "PASSED" else "✗" if "FAILED" in status else "⚠"
@@ -176,9 +176,9 @@ def test_backend_convolutions():
 
 def test_microbenchmarking():
     """Test microbenchmarking functionality."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Testing Microbenchmarking")
-    print("="*60)
+    print("=" * 60)
 
     from src.benchmarking.microbench import time_callable
 
@@ -202,15 +202,11 @@ def test_microbenchmarking():
 
 def test_memory_profiling():
     """Test memory profiling utilities."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Testing Memory Profiling")
-    print("="*60)
+    print("=" * 60)
 
-    from src.benchmarking.memory import (
-        capture_cuda_snapshot,
-        human_bytes,
-        measure_peak_cuda_memory_during
-    )
+    from src.benchmarking.memory import capture_cuda_snapshot, human_bytes, measure_peak_cuda_memory_during
 
     def memory_test():
         x = torch.randn(1000, 1000, device="cuda" if torch.cuda.is_available() else "cpu")
@@ -239,13 +235,13 @@ def test_memory_profiling():
 
 def test_model_building():
     """Test YAML-based model building."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Testing Model Building from YAML")
-    print("="*60)
+    print("=" * 60)
 
+    import src.models.architecture  # Import to register architectures
     from src.models.config import classifier_spec_from_config
     from src.models.registry import ModelRegistry
-    import src.models.architecture  # Import to register architectures
 
     # Test config
     config = {
@@ -264,7 +260,7 @@ def test_model_building():
                     "activation": "relu",
                     "dropout": 0.5,
                     "residual": False,
-                    "conv_kwargs": {"cached": True}
+                    "conv_kwargs": {"cached": True},
                 },
                 {
                     "layer_type": "residual_block",
@@ -276,10 +272,10 @@ def test_model_building():
                     "activation": "relu",
                     "dropout": 0.5,
                     "residual": True,
-                    "conv_kwargs": {"cached": True}
-                }
+                    "conv_kwargs": {"cached": True},
+                },
             ]
-        }
+        },
     }
 
     try:
@@ -296,7 +292,9 @@ def test_model_building():
         edge_index = torch.randint(0, 100, (2, 500))
         torch.set_default_device(x.device)
 
-        graph = GraphSample(backend=MODEL_BACKEND_TO_GRAPH_REPR["pyg"], x=x, y=torch.zeros(len(x)), edge_index=edge_index).graph_repr
+        graph = GraphSample(
+            backend=MODEL_BACKEND_TO_GRAPH_REPR["pyg"], x=x, y=torch.zeros(len(x)), edge_index=edge_index
+        ).graph_repr
         logits = model(x, graph)
         assert logits.shape == (100, 7), f"Wrong output shape: {logits.shape}"
         print(f"✓ Forward pass successful: output shape {logits.shape}")
@@ -314,9 +312,9 @@ def test_model_building():
 
 def main():
     """Run all tests."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("GNN BENCHMARKING REPOSITORY VERIFICATION")
-    print("="*60)
+    print("=" * 60)
 
     tests = [
         ("Backend Registration", test_backend_registration),
@@ -338,9 +336,9 @@ def main():
             results.append((name, False))
 
     # Final summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("FINAL RESULTS")
-    print("="*60)
+    print("=" * 60)
 
     for name, passed in results:
         status = "✓ PASSED" if passed else "✗ FAILED"

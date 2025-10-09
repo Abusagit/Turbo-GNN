@@ -2,8 +2,8 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-
-from torch_geometric.nn import GCNConv, GATv2Conv as _GAT, SAGEConv, GINConv
+from torch_geometric.nn import GATv2Conv as _GAT
+from torch_geometric.nn import GCNConv, GINConv, SAGEConv
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
@@ -15,6 +15,7 @@ PyG backend: wraps torch_geometric.nn layers and exposes them via BaseBackend.
 
 class _PygGCNConv(BaseConvolution):
     """PyG-backed GCNConv wrapper."""
+
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
         """Initialize a GCN convolution using PyG.
 
@@ -33,7 +34,7 @@ class _PygGCNConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None,
+        edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply GCNConv.
@@ -53,6 +54,7 @@ class _PygGCNConv(BaseConvolution):
 
 class _PygGATConv(BaseConvolution):
     """PyG-backed GAT (v2 if available)."""
+
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a GAT convolution using PyG.
 
@@ -72,7 +74,7 @@ class _PygGATConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None,
+        edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply GAT conv.
@@ -92,6 +94,7 @@ class _PygGATConv(BaseConvolution):
 
 class _PygSAGEConv(BaseConvolution):
     """PyG-backed GraphSAGE."""
+
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
         """Initialize a SAGE convolution using PyG.
 
@@ -110,7 +113,7 @@ class _PygSAGEConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None,
+        edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply SAGE conv.
@@ -130,6 +133,7 @@ class _PygSAGEConv(BaseConvolution):
 
 class _PygGINConv(BaseConvolution):
     """PyG-backed GIN (uses MLP/nn for `nn` argument)."""
+
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
         """Initialize a GIN convolution using PyG.
 
@@ -153,7 +157,7 @@ class _PygGINConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: Optional[torch.Tensor] = None,
+        edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply GIN conv.
@@ -174,6 +178,7 @@ class _PygGINConv(BaseConvolution):
 @BackendRegistry.register_backend("pyg")
 class PygBackend(BaseBackend):
     """Backend that instantiates PyG-based convolutions."""
+
     def create_conv(
         self,
         conv_type: str,

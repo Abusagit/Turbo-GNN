@@ -32,7 +32,7 @@ def prof_ctx(
     with_cuda: bool = True,
     record_shapes: bool = True,
     profile_memory: bool = True,
-    sched: Optional[Any] = None,
+    sched: Any | None = None,
 ):
     """Context manager for torch.profiler with sensible defaults.
 

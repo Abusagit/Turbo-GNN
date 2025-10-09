@@ -1,15 +1,16 @@
 import argparse
 import json
-from typing import Optional, Tuple
+import sys
 from pathlib import Path
+from typing import Optional, Tuple
+
 import torch
 
-import sys
 sys.path.append("./")
 
-from src.benchmarking.microbench import time_callable, MicrobenchResult
 from src.backends.registry import BackendRegistry
-from src.data.datasets import GraphSample, MODEL_BACKEND_TO_GRAPH_REPR
+from src.benchmarking.microbench import MicrobenchResult, time_callable
+from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, GraphSample
 
 doc = """
 Layer microbenchmark launcher.
@@ -19,7 +20,9 @@ times forward/backward kernel using CUDA events (or wall-clock on CPU).
 """
 
 
-def _make_random_graph(num_nodes: int, avg_degree: int, *, device: torch.device) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def _make_random_graph(
+    num_nodes: int, avg_degree: int, *, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Generate an Erdos-Renyi-like random edge_index with approx avg_degree.
 
     Args:
@@ -73,7 +76,13 @@ def main() -> int:
     edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
 
     x = torch.randn(args.num_nodes, args.in_ch, device=device)
-    graph = GraphSample(backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend], x=x, y=torch.zeros(len(x)),edge_index=edge_index, edge_weight=edge_weight).graph_repr
+    graph = GraphSample(
+        backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
+        x=x,
+        y=torch.zeros(len(x)),
+        edge_index=edge_index,
+        edge_weight=edge_weight,
+    ).graph_repr
     # conv
     backend = BackendRegistry.get_backend(args.backend)
     if args.layer != "gat":
@@ -103,11 +112,11 @@ def main() -> int:
         if amp_dtype is not None and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 out = conv(x, graph)
-                loss = (out ** 2).sum() * 1e-6
+                loss = (out**2).sum() * 1e-6
             loss.backward()
         else:
             out = conv(x, graph)
-            loss = (out ** 2).sum() * 1e-6
+            loss = (out**2).sum() * 1e-6
             loss.backward()
         opt.step()
 
@@ -116,7 +125,9 @@ def main() -> int:
     print(json.dumps({"iters": res.iters, "ms_per_iter": res.ms_per_iter, "device": res.device}, indent=2))
 
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps({"iters": res.iters, "ms_per_iter": res.ms_per_iter, "device": res.device}, indent=2))
+        Path(args.json_out).write_text(
+            json.dumps({"iters": res.iters, "ms_per_iter": res.ms_per_iter, "device": res.device}, indent=2)
+        )
 
     return 0
 

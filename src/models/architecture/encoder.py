@@ -30,7 +30,7 @@ class GNNEncoder(nn.Module):
         """
         super().__init__()
         self.spec = spec
-        blocks: List[nn.Module] = []
+        blocks: list[nn.Module] = []
         for layer in spec.layers:
             cls = _BLOCKS[layer.layer_type]
             blocks.append(

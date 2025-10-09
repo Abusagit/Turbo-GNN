@@ -1,9 +1,9 @@
 from typing import Any, Dict, List, Optional
 
-import yaml
 import torch.nn as nn
+import yaml
 
-from .base import LayerSpec, EncoderSpec, ClassifierSpec
+from .base import ClassifierSpec, EncoderSpec, LayerSpec
 from .registry import build as build_registered
 
 doc = """
@@ -51,11 +51,12 @@ Notes:
 
 # ---------------------------- Public entry points ---------------------------- #
 
+
 def load_model_spec_from_yaml(
     path: str,
     *,
-    input_dim: Optional[int] = None,
-    override_num_classes: Optional[int] = None,
+    input_dim: int | None = None,
+    override_num_classes: int | None = None,
 ) -> ClassifierSpec:
     """Load a model spec from a YAML file.
 
@@ -74,7 +75,7 @@ def load_model_spec_from_yaml(
         yaml.YAMLError: If the YAML is malformed.
         ValueError: If required fields are missing or invalid.
     """
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     return classifier_spec_from_config(cfg, input_dim=input_dim, override_num_classes=override_num_classes)
 
@@ -82,8 +83,8 @@ def load_model_spec_from_yaml(
 def build_model_from_yaml(
     path: str,
     *,
-    input_dim: Optional[int] = None,
-    override_num_classes: Optional[int] = None,
+    input_dim: int | None = None,
+    override_num_classes: int | None = None,
 ) -> nn.Module:
     """Build a registered model from a YAML file.
 
@@ -96,15 +97,17 @@ def build_model_from_yaml(
         nn.Module: Constructed model instance ready for training.
     """
     spec = load_model_spec_from_yaml(path, input_dim=input_dim, override_num_classes=override_num_classes)
-    arch_name = _read_architecture_name({}, default="node_classifier")  # spec defines the body; name controls registry key
+    arch_name = _read_architecture_name(
+        {}, default="node_classifier"
+    )  # spec defines the body; name controls registry key
     return build_registered(arch_name, spec=spec)
 
 
 def classifier_spec_from_config(
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     *,
-    input_dim: Optional[int] = None,
-    override_num_classes: Optional[int] = None,
+    input_dim: int | None = None,
+    override_num_classes: int | None = None,
 ) -> ClassifierSpec:
     """Create a ClassifierSpec from a config dict (as loaded from YAML).
 
@@ -132,7 +135,8 @@ def classifier_spec_from_config(
 
 # ------------------------------ Internal helpers ----------------------------- #
 
-def _read_architecture_name(cfg: Dict[str, Any], default: str = "node_classifier") -> str:
+
+def _read_architecture_name(cfg: dict[str, Any], default: str = "node_classifier") -> str:
     """Read the architecture name from config or return a default.
 
     Args:
@@ -146,7 +150,7 @@ def _read_architecture_name(cfg: Dict[str, Any], default: str = "node_classifier
     return str(name)
 
 
-def _read_encoder_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _read_encoder_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Read the encoder sub-config.
 
     Args:
@@ -164,7 +168,7 @@ def _read_encoder_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return enc
 
 
-def _parse_layer_dict(d: Dict[str, Any]) -> LayerSpec:
+def _parse_layer_dict(d: dict[str, Any]) -> LayerSpec:
     """Parse a single layer dictionary into a LayerSpec.
 
     Args:
@@ -219,7 +223,7 @@ def _parse_layer_dict(d: Dict[str, Any]) -> LayerSpec:
     )
 
 
-def _infer_in_channels(layers: List[LayerSpec], *, input_dim: Optional[int]) -> None:
+def _infer_in_channels(layers: list[LayerSpec], *, input_dim: int | None) -> None:
     """Fill missing `in_channels` in-place based on previous effective output.
 
     Args:
@@ -232,6 +236,7 @@ def _infer_in_channels(layers: List[LayerSpec], *, input_dim: Optional[int]) -> 
     Raises:
         ValueError: If the first layer needs inference but input_dim is None.
     """
+
     def effective_out(ls: LayerSpec) -> int:
         """Compute effective output features for chaining.
 
@@ -247,7 +252,7 @@ def _infer_in_channels(layers: List[LayerSpec], *, input_dim: Optional[int]) -> 
             return ls.out_channels * (ls.heads if concat else 1)
         return ls.out_channels
 
-    prev_out: Optional[int] = None
+    prev_out: int | None = None
     for i, ls in enumerate(layers):
         if ls.in_channels is None or ls.in_channels <= 0:
             if i == 0:

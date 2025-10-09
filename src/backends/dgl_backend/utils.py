@@ -1,15 +1,17 @@
-import torch
-
-from torch import Tensor
-from dgl import DGLGraph
 from typing import Any, Optional, Tuple, Union
+
+import torch
+from dgl import DGLGraph
+from torch import Tensor
 
 doc = """
 DGL backend utilities (edge extraction, conversions).
 """
 
 
-def extract_graph_edges(graph: Union[DGLGraph, Tuple[Tensor, Optional[Tensor], Optional[int]]]) -> Tuple[Tensor, Optional[Tensor], int]:
+def extract_graph_edges(
+    graph: DGLGraph | tuple[Tensor, Tensor | None, int | None],
+) -> tuple[Tensor, Tensor | None, int]:
     """Extract edges and num_nodes from DGLGraph or tuple.
 
     Args:
@@ -30,8 +32,10 @@ def extract_graph_edges(graph: Union[DGLGraph, Tuple[Tensor, Optional[Tensor], O
     if isinstance(graph, (tuple, list)) and len(graph) in (1, 2, 3):
         edge_index = graph[0]
         edge_weight = graph[1] if len(graph) >= 2 else None
-        num_nodes = int(graph[2].item()) if (len(graph) == 3 and torch.is_tensor(graph[2])) else (
-            int(graph[2]) if len(graph) == 3 else int(edge_index.max().item() + 1)
+        num_nodes = (
+            int(graph[2].item())
+            if (len(graph) == 3 and torch.is_tensor(graph[2]))
+            else (int(graph[2]) if len(graph) == 3 else int(edge_index.max().item() + 1))
         )
         return edge_index, edge_weight, num_nodes
     raise TypeError("Unsupported graph container for DGL backend")

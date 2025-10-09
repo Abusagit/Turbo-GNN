@@ -2,7 +2,6 @@ from typing import Any
 
 from ...backends.registry import BackendRegistry
 
-
 doc = """
 Dispatcher that instantiates a convolution for (conv_type, backend) via BackendRegistry.
 """
