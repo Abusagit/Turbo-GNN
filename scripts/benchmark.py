@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Parsed args.
     """
     p = argparse.ArgumentParser(description="Microbenchmark graph conv layers.")
-    p.add_argument("--layer", type=str, required=True, choices=["gcn", "gat", "sage", "gin"])
+    p.add_argument("--layer", type=str, required=True, choices=["gcn", "gat", "sage", "gin", "mean_aggr"])
     p.add_argument("--backend", type=str, required=True, help="Backend name (pyg|dgl|...).")
     p.add_argument("--num-nodes", type=int, default=20000)
     p.add_argument("--avg-degree", type=int, default=10)

@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Args.
     """
     p = argparse.ArgumentParser(description="Autotune a backend convolution.")
-    p.add_argument("--layer", type=str, required=True, choices=["gcn", "gat", "sage", "gin"])
+    p.add_argument("--layer", type=str, required=True, choices=["gcn", "gat", "sage", "gin", "mean_aggr"])
     p.add_argument("--backend", type=str, required=True)
     p.add_argument(
         "--param-space", type=str, required=True, help="YAML dict of lists, e.g., {'tile': [64,128], 'unroll':[1,2]}"
