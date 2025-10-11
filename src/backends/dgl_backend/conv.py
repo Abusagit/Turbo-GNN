@@ -25,7 +25,7 @@ class _DglGCNConv(BaseConvolution):
             **kwargs (Any): DGL GraphConv kwargs (norm, weight, ...).
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-        self._conv = GraphConv(in_channels, out_channels, bias=bias, allow_zero_in_degree=True, **kwargs)
+        self._conv = GraphConv(in_channels, out_channels, weight=False, bias=False, allow_zero_in_degree=True, **kwargs)
 
     def forward(
         self,
