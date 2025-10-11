@@ -68,6 +68,9 @@ class _PygGATConv(BaseConvolution):
         super().__init__(in_channels, out_channels, bias=bias, heads=heads, **kwargs)
 
         self._conv = _GAT(in_channels, out_channels, heads=heads, bias=bias, **kwargs)
+        self._outer_proj = torch.nn.Linear(
+            out_channels * heads, out_channels, bias=bias
+        )  # NOTE GAT produces 3D tensor [*, heads, out_channels] --> Need to project it to [*, out_channels]
 
     def forward(
         self,
@@ -89,90 +92,7 @@ class _PygGATConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout] (aggregated per PyG behavior).
         """
         edge_index, edge_weight = graph
-        return self._conv(x, edge_index)
-
-
-class _PygSAGEConv(BaseConvolution):
-    """PyG-backed GraphSAGE."""
-
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
-        """Initialize a SAGE convolution using PyG.
-
-        Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
-            bias (bool): Include bias.
-            **kwargs (Any): PyG SAGEConv kwargs (aggr='mean'/'sum'/'max', etc.).
-        """
-        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-
-        self._conv = SAGEConv(in_channels, out_channels, bias=bias, **kwargs)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        graph: Any,
-        *,
-        edge_weight: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        """Apply SAGE conv.
-
-        Args:
-            x (torch.Tensor): Node features [N, Fin].
-            graph (Any): PyG Data or (edge_index, edge_weight).
-            edge_weight (Optional[torch.Tensor]): Ignored by default SAGE.
-            **kwargs (Any): Extra kwargs ignored.
-
-        Returns:
-            torch.Tensor: Output features [N, Fout].
-        """
-        edge_index, edge_weight = graph
-        return self._conv(x, edge_index)
-
-
-class _PygGINConv(BaseConvolution):
-    """PyG-backed GIN (uses MLP/nn for `nn` argument)."""
-
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
-        """Initialize a GIN convolution using PyG.
-
-        Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
-            bias (bool): Include bias in internal MLP.
-            **kwargs (Any): PyG GINConv kwargs (eps, train_eps, etc.).
-        """
-        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-
-        mlp = nn.Sequential(
-            nn.Linear(in_channels, out_channels, bias=bias),
-            nn.ReLU(),
-            nn.Linear(out_channels, out_channels, bias=bias),
-        )
-        self._conv = GINConv(nn=mlp, **kwargs)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        graph: Any,
-        *,
-        edge_weight: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        """Apply GIN conv.
-
-        Args:
-            x (torch.Tensor): Node features [N, Fin].
-            graph (Any): PyG Data or (edge_index, edge_weight).
-            edge_weight (Optional[torch.Tensor]): Ignored by default GIN.
-            **kwargs (Any): Extra kwargs ignored.
-
-        Returns:
-            torch.Tensor: Output features [N, Fout].
-        """
-        edge_index, edge_weight = graph
-        return self._conv(x, edge_index)
+        return self._outer_proj(self._conv(x, edge_index))
 
 
 @BackendRegistry.register_backend("pyg")
@@ -203,8 +123,4 @@ class PygBackend(BaseBackend):
             return _PygGCNConv(in_channels, out_channels, **kwargs)
         if ct == "gat":
             return _PygGATConv(in_channels, out_channels, **kwargs)
-        if ct == "sage":
-            return _PygSAGEConv(in_channels, out_channels, **kwargs)
-        if ct == "gin":
-            return _PygGINConv(in_channels, out_channels, **kwargs)
         raise KeyError(f"Unsupported conv_type for PyG backend: {conv_type}")

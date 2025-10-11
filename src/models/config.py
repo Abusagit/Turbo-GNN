@@ -246,10 +246,6 @@ def _infer_in_channels(layers: list[LayerSpec], *, input_dim: int | None) -> Non
         Returns:
             int: Effective output feature size for next layer's input.
         """
-        if ls.conv_type == "gat":
-            # Assume concat=True unless user sets otherwise in conv_kwargs
-            concat = bool(ls.conv_kwargs.get("concat", True))
-            return ls.out_channels * (ls.heads if concat else 1)
         return ls.out_channels
 
     prev_out: int | None = None

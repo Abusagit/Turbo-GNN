@@ -136,8 +136,10 @@ class GraphSample:
 
     def _to_default_device(self, item: Any) -> Any:
         """If tensor, place on device"""
-        if isinstance(item, torch.Tensor):
-            return item.to(torch.get_default_device())
+        try:
+            item = item.to(torch.get_default_device())
+        except Exception:
+            pass
         return item
 
     @property

@@ -7,18 +7,18 @@ encoder:
   layers:
     - layer_type: residual_block
       conv_type: gat
-      backend: pyg
+      backend: dgl
       in_channels: auto
       out_channels: 16
       heads: 8
-      norm: layer
+      norm: batch
       activation: elu
       dropout: 0.6
       residual: false
-      conv_kwargs: {}      # last layer often concat=False
+      conv_kwargs: {}       # PyG GAT default is concat=True for hidden layers
     - layer_type: residual_block
       conv_type: gat
-      backend: pyg
+      backend: dgl
       in_channels: auto
       out_channels: 7
       heads: 1
