@@ -46,7 +46,13 @@ class ResidualBlock(torch.nn.Module):
         super().__init__()
 
         self.conv = create_conv_layer(
-            conv_type, backend, in_channels, out_channels, heads=heads, bias=bias, **conv_kwargs
+            conv_type,
+            backend,
+            in_channels,
+            in_channels,
+            heads=heads,
+            bias=bias,
+            **conv_kwargs,  # NOTE no projection, do it later
         )
         self.projection = nn.Linear(in_channels, out_channels)
         self.out_channels = out_channels
