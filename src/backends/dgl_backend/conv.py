@@ -1,6 +1,9 @@
 from typing import Any, Optional
 
+import dgl.nn.functional as F
 import torch
+import torch.nn as nn
+from dgl import ops
 from dgl.nn.pytorch import GraphConv
 
 from ..base import BaseBackend, BaseConvolution
@@ -48,6 +51,64 @@ class _DglGCNConv(BaseConvolution):
         return self._conv(graph, x, edge_weight=graph.edata.get("w"))
 
 
+class _DglGraphTransformer(BaseConvolution):
+    """DGL-backed GraphTransformer wrapper."""
+
+    def __init__(
+        self, hidden_dim: int, num_heads: int, edge_dim: bool, residual: bool, bias: bool, **kwargs: Any
+    ) -> None:
+        super().__init__(hidden_dim, hidden_dim, **kwargs)
+        self.num_heads = num_heads
+
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.edge_proj = nn.Linear(edge_dim, hidden_dim, bias=bias)
+
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        self.residual = residual
+
+        if self.residual:
+            self.residual_proj = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+            self.gating = nn.Linear(3 * hidden_dim, 1, bias=False)
+
+    def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        # get node features
+        n = graph.num_nodes()
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(n, self.num_heads, -1)
+        k = k.view(n, self.num_heads, -1)
+        v = v.view(n, self.num_heads, -1)
+
+        edge_w = graph.edata["w"]
+        edge_w = self.edge_proj(edge_w)
+        edge_w = edge_w.view(n, self.num_heads, -1)
+
+        attn_scores = ops.e_add_v(graph, edge_w, k)
+        attn_scores = ops.e_dot_v(graph, attn_scores, v)
+        attn_scores = F.edge_softmax(graph, attn_scores)
+
+        values = ops.e_add_v(graph, edge_w, v)
+
+        hidden = ops.u_mul_e(graph, values, attn_scores).view(n, -1)
+
+        if self.residual:
+            residual = self.residual_proj(x)
+            gate = self.gating(torch.cat([residual, hidden, hidden - residual], dim=-1))
+            beta = torch.nn.functional.sigmoid(gate)
+            hidden = beta * residual + (1 - beta) * hidden
+
+        hidden = torch.nn.functional.relu(self.layer_norm(hidden))
+
+        return hidden
+
+
 @BackendRegistry.register_backend("dgl")
 class DglBackend(BaseBackend):
     """Backend that instantiates DGL-based convolutions."""
@@ -74,4 +135,6 @@ class DglBackend(BaseBackend):
         if ct == "gcn":
             return _DglGCNConv(in_channels, out_channels, **kwargs)
         # TODO: Add DGL GAT/SAGE/GIN when needed
+        elif ct == "graph_transformer":
+            return _DglGraphTransformer(in_channels, out_channels, **kwargs)
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
