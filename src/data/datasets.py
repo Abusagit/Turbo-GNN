@@ -133,9 +133,8 @@ class GraphSample:
             graph = self._to_default_device(graph)
         elif self.backend == "cugraph":
             normalized_gcn_adjacency = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=True)
-            edge_index = normalized_gcn_adjacency.indices()
+            edge_index = normalized_gcn_adjacency.indices().tolist()
             edge_weights_for_gcn = normalized_gcn_adjacency.values()
-
             edge_index_for_pyg = EdgeIndex(edge_index, sparse_size=(self.num_nodes, self.num_nodes), sort_order='row', is_undirected=False, device=torch.get_default_device())
             csc_graph = get_cugraph_with_gcn_weights(edge_index_for_pyg)  # edge index is already on GPU
             graph = (csc_graph, edge_weights_for_gcn)

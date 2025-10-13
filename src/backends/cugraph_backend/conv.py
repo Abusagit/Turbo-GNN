@@ -26,12 +26,13 @@ class _CugraphGATv2Conv(BaseConvolution):
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
         self.linear_gat_projection = nn.Linear(in_channels, heads * in_channels, bias=False)  # NOTE init from PyG
-        self.attn_weights = nn.Parameter(torch.empty(heads * in_channels))
+        self.attn_weights = nn.Parameter(torch.empty(heads, in_channels))
+
         self.outer_projection = nn.Linear(heads * in_channels, out_channels)
         self.heads = heads
         self.out_channels = out_channels
 
-        gain = nn.init.calculate_gain("leaky_relu", 0.2)
+        gain = nn.init.calculate_gain("relu")
         nn.init.xavier_normal_(self.attn_weights, gain=gain)
 
     def forward(
@@ -58,7 +59,7 @@ class _CugraphGATv2Conv(BaseConvolution):
 
         out = operators.mha_gat_v2_n2n(
             feat=x,
-            attn_weights=self.attn_weights,
+            attn_weights=self.attn_weights.flatten(),
             graph=csc_graph,
             num_heads=self.heads,
             activation="LeakyReLU",
@@ -205,7 +206,7 @@ class CugraphBackend(BaseBackend):
         """Factory for Torch-native mean aggregation convs.
 
         Args:
-            conv_type (str): 'gcn' supported (mean aggregation variant).
+            conv_type (str): supported convolution type.
             in_channels (int): Input feature size.
             out_channels (int): Output feature size.
             **kwargs (Any): Extra kwargs.
@@ -226,4 +227,5 @@ class CugraphBackend(BaseBackend):
         if conv_type == "gat":
             return _CugraphGATv2Conv(in_channels, out_channels, **kwargs)
         if conv_type == "graph_transformer":
-            return _CugraphGraphTransfomerConv(in_channels, out_channels, **kwargs)
+            raise NotImplementedError("mha_simple_n2n is broken and doesn't work with correct inputs")
+            # return _CugraphGraphTransfomerConv(in_channels, out_channels, **kwargs)
