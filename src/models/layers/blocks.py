@@ -46,10 +46,16 @@ class ResidualBlock(torch.nn.Module):
         super().__init__()
 
         self.conv = create_conv_layer(
-            conv_type, backend, in_channels, out_channels, heads=heads, bias=bias, **conv_kwargs
+            conv_type,
+            backend,
+            in_channels,
+            in_channels,
+            heads=heads,
+            bias=bias,
+            **conv_kwargs,  # NOTE no projection, do it later
         )
-
-        self.out_channels = getattr(self.conv, "out_channels", out_channels * getattr(self.conv, "heads", heads))
+        self.projection = nn.Linear(in_channels, out_channels)
+        self.out_channels = out_channels
         self.norm = norm_factory(norm, self.out_channels)
         self.act = activation_factory(activation, dim=self.out_channels)
         self.drop = nn.Dropout(p=dropout) if dropout and dropout > 0.0 else nn.Identity()
@@ -73,6 +79,7 @@ class ResidualBlock(torch.nn.Module):
             torch.Tensor: Output features [N, Fout].
         """
         out = self.conv(x, graph)
+        out = self.projection(x)
         out = self.norm(out)
         out = self.act(out)
         out = self.drop(out)

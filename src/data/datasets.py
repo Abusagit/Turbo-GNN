@@ -12,7 +12,9 @@ from functools import wraps
 
 from ogb.nodeproppred import NodePropPredDataset
 
-from dgl import graph as dgl_graph
+
+from torch_geometric.utils import add_self_loops as add_self_loops_pyg
+from dgl import add_self_loop, graph as dgl_graph
 import dgl.data as dgl_data
 
 GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat", "adj_mat_in_degree_normalized_transposed"] # NOTE we can define cached formalizations via this option
@@ -95,22 +97,26 @@ class GraphSample:
 
     def __post_init__(self):
         """
+        Add self loops -- For correct benchmarking purposes (We aren't racing for the SOTA architectures here so we can do whatever we want)
             1) Store graph representation in _graph_repr field --> it will be used in the convolutions
             2) Place everything on a default device -- defined in scripts
         """
         graph = None
         if self.backend == "pyg":  # pyg eats standard edge index & weight
+            self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
             graph = (self._to_default_device(self.edge_index), self._to_default_device(self.edge_weight))
+            # TODO add self-loops
         elif self.backend == "dgl":
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             if self.edge_weight is not None:
                 graph.edata["w"] = self.edge_weight  # type: ignore
+            graph = add_self_loop(graph)
             graph = self._to_default_device(graph)
         elif self.backend == "normalized_adj_mat_gcn":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=False)
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=True)
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat_in_degree_normalized_transposed":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=False)
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=True)
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
             ...
@@ -136,8 +142,10 @@ class GraphSample:
 
     def _to_default_device(self, item: Any) -> Any:
         """If tensor, place on device"""
-        if isinstance(item, torch.Tensor):
-            return item.to(torch.get_default_device())
+        try:
+            item = item.to(torch.get_default_device())
+        except Exception:
+            pass
         return item
 
     @property
@@ -516,7 +524,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
     Returns:
         torch.Tensor: Sparse COO adjacency with added self-loops and:
             - D^{-1/2} A D^{-1/2} normalization if `how` == "both".
-            - ...
+            - D_in^{-1} A^T normalization if `how` == "right" -- normalization for mean-aggregation
             - ...
     """
     device = edge_index.device

@@ -24,7 +24,6 @@ class _TorchNativeGCNConv(BaseConvolution):
             **kwargs (Any): Reserved for future options.
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-        self.lin = nn.Linear(in_channels, out_channels, bias=bias)
 
     def forward(
         self,
@@ -46,8 +45,7 @@ class _TorchNativeGCNConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
         normalized_adgacency = graph
-        out = self.lin(x)
-        return torch.sparse.mm(normalized_adgacency, out)
+        return torch.sparse.mm(normalized_adgacency, x)
 
 
 class _TorchNativeMeanConv(BaseConvolution):
@@ -63,7 +61,7 @@ class _TorchNativeMeanConv(BaseConvolution):
             **kwargs (Any): Reserved for future options.
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-        self.lin = nn.Linear(in_channels, out_channels, bias=bias)
+        # self.lin = nn.Linear(in_channels, out_channels, bias=bias)
 
     def forward(
         self,
@@ -88,8 +86,7 @@ class _TorchNativeMeanConv(BaseConvolution):
         """
         adj_mat_normalized_by_in_degree_transposed = graph
 
-        out = self.lin(x)
-        out = torch.sparse.mm(adj_mat_normalized_by_in_degree_transposed, out)
+        out = torch.sparse.mm(adj_mat_normalized_by_in_degree_transposed, x)
 
         return out
 

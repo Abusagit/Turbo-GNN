@@ -80,8 +80,7 @@ def test_backend_convolutions():
     # Create small test graph
     num_nodes = 100
     num_edges = 500
-    in_channels = 16
-    out_channels = 32
+    in_channels = out_channels = 16
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Testing on device: {device}")
