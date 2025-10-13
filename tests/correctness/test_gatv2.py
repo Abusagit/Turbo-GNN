@@ -12,7 +12,7 @@ def _set_identity_(W):
 
 
 @pytest.mark.parametrize("heads", [1, 2])
-def test_pyg_vs_dgl_stupid_graph(karate_like_club_graph, heads):
+def test_pyg_vs_dgl_graph(karate_like_club_graph, heads):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(1234)
 
