@@ -52,7 +52,7 @@ class _DglGCNConv(BaseConvolution):
 class _DGLGATv2Conv(BaseConvolution):
     """DGL-backed GATv2Conv wrapper."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a GATv2 layer using DGL.
 
         Args:

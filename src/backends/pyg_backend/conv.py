@@ -55,7 +55,7 @@ class _PygGCNConv(BaseConvolution):
 class _PygGATConv(BaseConvolution):
     """PyG-backed GAT (v2 if available)."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a GAT convolution using PyG.
 
         Args:
