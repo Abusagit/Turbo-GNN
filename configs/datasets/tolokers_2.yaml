@@ -1,0 +1,4 @@
+dataset:
+  source: pyg
+  name: tolokers-2
+  root: data

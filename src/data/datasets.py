@@ -17,6 +17,8 @@ from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 from dgl import add_self_loop, graph as dgl_graph
 import dgl.data as dgl_data
 
+from .graphland_datasets import GraphLandDataset
+
 try:  # pragma: no cover
     LEGACY_MODE = False
     from pylibcugraphops.pytorch import CSC, HeteroCSC
@@ -371,6 +373,10 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         elif n in ("reddit",):
             dset = Reddit(root=root)
             data = dset[0]
+
+        elif n in ('hm-categories', 'pokec-regions', 'web-topics', 'tolokers-2', 'city-reviews', 'artnet-exp', 'web-fraud'):
+            dset = GraphLandDataset(root=root, name=name, split="RL")
+            data = dset[0]
         else:
             # try dynamic import by attribute name (PascalCase/Exact)
             if hasattr(pyg_datasets, name):
@@ -482,7 +488,6 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         test_mask=test_mask.bool(),
         backend=graph_backend,
     )
-
 
 # ------------------------------ Public factories ----------------------------- #
 
