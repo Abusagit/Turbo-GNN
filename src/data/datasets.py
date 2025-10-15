@@ -12,12 +12,24 @@ from functools import wraps
 
 from ogb.nodeproppred import NodePropPredDataset
 
-
+from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 from dgl import add_self_loop, graph as dgl_graph
 import dgl.data as dgl_data
 
-GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat", "adj_mat_in_degree_normalized_transposed"] # NOTE we can define cached formalizations via this option
+try:  # pragma: no cover
+    LEGACY_MODE = False
+    from pylibcugraphops.pytorch import CSC, HeteroCSC
+    HAS_PYLIBCUGRAPHOPS = True
+except ImportError:
+    HAS_PYLIBCUGRAPHOPS = False
+    try:  # pragma: no cover
+        from pylibcugraphops import make_fg_csr
+        LEGACY_MODE = True
+    except ImportError:
+        pass
+
+GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat", "adj_mat_in_degree_normalized_transposed", "cugraph"] # NOTE we can define cached formalizations via this option
 
 
 # NOTE place representations here when you add new backend
@@ -26,7 +38,8 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "dgl": "dgl",
     "torch_native_gcn": "normalized_adj_mat_gcn",
     "torch_native_adj_mat": "adj_mat",
-    "torch_native_meanaggr": "adj_mat_in_degree_normalized_transposed"
+    "torch_native_meanaggr": "adj_mat_in_degree_normalized_transposed",
+    "cugraph": "cugraph",
 }
 
 
@@ -118,6 +131,13 @@ class GraphSample:
         elif self.backend == "adj_mat_in_degree_normalized_transposed":
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=True)
             graph = self._to_default_device(graph)
+        elif self.backend == "cugraph":
+            normalized_gcn_adjacency = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=True)
+            edge_index = normalized_gcn_adjacency.indices().tolist()
+            edge_weights_for_gcn = normalized_gcn_adjacency.values()
+            edge_index_for_pyg = EdgeIndex(edge_index, sparse_size=(self.num_nodes, self.num_nodes), sort_order='row', is_undirected=False, device=torch.get_default_device())
+            csc_graph = get_cugraph_with_gcn_weights(edge_index_for_pyg)  # edge index is already on GPU
+            graph = (csc_graph, edge_weights_for_gcn)
         elif self.backend == "adj_mat":
             ...
         elif self.backend == "coo":
@@ -538,7 +558,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
     if how == "both":
         # add self loops
         values = torch.ones(idx.size(1), device=device)
-        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes))
+        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes)).to(values.device)
 
         deg = torch.sparse.sum(adj, dim=1).to_dense()
         deg_inv_sqrt = torch.pow(deg.clamp(min=1.0), -0.5)
@@ -592,3 +612,31 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
 
     else:
         raise ValueError(f"Normalization type {how} is inappropriate")
+
+def get_cugraph_with_gcn_weights(
+    edge_index: EdgeIndex,
+) -> CSC:
+    """Constructs a :obj:`cugraph` graph object from CSC representation.
+        NOTE
+
+    Args:
+        edge_index (EdgeIndex): The edge indices.
+
+    Returns CSC graph and edge index which is used only in GCN computation
+
+    """
+    if not isinstance(edge_index, EdgeIndex):
+        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' "
+                            f"(got {type(edge_index)})")
+
+    edge_index = edge_index.sort_by('col')[0]
+    num_src_nodes = edge_index.get_sparse_size(0)
+    (colptr, row), _ = edge_index.get_csc()
+
+    if not row.is_cuda:
+        raise RuntimeError("'get_cugraph' requires GPU-based processing (got CPU tensor)")
+
+    if LEGACY_MODE:
+        return make_fg_csr(colptr, row)
+
+    return CSC(colptr, row, num_src_nodes=num_src_nodes)

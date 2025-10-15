@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch_geometric.utils import add_self_loops
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -52,6 +53,7 @@ def small_graph_data(device):
     src = torch.arange(1, num_nodes, device=device)
     dst = torch.zeros(num_nodes - 1, dtype=torch.long, device=device)
     edge_index = torch.stack([src, dst], dim=0)
+    edge_index, _ = add_self_loops(edge_index)
 
     # Node i has feature value i everywhere (for easy verification)
     features = torch.arange(num_nodes, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
@@ -83,6 +85,7 @@ def random_graph_data(device):
 
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     features = torch.randn(num_nodes, in_channels, device=device)
+    edge_index, _ = add_self_loops(edge_index)
 
     return {
         "num_nodes": num_nodes,
@@ -98,7 +101,8 @@ def random_graph_data(device):
 def karate_like_club_graph(device):
     """
     Create Zachary's Karate Club graph (classic small social network).
-    34 nodes, 78 edges (undirected, so 156 directed edges).
+    34 nodes, 78 edges (undirected, so 156 directed edges)
+    + added self-loops for batter consistency with GraphSample dataclass
 
     Returns:
         dict: Contains num_nodes, edge_index, and features
@@ -193,8 +197,9 @@ def karate_like_club_graph(device):
         dst_list.extend([v, u])
 
     num_nodes = 34
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long, device=device)
-
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_index, _ = add_self_loops(edge_index)
+    edge_index = edge_index.to(device=device)
     # Random features
     in_channels = 16
     features = torch.randn(num_nodes, in_channels, device=device)
