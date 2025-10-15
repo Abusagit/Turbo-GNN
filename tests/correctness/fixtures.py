@@ -5,9 +5,6 @@ import pytest
 import torch
 from torch_geometric.utils import add_self_loops
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import src.backends.dgl_backend  # noqa: F401
 import src.backends.pyg_backend  # noqa: F401
 import src.backends.torch_native_backend  # noqa: F401

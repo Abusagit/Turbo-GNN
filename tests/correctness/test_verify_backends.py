@@ -12,11 +12,6 @@ import pytest
 import torch
 import yaml
 
-# pytest: keep imports identical; we only add assertions so failures fail
-# (no deletions or large refactors)
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, "./")
-
 from src.backends.registry import BackendRegistry
 from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
 
