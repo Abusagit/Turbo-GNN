@@ -558,7 +558,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
     if how == "both":
         # add self loops
         values = torch.ones(idx.size(1), device=device)
-        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes))
+        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes)).to(values.device)
 
         deg = torch.sparse.sum(adj, dim=1).to_dense()
         deg_inv_sqrt = torch.pow(deg.clamp(min=1.0), -0.5)
