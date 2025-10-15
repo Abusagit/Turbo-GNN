@@ -1,6 +1,8 @@
 __doc__ = """
     Code from official PR to Pytorch Geometric -- https://github.com/pyg-team/pytorch_geometric/pull/10458
 
+
+NOTE all regression datasets are converted to classification via binning strategy
 """
 
 import os
@@ -59,6 +61,14 @@ class GraphLandDataset(InMemoryDataset):
             :obj:`"TH"` and :obj:`"THI"` splits are not available for the
             following datasets: :obj:`"city-reviews"`, :obj:`"city-roads-M"`,
             :obj:`"city-roads-L"`, :obj:`"web-traffic"`.
+        convert_regression_to_classification (bool, optional): Whether to convert
+            regression targets to classification. Only applies to regression datasets.
+            (default: :obj:`False`).
+        num_classes_for_regression (int, optional): Number of classes when converting
+            regression to classification. (default: :obj:`5`).
+        binning_strategy (str, optional): Strategy for binning regression targets
+            (:obj:`"quantile"` for equal-frequency bins, :obj:`"uniform"` for
+            equal-width bins). (default: :obj:`"quantile"`).
         numerical_features_transform (str, optional): A transform applied to
             numerical features (:obj:`None`, :obj:`"standard_scaler"`,
             :obj:`"min_max_scaler"`, :obj:`"quantile_transform_normal"`,
@@ -214,6 +224,9 @@ class GraphLandDataset(InMemoryDataset):
         root: str,
         name: str,
         split: str,
+        convert_regression_to_classification: bool = True,
+        num_classes_for_regression: int = 5,
+        binning_strategy: str = 'quantile',
         numerical_features_transform: Optional[
             str] = 'quantile_transform_normal',
         fraction_features_transform: Optional[str] = None,
@@ -241,6 +254,8 @@ class GraphLandDataset(InMemoryDataset):
                 'web-trafic',
             ], ('Temporal split is not available for city-reviews, '
                 'city-roads-M, city-roads-L, web-trafic.')
+        assert binning_strategy in ['quantile', 'uniform'], \
+            f'Unsupported binning strategy: {binning_strategy}'
 
         if numerical_features_transform is not None:
             assert numerical_features_transform in [
@@ -274,6 +289,16 @@ class GraphLandDataset(InMemoryDataset):
         self.name = name
         self.split = split
         self.task = self.GRAPHLAND_DATASETS[name]
+        self.convert_regression_to_classification = convert_regression_to_classification
+        self.num_classes_for_regression = num_classes_for_regression
+        self.binning_strategy = binning_strategy
+
+        if self.task == 'regression' and convert_regression_to_classification:
+            self.task = 'multiclass_classification'
+            self.original_task = 'regression'
+        else:
+            self.original_task = self.task
+
         self._num_transform = numerical_features_transform
         self._frac_transform = fraction_features_transform
         self._cat_transform = categorical_features_transform
@@ -321,8 +346,7 @@ class GraphLandDataset(InMemoryDataset):
         }
         self._imputer = SimpleImputer
 
-        super().__init__(root, transform, pre_transform,
-                         force_reload=force_reload)
+        super().__init__(root, transform, pre_transform, force_reload=force_reload)
         self.load(self.processed_paths[0])
 
     @property
@@ -340,6 +364,9 @@ class GraphLandDataset(InMemoryDataset):
             self._num_imputation,
             self._frac_imputation,
             self._to_undirected,
+            self.convert_regression_to_classification,
+            self.num_classes_for_regression if self.convert_regression_to_classification else 'none',
+            self.binning_strategy if self.convert_regression_to_classification else 'none',
         ])
         return osp.join(self.root, self.name, 'processed', specs)
 
@@ -411,19 +438,77 @@ class GraphLandDataset(InMemoryDataset):
             'edges': edges,
         }
 
+    def _convert_regression_to_classification(self, targets: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
+        """
+        Convert regression targets to classification by binning.
+
+        Args:
+            targets: numpy array of regression targets
+            train_mask: boolean mask indicating training samples
+
+        Returns:
+            Converted targets and bin edges used for conversion
+        """
+        # Get non-NaN targets for computing bins
+        valid_targets = targets[~np.isnan(targets)]
+        train_targets = targets[train_mask & ~np.isnan(targets)]
+
+        if self.binning_strategy == 'quantile':
+            # Create equal-frequency bins based on training data
+            quantiles = np.linspace(0, 1, self.num_classes_for_regression + 1)
+            bin_edges = np.percentile(train_targets, quantiles * 100)
+            # Ensure unique bin edges
+            bin_edges = np.unique(bin_edges)
+            if len(bin_edges) < self.num_classes_for_regression + 1:
+                print(f"Warning: Could not create {self.num_classes_for_regression} unique bins. "
+                      f"Created {len(bin_edges) - 1} bins instead.")
+        else:  # uniform
+            # Create equal-width bins based on training data
+            min_val = train_targets.min()
+            max_val = train_targets.max()
+            bin_edges = np.linspace(min_val, max_val, self.num_classes_for_regression + 1)
+
+        # Extend edges slightly to ensure all values are included
+        bin_edges[0] = bin_edges[0] - 1e-6
+        bin_edges[-1] = bin_edges[-1] + 1e-6
+
+        # Convert targets to class labels
+        converted_targets = np.full_like(targets, np.nan)
+        valid_mask = ~np.isnan(targets)
+        converted_targets[valid_mask] = np.digitize(targets[valid_mask], bin_edges) - 1
+
+        # Clip to ensure values are in valid range [0, num_classes-1]
+        converted_targets[valid_mask] = np.clip(
+            converted_targets[valid_mask],
+            0,
+            len(bin_edges) - 2
+        )
+
+        # Store bin edges for reference
+        self.bin_edges = bin_edges
+
+        return converted_targets.astype(np.float32)
+
     def _get_transductive_data(self) -> list[Data]:
         raw_data = self._get_raw_data()
 
         # >>> process targets
         targets = raw_data['targets']
         labeled_mask = ~np.isnan(targets)
-        if (raw_data['info']['task'] == 'regression'
-                and self._reg_transform is not None):
+
+        # Convert regression to classification if needed
+        if raw_data['info']['task'] == 'regression' and self.convert_regression_to_classification:
+            targets = self._convert_regression_to_classification(targets, raw_data['masks']['train'])
+        elif raw_data['info']['task'] == 'regression' and self._reg_transform is not None:
             targets = targets.reshape(-1, 1)
             transform = self._transforms[self._reg_transform]()
             transform.fit(targets[raw_data['masks']['train']])
             targets = transform.transform(targets).reshape(-1)
         targets = torch.from_numpy(targets).float()
+
+        # Convert to long tensor for classification tasks
+        if self.task in ['binary_classification', 'multiclass_classification']:
+            targets = targets.long()
 
         # >>> process numerical features
         num_features = raw_data['num_features']
@@ -501,6 +586,10 @@ class GraphLandDataset(InMemoryDataset):
             x_fraction_mask=frac_mask,
             x_categorical_mask=cat_mask,
         )
+        # Add metadata about conversion if applicable
+        if self.convert_regression_to_classification and hasattr(self, 'bin_edges'):
+            data.bin_edges = torch.from_numpy(self.bin_edges).float()
+
         return [data]
 
     def _get_inductive_data(self) -> list[Data]:
@@ -510,13 +599,18 @@ class GraphLandDataset(InMemoryDataset):
         # >>> process targets
         targets = raw_data['targets']
         labeled_mask = ~np.isnan(targets)
-        if (raw_data['info']['task'] == 'regression'
-                and self._reg_transform is not None):
+        # Convert regression to classification if needed
+        if raw_data['info']['task'] == 'regression' and self.convert_regression_to_classification:
+            targets = self._convert_regression_to_classification(targets, transform_mask)
+        elif raw_data['info']['task'] == 'regression' and self._reg_transform is not None:
             targets = targets.reshape(-1, 1)
             transform = self._transforms[self._reg_transform]()
             transform.fit(targets[transform_mask])
             targets = transform.transform(targets).reshape(-1)
         targets = torch.from_numpy(targets).float()
+        # Convert to long tensor for classification tasks
+        if self.task in ['binary_classification', 'multiclass_classification']:
+            targets = targets.long()
 
         # >>> process numerical features
         num_features = raw_data['num_features']
@@ -583,7 +677,7 @@ class GraphLandDataset(InMemoryDataset):
         train_label_mask = torch.from_numpy(train_label_mask).bool()
 
         train_node_id = np.where(train_graph_mask)[0]
-        train_node_id = torch.from_numpy(train_node_id).bool()
+        train_node_id = torch.from_numpy(train_node_id).long()
 
         train_edge_index, _ = subgraph(
             train_graph_mask,
@@ -656,6 +750,11 @@ class GraphLandDataset(InMemoryDataset):
             node_id=test_node_id,
         )
 
+        # Add metadata about conversion if applicable
+        if self.convert_regression_to_classification and hasattr(self, 'bin_edges'):
+            for data in [train_data, val_data, test_data]:
+                data.bin_edges = torch.from_numpy(self.bin_edges).float()
+
         return [train_data, val_data, test_data]
 
     def process(self) -> None:
@@ -669,4 +768,4 @@ class GraphLandDataset(InMemoryDataset):
         self.save(data, self.processed_paths[0])
 
     def __repr__(self) -> str:
-        return f'{self.__class__.__name__}(name={self.name})'
+        return f'{self.__class__.__name__}(name={self.name}, task={self.task})'

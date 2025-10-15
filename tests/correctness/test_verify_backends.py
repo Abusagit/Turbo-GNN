@@ -49,7 +49,7 @@ def test_dataset_loading():
     print("=" * 60)
 
     test_configs = [
-        DatasetConfig(source="pyg", name="Cora", root="data", graph_backend="pyg"),
+        DatasetConfig(source="pyg", name="cora", root="data", graph_backend="pyg"),
         DatasetConfig(source="dgl", name="cora", root="data", graph_backend="pyg"),
         DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data", graph_backend="pyg"),  # Large dataset
     ]

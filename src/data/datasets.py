@@ -367,29 +367,20 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
     """
     @ensure_cpu_device
     def _load_pyg_cpu():
-        if n in ("cora", "citeseer", "pubmed"):
+        if name in ("cora", "citeseer", "pubmed"):
             dset = Planetoid(root=root, name=name)
             data: Data = dset[0]
-        elif n in ("reddit",):
+        elif name in ("reddit",):
             dset = Reddit(root=root)
             data = dset[0]
-
-        elif n in ('hm-categories', 'pokec-regions', 'web-topics', 'tolokers-2', 'city-reviews', 'artnet-exp', 'web-fraud'):
+        elif name in ('hm-categories', 'pokec-regions', 'web-topics', 'tolokers-2', 'city-reviews', 'artnet-exp', 'web-fraud',
+                   'hm-prices', 'avazu-ctr','city-roads-M', 'city-roads-L', 'twitch-views', 'artnet-views', 'web-traffic'):
             dset = GraphLandDataset(root=root, name=name, split="RL")
             data = dset[0]
         else:
-            # try dynamic import by attribute name (PascalCase/Exact)
-            if hasattr(pyg_datasets, name):
-                D = getattr(pyg_datasets, name)
-                dset = D(root=root)
-                if len(dset) != 1:
-                    raise ValueError(f"Expected a single-graph dataset for '{name}', got {len(dset)} graphs")
-                data = dset[0]
-            else:
-                raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
+            raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
         return data
 
-    n = name.lower()
     data = _load_pyg_cpu()
 
     x = data.x.float()
@@ -444,19 +435,18 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
 
     @ensure_cpu_device
     def _load_dgl_cpu():
-        if n == "cora":
+        if name == "cora":
             dset = dgl_data.CoraGraphDataset(raw_dir=root)
-        elif n == "citeseer":
+        elif name == "citeseer":
             dset = dgl_data.CiteseerGraphDataset(raw_dir=root)
-        elif n == "pubmed":
+        elif name == "pubmed":
             dset = dgl_data.PubmedGraphDataset(raw_dir=root)
-        elif n == "reddit":
+        elif name == "reddit":
             dset = dgl_data.RedditDataset(raw_dir=root)
         else:
             raise ValueError(f"Unknown DGL dataset '{name}'. Supported: cora/citeseer/pubmed/reddit.")
         return dset
 
-    n = name.lower()
     dset = _load_dgl_cpu()
     g = dset[0]
 
