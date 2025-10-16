@@ -3,10 +3,6 @@ from pathlib import Path
 
 import pytest
 import torch
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-sys.path.insert(0, str(Path(__file__)))
-
 from fixtures import (
     create_conv_layer,
     create_graph_sample,

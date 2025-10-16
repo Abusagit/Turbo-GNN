@@ -12,12 +12,26 @@ from functools import wraps
 
 from ogb.nodeproppred import NodePropPredDataset
 
-
+from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 from dgl import add_self_loop, graph as dgl_graph
 import dgl.data as dgl_data
 
-GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat", "adj_mat_in_degree_normalized_transposed"] # NOTE we can define cached formalizations via this option
+from .graphland_datasets import GraphLandDataset
+
+try:  # pragma: no cover
+    LEGACY_MODE = False
+    from pylibcugraphops.pytorch import CSC, HeteroCSC
+    HAS_PYLIBCUGRAPHOPS = True
+except ImportError:
+    HAS_PYLIBCUGRAPHOPS = False
+    try:  # pragma: no cover
+        from pylibcugraphops import make_fg_csr
+        LEGACY_MODE = True
+    except ImportError:
+        pass
+
+GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat", "adj_mat_in_degree_normalized_transposed", "cugraph"] # NOTE we can define cached formalizations via this option
 
 
 # NOTE place representations here when you add new backend
@@ -27,6 +41,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "torch_native_gcn": "normalized_adj_mat_gcn",
     "torch_native_mean_aggr": "adj_mat_in_degree_normalized_transposed",
     "torch_native_sum_aggr": "adj_mat",
+    "cugraph": "cugraph",
 }
 
 
@@ -120,6 +135,13 @@ class GraphSample:
         elif self.backend == "adj_mat_in_degree_normalized_transposed":
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=self.add_self_loops)
             graph = self._to_default_device(graph)
+        elif self.backend == "cugraph":
+            normalized_gcn_adjacency = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=True)
+            edge_index = normalized_gcn_adjacency.indices().tolist()
+            edge_weights_for_gcn = normalized_gcn_adjacency.values()
+            edge_index_for_pyg = EdgeIndex(edge_index, sparse_size=(self.num_nodes, self.num_nodes), sort_order='row', is_undirected=False, device=torch.get_default_device())
+            csc_graph = get_cugraph_with_gcn_weights(edge_index_for_pyg)  # edge index is already on GPU
+            graph = (csc_graph, edge_weights_for_gcn)
         elif self.backend == "adj_mat":
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='none', add_self_loops=self.add_self_loops)
             graph = self._to_default_device(graph)
@@ -349,25 +371,20 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
     """
     @ensure_cpu_device
     def _load_pyg_cpu():
-        if n in ("cora", "citeseer", "pubmed"):
+        if name in ("cora", "citeseer", "pubmed"):
             dset = Planetoid(root=root, name=name)
             data: Data = dset[0]
-        elif n in ("reddit",):
+        elif name in ("reddit",):
             dset = Reddit(root=root)
             data = dset[0]
+        elif name in ('hm-categories', 'pokec-regions', 'web-topics', 'tolokers-2', 'city-reviews', 'artnet-exp', 'web-fraud',
+                   'hm-prices', 'avazu-ctr','city-roads-M', 'city-roads-L', 'twitch-views', 'artnet-views', 'web-traffic'):
+            dset = GraphLandDataset(root=root, name=name, split="RL")
+            data = dset[0]
         else:
-            # try dynamic import by attribute name (PascalCase/Exact)
-            if hasattr(pyg_datasets, name):
-                D = getattr(pyg_datasets, name)
-                dset = D(root=root)
-                if len(dset) != 1:
-                    raise ValueError(f"Expected a single-graph dataset for '{name}', got {len(dset)} graphs")
-                data = dset[0]
-            else:
-                raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
+            raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
         return data
 
-    n = name.lower()
     data = _load_pyg_cpu()
 
     x = data.x.float()
@@ -422,19 +439,18 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
 
     @ensure_cpu_device
     def _load_dgl_cpu():
-        if n == "cora":
+        if name == "cora":
             dset = dgl_data.CoraGraphDataset(raw_dir=root)
-        elif n == "citeseer":
+        elif name == "citeseer":
             dset = dgl_data.CiteseerGraphDataset(raw_dir=root)
-        elif n == "pubmed":
+        elif name == "pubmed":
             dset = dgl_data.PubmedGraphDataset(raw_dir=root)
-        elif n == "reddit":
+        elif name == "reddit":
             dset = dgl_data.RedditDataset(raw_dir=root)
         else:
             raise ValueError(f"Unknown DGL dataset '{name}'. Supported: cora/citeseer/pubmed/reddit.")
         return dset
 
-    n = name.lower()
     dset = _load_dgl_cpu()
     g = dset[0]
 
@@ -466,7 +482,6 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         test_mask=test_mask.bool(),
         backend=graph_backend,
     )
-
 
 # ------------------------------ Public factories ----------------------------- #
 
@@ -542,7 +557,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
 
     if how == "both":
         values = torch.ones(idx.size(1), device=device)
-        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes)).T.coalesce()
+        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes)).T.coalesce().to(values.device)
 
         deg1 = torch.sparse.sum(adj, dim=1).to_dense()
         D_inv_sqrt1 = torch.pow(deg1.clamp(min=1.0), -0.5)
@@ -607,3 +622,31 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
         return adj_t
     else:
         raise ValueError(f"Normalization type {how} is inappropriate")
+
+def get_cugraph_with_gcn_weights(
+    edge_index: EdgeIndex,
+) -> CSC:
+    """Constructs a :obj:`cugraph` graph object from CSC representation.
+        NOTE
+
+    Args:
+        edge_index (EdgeIndex): The edge indices.
+
+    Returns CSC graph and edge index which is used only in GCN computation
+
+    """
+    if not isinstance(edge_index, EdgeIndex):
+        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' "
+                            f"(got {type(edge_index)})")
+
+    edge_index = edge_index.sort_by('col')[0]
+    num_src_nodes = edge_index.get_sparse_size(0)
+    (colptr, row), _ = edge_index.get_csc()
+
+    if not row.is_cuda:
+        raise RuntimeError("'get_cugraph' requires GPU-based processing (got CPU tensor)")
+
+    if LEGACY_MODE:
+        return make_fg_csr(colptr, row)
+
+    return CSC(colptr, row, num_src_nodes=num_src_nodes)

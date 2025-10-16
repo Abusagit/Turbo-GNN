@@ -3,9 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from torch_geometric.utils import add_self_loops
 
 import src.backends.dgl_backend  # noqa: F401
 import src.backends.pyg_backend  # noqa: F401
@@ -127,7 +125,8 @@ def random_graph_data(device):
 def karate_like_club_graph(device):
     """
     Create Zachary's Karate Club graph (classic small social network).
-    34 nodes, 78 edges (undirected, so 156 directed edges).
+    34 nodes, 78 edges (undirected, so 156 directed edges)
+    + added self-loops for batter consistency with GraphSample dataclass
 
     Returns:
         dict: Contains num_nodes, edge_index, and features
@@ -222,8 +221,8 @@ def karate_like_club_graph(device):
         dst_list.extend([v, u])
 
     num_nodes = 34
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long, device=device)
-
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_index = edge_index.to(device=device)
     # Random features
     in_channels = 16
     features = torch.randn(num_nodes, in_channels, device=device)

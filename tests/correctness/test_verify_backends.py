@@ -12,11 +12,6 @@ import pytest
 import torch
 import yaml
 
-# pytest: keep imports identical; we only add assertions so failures fail
-# (no deletions or large refactors)
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, "./")
-
 from src.backends.registry import BackendRegistry
 from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
 
@@ -54,7 +49,7 @@ def test_dataset_loading():
     print("=" * 60)
 
     test_configs = [
-        DatasetConfig(source="pyg", name="Cora", root="data", graph_backend="pyg"),
+        DatasetConfig(source="pyg", name="cora", root="data", graph_backend="pyg"),
         DatasetConfig(source="dgl", name="cora", root="data", graph_backend="pyg"),
         DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data", graph_backend="pyg"),  # Large dataset
     ]
