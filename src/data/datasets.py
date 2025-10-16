@@ -25,8 +25,8 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "pyg": "pyg",
     "dgl": "dgl",
     "torch_native_gcn": "normalized_adj_mat_gcn",
-    "torch_native_adj_mat": "adj_mat",
-    "torch_native_meanaggr": "adj_mat_in_degree_normalized_transposed"
+    "torch_native_mean_aggr": "adj_mat_in_degree_normalized_transposed",
+    "torch_native_sum_aggr": "adj_mat",
 }
 
 
@@ -94,6 +94,7 @@ class GraphSample:
     val_mask: Optional[torch.BoolTensor] = None
     test_mask: Optional[torch.BoolTensor] = None
     _graph_repr: Any = None
+    add_self_loops: bool = True
 
     def __post_init__(self):
         """
@@ -103,23 +104,25 @@ class GraphSample:
         """
         graph = None
         if self.backend == "pyg":  # pyg eats standard edge index & weight
-            self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
             graph = (self._to_default_device(self.edge_index), self._to_default_device(self.edge_weight))
-            # TODO add self-loops
         elif self.backend == "dgl":
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             if self.edge_weight is not None:
                 graph.edata["w"] = self.edge_weight  # type: ignore
-            graph = add_self_loop(graph)
+            if self.add_self_loops:
+                graph = add_self_loop(graph)
             graph = self._to_default_device(graph)
         elif self.backend == "normalized_adj_mat_gcn":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=True)
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=self.add_self_loops)
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat_in_degree_normalized_transposed":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=True)
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=self.add_self_loops)
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
-            ...
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='none', add_self_loops=self.add_self_loops)
+            graph = self._to_default_device(graph)
         elif self.backend == "coo":
             ... # TODO
         elif self.backend == "csr":
@@ -129,6 +132,7 @@ class GraphSample:
         elif self.backend == "edge_list":
             edge_list = self.edge_index.T
             graph = (self._to_default_device(edge_list), self._to_default_device(self.edge_weight))
+            # TODO: add self-loops
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"
@@ -534,17 +538,21 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
         self_loops = torch.arange(num_nodes, device=device)
         loop_idx = torch.stack([self_loops, self_loops], dim=0)
         idx = torch.cat([idx, loop_idx], dim=1)
+        edge_index = idx
 
     if how == "both":
-        # add self loops
         values = torch.ones(idx.size(1), device=device)
-        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes))
+        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes)).T.coalesce()
 
-        deg = torch.sparse.sum(adj, dim=1).to_dense()
-        deg_inv_sqrt = torch.pow(deg.clamp(min=1.0), -0.5)
-        D_inv_sqrt = deg_inv_sqrt
+        deg1 = torch.sparse.sum(adj, dim=1).to_dense()
+        D_inv_sqrt1 = torch.pow(deg1.clamp(min=1.0), -0.5)
+
+        deg0 = torch.sparse.sum(adj, dim=0).to_dense()
+        D_inv_sqrt0 = torch.pow(deg0.clamp(min=1.0), -0.5)
+
+        idx, values = adj.indices(), adj.values()
         row, col = idx
-        norm_vals = D_inv_sqrt[row] * values * D_inv_sqrt[col]
+        norm_vals = D_inv_sqrt1[row] * values * D_inv_sqrt0[col]
         return torch.sparse_coo_tensor(idx, norm_vals, (num_nodes, num_nodes)).coalesce()
     elif how == "left":
         raise NotImplementedError()
@@ -557,12 +565,6 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
         src, dst = edge_index[0], edge_index[1]
 
         values = torch.ones(edge_index.size(1), device=device)
-        adj = torch.sparse_coo_tensor(
-            torch.stack([src, dst], dim=0),
-            values,
-            (num_nodes, num_nodes)
-        ).coalesce()
-
         adj_t_indices = torch.stack([dst, src], dim=0)
         adj_t = torch.sparse_coo_tensor(
             adj_t_indices,
@@ -586,9 +588,22 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
 
         adj_t_normalized = in_degree_inv_diag @ adj_t
         return adj_t_normalized
-
     elif how == "none":
-        raise NotImplementedError()
+        """
+            Computes A^T (transposed adjacency).
+            This matches DGL's copy_u_sum operation.
+        """
+        device = edge_index.device
+        src, dst = edge_index[0], edge_index[1]
 
+        values = torch.ones(edge_index.size(1), device=device)
+        adj_t_indices = torch.stack([dst, src], dim=0)
+        adj_t = torch.sparse_coo_tensor(
+            adj_t_indices,
+            values,
+            (num_nodes, num_nodes)
+        ).coalesce()
+
+        return adj_t
     else:
         raise ValueError(f"Normalization type {how} is inappropriate")

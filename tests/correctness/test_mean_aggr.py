@@ -26,22 +26,22 @@ class TestBackendRegistration:
     def test_backend_is_registered(self):
         """Verify torch_native_mean backend is registered."""
         backends = BackendRegistry.list_backends()
-        assert "torch_native_meanaggr" in backends, f"torch_native_mean not in registered backends: {backends}"
+        assert "torch_native_mean_aggr" in backends, f"torch_native_mean not in registered backends: {backends}"
 
     def test_graph_representation_mapping(self):
         """Verify backend has correct graph representation mapping."""
-        assert "torch_native_meanaggr" in MODEL_BACKEND_TO_GRAPH_REPR
-        assert MODEL_BACKEND_TO_GRAPH_REPR["torch_native_meanaggr"] == "adj_mat_in_degree_normalized_transposed"
+        assert "torch_native_mean_aggr" in MODEL_BACKEND_TO_GRAPH_REPR
+        assert MODEL_BACKEND_TO_GRAPH_REPR["torch_native_mean_aggr"] == "adj_mat_in_degree_normalized_transposed"
 
     def test_backend_instantiation(self):
         """Verify backend can be instantiated."""
-        backend = BackendRegistry.get_backend("torch_native_meanaggr")
+        backend = BackendRegistry.get_backend("torch_native_mean_aggr")
         assert backend is not None
         assert hasattr(backend, "create_conv")
 
     def test_conv_layer_creation(self):
         """Verify backend can create GCN convolution layers."""
-        backend = BackendRegistry.get_backend("torch_native_meanaggr")
+        backend = BackendRegistry.get_backend("torch_native_mean_aggr")
         conv = backend.create_conv("mean_aggr", in_channels=16, out_channels=16, bias=True)
 
         assert conv is not None
@@ -72,6 +72,7 @@ class TestAggregationCorrectness:
         dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
             data["device"]
         )
+        dgl_graph = dgl.add_self_loop(dgl_graph)
 
         dgl_output = dgl_ops.copy_u_mean(dgl_graph, features)
 
@@ -79,11 +80,11 @@ class TestAggregationCorrectness:
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
-            backend="torch_native_meanaggr",
+            backend="torch_native_mean_aggr",
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", data["in_channels"], out_channels, bias=False)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", data["in_channels"], out_channels, bias=False)
 
         our_output = conv(features, graph_sample.graph_repr)
 
@@ -117,11 +118,15 @@ class TestAggregationCorrectness:
         features = torch.randn(num_nodes, in_channels, device=device)
 
         graph_sample = create_graph_sample(
-            edge_index=edge_index, features=features, backend="torch_native_meanaggr", num_nodes=num_nodes
+            edge_index=edge_index,
+            features=features,
+            backend="torch_native_mean_aggr",
+            num_nodes=num_nodes,
+            add_self_loops=False,
         )
 
         conv = create_conv_layer(
-            "torch_native_meanaggr",
+            "torch_native_mean_aggr",
             "mean_aggr",
             in_channels,
             16,
@@ -159,11 +164,11 @@ class TestGradientFlow:
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
-            backend="torch_native_meanaggr",
+            backend="torch_native_mean_aggr",
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", data["in_channels"], 32, bias=True)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", data["in_channels"], 32, bias=True)
 
         # Forward pass
         output = conv(features, graph_sample.graph_repr)
@@ -198,11 +203,11 @@ class TestGradientFlow:
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
-            backend="torch_native_meanaggr",
+            backend="torch_native_mean_aggr",
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", in_channels, out_channels, bias=True)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", in_channels, out_channels, bias=True)
 
         # Convert to double precision (required for gradcheck)
         conv = conv.double()
@@ -233,11 +238,11 @@ class TestGradientFlow:
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features_double,
-            backend="torch_native_meanaggr",
+            backend="torch_native_mean_aggr",
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", in_channels, out_channels, bias=True)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", in_channels, out_channels, bias=True)
         conv = conv.double()
 
         # Freeze conv parameters (we only check feature gradients)
@@ -270,12 +275,12 @@ class TestGradientFlow:
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
-            backend="torch_native_meanaggr",
+            backend="torch_native_mean_aggr",
             num_nodes=data["num_nodes"],
         )
 
         conv = create_conv_layer(
-            "torch_native_meanaggr",
+            "torch_native_mean_aggr",
             "mean_aggr",
             data["in_channels"],
             data["in_channels"],  # Same size
@@ -324,11 +329,11 @@ class TestGradientFlow:
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
-            backend="torch_native_meanaggr",
+            backend="torch_native_mean_aggr",
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", data["in_channels"], 16, bias=True)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", data["in_channels"], 16, bias=True)
 
         # First forward/backward
         output = conv(features, graph_sample.graph_repr) @ weight.T
@@ -367,10 +372,14 @@ class TestEdgeCases:
         features = torch.randn(num_nodes, in_channels, device=device)
 
         graph_sample = create_graph_sample(
-            edge_index=edge_index, features=features, backend="torch_native_meanaggr", num_nodes=num_nodes
+            edge_index=edge_index,
+            features=features,
+            backend="torch_native_mean_aggr",
+            num_nodes=num_nodes,
+            add_self_loops=False,
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", in_channels, 16, bias=False)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", in_channels, 16, bias=False)
         output = conv(features, graph_sample.graph_repr)
 
         # All nodes isolated -> zero aggregation
@@ -386,10 +395,10 @@ class TestEdgeCases:
         features = torch.randn(num_nodes, in_channels, device=device)
 
         graph_sample = create_graph_sample(
-            edge_index=edge_index, features=features, backend="torch_native_meanaggr", num_nodes=num_nodes
+            edge_index=edge_index, features=features, backend="torch_native_mean_aggr", num_nodes=num_nodes
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", in_channels, in_channels, bias=False)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", in_channels, in_channels, bias=False)
 
         output = conv(features, graph_sample.graph_repr)
 
@@ -410,10 +419,14 @@ class TestEdgeCases:
         features = torch.randn(num_nodes, in_channels, device=device)
 
         graph_sample = create_graph_sample(
-            edge_index=edge_index, features=features, backend="torch_native_meanaggr", num_nodes=num_nodes
+            edge_index=edge_index,
+            features=features,
+            backend="torch_native_mean_aggr",
+            num_nodes=num_nodes,
+            add_self_loops=False,
         )
 
-        conv = create_conv_layer("torch_native_meanaggr", "mean_aggr", in_channels, in_channels, bias=False)
+        conv = create_conv_layer("torch_native_mean_aggr", "mean_aggr", in_channels, in_channels, bias=False)
 
         output = conv(features, graph_sample.graph_repr)
 

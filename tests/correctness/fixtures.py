@@ -70,6 +70,35 @@ def small_graph_data(device):
 
 
 @pytest.fixture
+def small_undirected_cylce_data(device):
+    """
+    Create a simple cycle graph for testing.
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features
+    """
+    num_nodes = 5
+    in_channels = 2
+
+    src1 = torch.arange(0, num_nodes, device=device)
+    dst1 = (src1 + 1) % num_nodes
+    src2 = src1.clone()
+    dst2 = (src2 + num_nodes - 1) % num_nodes
+    edge_index = torch.stack([torch.concat((src1, src2)), torch.concat((dst1, dst2))], dim=0)
+
+    # Node i has feature value i everywhere (for easy verification)
+    features = torch.arange(num_nodes, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "device": device,
+    }
+
+
+@pytest.fixture
 def random_graph_data(device):
     """
     Create a random graph for general testing.
@@ -208,7 +237,7 @@ def karate_like_club_graph(device):
     }
 
 
-@pytest.fixture(params=["torch_native_meanaggr", "pyg", "dgl"])
+@pytest.fixture(params=["torch_native_mean_aggr", "pyg", "dgl"])
 def graph_backend(request):
     """Parametrized fixture for different graph backends."""
     return request.param
@@ -227,7 +256,7 @@ def create_graph_sample(set_default_device):
         )
     """
 
-    def _create(edge_index, features, backend, num_nodes=None):
+    def _create(edge_index, features, backend, num_nodes=None, add_self_loops=True):
         if num_nodes is None:
             num_nodes = features.shape[0]
 
@@ -236,6 +265,7 @@ def create_graph_sample(set_default_device):
             x=features,
             y=torch.zeros(num_nodes, device=features.device),
             edge_index=edge_index,
+            add_self_loops=add_self_loops,
         )
 
     return _create
@@ -248,7 +278,7 @@ def create_conv_layer(set_default_device):
 
     Usage:
         conv = create_conv_layer(
-            backend_name="torch_native_meanaggr",
+            backend_name="torch_native_mean_aggr",
             conv_type="gcn",
             in_channels=16,
             out_channels=32
@@ -272,7 +302,7 @@ def identity_weight_conv(create_conv_layer, set_default_device):
 
     Usage:
         conv = identity_weight_conv(
-            backend_name="torch_native_meanaggr",
+            backend_name="torch_native_mean_aggr",
             conv_type="gcn",
             in_channels=16,
             out_channels=16

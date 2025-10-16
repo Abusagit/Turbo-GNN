@@ -3,7 +3,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GATv2Conv as _GAT
-from torch_geometric.nn import GCNConv, GINConv, SAGEConv
+from torch_geometric.nn import GCNConv as _GCN
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
@@ -16,7 +16,7 @@ PyG backend: wraps torch_geometric.nn layers and exposes them via BaseBackend.
 class _PygGCNConv(BaseConvolution):
     """PyG-backed GCNConv wrapper."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, **kwargs: Any) -> None:
         """Initialize a GCN convolution using PyG.
 
         Args:
@@ -27,7 +27,7 @@ class _PygGCNConv(BaseConvolution):
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
 
-        self._conv = GCNConv(in_channels, out_channels, bias=bias, **kwargs)
+        self._conv = _GCN(in_channels, out_channels, bias=bias, **kwargs)
 
     def forward(
         self,
@@ -49,13 +49,21 @@ class _PygGCNConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
         edge_index, edge_weight = graph
+
+        # disable weight
+        lin = self._conv.lin
+        with torch.no_grad():
+            torch.nn.init.eye_(lin.weight)
+            if lin.bias is not None:
+                torch.nn.init.zeros_(lin.bias)
+
         return self._conv(x, edge_index, edge_weight=edge_weight)
 
 
 class _PygGATConv(BaseConvolution):
     """PyG-backed GAT (v2 if available)."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a GAT convolution using PyG.
 
         Args:
@@ -118,9 +126,13 @@ class PygBackend(BaseBackend):
             BaseConvolution: An instance of the requested PyG conv.
         """
         ct = conv_type.lower()
-
-        if ct == "gcn":
-            return _PygGCNConv(in_channels, out_channels, **kwargs)
-        if ct == "gat":
-            return _PygGATConv(in_channels, out_channels, **kwargs)
+        match ct:
+            case "gcn":
+                return _PygGCNConv(in_channels, out_channels, **kwargs)
+            case "mean_aggr":
+                return _PygGCNConv(in_channels, out_channels, aggr="mean", normalize=False, **kwargs)
+            case "sum_aggr":
+                return _PygGCNConv(in_channels, out_channels, normalize=False, **kwargs)
+            case "gat":
+                return _PygGATConv(in_channels, out_channels, **kwargs)
         raise KeyError(f"Unsupported conv_type for PyG backend: {conv_type}")

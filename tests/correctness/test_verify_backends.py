@@ -89,17 +89,20 @@ def test_backend_convolutions():
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     x = torch.randn(num_nodes, in_channels, device=device, requires_grad=True)
 
-    backends_to_test = ["pyg", "dgl", "torch_native_gcn"]
-    conv_types = ["gcn"]
+    backends_to_test = ["pyg", "dgl", "torch_native"]
+    conv_types = ["gcn", "mean_aggr", "sum_aggr"]
 
     results = {}
 
-    for backend_name in backends_to_test:
-        print(f"\n{backend_name.upper()} Backend:")
+    for _backend_name in backends_to_test:
         try:
-            backend = BackendRegistry.get_backend(backend_name)
-
             for conv_type in conv_types:
+                if _backend_name == "torch_native":
+                    backend_name = f"{_backend_name}_{conv_type}"
+                else:
+                    backend_name = _backend_name
+                print(f"\n{backend_name.upper()} Backend:")
+                backend = BackendRegistry.get_backend(backend_name)
                 try:
                     # Create convolution
                     conv = backend.create_conv(conv_type, in_channels, out_channels, bias=True).to(device)
