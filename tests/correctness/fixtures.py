@@ -58,6 +58,10 @@ def small_graph_data(device):
 
     # Expected mean for center node (receives from nodes 1-9)
     expected_center_mean = torch.arange(1, num_nodes, device=device, dtype=torch.float32).mean()
+    expected_min = torch.zeros((num_nodes, in_channels), device=device, dtype=torch.float32)
+    expected_min[0, :] = 1
+    expected_max = torch.zeros((num_nodes, in_channels), device=device, dtype=torch.float32)
+    expected_max[0, :] = num_nodes - 1
 
     return {
         "num_nodes": num_nodes,
@@ -65,6 +69,119 @@ def small_graph_data(device):
         "features": features,
         "in_channels": in_channels,
         "expected_center_mean": expected_center_mean,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
+        "device": device,
+    }
+
+
+@pytest.fixture
+def fully_connected_on_3_vertices_data(device):
+    """
+    Create a simple fully connected graph (Kn) for testing.
+
+    Structure: Nodes 0, 1, ... , n are all interconnected and pass messages to each other
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features, and expected results
+    """
+
+    num_nodes = 3
+    in_channels = 16
+
+    row, col = torch.meshgrid(
+        torch.arange(num_nodes, device=device), torch.arange(num_nodes, device=device), indexing="ij"
+    )
+
+    mask = row != col
+    edge_index = torch.stack([row[mask], col[mask]], dim=0)
+
+    features = torch.arange(num_nodes, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+
+    expected_min = torch.zeros((num_nodes, in_channels), device=device, dtype=torch.float32)
+    expected_min[0, :] = 1
+    expected_max = torch.ones((num_nodes, in_channels), device=device, dtype=torch.float32) * (num_nodes - 1)
+    expected_max[num_nodes - 1, :] = num_nodes - 2
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
+        "device": device,
+    }
+
+
+@pytest.fixture
+def empty_graph_data(device):
+    """
+    Create an empty graph for crash testing.
+
+    Structure: No nodes. No edges.
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features, and expected results
+    """
+
+    num_nodes = 0
+    in_channels = 16
+
+    edge_index = (
+        [torch.tensor([], device=device, dtype=torch.float32)],
+        [torch.tensor([], device=device, dtype=torch.float32)],
+    )
+
+    features = torch.empty((num_nodes, in_channels), device=device, dtype=torch.float32)
+
+    expected_min = torch.tensor([], device=device, dtype=torch.float32)
+    expected_max = torch.tensor([], device=device, dtype=torch.float32)
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
+        "device": device,
+    }
+
+
+@pytest.fixture
+def connectivity_component_and_isolated_vertice_data(device):
+    """
+    Create a simple graph to test nothing leaks to isolated vertices
+
+    Structure: Nodes 0, 1 are bidirectionally connected to each other, node 2 is isolated.
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features, and expected results
+    """
+
+    num_nodes = 3
+    in_channels = 16
+
+    # Star graph: nodes 1-9 -> node 0
+    src = torch.tensor([0, 1], dtype=torch.long, device=device)
+    dst = torch.tensor([1, 0], dtype=torch.long, device=device)
+    edge_index = torch.stack([src, dst], dim=0)
+
+    # Node i has feature value i everywhere (for easy verification)
+    features = torch.arange(1, num_nodes + 1, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+
+    # Expected mean for center node (receives from nodes 1-9)
+    expected_min = torch.tensor([2.0, 1.0, 0.0], device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+    expected_max = expected_min
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
         "device": device,
     }
 

@@ -1,5 +1,6 @@
 from typing import Any, Optional
 
+import dgl
 import torch
 from dgl.nn.pytorch import GraphConv
 from dgl.nn.pytorch.conv import GATv2Conv as _GAT
@@ -47,6 +48,82 @@ class _DglGCNConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
         return self._conv(graph, x, edge_weight=graph.edata.get("w"))
+
+
+class _DGLMinAggrConv(BaseConvolution):
+    """DGL-backed MinAggregation wrapper."""
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
+        """Initialize a MinAggr layer using DGL.
+
+        Args:
+            in_channels (int): Input feature size.
+            out_channels (int): Output feature size.
+            bias (bool): Include bias.
+            **kwargs (Any): Reserved for future options.
+        """
+        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: Any,
+        *,
+        edge_weight: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Apply DglMinAggrOp.
+
+        Args:
+            x (torch.Tensor): Node features [N, Fin].
+            graph (Any): dgl.DGLGraph or (edge_index, edge_weight, num_nodes).
+            edge_weight (Optional[torch.Tensor]): Edge weights [E].
+            **kwargs (Any): Extra kwargs (ignored).
+
+        Returns:
+            torch.Tensor: Output features [N, Fout].
+        """
+        x_aggregated = dgl.ops.copy_u_min(graph, x)
+        x_aggregated[x_aggregated.isinf()] = 0
+        return x_aggregated
+
+
+class _DGLMaxAggrConv(BaseConvolution):
+    """DGL-backed MinAggregation wrapper."""
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
+        """Initialize a MaxAggr layer using DGL.
+
+        Args:
+            in_channels (int): Input feature size.
+            out_channels (int): Output feature size.
+            bias (bool): Include bias.
+            **kwargs (Any): Reserved for future options.
+        """
+        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: Any,
+        *,
+        edge_weight: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Apply DglMinAggrOp.
+
+        Args:
+            x (torch.Tensor): Node features [N, Fin].
+            graph (Any): dgl.DGLGraph or (edge_index, edge_weight, num_nodes).
+            edge_weight (Optional[torch.Tensor]): Edge weights [E].
+            **kwargs (Any): Extra kwargs (ignored).
+
+        Returns:
+            torch.Tensor: Output features [N, Fout].
+        """
+        x_aggregated = dgl.ops.copy_u_max(graph, x)
+        x_aggregated[x_aggregated.isinf()] = 0
+        return x_aggregated
 
 
 class _DGLGATv2Conv(BaseConvolution):
@@ -120,4 +197,8 @@ class DglBackend(BaseBackend):
             return _DglGCNConv(in_channels, out_channels, **kwargs)
         if ct == "gat":
             return _DGLGATv2Conv(in_channels, out_channels, **kwargs)
+        if ct == "min_aggr":
+            return _DGLMinAggrConv(in_channels, out_channels, **kwargs)
+        if ct == "max_aggr":
+            return _DGLMaxAggrConv(in_channels, out_channels, **kwargs)
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
