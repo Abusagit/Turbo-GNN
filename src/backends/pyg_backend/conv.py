@@ -28,6 +28,7 @@ class _PygGCNConv(BaseConvolution):
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
 
         self._conv = _GCN(in_channels, out_channels, bias=bias, **kwargs)
+        self._conv.lin = torch.nn.Identity()  # disable weight
 
     def forward(
         self,
@@ -49,14 +50,6 @@ class _PygGCNConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
         edge_index, edge_weight = graph
-
-        # disable weight
-        lin = self._conv.lin
-        with torch.no_grad():
-            torch.nn.init.eye_(lin.weight)
-            if lin.bias is not None:
-                torch.nn.init.zeros_(lin.bias)
-
         return self._conv(x, edge_index, edge_weight=edge_weight)
 
 
