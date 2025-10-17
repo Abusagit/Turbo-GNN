@@ -46,6 +46,7 @@ class TestCugraphBasicAggregation:
         dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
             data["device"]
         )
+        dgl_graph = dgl.add_self_loop(dgl_graph)
 
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
