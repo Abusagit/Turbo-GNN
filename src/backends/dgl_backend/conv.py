@@ -104,8 +104,6 @@ class _DglGraphTransformer(BaseConvolution):
         in_channels: int,
         out_channels: int,
         num_heads: int = 8,
-        edge_dim: bool = 1,
-        residual: bool = True,
         bias: bool = True,
         **kwargs: Any,
     ) -> None:
@@ -117,15 +115,8 @@ class _DglGraphTransformer(BaseConvolution):
         self.q_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
         self.k_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
         self.v_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
-        self.edge_proj = nn.Linear(edge_dim, self.hidden_dim, bias=bias)
 
         self.layer_norm = nn.LayerNorm(self.hidden_dim)
-
-        self.residual = residual
-
-        if self.residual:
-            self.residual_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=bias)
-            self.gating = nn.Linear(3 * self.hidden_dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         # get node features
@@ -140,28 +131,13 @@ class _DglGraphTransformer(BaseConvolution):
         k = k.view(n, self.num_heads, -1)
         v = v.view(n, self.num_heads, -1)
 
-        if "w" in graph.edata.keys():
-            edge_w = graph.edata["w"]
-            edge_w = self.edge_proj(edge_w)
-            edge_w = edge_w.view(e, self.num_heads, -1)
-        else:
-            edge_w = torch.zeros(e, self.hidden_dim, dtype=x.dtype, device=x.device).view(e, self.num_heads, -1)
+        edge_placeholder = torch.zeros(e, self.hidden_dim, dtype=x.dtype, device=x.device).view(e, self.num_heads, -1)
 
-        attn_scores = ops.e_add_v(graph, edge_w, k)
-        attn_scores = ops.e_dot_v(graph, attn_scores, v)
-        attn_scores = F.edge_softmax(graph, attn_scores)
-        values = ops.e_add_v(graph, edge_w, v)
+        attn_scores = ops.e_add_v(graph, edge_placeholder, k)
+        attn_scores = ops.e_dot_v(graph, attn_scores, q)
+        attn_probs = F.edge_softmax(graph, attn_scores)
 
-        values = values * attn_scores
-        hidden = ops.copy_e_sum(graph, values).view(n, -1)
-
-        if self.residual:
-            residual = self.residual_proj(x)
-            gate = self.gating(torch.cat([residual, hidden, hidden - residual], dim=-1))
-            beta = torch.nn.functional.sigmoid(gate)
-            residual.mul_(beta)
-            hidden.mul_(1 - beta)
-            hidden.add_(residual)
+        hidden = ops.u_mul_e_sum(graph, v, attn_probs).view(n, -1)
 
         hidden = self.layer_norm(hidden)
         torch.nn.functional.relu(hidden, inplace=True)
