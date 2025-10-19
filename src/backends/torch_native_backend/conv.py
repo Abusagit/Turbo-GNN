@@ -91,6 +91,98 @@ class _TorchNativeMeanConv(BaseConvolution):
         return out
 
 
+class _TorchNativeMinConv(BaseConvolution):
+    """Min aggregation of incoming neighbors."""
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
+        """Initialize a Torch-native min aggregation convolution.
+
+        Args:
+            in_channels (int): Input feature size.
+            out_channels (int): Output feature size.
+            bias (bool): Include bias in linear transform.
+            **kwargs (Any): Reserved for future options.
+        """
+        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: Any,
+        *,
+        edge_weight: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Apply min aggregation convolution
+
+        Args:
+            x (torch.Tensor): Node features [N, Fin].
+            graph (Any):
+                - adj_mat: sparse COO tensor [N, N] (A^T)
+            edge_weight (Optional[torch.Tensor]): Unused for this baseline.
+            **kwargs (Any): Extra kwargs ignored.
+
+        Returns:
+            torch.Tensor: Output features [N, Fout].
+        """
+        src, dst = graph.indices()
+        # we don't care what the values inside are
+        # we can avoid normalizing / re-normalizing prior to this layer for speedup
+        messages = x[src]
+        num_nodes, feat_dim = x.size()
+        out = torch.full((num_nodes, feat_dim), float("inf"), device=x.device)
+        index = dst.unsqueeze(1).expand(-1, feat_dim)
+        out.scatter_reduce_(0, index, messages, reduce="amin", include_self=False)
+        out[out == float("inf")] = 0.0
+        return out
+
+
+class _TorchNativeMaxConv(BaseConvolution):
+    """Max aggregation of incoming neighbors."""
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
+        """Initialize a Torch-native max aggregation convolution.
+
+        Args:
+            in_channels (int): Input feature size.
+            out_channels (int): Output feature size.
+            bias (bool): Include bias in linear transform.
+            **kwargs (Any): Reserved for future options.
+        """
+        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: Any,
+        *,
+        edge_weight: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Apply max aggregation convolution
+
+        Args:
+            x (torch.Tensor): Node features [N, Fin].
+            graph (Any):
+                - adj_mat: sparse COO tensor [N, N] (A^T)
+            edge_weight (Optional[torch.Tensor]): Unused for this baseline.
+            **kwargs (Any): Extra kwargs ignored.
+
+        Returns:
+            torch.Tensor: Output features [N, Fout].
+        """
+        src, dst = graph.indices()
+        # we don't care what the values inside are
+        # we can avoid normalizing / re-normalizing prior to this layer for speedup
+        messages = x[src]
+        num_nodes, feat_dim = x.size()
+        out = torch.full((num_nodes, feat_dim), float("-inf"), device=x.device)
+        index = dst.unsqueeze(1).expand(-1, feat_dim)
+        out.scatter_reduce_(0, index, messages, reduce="amax", include_self=False)
+        out[out == float("-inf")] = 0.0
+        return out
+
+
 @BackendRegistry.register_backend("torch_native_gcn")
 class TorchNativeBackend(BaseBackend):
     """Backend instantiating simple Torch-native GNN convs."""
@@ -116,6 +208,36 @@ class TorchNativeBackend(BaseBackend):
         # guard unsupported backends
         if conv_type == "gcn":
             return _TorchNativeGCNConv(in_channels, out_channels, **kwargs)
+        raise NotImplementedError(f"Convolution `{conv_type}` is not implemented for backend {self.__class__.__name__}")
+
+
+@BackendRegistry.register_backend("torch_native_adj_mat")
+class TorchNativeAdjMatBackend(BaseBackend):
+    """Factory for Torch-native pooling GNN convs."""
+
+    def create_conv(
+        self,
+        conv_type: str,
+        in_channels: int,
+        out_channels: int,
+        **kwargs: Any,
+    ):
+        """Factory for Torch-native pooling convs.
+
+        Args:
+            conv_type (str): 'gcn' supported (extend as needed).
+            in_channels (int): Input feature size.
+            out_channels (int): Output feature size.
+            **kwargs (Any): Extra kwargs.
+
+        Returns:
+            BaseConvolution: Torch-native convolution layer.
+        """
+        # guard unsupported backends
+        if conv_type == "min_aggr":
+            return _TorchNativeMinConv(in_channels, out_channels, **kwargs)
+        if conv_type == "max_aggr":
+            return _TorchNativeMaxConv(in_channels, out_channels, **kwargs)
         raise NotImplementedError(f"Convolution `{conv_type}` is not implemented for backend {self.__class__.__name__}")
 
 

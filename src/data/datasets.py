@@ -119,7 +119,8 @@ class GraphSample:
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=True)
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
-            ...
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='none', add_self_loops=False)
+            graph = self._to_default_device(graph)
         elif self.backend == "coo":
             ... # TODO
         elif self.backend == "csr":
@@ -525,7 +526,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
         torch.Tensor: Sparse COO adjacency with added self-loops and:
             - D^{-1/2} A D^{-1/2} normalization if `how` == "both".
             - D_in^{-1} A^T normalization if `how` == "right" -- normalization for mean-aggregation
-            - ...
+            - A if `how` == "none" -- normalization for adj-mat backend
     """
     device = edge_index.device
     idx = edge_index
@@ -588,7 +589,9 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
         return adj_t_normalized
 
     elif how == "none":
-        raise NotImplementedError()
+        values = torch.ones(idx.size(1), device=device)
+        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes))
+        return adj.coalesce()
 
     else:
         raise ValueError(f"Normalization type {how} is inappropriate")
