@@ -124,6 +124,7 @@ class TestAggregationCorrectness:
                 features=features,
                 backend="torch_native_adj_mat",
                 num_nodes=data["num_nodes"],
+                add_self_loops=False,
             )
 
             conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
@@ -200,6 +201,7 @@ class TestAggregationCorrectness:
                 features=features,
                 backend="torch_native_adj_mat",
                 num_nodes=data["num_nodes"],
+                add_self_loops=False,
             )
 
             conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
@@ -276,6 +278,7 @@ class TestAggregationCorrectness:
                 features=features,
                 backend="torch_native_adj_mat",
                 num_nodes=data["num_nodes"],
+                add_self_loops=False,
             )
 
             conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
@@ -347,6 +350,7 @@ class TestAggregationEquivalence:
             features=features,
             backend="torch_native_adj_mat",
             num_nodes=data["num_nodes"],
+            add_self_loops=False,
         )
 
         conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
@@ -406,6 +410,7 @@ class TestAggregationEquivalence:
             features=features,
             backend="torch_native_adj_mat",
             num_nodes=data["num_nodes"],
+            add_self_loops=False,
         )
 
         conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)

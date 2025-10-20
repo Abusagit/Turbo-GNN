@@ -31,7 +31,19 @@ except ImportError:
     except ImportError:
         pass
 
-GraphBackendOption = Literal["pyg", "dgl", "edge_list", "coo", "csr", "csc", "normalized_adj_mat_gcn", "adj_mat", "adj_mat_in_degree_normalized_transposed", "cugraph"] # NOTE we can define cached formalizations via this option
+GraphBackendOption = Literal[
+    "pyg",
+    "dgl",
+    "edge_list",
+    "coo",
+    "csr",
+    "csc",
+    "normalized_adj_mat_gcn",
+    "adj_mat",
+    "adj_mat_in_degree_normalized_transposed",
+    "adj_mat_transposed",
+    "cugraph",
+] # NOTE we can define cached formalizations via this option
 
 
 # NOTE place representations here when you add new backend
@@ -40,8 +52,9 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "dgl": "dgl",
     "torch_native_gcn": "normalized_adj_mat_gcn",
     "torch_native_mean_aggr": "adj_mat_in_degree_normalized_transposed",
-    "torch_native_sum_aggr": "adj_mat",
+    "torch_native_sum_aggr": "adj_mat_transposed",
     "cugraph": "cugraph",
+    "torch_native_adj_mat": "adj_mat",
 }
 
 
@@ -142,8 +155,11 @@ class GraphSample:
             edge_index_for_pyg = EdgeIndex(edge_index, sparse_size=(self.num_nodes, self.num_nodes), sort_order='row', is_undirected=False, device=torch.get_default_device())
             csc_graph = get_cugraph_with_gcn_weights(edge_index_for_pyg)  # edge index is already on GPU
             graph = (csc_graph, edge_weights_for_gcn)
-        elif self.backend == "adj_mat":
+        elif self.backend == "adj_mat_transposed":
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='none', add_self_loops=self.add_self_loops)
+            graph = self._to_default_device(graph)
+        elif self.backend == "adj_mat":
+            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='none', add_self_loops=self.add_self_loops).T.coalesce()
             graph = self._to_default_device(graph)
         elif self.backend == "coo":
             ... # TODO
