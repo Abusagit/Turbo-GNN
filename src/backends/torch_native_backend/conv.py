@@ -179,7 +179,7 @@ class _TorchNativeMaxConv(BaseConvolution):
         out = torch.full((num_nodes, feat_dim), float("-inf"), device=x.device)
         index = dst.unsqueeze(1).expand(-1, feat_dim)
         out.scatter_reduce_(0, index, messages, reduce="amax", include_self=False)
-        out[out == float("-inf")] = 0.0
+        out[out.isinf()] = 0.0
         return out
 
 
