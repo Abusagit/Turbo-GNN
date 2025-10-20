@@ -107,9 +107,9 @@ class СuSparseBackend(BaseBackend):
 
         conv_type = conv_type.lower()
 
-        if conv_type == "sum":
+        if conv_type == "sum_aggr":
             return _СuSparseMatMulConv(norm_type="none", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
-        if conv_type == "mean":
+        if conv_type == "mean_aggr":
             return _СuSparseMatMulConv(norm_type="right", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
         if conv_type == "random_walk":
             return _СuSparseMatMulConv(norm_type="left", cu_sparse_algorithm_id=cu_sparse_algorithm_id)

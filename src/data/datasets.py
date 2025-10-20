@@ -185,8 +185,14 @@ class GraphSample:
         elif self.backend == "coo":
             ...  # TODO
         elif self.backend == "csr":
-            rows = self.edge_index[0]
-            cols = self.edge_index[1]
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+
+            # Here we actually transpose adj matrix, that's why not
+            # rows = self.edge_index[0]
+            # cols = self.edge_index[1]
+            rows = self.edge_index[1]
+            cols = self.edge_index[0]
             N = self.num_nodes
 
             # Sort edges by (row, col) for a canonical CSR

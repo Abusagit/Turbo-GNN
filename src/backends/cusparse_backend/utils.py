@@ -1,4 +1,5 @@
 import glob
+from pathlib import Path
 
 import torch
 from torch.utils.cpp_extension import load
@@ -6,12 +7,14 @@ from torch.utils.cpp_extension import load
 path = __file__.replace("utils.py", "")
 sources = ["cusparse_spmm.cpp", "edge_norm_kernels.cu"]
 
+repo_root_path = Path(__file__).parent.parent.parent.parent
+
 cuda_kernels = load(
     name="cuda_kernels",
     extra_cflags=["-O3"],
     extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_80", "--generate-line-info", "-lcusparse"],
     extra_include_paths=glob.glob(
-        "/home/daniilkk/repos/Accelerating-GNNs/.venv/lib/python3.11/site-packages/**/include", recursive=True
+        str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True
     ),
     sources=[path + s for s in sources],
     verbose=True,
@@ -48,7 +51,7 @@ def csr_SPMM_normalized(
         edge_weights_gpu = edge_weights.to(features.device).to(torch.float32)
 
     out = cuda_kernels.csr_SPMM_normalized(
-        indptr, indices, features, edge_weights_gpu, norm, algorithm, use_cache, do_transpose_a
+        indptr, indices, features.contiguous(), edge_weights_gpu, norm, algorithm, use_cache, do_transpose_a
     )
 
     return out

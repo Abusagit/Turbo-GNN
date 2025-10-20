@@ -24,7 +24,7 @@ class TestMatMulConvCorrectness:
     """Test basic aggregation operations (gcn, mean, sum)."""
 
     @pytest.mark.parametrize("aggr_type", ["gcn", "mean_aggr", "sum_aggr"])
-    @pytest.mark.parametrize("backend", ["pyg", "torch_native"])
+    @pytest.mark.parametrize("backend", ["pyg", "torch_native", "cusparse"])
     def test_matmul_conv_matches_dgl_on_undirected_graph(
         self, aggr_type, backend, karate_like_club_graph, create_graph_sample, create_conv_layer
     ):
@@ -34,7 +34,7 @@ class TestMatMulConvCorrectness:
 
     # works on ("gcn", "torch_native"), but not on ("gcn", "pyg")
     @pytest.mark.parametrize("aggr_type", ["mean_aggr", "sum_aggr"])
-    @pytest.mark.parametrize("backend", ["pyg", "torch_native"])
+    @pytest.mark.parametrize("backend", ["pyg", "torch_native", "cusparse"])
     def test_matmul_conv_matches_dgl_on_directed_graph(
         self, aggr_type, backend, random_graph_data, create_graph_sample, create_conv_layer
     ):
@@ -42,7 +42,7 @@ class TestMatMulConvCorrectness:
             aggr_type, backend, random_graph_data, create_graph_sample, create_conv_layer
         )
 
-    @pytest.mark.parametrize("aggr_type,backend", [("gcn", "torch_native")])
+    @pytest.mark.parametrize("aggr_type,backend", [("gcn", "torch_native"), ("gcn", "cusparse")])
     def test_matmul_conv_matches_dgl_on_directed_graph2(
         self, aggr_type, backend, random_graph_data, create_graph_sample, create_conv_layer
     ):
