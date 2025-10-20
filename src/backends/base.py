@@ -5,6 +5,8 @@ This module provides abstract base classes that define the interface for all bac
 implementations and convolution layers in the benchmarking framework.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any
@@ -74,7 +76,7 @@ class BaseBackend(ABC):
         in_channels: int,
         out_channels: int,
         **kwargs: Any,
-    ):
+    ) -> BaseConvolution:
         """Factory for convolution layers.
 
         Args:

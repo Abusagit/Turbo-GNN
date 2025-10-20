@@ -288,7 +288,7 @@ exclude = [
     "__pycache__",
     "build",
     "dist",
-    "data",
+    "/data",
     "runs",
     "experiments",
     "__examples",
