@@ -1,32 +1,31 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Literal, Mapping
-
-import torch
-from torch.utils.data import Dataset
-
-from torch_geometric.datasets import Planetoid, Reddit
-from torch_geometric.data import Data
-import torch_geometric.datasets as pyg_datasets
-
 from functools import wraps
+from typing import Any, Dict, Literal, Mapping, Optional, Tuple
 
+import dgl.data as dgl_data
+import torch
+import torch_geometric.datasets as pyg_datasets
+from dgl import add_self_loop
+from dgl import graph as dgl_graph
 from ogb.nodeproppred import NodePropPredDataset
-
+from torch.utils.data import Dataset
+from torch_geometric.data import Data
+from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
-from dgl import add_self_loop, graph as dgl_graph
-import dgl.data as dgl_data
 
 from .graphland_datasets import GraphLandDataset
 
 try:  # pragma: no cover
     LEGACY_MODE = False
     from pylibcugraphops.pytorch import CSC, HeteroCSC
+
     HAS_PYLIBCUGRAPHOPS = True
 except ImportError:
     HAS_PYLIBCUGRAPHOPS = False
     try:  # pragma: no cover
         from pylibcugraphops import make_fg_csr
+
         LEGACY_MODE = True
     except ImportError:
         pass
@@ -43,11 +42,12 @@ GraphBackendOption = Literal[
     "adj_mat_in_degree_normalized_transposed",
     "adj_mat_transposed",
     "cugraph",
-] # NOTE we can define cached formalizations via this option
+]  # NOTE we can define cached formalizations via this option
 
 
 # NOTE place representations here when you add new backend
-MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this dict contains mapping for suitable graph representation for each convolution backend
+MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this dict contains mapping for suitable graph
+    # representation for each convolution backend
     "pyg": "pyg",
     "dgl": "dgl",
     "torch_native_gcn": "normalized_adj_mat_gcn",
@@ -55,6 +55,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "torch_native_sum_aggr": "adj_mat_transposed",
     "cugraph": "cugraph",
     "torch_native_adj_mat": "adj_mat",
+    "cusparse": "csr",
 }
 
 
@@ -78,6 +79,7 @@ Notes:
 
 # NOTE the last one can be optimized -- graph tensors can be placed on GPU once during the training
 
+
 def ensure_cpu_device(func):
     """Wrap a function to ensure that default device is CPU.
     Returns back default device after the execution
@@ -88,7 +90,6 @@ def ensure_cpu_device(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-
         prev_default_device = torch.get_default_device()
         torch.set_default_device("cpu")
         res = func(*args, **kwargs)
@@ -97,7 +98,9 @@ def ensure_cpu_device(func):
 
     return wrapper
 
+
 # ------------------------- Canonical sample container ------------------------- #
+
 
 @dataclass
 class GraphSample:
@@ -113,6 +116,7 @@ class GraphSample:
         val_mask (Optional[torch.BoolTensor]): Validation mask [N].
         test_mask (Optional[torch.BoolTensor]): Test mask [N].
     """
+
     backend: GraphBackendOption
     x: torch.Tensor
     y: torch.Tensor
@@ -126,11 +130,12 @@ class GraphSample:
 
     def __post_init__(self):
         """
-        Add self loops -- For correct benchmarking purposes (We aren't racing for the SOTA architectures here so we can do whatever we want)
+        Add self loops -- For correct benchmarking purposes (We aren't racing for the SOTA architectures here so we can
+        do whatever we want)
             1) Store graph representation in _graph_repr field --> it will be used in the convolutions
             2) Place everything on a default device -- defined in scripts
         """
-        graph = None
+        graph: Any = None
         if self.backend == "pyg":  # pyg eats standard edge index & weight
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
@@ -138,35 +143,78 @@ class GraphSample:
         elif self.backend == "dgl":
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             if self.edge_weight is not None:
-                graph.edata["w"] = self.edge_weight  # type: ignore
+                graph.edata["w"] = self.edge_weight
             if self.add_self_loops:
                 graph = add_self_loop(graph)
             graph = self._to_default_device(graph)
         elif self.backend == "normalized_adj_mat_gcn":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=self.add_self_loops)
+            graph = normalize_adj(
+                edge_index=self.edge_index, num_nodes=self.num_nodes, how="both", add_self_loops=self.add_self_loops
+            )
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat_in_degree_normalized_transposed":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=self.add_self_loops)
+            graph = normalize_adj(
+                edge_index=self.edge_index, num_nodes=self.num_nodes, how="right", add_self_loops=self.add_self_loops
+            )
             graph = self._to_default_device(graph)
         elif self.backend == "cugraph":
-            normalized_gcn_adjacency = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=self.add_self_loops)
+            normalized_gcn_adjacency = normalize_adj(
+                edge_index=self.edge_index, num_nodes=self.num_nodes, how="both", add_self_loops=self.add_self_loops
+            )
             edge_index = normalized_gcn_adjacency.indices().tolist()
             edge_weights_for_gcn = normalized_gcn_adjacency.values()
-            edge_index_for_pyg = EdgeIndex(edge_index, sparse_size=(self.num_nodes, self.num_nodes), sort_order='row', is_undirected=False, device=torch.get_default_device())
+            edge_index_for_pyg = EdgeIndex(
+                edge_index,
+                sparse_size=(self.num_nodes, self.num_nodes),
+                sort_order="row",
+                is_undirected=False,
+                device=torch.get_default_device(),
+            )
             csc_graph = get_cugraph_with_gcn_weights(edge_index_for_pyg)  # edge index is already on GPU
             graph = (csc_graph, edge_weights_for_gcn)
         elif self.backend == "adj_mat_transposed":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='none', add_self_loops=self.add_self_loops)
+            graph = normalize_adj(
+                edge_index=self.edge_index, num_nodes=self.num_nodes, how="none", add_self_loops=self.add_self_loops
+            )
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
-            graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='none', add_self_loops=self.add_self_loops).T.coalesce()
+            graph = normalize_adj(
+                edge_index=self.edge_index, num_nodes=self.num_nodes, how="none", add_self_loops=self.add_self_loops
+            ).T.coalesce()
             graph = self._to_default_device(graph)
         elif self.backend == "coo":
-            ... # TODO
+            ...  # TODO
         elif self.backend == "csr":
-            ... # TODO
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+
+            # Here we actually transpose adj matrix, that's why not
+            # rows = self.edge_index[0]
+            # cols = self.edge_index[1]
+            rows = self.edge_index[1]
+            cols = self.edge_index[0]
+            N = self.num_nodes
+
+            # Sort edges by (row, col) for a canonical CSR
+            perm = (rows * N + cols).argsort()
+            rows = rows[perm]
+            cols = cols[perm]
+            w = self.edge_weight[perm] if self.edge_weight is not None else None
+
+            # Build CSR row pointers
+            counts = torch.bincount(rows, minlength=N)
+            row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
+            row_ptr[1:] = counts.cumsum(0)
+
+            # Store graph as (row_pointers, column_indices, edge_weight) on default device
+            graph = (
+                self._to_int32(self._to_default_device(row_ptr)),
+                self._to_int32(self._to_default_device(cols)),
+                self._to_int32(self._to_default_device(w)),
+            )
+
         elif self.backend == "csc":
-            ... # TODO
+            ...  # TODO
         elif self.backend == "edge_list":
             edge_list = self.edge_index.T
             graph = (self._to_default_device(edge_list), self._to_default_device(self.edge_weight))
@@ -190,24 +238,32 @@ class GraphSample:
             pass
         return item
 
+    def _to_int32(self, item: Any) -> Any:
+        """If tensor, convert to int32"""
+        try:
+            item = item.to(torch.int32)
+        except Exception:
+            pass
+        return item
+
     @property
     def num_nodes(self) -> int:
         """Number of nodes N."""
-        return self.x.shape[0] # type: ignore
+        return self.x.shape[0]  # type: ignore
 
     @property
     def num_features(self) -> int:
         """Feature dimensionality F."""
-        return self.x.shape[1] # type: ignore
+        return self.x.shape[1]  # type: ignore
 
     @property
     def num_classes(self) -> int:
         """Number of classes if labels are class indices or one-hot."""
         if self.y.ndim == 1 and self.y.numel() > 0:
             # class indices -> infer max+1
-            return self.y.max().item() + 1 # type: ignore
+            return self.y.max().item() + 1  # type: ignore
         if self.y.ndim == 2:
-            return self.y.shape[1] # type: ignore
+            return self.y.shape[1]  # type: ignore
         assert False, "Unreachable"
 
     @property
@@ -221,6 +277,7 @@ class GraphSample:
 
 
 # ------------------------- Dataset wrapper (per split) ------------------------ #
+
 
 class SingleGraphDataset(Dataset):
     """Wrap a single large graph as a PyTorch Dataset, exposing one item.
@@ -288,7 +345,10 @@ class SingleGraphDataset(Dataset):
 
 # ------------------------------ Utility helpers ------------------------------ #
 
-def _masks_from_indices(num_nodes: int, splits: Dict[str, torch.Tensor]) -> Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+
+def _masks_from_indices(
+    num_nodes: int, splits: Dict[str, torch.Tensor]
+) -> Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
     """Create boolean masks from split index tensors.
 
     Args:
@@ -319,6 +379,7 @@ def _masks_from_indices(num_nodes: int, splits: Dict[str, torch.Tensor]) -> Tupl
 
 # ------------------------------- OGBN loaders -------------------------------- #
 
+
 def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
     """Load an ogbn-* node property prediction dataset as a single-graph sample.
 
@@ -333,6 +394,7 @@ def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") 
     Raises:
         ImportError: If OGB is not installed.
     """
+
     @ensure_cpu_device
     def _load_oggn_cpu():
         return NodePropPredDataset(name=name, root=root)
@@ -364,6 +426,7 @@ def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") 
 
 # ------------------------------- PyG loaders --------------------------------- #
 
+
 def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
     """Load a single-graph dataset from PyTorch Geometric.
 
@@ -385,6 +448,7 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         ImportError: If PyG is not installed.
         ValueError: If dataset cannot be loaded as a single graph.
     """
+
     @ensure_cpu_device
     def _load_pyg_cpu():
         if name in ("cora", "citeseer", "pubmed"):
@@ -393,12 +457,29 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         elif name in ("reddit",):
             dset = Reddit(root=root)
             data = dset[0]
-        elif name in ('hm-categories', 'pokec-regions', 'web-topics', 'tolokers-2', 'city-reviews', 'artnet-exp', 'web-fraud',
-                   'hm-prices', 'avazu-ctr','city-roads-M', 'city-roads-L', 'twitch-views', 'artnet-views', 'web-traffic'):
+        elif name in (
+            "hm-categories",
+            "pokec-regions",
+            "web-topics",
+            "tolokers-2",
+            "city-reviews",
+            "artnet-exp",
+            "web-fraud",
+            "hm-prices",
+            "avazu-ctr",
+            "city-roads-M",
+            "city-roads-L",
+            "twitch-views",
+            "artnet-views",
+            "web-traffic",
+        ):
             dset = GraphLandDataset(root=root, name=name, split="RL")
             data = dset[0]
         else:
-            raise ValueError(f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in torch_geometric.datasets.")
+            raise ValueError(
+                f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in "
+                "torch_geometric.datasets."
+            )
         return data
 
     data = _load_pyg_cpu()
@@ -432,6 +513,7 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
 
 
 # -------------------------------- DGL loaders -------------------------------- #
+
 
 def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
     """Load a single-graph dataset from DGL.
@@ -481,7 +563,6 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
     if edge_weight is not None:
         edge_weight = edge_weight.float()
 
-
     train_mask = g.ndata.get("train_mask", None)
     val_mask = g.ndata.get("val_mask", None)
     test_mask = g.ndata.get("test_mask", None)
@@ -499,7 +580,9 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         backend=graph_backend,
     )
 
+
 # ------------------------------ Public factories ----------------------------- #
+
 
 @dataclass
 class DatasetConfig:
@@ -511,10 +594,12 @@ class DatasetConfig:
         graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
         root (str): Download/cache directory.
     """
+
     source: str
     name: str
     graph_backend: GraphBackendOption
     root: str = "data"
+
 
 def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     """Load a canonical single-graph sample according to config.
@@ -536,7 +621,6 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     if s == "dgl":
         return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
     if s == "auto":
-
         # ogbn-* -> OGBN; else try PyG; then DGL.
         if cfg.name.lower().startswith("ogbn-"):
             return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
@@ -548,8 +632,9 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     raise KeyError(f"Unsupported dataset source '{cfg.source}'")
 
 
-def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left", "right", "both", "none"],
-                  add_self_loops: bool = True) -> torch.Tensor:
+def normalize_adj(
+    edge_index: torch.Tensor, num_nodes: int, how: Literal["left", "right", "both", "none"], add_self_loops: bool = True
+) -> torch.Tensor:
     """Compute symmetric normalized adjacency (A_hat) as sparse COO.
 
     Args:
@@ -597,11 +682,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
 
         values = torch.ones(edge_index.size(1), device=device)
         adj_t_indices = torch.stack([dst, src], dim=0)
-        adj_t = torch.sparse_coo_tensor(
-            adj_t_indices,
-            values,
-            (num_nodes, num_nodes)
-        ).coalesce()
+        adj_t = torch.sparse_coo_tensor(adj_t_indices, values, (num_nodes, num_nodes)).coalesce()
 
         in_degrees = torch.zeros(num_nodes, device=device)
         in_degrees.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
@@ -611,11 +692,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
 
         in_degree_inv = 1.0 / in_degrees
         diag_indices = torch.arange(num_nodes, device=device).unsqueeze(0).repeat(2, 1)
-        in_degree_inv_diag = torch.sparse_coo_tensor(
-            diag_indices,
-            in_degree_inv,
-            (num_nodes, num_nodes)
-        ).coalesce()
+        in_degree_inv_diag = torch.sparse_coo_tensor(diag_indices, in_degree_inv, (num_nodes, num_nodes)).coalesce()
 
         adj_t_normalized = in_degree_inv_diag @ adj_t
         return adj_t_normalized
@@ -629,15 +706,12 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
 
         values = torch.ones(edge_index.size(1), device=device)
         adj_t_indices = torch.stack([dst, src], dim=0)
-        adj_t = torch.sparse_coo_tensor(
-            adj_t_indices,
-            values,
-            (num_nodes, num_nodes)
-        ).coalesce()
+        adj_t = torch.sparse_coo_tensor(adj_t_indices, values, (num_nodes, num_nodes)).coalesce()
 
         return adj_t
     else:
         raise ValueError(f"Normalization type {how} is inappropriate")
+
 
 def get_cugraph_with_gcn_weights(
     edge_index: EdgeIndex,
@@ -652,10 +726,9 @@ def get_cugraph_with_gcn_weights(
 
     """
     if not isinstance(edge_index, EdgeIndex):
-        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' "
-                            f"(got {type(edge_index)})")
+        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' " f"(got {type(edge_index)})")
 
-    edge_index = edge_index.sort_by('col')[0]
+    edge_index = edge_index.sort_by("col")[0]
     num_src_nodes = edge_index.get_sparse_size(0)
     (colptr, row), _ = edge_index.get_csc()
 
