@@ -136,7 +136,7 @@ class GraphSample:
             graph = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='right', add_self_loops=self.add_self_loops)
             graph = self._to_default_device(graph)
         elif self.backend == "cugraph":
-            normalized_gcn_adjacency = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=True)
+            normalized_gcn_adjacency = normalize_adj(edge_index=self.edge_index, num_nodes=self.num_nodes, how='both', add_self_loops=self.add_self_loops)
             edge_index = normalized_gcn_adjacency.indices().tolist()
             edge_weights_for_gcn = normalized_gcn_adjacency.values()
             edge_index_for_pyg = EdgeIndex(edge_index, sparse_size=(self.num_nodes, self.num_nodes), sort_order='row', is_undirected=False, device=torch.get_default_device())
@@ -544,7 +544,7 @@ def normalize_adj(edge_index: torch.Tensor, num_nodes: int, how: Literal["left",
         torch.Tensor: Sparse COO adjacency with added self-loops and:
             - D^{-1/2} A D^{-1/2} normalization if `how` == "both".
             - D_in^{-1} A^T normalization if `how` == "right" -- normalization for mean-aggregation
-            - ...
+            - A if `how` == "none" -- normalization for adj-mat backend
     """
     device = edge_index.device
     idx = edge_index
