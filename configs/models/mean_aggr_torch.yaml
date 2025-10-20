@@ -6,7 +6,7 @@ encoder:
   layers:
     - layer_type: residual_block
       conv_type: mean_aggr
-      backend: torch_native_meanaggr
+      backend: torch_native_mean_aggr
       in_channels: auto   # inferred from dataset feature dim
       out_channels: 128
       norm: batch
@@ -16,7 +16,7 @@ encoder:
       conv_kwargs: {}
     - layer_type: residual_block
       conv_type: mean_aggr
-      backend: torch_native_meanaggr
+      backend: torch_native_mean_aggr
       in_channels: auto   # inferred from previous layer
       out_channels: 128
       norm: batch

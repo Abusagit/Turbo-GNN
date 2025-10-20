@@ -13,20 +13,23 @@ DGL backend: wraps dgl.nn layers behind the BaseBackend interface.
 """
 
 
-class _DglGCNConv(BaseConvolution):
-    """DGL-backed GCNConv wrapper."""
+class _DglGraphConv(BaseConvolution):
+    """DGL-backed GraphConv wrapper."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
-        """Initialize a GCN layer using DGL.
+    def __init__(self, in_channels: int, out_channels: int, norm: str, bias: bool = False, **kwargs: Any) -> None:
+        """Initialize a GraphConv layer using DGL.
 
         Args:
             in_channels (int): Input feature size.
             out_channels (int): Output feature size.
+            norm (str): How to apply the normalizer.
             bias (bool): Include bias.
-            **kwargs (Any): DGL GraphConv kwargs (norm, weight, ...).
+            **kwargs (Any): DGL GraphConv kwargs (weight, ...).
         """
         super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-        self._conv = GraphConv(in_channels, out_channels, weight=False, bias=False, allow_zero_in_degree=True, **kwargs)
+        self._conv = GraphConv(
+            in_channels, out_channels, norm=norm, weight=False, bias=False, allow_zero_in_degree=True, **kwargs
+        )
 
     def forward(
         self,
@@ -129,7 +132,7 @@ class _DGLMaxAggrConv(BaseConvolution):
 class _DGLGATv2Conv(BaseConvolution):
     """DGL-backed GATv2Conv wrapper."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a GATv2 layer using DGL.
 
         Args:
@@ -193,12 +196,17 @@ class DglBackend(BaseBackend):
             BaseConvolution: An instance of the requested DGL conv.
         """
         ct = conv_type.lower()
-        if ct == "gcn":
-            return _DglGCNConv(in_channels, out_channels, **kwargs)
-        if ct == "gat":
-            return _DGLGATv2Conv(in_channels, out_channels, **kwargs)
-        if ct == "min_aggr":
-            return _DGLMinAggrConv(in_channels, out_channels, **kwargs)
-        if ct == "max_aggr":
-            return _DGLMaxAggrConv(in_channels, out_channels, **kwargs)
+        match ct:
+            case "min_aggr":
+                return _DGLMinAggrConv(in_channels, out_channels, **kwargs)
+            case "max_aggr":
+                return _DGLMaxAggrConv(in_channels, out_channels, **kwargs)
+            case "gcn":
+                return _DglGraphConv(in_channels, out_channels, norm="both", **kwargs)
+            case "mean_aggr":
+                return _DglGraphConv(in_channels, out_channels, norm="right", **kwargs)
+            case "sum_aggr":
+                return _DglGraphConv(in_channels, out_channels, norm="none", **kwargs)
+            case "gat":
+                return _DGLGATv2Conv(in_channels, out_channels, **kwargs)
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")

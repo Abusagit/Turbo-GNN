@@ -1,4 +1,4 @@
 dataset:
   source: pyg
-  name: cora
+  name: tolokers-2
   root: data

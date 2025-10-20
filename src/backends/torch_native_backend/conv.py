@@ -11,48 +11,11 @@ Torch-native backend: reference implementations using PyTorch sparse/dense ops.
 """
 
 
-class _TorchNativeGCNConv(BaseConvolution):
-    """Reference GCN using sym-normalized adjacency and sparse matmul."""
+class _TorchNativeMatMulConv(BaseConvolution):
+    """Reference GraphConv using modified adjacency and sparse matmul."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
-        """Initialize a Torch-native GCN.
-
-        Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
-            bias (bool): Include bias in linear transform.
-            **kwargs (Any): Reserved for future options.
-        """
-        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        graph: Any,
-        *,
-        edge_weight: torch.Tensor | None = None,  # ignored for baseline
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        """Apply GCN: X' = A_hat @ (X W).
-
-        Args:
-            x (torch.Tensor): Node features [N, Fin].
-            graph (Any): Either (edge_index, num_nodes) or (edge_index, edge_weight) or (edge_index, ew, num_nodes).
-            edge_weight (Optional[torch.Tensor]): Unused baseline.
-            **kwargs (Any): Extra kwargs ignored.
-
-        Returns:
-            torch.Tensor: Output features [N, Fout].
-        """
-        normalized_adgacency = graph
-        return torch.sparse.mm(normalized_adgacency, x)
-
-
-class _TorchNativeMeanConv(BaseConvolution):
-    """Reference GNN convolution using mean aggregation of incoming neighbors."""
-
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, **kwargs: Any) -> None:
-        """Initialize a Torch-native mean aggregation convolution.
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, **kwargs: Any) -> None:
+        """Initialize a Torch-native GraphConv.
 
         Args:
             in_channels (int): Input feature size.
@@ -68,27 +31,50 @@ class _TorchNativeMeanConv(BaseConvolution):
         x: torch.Tensor,
         graph: Any,
         *,
-        edge_weight: torch.Tensor | None = None,
+        edge_weight: torch.Tensor | None = None,  # ignored for baseline
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Apply mean aggregation convolution: X' = D_in^{-1} @ A^T @ (X @ W).
+        """Apply GraphConv: X' = A_hat @ (X W).
 
         Args:
             x (torch.Tensor): Node features [N, Fin].
-            graph (Any): Tuple of (adj_matrix_transposed, in_degree_inv_diag) where:
-                - adj_mat_normalized_by_in_degree_transposed: sparse COO tensor [N, N] (A^T),
-                normalized by in-degree before transposition
-            edge_weight (Optional[torch.Tensor]): Unused for this baseline.
+            graph (Any): Either (edge_index, num_nodes) or (edge_index, edge_weight) or (edge_index, ew, num_nodes).
+            edge_weight (Optional[torch.Tensor]): Unused baseline.
             **kwargs (Any): Extra kwargs ignored.
 
         Returns:
             torch.Tensor: Output features [N, Fout].
         """
-        adj_mat_normalized_by_in_degree_transposed = graph
+        modified_adgacency = graph
+        return torch.sparse.mm(modified_adgacency, x)
 
-        out = torch.sparse.mm(adj_mat_normalized_by_in_degree_transposed, x)
 
-        return out
+class TorchNativeMatMulBackend(BaseBackend):
+    """Backend instantiating simple Torch-native MatMul GNN convs."""
+    CONV_TYPE: Optional[str] = None
+
+    def create_conv(
+        self,
+        conv_type: str,
+        in_channels: int,
+        out_channels: int,
+        **kwargs: Any,
+    ):
+        """Factory for Torch-native matmul convs.
+
+        Args:
+            conv_type (str): {CONV_TYPE} supported (extend as needed).
+            in_channels (int): Input feature size.
+            out_channels (int): Output feature size.
+            **kwargs (Any): Extra kwargs.
+
+        Returns:
+            BaseConvolution: Torch-native convolution layer.
+        """
+        # guard unsupported backends
+        if conv_type == self.CONV_TYPE:
+            return _TorchNativeMatMulConv(in_channels, out_channels, **kwargs)
+        raise NotImplementedError(f"Convolution `{conv_type}` is not implemented for backend {self.__class__.__name__}")
 
 
 class _TorchNativeMinConv(BaseConvolution):
@@ -182,35 +168,6 @@ class _TorchNativeMaxConv(BaseConvolution):
         out[out.isinf()] = 0.0
         return out
 
-
-@BackendRegistry.register_backend("torch_native_gcn")
-class TorchNativeBackend(BaseBackend):
-    """Backend instantiating simple Torch-native GNN convs."""
-
-    def create_conv(
-        self,
-        conv_type: str,
-        in_channels: int,
-        out_channels: int,
-        **kwargs: Any,
-    ):
-        """Factory for Torch-native convs.
-
-        Args:
-            conv_type (str): 'gcn' supported (extend as needed).
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
-            **kwargs (Any): Extra kwargs.
-
-        Returns:
-            BaseConvolution: Torch-native convolution layer.
-        """
-        # guard unsupported backends
-        if conv_type == "gcn":
-            return _TorchNativeGCNConv(in_channels, out_channels, **kwargs)
-        raise NotImplementedError(f"Convolution `{conv_type}` is not implemented for backend {self.__class__.__name__}")
-
-
 @BackendRegistry.register_backend("torch_native_adj_mat")
 class TorchNativeAdjMatBackend(BaseBackend):
     """Factory for Torch-native pooling GNN convs."""
@@ -240,29 +197,21 @@ class TorchNativeAdjMatBackend(BaseBackend):
             return _TorchNativeMaxConv(in_channels, out_channels, **kwargs)
         raise NotImplementedError(f"Convolution `{conv_type}` is not implemented for backend {self.__class__.__name__}")
 
+@BackendRegistry.register_backend("torch_native_gcn")
+class TorchNativeGCNBackend(TorchNativeMatMulBackend):
+    """Backend instantiating simple Torch-native GCN convs."""
 
-@BackendRegistry.register_backend("torch_native_meanaggr")
-class TorchNativeMeanBackend(BaseBackend):
+    CONV_TYPE = "gcn"
+
+@BackendRegistry.register_backend("torch_native_mean_aggr")
+class TorchNativeMeanAggrBackend(TorchNativeMatMulBackend):
     """Backend instantiating simple Torch-native mean aggregation convs."""
 
-    def create_conv(
-        self,
-        conv_type: str,
-        in_channels: int,
-        out_channels: int,
-        **kwargs: Any,
-    ):
-        """Factory for Torch-native mean aggregation convs.
+    CONV_TYPE = "mean_aggr"
 
-        Args:
-            conv_type (str): 'gcn' supported (mean aggregation variant).
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
-            **kwargs (Any): Extra kwargs.
 
-        Returns:
-            BaseConvolution: Torch-native mean aggregation convolution layer.
-        """
-        if conv_type == "mean_aggr":
-            return _TorchNativeMeanConv(in_channels, out_channels, **kwargs)
-        raise NotImplementedError(f"Convolution `{conv_type}` is not implemented for backend {self.__class__.__name__}")
+@BackendRegistry.register_backend("torch_native_sum_aggr")
+class TorchNativeSumAggrBackend(TorchNativeMatMulBackend):
+    """Backend instantiating simple Torch-native sum aggregation convs."""
+
+    CONV_TYPE = "sum_aggr"
