@@ -1,7 +1,12 @@
-from .conv import TorchNativeBackend
+from .conv import TorchNativeAdjMatBackend, TorchNativeGCNBackend, TorchNativeMeanAggrBackend, TorchNativeSumAggrBackend
 
 doc = """
 Torch-native backend (edge-index + torch.sparse CSR/COO baselines).
 """
 
-__all__ = ["TorchNativeBackend"]
+__all__ = [
+    "TorchNativeGCNBackend",
+    "TorchNativeMeanAggrBackend",
+    "TorchNativeSumAggrBackend",
+    "TorchNativeAdjMatBackend",
+]

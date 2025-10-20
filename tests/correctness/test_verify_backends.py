@@ -12,11 +12,6 @@ import pytest
 import torch
 import yaml
 
-# pytest: keep imports identical; we only add assertions so failures fail
-# (no deletions or large refactors)
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, "./")
-
 from src.backends.registry import BackendRegistry
 from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
 
@@ -54,7 +49,7 @@ def test_dataset_loading():
     print("=" * 60)
 
     test_configs = [
-        DatasetConfig(source="pyg", name="Cora", root="data", graph_backend="pyg"),
+        DatasetConfig(source="pyg", name="cora", root="data", graph_backend="pyg"),
         DatasetConfig(source="dgl", name="cora", root="data", graph_backend="pyg"),
         DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data", graph_backend="pyg"),  # Large dataset
     ]
@@ -89,17 +84,20 @@ def test_backend_convolutions():
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     x = torch.randn(num_nodes, in_channels, device=device, requires_grad=True)
 
-    backends_to_test = ["pyg", "dgl", "torch_native_gcn"]
-    conv_types = ["gcn"]
+    backends_to_test = ["pyg", "dgl", "torch_native"]
+    conv_types = ["gcn", "mean_aggr", "sum_aggr"]
 
     results = {}
 
-    for backend_name in backends_to_test:
-        print(f"\n{backend_name.upper()} Backend:")
+    for _backend_name in backends_to_test:
         try:
-            backend = BackendRegistry.get_backend(backend_name)
-
             for conv_type in conv_types:
+                if _backend_name == "torch_native":
+                    backend_name = f"{_backend_name}_{conv_type}"
+                else:
+                    backend_name = _backend_name
+                print(f"\n{backend_name.upper()} Backend:")
+                backend = BackendRegistry.get_backend(backend_name)
                 try:
                     # Create convolution
                     conv = backend.create_conv(conv_type, in_channels, out_channels, bias=True).to(device)

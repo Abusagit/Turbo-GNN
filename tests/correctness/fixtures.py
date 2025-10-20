@@ -3,9 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from torch_geometric.utils import add_self_loops
 
 import src.backends.dgl_backend  # noqa: F401
 import src.backends.pyg_backend  # noqa: F401
@@ -58,6 +56,10 @@ def small_graph_data(device):
 
     # Expected mean for center node (receives from nodes 1-9)
     expected_center_mean = torch.arange(1, num_nodes, device=device, dtype=torch.float32).mean()
+    expected_min = torch.zeros((num_nodes, in_channels), device=device, dtype=torch.float32)
+    expected_min[0, :] = 1
+    expected_max = torch.zeros((num_nodes, in_channels), device=device, dtype=torch.float32)
+    expected_max[0, :] = num_nodes - 1
 
     return {
         "num_nodes": num_nodes,
@@ -65,6 +67,148 @@ def small_graph_data(device):
         "features": features,
         "in_channels": in_channels,
         "expected_center_mean": expected_center_mean,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
+        "device": device,
+    }
+
+
+@pytest.fixture
+def fully_connected_on_3_vertices_data(device):
+    """
+    Create a simple fully connected graph (Kn) for testing.
+
+    Structure: Nodes 0, 1, ... , n are all interconnected and pass messages to each other
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features, and expected results
+    """
+
+    num_nodes = 3
+    in_channels = 16
+
+    row, col = torch.meshgrid(
+        torch.arange(num_nodes, device=device), torch.arange(num_nodes, device=device), indexing="ij"
+    )
+
+    mask = row != col
+    edge_index = torch.stack([row[mask], col[mask]], dim=0)
+
+    features = torch.arange(num_nodes, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+
+    expected_min = torch.zeros((num_nodes, in_channels), device=device, dtype=torch.float32)
+    expected_min[0, :] = 1
+    expected_max = torch.ones((num_nodes, in_channels), device=device, dtype=torch.float32) * (num_nodes - 1)
+    expected_max[num_nodes - 1, :] = num_nodes - 2
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
+        "device": device,
+    }
+
+
+@pytest.fixture
+def empty_graph_data(device):
+    """
+    Create an empty graph for crash testing.
+
+    Structure: No nodes. No edges.
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features, and expected results
+    """
+
+    num_nodes = 0
+    in_channels = 16
+
+    edge_index = (
+        [torch.tensor([], device=device, dtype=torch.float32)],
+        [torch.tensor([], device=device, dtype=torch.float32)],
+    )
+
+    features = torch.empty((num_nodes, in_channels), device=device, dtype=torch.float32)
+
+    expected_min = torch.tensor([], device=device, dtype=torch.float32)
+    expected_max = torch.tensor([], device=device, dtype=torch.float32)
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
+        "device": device,
+    }
+
+
+@pytest.fixture
+def connectivity_component_and_isolated_vertice_data(device):
+    """
+    Create a simple graph to test nothing leaks to isolated vertices
+
+    Structure: Nodes 0, 1 are bidirectionally connected to each other, node 2 is isolated.
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features, and expected results
+    """
+
+    num_nodes = 3
+    in_channels = 16
+
+    # Star graph: nodes 1-9 -> node 0
+    src = torch.tensor([0, 1], dtype=torch.long, device=device)
+    dst = torch.tensor([1, 0], dtype=torch.long, device=device)
+    edge_index = torch.stack([src, dst], dim=0)
+
+    # Node i has feature value i everywhere (for easy verification)
+    features = torch.arange(1, num_nodes + 1, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+
+    # Expected mean for center node (receives from nodes 1-9)
+    expected_min = torch.tensor([2.0, 1.0, 0.0], device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+    expected_max = expected_min
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "expected_min": expected_min,
+        "expected_max": expected_max,
+        "device": device,
+    }
+
+
+@pytest.fixture
+def small_undirected_cylce_data(device):
+    """
+    Create a simple cycle graph for testing.
+
+    Returns:
+        dict: Contains num_nodes, edge_index, features
+    """
+    num_nodes = 5
+    in_channels = 2
+
+    src1 = torch.arange(0, num_nodes, device=device)
+    dst1 = (src1 + 1) % num_nodes
+    src2 = src1.clone()
+    dst2 = (src2 + num_nodes - 1) % num_nodes
+    edge_index = torch.stack([torch.concat((src1, src2)), torch.concat((dst1, dst2))], dim=0)
+
+    # Node i has feature value i everywhere (for easy verification)
+    features = torch.arange(num_nodes, device=device, dtype=torch.float32).unsqueeze(1).repeat(1, in_channels)
+
+    return {
+        "num_nodes": num_nodes,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
         "device": device,
     }
 
@@ -98,7 +242,8 @@ def random_graph_data(device):
 def karate_like_club_graph(device):
     """
     Create Zachary's Karate Club graph (classic small social network).
-    34 nodes, 78 edges (undirected, so 156 directed edges).
+    34 nodes, 78 edges (undirected, so 156 directed edges)
+    + added self-loops for batter consistency with GraphSample dataclass
 
     Returns:
         dict: Contains num_nodes, edge_index, and features
@@ -193,8 +338,8 @@ def karate_like_club_graph(device):
         dst_list.extend([v, u])
 
     num_nodes = 34
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long, device=device)
-
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_index = edge_index.to(device=device)
     # Random features
     in_channels = 16
     features = torch.randn(num_nodes, in_channels, device=device)
@@ -208,7 +353,7 @@ def karate_like_club_graph(device):
     }
 
 
-@pytest.fixture(params=["torch_native_meanaggr", "pyg", "dgl"])
+@pytest.fixture(params=["torch_native_mean_aggr", "pyg", "dgl"])
 def graph_backend(request):
     """Parametrized fixture for different graph backends."""
     return request.param
@@ -227,7 +372,7 @@ def create_graph_sample(set_default_device):
         )
     """
 
-    def _create(edge_index, features, backend, num_nodes=None):
+    def _create(edge_index, features, backend, num_nodes=None, add_self_loops=True):
         if num_nodes is None:
             num_nodes = features.shape[0]
 
@@ -236,6 +381,7 @@ def create_graph_sample(set_default_device):
             x=features,
             y=torch.zeros(num_nodes, device=features.device),
             edge_index=edge_index,
+            add_self_loops=add_self_loops,
         )
 
     return _create
@@ -248,7 +394,7 @@ def create_conv_layer(set_default_device):
 
     Usage:
         conv = create_conv_layer(
-            backend_name="torch_native_meanaggr",
+            backend_name="torch_native_mean_aggr",
             conv_type="gcn",
             in_channels=16,
             out_channels=32
@@ -272,7 +418,7 @@ def identity_weight_conv(create_conv_layer, set_default_device):
 
     Usage:
         conv = identity_weight_conv(
-            backend_name="torch_native_meanaggr",
+            backend_name="torch_native_mean_aggr",
             conv_type="gcn",
             in_channels=16,
             out_channels=16
