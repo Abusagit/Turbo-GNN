@@ -116,6 +116,8 @@ class _DglGraphTransformer(BaseConvolution):
         self.k_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
         self.v_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
 
+        self.attn_scores_multiplier = 1 / torch.tensor(self.hidden_dim // num_heads).sqrt()
+
         self.layer_norm = nn.LayerNorm(self.hidden_dim)
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
@@ -135,6 +137,7 @@ class _DglGraphTransformer(BaseConvolution):
 
         attn_scores = ops.e_add_v(graph, edge_placeholder, k)
         attn_scores = ops.e_dot_v(graph, attn_scores, q)
+        attn_scores = attn_scores * self.attn_scores_multiplier
         attn_probs = F.edge_softmax(graph, attn_scores)
 
         hidden = ops.u_mul_e_sum(graph, v, attn_probs).view(n, -1)
