@@ -131,10 +131,7 @@ class _DglGraphTransformer(BaseConvolution):
         k = k.view(n, self.num_heads, -1)
         v = v.view(n, self.num_heads, -1)
 
-        edge_placeholder = torch.zeros(e, self.hidden_dim, dtype=x.dtype, device=x.device).view(e, self.num_heads, -1)
-
-        attn_scores = ops.e_add_v(graph, edge_placeholder, k)
-        attn_scores = ops.e_dot_v(graph, attn_scores, q)
+        attn_scores = ops.u_dot_v(graph, q, k)
         attn_scores = attn_scores * self.attn_scores_multiplier
         attn_probs = F.edge_softmax(graph, attn_scores)
 
