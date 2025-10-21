@@ -118,8 +118,6 @@ class _DglGraphTransformer(BaseConvolution):
 
         self.attn_scores_multiplier = 1 / torch.tensor(self.hidden_dim // num_heads).sqrt()
 
-        self.layer_norm = nn.LayerNorm(self.hidden_dim)
-
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         # get node features
         n = graph.num_nodes()
@@ -142,7 +140,6 @@ class _DglGraphTransformer(BaseConvolution):
 
         hidden = ops.u_mul_e_sum(graph, v, attn_probs).view(n, -1)
 
-        hidden = self.layer_norm(hidden)
         torch.nn.functional.relu(hidden, inplace=True)
         return hidden
 
