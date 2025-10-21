@@ -8,9 +8,13 @@ path = __file__.replace("utils.py", "")
 sources = ["cusparse_spmm.cpp", "edge_norm_kernels.cu"]
 
 repo_root_path = Path(__file__).parent.parent.parent.parent
+build_path = repo_root_path / "build/cusparse"
+if not build_path.is_dir():
+    build_path.mkdir(parents=True)
 
 cuda_kernels = load(
     name="cuda_kernels",
+    build_directory=str(build_path),
     extra_cflags=["-O3"],
     extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_80", "--generate-line-info", "-lcusparse"],
     extra_include_paths=glob.glob(

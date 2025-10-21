@@ -8,6 +8,8 @@ dataset/*
 
 /data/
 
+/build/
+
 runs/
 
 .venv/*
