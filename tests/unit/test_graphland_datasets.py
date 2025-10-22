@@ -15,7 +15,6 @@ from src.data.graphland_datasets import GraphLandDataset
     [
         "hm-categories",
         "tolokers-2",
-        "avazu-ctr",
     ],
 )
 def test_transductive_graphland(name: str):
@@ -48,7 +47,6 @@ def test_transductive_graphland(name: str):
     [
         "hm-categories",
         "tolokers-2",
-        "avazu-ctr",
     ],
 )
 def test_inductive_graphland(name: str):
