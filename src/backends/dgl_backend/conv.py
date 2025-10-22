@@ -121,7 +121,6 @@ class _DglGraphTransformer(BaseConvolution):
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         # get node features
         n = graph.num_nodes()
-        e = graph.num_edges()
 
         q = self.q_proj(x)
         k = self.k_proj(x)
