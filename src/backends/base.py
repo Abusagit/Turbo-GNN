@@ -126,11 +126,3 @@ class BaseConvolution(nn.Module):
             Output node features of shape [num_nodes, feature_dim]
         """
         pass
-
-    def extra_repr(self) -> str:
-        """Get extra representation string for printing.
-
-        Returns:
-            String representation of layer configuration
-        """
-        return f"bias={self.use_bias}, " f"cached={self.cached}, " f"normalize={self.normalize}"

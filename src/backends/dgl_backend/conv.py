@@ -191,9 +191,7 @@ class _DglGraphTransformer(BaseConvolution):
         self.feature_dim = feature_dim
         self.num_heads = heads
 
-        self.q_proj = nn.Linear(self.feature_dim, self.feature_dim)
-        self.k_proj = nn.Linear(self.feature_dim, self.feature_dim)
-        self.v_proj = nn.Linear(self.feature_dim, self.feature_dim)
+        self.qkv_proj = nn.Linear(self.feature_dim, 3 * self.feature_dim)
 
         self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.feature_dim // self.num_heads))
 
@@ -201,9 +199,8 @@ class _DglGraphTransformer(BaseConvolution):
         # get node features
         n = graph.num_nodes()
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        qkv: torch.Tensor = self.qkv_proj(x)
+        q, k, v = qkv.split(self.feature_dim, -1)
 
         q = q.view(n, self.num_heads, -1)
         k = k.view(n, self.num_heads, -1)
