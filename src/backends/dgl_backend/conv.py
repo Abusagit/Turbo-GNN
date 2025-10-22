@@ -227,7 +227,7 @@ class DglBackend(BaseBackend):
         """Factory for DGL convolution layers.
 
         Args:
-            conv_type (str): 'gcn' or 'gat' currently. (Extend with GIN/SAGE as needed.)
+            conv_type (str): 'gcn' or 'gat_v2' currently. (Extend with GIN/SAGE as needed.)
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments for DGL layers.
 
@@ -248,7 +248,7 @@ class DglBackend(BaseBackend):
                 return _DglGraphConv(feature_dim=feature_dim, norm="right")
             case "sum_aggr":
                 return _DglGraphConv(feature_dim=feature_dim, norm="none")
-            case "gat":
+            case "gat_v2":
                 heads = kwargs.pop("heads")
                 return _DGLGATv2Conv(feature_dim=feature_dim, heads=heads)
             case "gt":

@@ -13,7 +13,7 @@ Cugraph Backend: implementations using `pylibcugraph` library.
 
 
 class _CugraphGATv2Conv(BaseConvolution):
-    """GAT conv with CuGraph backend"""
+    """GATv2 conv with CuGraph backend"""
 
     def __init__(self, feature_dim: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a Torch-native GCN.
@@ -215,7 +215,7 @@ class CugraphBackend(BaseBackend):
             return _SimpleAggrGraphConv(aggr_type="max", use_edge_weights=False)
         if conv_type == "gcn":
             return _SimpleAggrGraphConv(aggr_type="sum", use_edge_weights=True)
-        if conv_type == "gat":
+        if conv_type == "gat_v2":
             return _CugraphGATv2Conv(feature_dim)
         if conv_type == "graph_transformer":
             raise NotImplementedError("mha_simple_n2n is broken and doesn't work with correct inputs")

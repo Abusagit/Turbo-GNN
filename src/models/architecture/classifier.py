@@ -34,7 +34,7 @@ class NodeClassifier(nn.Module):
 
         # infer encoder output dim from last layer
         last = spec.encoder.layers[-1]
-        out_dim = int(last.out_channels if last.conv_type != "gat" else last.out_channels * max(1, last.heads))
+        out_dim = int(last.out_channels if last.conv_type != "gat_v2" else last.out_channels * max(1, last.heads))
         self.dropout = nn.Dropout(p=spec.dropout) if spec.dropout and spec.dropout > 0.0 else nn.Identity()
         self.head = nn.Linear(out_dim, spec.num_classes, bias=True)
 

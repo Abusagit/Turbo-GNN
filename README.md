@@ -102,7 +102,7 @@ This framework addresses the critical challenge of accelerating Graph Neural Net
 │   │   └── loaders.py      # DataLoader builders
 │   ├── models/             # Model components
 │   │   ├── architecture/   # High-level architectures
-│   │   ├── layers/         # Layer blocks (GCN, GAT, SAGE, GIN)
+│   │   ├── layers/         # Layer blocks (GCN, GATv2, SAGE, GIN)
 │   │   ├── base.py        # Model specifications
 │   │   ├── config.py      # YAML-based model building
 │   │   └── registry.py    # Model registration
@@ -203,7 +203,7 @@ python scripts/validate.py \
 
 ### Backend System
 
-The framework uses a **registry pattern** to manage different backend implementations. Each backend provides convolution layers (GCN, GAT, GraphSAGE, GIN) with consistent interfaces.
+The framework uses a **registry pattern** to manage different backend implementations. Each backend provides convolution layers (GCN, GATv2, GraphSAGE, GIN) with consistent interfaces.
 
 **Available Backends:**
 - `pyg`: PyTorch Geometric
@@ -339,7 +339,7 @@ dataset:
 Models support **auto-inference** of `in_channels` from the dataset and previous layers.
 
 **Key Fields:**
-- `conv_type`: `gcn`, `gat`, `sage`, `gin`
+- `conv_type`: `gcn`, `gat_v2`, `sage`, `gin`
 - `backend`: Backend name (must be registered)
 - `in_channels`: Input features (use `auto` for inference)
 - `out_channels`: Output features

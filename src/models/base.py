@@ -21,7 +21,7 @@ class LayerSpec:
 
     Attributes:
         layer_type (Literal['residual_block']): Type of encoder block
-        conv_type (Literal['gcn','gat','sage','gin']): Convolution type.
+        conv_type (Literal['gcn','gat_v2','sage','gin']): Convolution type.
         backend (str): Backend name ('pyg','dgl','torch_native', ...).
         in_channels (int): Input feature size.
         out_channels (int): Output feature size.
@@ -35,7 +35,7 @@ class LayerSpec:
     """
 
     layer_type: Literal["redisual_block"]
-    conv_type: Literal["gcn", "gat", "sage", "gin"]
+    conv_type: Literal["gcn", "gat_v2", "sage", "gin"]
     backend: str
     in_channels: int
     out_channels: int

@@ -7,7 +7,7 @@ from ..base import EncoderSpec
 from ..layers import ResidualBlock
 
 doc = """
-GNNEncoder: stacks typed layer blocks (GCN/GAT/SAGE/GIN) per EncoderSpec.
+GNNEncoder: stacks typed layer blocks (GCN/GATv2/SAGE/GIN) per EncoderSpec.
 """
 
 
