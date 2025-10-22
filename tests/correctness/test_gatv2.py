@@ -35,7 +35,7 @@ def test_pyg_vs_dgl_graph(karate_like_club_graph, heads):
     dgl_backend = BackendRegistry.get_backend("dgl")
 
     pyg_layer = pyg_backend.create_conv(
-        "gat",
+        "gat_v2",
         feature_dim=feature_dim,
         heads=heads,
         add_self_loops=False,
@@ -50,7 +50,7 @@ def test_pyg_vs_dgl_graph(karate_like_club_graph, heads):
     pyg_layer._conv.att.data = torch.ones_like(pyg_layer._conv.att.data)
 
     dgl_layer = dgl_backend.create_conv(
-        "gat",
+        "gat_v2",
         feature_dim=feature_dim,
         heads=heads,
         feat_drop=0.0,
@@ -93,7 +93,7 @@ def test_dgl_matches_tiny_graph():
     dgl_backend = BackendRegistry.get_backend("dgl")
 
     dgl_layer = dgl_backend.create_conv(
-        "gat",
+        "gat_v2",
         feature_dim=feature_dim,
         heads=heads,
         feat_drop=0.0,

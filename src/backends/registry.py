@@ -19,7 +19,7 @@ registration and factory methods for instantiation.
 
 The registry supports:
 - Multiple backend implementations (DGL, PyG, CUDA, etc.)
-- Multiple convolution types per backend (GCN, GAT, GraphSAGE, etc.)
+- Multiple convolution types per backend (GCN, GATv2, GraphSAGE, etc.)
 - Runtime backend availability checking
 - Factory methods for creating instances
 """
@@ -72,7 +72,7 @@ class BackendRegistry:
 
         Args:
             backend: Name of the backend this convolution belongs to
-            conv_type: Type of convolution (e.g., 'gcn', 'gat', 'sage')
+            conv_type: Type of convolution (e.g., 'gcn', 'gat_v2', 'sage')
 
         Returns:
             Decorator function that registers the convolution class

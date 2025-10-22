@@ -1,4 +1,4 @@
-# 2-layer GAT. Effective out of layer 1 = out_channels * heads (if concat=true).
+# 2-layer GATv2. Effective out of layer 1 = out_channels * heads (if concat=true).
 architecture: node_classifier
 num_classes: 0
 dropout: 0.5
@@ -6,19 +6,19 @@ dropout: 0.5
 encoder:
   layers:
     - layer_type: residual_block
-      conv_type: gat
-      backend: pyg
+      conv_type: gat_v2
+      backend: cugraph
       in_channels: auto
       out_channels: 16
       heads: 8
-      norm: layer
+      norm: batch
       activation: elu
       dropout: 0.6
       residual: false
-      conv_kwargs: {}      # last layer often concat=False
+      conv_kwargs: {}       # PyG GAT default is concat=True for hidden layers
     - layer_type: residual_block
-      conv_type: gat
-      backend: pyg
+      conv_type: gat_v2
+      backend: cugraph
       in_channels: auto
       out_channels: 7
       heads: 1
