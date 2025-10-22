@@ -1,0 +1,77 @@
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+from torch_geometric.testing import onlyOnline, withPackage
+
+from src.data.graphland_datasets import GraphLandDataset
+
+
+@onlyOnline
+@withPackage("pandas", "sklearn", "yaml")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "hm-categories",
+        "tolokers-2",
+    ],
+)
+def test_transductive_graphland(name: str):
+    dataset = GraphLandDataset(
+        root="./data",
+        split="RL",
+        name=name,
+        to_undirected=True,
+    )
+    assert len(dataset) == 1
+
+    data = dataset[0]
+    assert data.num_nodes == data.x.shape[0] == data.y.shape[0]
+
+    assert not (data.train_mask & data.val_mask & data.test_mask).any().item()
+
+    labeled_mask = data.train_mask | data.val_mask | data.test_mask
+    assert not torch.isnan(data.y[labeled_mask]).any().item()
+    assert not torch.isnan(data.x).any().item()
+
+    assert not (data.x_numerical_mask & data.x_fraction_mask & data.x_categorical_mask).any().item()
+
+    assert (data.x_numerical_mask | data.x_fraction_mask | data.x_categorical_mask).all().item()
+
+
+@onlyOnline
+@withPackage("pandas", "sklearn", "yaml")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "hm-categories",
+        "tolokers-2",
+    ],
+)
+def test_inductive_graphland(name: str):
+    base_data = GraphLandDataset(
+        root="./data",
+        split="TH",
+        name=name,
+        to_undirected=True,
+    )[0]
+    num_nodes = base_data.num_nodes
+    num_edges = base_data.num_edges
+    del base_data
+
+    dataset = GraphLandDataset(
+        root="./data",
+        split="THI",
+        name=name,
+        to_undirected=True,
+    )
+    assert len(dataset) == 3
+
+    data_train, data_val, data_test = dataset
+    assert num_nodes == data_test.num_nodes == data_test.node_id.shape[0]
+    assert num_edges == data_test.num_edges
+
+    assert not torch.isnan(data_train.y[data_train.mask]).any().item()
+    assert not torch.isnan(data_val.y[data_val.mask]).any().item()
+    assert not torch.isnan(data_test.y[data_test.mask]).any().item()

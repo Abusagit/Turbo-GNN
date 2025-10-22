@@ -86,9 +86,9 @@ def main() -> int:
     # conv
     backend = BackendRegistry.get_backend(args.backend)
     if args.layer != "gat":
-        conv = backend.create_conv(args.layer, args.in_ch, args.out_ch)
+        conv = backend.create_conv(args.layer, feature_dim=args.in_ch)
     else:
-        conv = backend.create_conv(args.layer, args.in_ch, args.out_ch, heads=args.heads)
+        conv = backend.create_conv(args.layer, feature_dim=args.in_ch, heads=args.heads)
 
     conv = conv.to(device)
 

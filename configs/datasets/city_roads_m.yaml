@@ -1,4 +1,4 @@
 dataset:
   source: pyg
-  name: cora
+  name: city-roads-M
   root: data

@@ -58,6 +58,10 @@ pyg = [
     "torch-spline-conv",
 ]
 
+cugraph = [
+    "pylibcugraphops-cu12",
+]
+
 dgl = [
     "dgl==2.4.0",
 ]
@@ -108,7 +112,7 @@ dev = [
 
 # All optional dependencies combined
 all = [
-    "gnn-benchmark[pyg,dgl,triton,cuda,viz,notebook,tracking]",
+    "gnn-benchmark[pyg,dgl,cugraph,triton,cuda,viz,notebook,tracking]",
 ]
 
 # Development with all features
@@ -288,7 +292,7 @@ exclude = [
     "__pycache__",
     "build",
     "dist",
-    "data",
+    "/data",
     "runs",
     "experiments",
     "__examples",
