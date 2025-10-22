@@ -1,7 +1,7 @@
 from typing import Any, Optional
 
-import dgl.nn.functional as F
 import dgl
+import dgl.nn.functional as F
 import torch
 import torch.nn as nn
 from dgl import ops
@@ -181,22 +181,21 @@ class _DglGraphTransformer(BaseConvolution):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        num_heads: int = 8,
-        bias: bool = True,
+        feature_dim: int,
+        heads: int = 8,
         **kwargs: Any,
     ) -> None:
-        super().__init__(feature_dim, num_heads, **kwargs)
+        super().__init__(feature_dim=feature_dim, heads=heads, **kwargs)
+
+        assert feature_dim % heads == 0, "hidden_dim must be divisible by num_heads"
         self.feature_dim = feature_dim
-        self.num_heads = num_heads
+        self.num_heads = heads
 
-        assert self.hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
-        self.q_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
-        self.k_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
-        self.v_proj = nn.Linear(in_channels, self.hidden_dim, bias=bias)
+        self.q_proj = nn.Linear(self.feature_dim, self.feature_dim)
+        self.k_proj = nn.Linear(self.feature_dim, self.feature_dim)
+        self.v_proj = nn.Linear(self.feature_dim, self.feature_dim)
 
-        self.attn_scores_multiplier = 1 / torch.tensor(self.hidden_dim // num_heads).sqrt()
+        self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.feature_dim // self.num_heads))
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         # get node features
@@ -211,7 +210,7 @@ class _DglGraphTransformer(BaseConvolution):
         v = v.view(n, self.num_heads, -1)
 
         attn_scores = ops.u_dot_v(graph, q, k)
-        attn_scores = attn_scores * self.attn_scores_multiplier
+        attn_scores *= self.attn_scores_multiplier
         attn_probs = F.edge_softmax(graph, attn_scores)
 
         hidden = ops.u_mul_e_sum(graph, v, attn_probs).view(n, -1)
@@ -253,8 +252,9 @@ class DglBackend(BaseBackend):
             case "sum_aggr":
                 return _DglGraphConv(feature_dim=feature_dim, norm="none")
             case "gat":
-                return _DGLGATv2Conv(feature_dim=feature_dim)
+                heads = kwargs.pop("heads")
+                return _DGLGATv2Conv(feature_dim=feature_dim, heads=heads)
             case "gt":
-                num_heads = kwargs["num_heads"]
-                return _DglGraphTransformer(feature_dim=feature_dim, num_heads=num_heads, **kwargs)
+                heads = kwargs.pop("heads")
+                return _DglGraphTransformer(feature_dim=feature_dim, heads=heads)
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")

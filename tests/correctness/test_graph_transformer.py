@@ -16,7 +16,7 @@ class TestGraphTransformer:
         num_heads = 4
 
         # initialize conv
-        conv = backend.create_conv("gt", in_channels=hidden_dim, out_channels=hidden_dim, num_heads=num_heads)
+        conv = backend.create_conv("gt", feature_dim=hidden_dim, heads=num_heads)
         conv.v_proj.bias.data = torch.randn(hidden_dim)
 
         # create test graph
