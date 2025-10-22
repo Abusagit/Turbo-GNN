@@ -78,7 +78,7 @@ class BaseBackend(ABC):
         """Factory for convolution layers.
 
         Args:
-            conv_type (str): 'gcn' currently. (Extend with GAT/GIN/SAGE as needed.)
+            conv_type (str): 'gcn' currently. (Extend with GATv2/GIN/SAGE as needed.)
             **kwargs (Any): Extra arguments for some layers.
 
         Returns:

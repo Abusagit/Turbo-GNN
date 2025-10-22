@@ -1,5 +1,5 @@
 microbench:
-  layer: gcn                 # gcn|gat|sage|gin
+  layer: gcn                 # gcn|gatv2|sage|gin
   backends: [pyg, dgl, torch_native]
   feature_dims: [64, 128, 256, 512]
   num_nodes: [5_000, 20_000, 100_000]

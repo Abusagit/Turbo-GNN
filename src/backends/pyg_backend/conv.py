@@ -51,8 +51,8 @@ class _PygGCNConv(BaseConvolution):
         return self._conv(x, edge_index, edge_weight=edge_weight)
 
 
-class _PygGATConv(BaseConvolution):
-    """PyG-backed GAT (v2 if available)."""
+class _PygGATv2Conv(BaseConvolution):
+    """PyG-backed GATv2."""
 
     def __init__(self, feature_dim: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a GAT convolution using PyG.
@@ -78,12 +78,12 @@ class _PygGATConv(BaseConvolution):
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Apply GAT conv.
+        """Apply GATv2 conv.
 
         Args:
             x (torch.Tensor): Node features [N, Fin].
             graph (Any): PyG Data or (edge_index, edge_weight).
-            edge_weight (Optional[torch.Tensor]): Ignored by classic GAT.
+            edge_weight (Optional[torch.Tensor]): Ignored by classic GATv2.
             **kwargs (Any): Extra kwargs ignored.
 
         Returns:
@@ -105,7 +105,7 @@ class PygBackend(BaseBackend):
         """Factory for PyG convolution layers.
 
         Args:
-            conv_type (str): 'gcn' | 'gat' | 'sage' | 'gin'.
+            conv_type (str): 'gcn' | 'gat_v2' | 'sage' | 'gin'.
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments passed to the underlying PyG layer.
 
@@ -121,8 +121,14 @@ class PygBackend(BaseBackend):
             case "mean_aggr":
                 return _PygGCNConv(feature_dim, aggr="mean", normalize=False)
             case "sum_aggr":
+<<<<<<< HEAD
                 return _PygGCNConv(feature_dim, normalize=False)
             case "gat":
                 heads = kwargs.pop("heads")
                 return _PygGATConv(feature_dim, heads=heads, **kwargs)
+=======
+                return _PygGCNConv(in_channels, out_channels, normalize=False, **kwargs)
+            case "gat_v2":
+                return _PygGATv2Conv(in_channels, out_channels, **kwargs)
+>>>>>>> b663137 (RENAME)
         raise KeyError(f"Unsupported conv_type for PyG backend: {conv_type}")

@@ -96,7 +96,7 @@ class TestCugraphGATv2:
         dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
             data["device"]
         )
-        cugraph_conv = create_conv_layer("cugraph", "gat", feature_dim=feature_dim, heads=heads, bias=False)
+        cugraph_conv = create_conv_layer("cugraph", "gat_v2", feature_dim=feature_dim, heads=heads, bias=False)
 
         with torch.no_grad():
             cugraph_conv.linear_gat_projection.weight.data = dgl_conv.fc_src.weight.data.clone()
@@ -129,7 +129,7 @@ class TestCugraphGATv2:
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("cugraph", "gat", feature_dim=data["in_channels"], heads=4, bias=False)
+        conv = create_conv_layer("cugraph", "gat_v2", feature_dim=data["in_channels"], heads=4, bias=False)
 
         output = conv(features, graph_sample.graph_repr)
         assert output.shape == (data["num_nodes"], 16)

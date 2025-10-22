@@ -16,7 +16,7 @@ def create_conv_layer(
     Create a convolution layer via the backend registry.
 
     Args:
-        conv_type (str): Convolution type ("gcn", "gat", "sage", "gin", ...).
+        conv_type (str): Convolution type ("gcn", "gat_v2", "sage", "gin", ...).
         backend (str): Backend name ("pyg", "dgl", "torch_native", "cusparse", ...).
         **kwargs (Any): Additional layer params (heads, bias, aggr, etc).
 
@@ -24,7 +24,7 @@ def create_conv_layer(
         torch.nn.Module: A backend-specific convolution layer instance.
     """
 
-    if conv_type.lower() != "gat":
+    if conv_type.lower() != "gat_v2":
         kwargs.pop("heads", None)
         kwargs.pop("concat", None)
 

@@ -230,7 +230,7 @@ class DglBackend(BaseBackend):
         """Factory for DGL convolution layers.
 
         Args:
-            conv_type (str): 'gcn' or 'gat' currently. (Extend with GIN/SAGE as needed.)
+            conv_type (str): 'gcn' or 'gat_v2' currently. (Extend with GIN/SAGE as needed.)
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments for DGL layers.
 
@@ -250,6 +250,7 @@ class DglBackend(BaseBackend):
             case "mean_aggr":
                 return _DglGraphConv(feature_dim=feature_dim, norm="right")
             case "sum_aggr":
+<<<<<<< HEAD
                 return _DglGraphConv(feature_dim=feature_dim, norm="none")
             case "gat":
                 heads = kwargs.pop("heads")
@@ -257,4 +258,9 @@ class DglBackend(BaseBackend):
             case "gt":
                 heads = kwargs.pop("heads")
                 return _DglGraphTransformer(feature_dim=feature_dim, heads=heads)
+=======
+                return _DglGraphConv(in_channels, out_channels, norm="none", **kwargs)
+            case "gat_v2":
+                return _DGLGATv2Conv(in_channels, out_channels, **kwargs)
+>>>>>>> b663137 (RENAME)
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
