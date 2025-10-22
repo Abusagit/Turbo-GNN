@@ -209,15 +209,15 @@ def infer_graph_backend(model_config_path: str) -> GraphBackendOption:
             layers = value["layers"]
 
             backends = [layer["backend"] for layer in layers]
-            assert all(
-                backends[i - 1] == backends[i] for i in range(1, len(backends))
-            ), f"So far single backend per run is supported, got multiple backends: {backends}"
+            assert all(backends[i - 1] == backends[i] for i in range(1, len(backends))), (
+                f"So far single backend per run is supported, got multiple backends: {backends}"
+            )
 
             graph_representation_backend = MODEL_BACKEND_TO_GRAPH_REPR.get(backends[0])
             if graph_representation_backend is None:
                 raise ValueError(
                     f"Couldn't infer suitable graph representation for backend {graph_representation_backend}."
-                    "Current supporting mapping is: {MODEL_BACKEND_TO_GRAPH_REPR}"
+                    f"Current supporting mapping is: {MODEL_BACKEND_TO_GRAPH_REPR}"
                 )
             return graph_representation_backend
 
