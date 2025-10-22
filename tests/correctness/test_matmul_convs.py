@@ -63,7 +63,6 @@ class TestMatMulConvCorrectness:
         data = cur_data
         features = data["features"]
         features.requires_grad = True
-        out_channels = data["in_channels"]
 
         def apply_conv(backend):
             graph = create_graph_sample(
@@ -73,7 +72,7 @@ class TestMatMulConvCorrectness:
                 num_nodes=data["num_nodes"],
             )
 
-            conv = create_conv_layer(backend, aggr_type, data["in_channels"], out_channels, bias=False)
+            conv = create_conv_layer(backend, aggr_type, feature_dim=data["in_channels"], bias=False)
 
             output = conv(features, graph.graph_repr)
             output.sum().backward()

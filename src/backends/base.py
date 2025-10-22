@@ -73,20 +73,16 @@ class BaseBackend(ABC):
     def create_conv(
         self,
         conv_type: str,
-        in_channels: int,
-        out_channels: int,
         **kwargs: Any,
     ) -> BaseConvolution:
         """Factory for convolution layers.
 
         Args:
             conv_type (str): 'gcn' currently. (Extend with GAT/GIN/SAGE as needed.)
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
-            **kwargs (Any): Extra arguments for DGL layers.
+            **kwargs (Any): Extra arguments for some layers.
 
         Returns:
-            BaseConvolution: An instance of the requested DGL conv.
+            BaseConvolution: An instance of the requested conv.
         """
         pass
 
@@ -98,8 +94,6 @@ class BaseConvolution(nn.Module):
     convolution implementations across different backends.
 
     Attributes:
-        in_channels: Number of input features
-        out_channels: Number of output features
         use_bias: Whether to use bias parameters
         cached: Whether to cache normalized adjacency matrices
         normalize: Whether to apply normalization
@@ -107,21 +101,15 @@ class BaseConvolution(nn.Module):
         bias: Learnable bias vector (optional)
     """
 
-    def __init__(
-        self, in_channels: int, out_channels: int, bias: bool = True, dropout: float = 0.0, **kwargs: Any
-    ) -> None:
+    def __init__(self, bias: bool = True, dropout: float = 0.0, **kwargs: Any) -> None:
         """Initialize the graph convolution layer.
 
         Args:
-            in_channels: Number of input feature channels
-            out_channels: Number of output feature channels
             bias: Whether to add a learnable bias term
             dropout: Dropout probability (default: 0.0)
             **kwargs: Additional backend-specific arguments
         """
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
         self.use_bias = bias
         self.dropout = dropout
 
@@ -130,12 +118,12 @@ class BaseConvolution(nn.Module):
         """Perform forward pass of the graph convolution.
 
         Args:
-            x: Input node features of shape [num_nodes, in_channels]
+            x: Input node features of shape [num_nodes, feature_dim]
             graph: Graph structure in backend-specific format
             **kwargs: Additional backend-specific arguments
 
         Returns:
-            Output node features of shape [num_nodes, out_channels]
+            Output node features of shape [num_nodes, feature_dim]
         """
         pass
 
@@ -145,10 +133,4 @@ class BaseConvolution(nn.Module):
         Returns:
             String representation of layer configuration
         """
-        return (
-            f"in_channels={self.in_channels}, "
-            f"out_channels={self.out_channels}, "
-            f"bias={self.use_bias}, "
-            f"cached={self.cached}, "
-            f"normalize={self.normalize}"
-        )
+        return f"bias={self.use_bias}, " f"cached={self.cached}, " f"normalize={self.normalize}"

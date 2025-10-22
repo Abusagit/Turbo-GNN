@@ -70,7 +70,7 @@ class TestBackendRegistration:
     def test_pooling_creation(self, backend_type, aggr_type):
         """Verify the backends necessary can create pooling layers declared."""
         backend = BackendRegistry.get_backend(backend_type)
-        conv = backend.create_conv(aggr_type, in_channels=16, out_channels=16, bias=True)
+        conv = backend.create_conv(aggr_type, feature_dim=16, bias=True)
 
         assert conv is not None
         assert hasattr(conv, "forward")
@@ -115,7 +115,7 @@ class TestAggregationCorrectness:
                 data["device"]
             )
 
-            conv = create_conv_layer("dgl", aggr_type, data["in_channels"], out_channels, bias=False)
+            conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
 
             our_output = conv(features, our_graph)
         elif backend_type == "torch_native_adj_mat":
@@ -127,7 +127,7 @@ class TestAggregationCorrectness:
                 add_self_loops=False,
             )
 
-            conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
+            conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
 
             our_output = conv(features, graph_sample.graph_repr)
         else:
@@ -179,7 +179,6 @@ class TestAggregationCorrectness:
 
         data = fully_connected_on_3_vertices_data
         features = data["features"]
-        out_channels = features.shape[1]
 
         # ===== gt =====
 
@@ -192,7 +191,7 @@ class TestAggregationCorrectness:
                 data["device"]
             )
 
-            conv = create_conv_layer("dgl", aggr_type, data["in_channels"], out_channels, bias=False)
+            conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
 
             our_output = conv(features, our_graph)
         elif backend_type == "torch_native_adj_mat":
@@ -204,7 +203,7 @@ class TestAggregationCorrectness:
                 add_self_loops=False,
             )
 
-            conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
+            conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
 
             our_output = conv(features, graph_sample.graph_repr)
         else:
@@ -256,7 +255,6 @@ class TestAggregationCorrectness:
 
         data = connectivity_component_and_isolated_vertice_data
         features = data["features"]
-        out_channels = features.shape[1]
 
         # ===== gt =====
 
@@ -269,7 +267,7 @@ class TestAggregationCorrectness:
                 data["device"]
             )
 
-            conv = create_conv_layer("dgl", aggr_type, data["in_channels"], out_channels, bias=False)
+            conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
 
             our_output = conv(features, our_graph)
         elif backend_type == "torch_native_adj_mat":
@@ -281,7 +279,7 @@ class TestAggregationCorrectness:
                 add_self_loops=False,
             )
 
-            conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
+            conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
 
             our_output = conv(features, graph_sample.graph_repr)
         else:
@@ -333,7 +331,6 @@ class TestAggregationEquivalence:
 
         data = karate_like_club_graph
         features = data["features"]
-        out_channels = features.shape[1]
 
         # ===== two outputs =====
 
@@ -341,7 +338,7 @@ class TestAggregationEquivalence:
             data["device"]
         )
 
-        conv = create_conv_layer("dgl", aggr_type, data["in_channels"], out_channels, bias=False)
+        conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
 
         dgl_output = conv(features, our_graph)
 
@@ -353,7 +350,7 @@ class TestAggregationEquivalence:
             add_self_loops=False,
         )
 
-        conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
+        conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
 
         native_output = conv(features, graph_sample.graph_repr)
 
@@ -393,7 +390,6 @@ class TestAggregationEquivalence:
 
         data = random_graph_data
         features = data["features"]
-        out_channels = features.shape[1]
 
         # ===== two outputs =====
 
@@ -401,7 +397,7 @@ class TestAggregationEquivalence:
             data["device"]
         )
 
-        conv = create_conv_layer("dgl", aggr_type, data["in_channels"], out_channels, bias=False)
+        conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
 
         dgl_output = conv(features, our_graph)
 
@@ -413,7 +409,7 @@ class TestAggregationEquivalence:
             add_self_loops=False,
         )
 
-        conv = create_conv_layer("torch_native_adj_mat", aggr_type, data["in_channels"], out_channels, bias=False)
+        conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
 
         native_output = conv(features, graph_sample.graph_repr)
 

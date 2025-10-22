@@ -396,14 +396,13 @@ def create_conv_layer(set_default_device):
         conv = create_conv_layer(
             backend_name="torch_native_mean_aggr",
             conv_type="gcn",
-            in_channels=16,
-            out_channels=32
+            feature_dim=16,
         )
     """
 
-    def _create(backend_name, conv_type, in_channels, out_channels, **kwargs):
+    def _create(backend_name, conv_type, feature_dim, **kwargs):
         backend = BackendRegistry.get_backend(backend_name)
-        conv = backend.create_conv(conv_type, in_channels, out_channels, **kwargs)
+        conv = backend.create_conv(conv_type, feature_dim=feature_dim, **kwargs)
         device = torch.get_default_device()
         return conv.to(device)
 
@@ -420,21 +419,17 @@ def identity_weight_conv(create_conv_layer, set_default_device):
         conv = identity_weight_conv(
             backend_name="torch_native_mean_aggr",
             conv_type="gcn",
-            in_channels=16,
-            out_channels=16
+            feature_dim=16,
         )
     """
 
-    def _create(backend_name, conv_type, in_channels, out_channels=None, **kwargs):
-        if out_channels is None:
-            out_channels = in_channels
+    def _create(backend_name, conv_type, feature_dim, **kwargs):
+        conv = create_conv_layer(backend_name, conv_type, feature_dim=feature_dim, bias=False, **kwargs)
 
-        conv = create_conv_layer(backend_name, conv_type, in_channels, out_channels, bias=False, **kwargs)
-
-        # set weight to identity (or truncated identity if dims don't match)
+        # set weight to identity
         device = torch.get_default_device()
         with torch.no_grad():
-            identity = torch.eye(min(in_channels, out_channels), in_channels, device=device)
+            identity = torch.eye(feature_dim, feature_dim, device=device)
             if hasattr(conv, "lin"):
                 conv.lin.weight.data = identity
                 conv.lin.bias.data = torch.zeros_like(conv.lin.bias.data)

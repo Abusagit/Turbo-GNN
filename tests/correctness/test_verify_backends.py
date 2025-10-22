@@ -75,14 +75,14 @@ def test_backend_convolutions():
     # Create small test graph
     num_nodes = 100
     num_edges = 500
-    in_channels = out_channels = 16
+    feature_dim = 16
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Testing on device: {device}")
     torch.set_default_device(device)
     # Generate random graph
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
-    x = torch.randn(num_nodes, in_channels, device=device, requires_grad=True)
+    x = torch.randn(num_nodes, feature_dim, device=device, requires_grad=True)
 
     backends_to_test = ["pyg", "dgl", "torch_native"]
     conv_types = ["gcn", "mean_aggr", "sum_aggr"]
@@ -100,7 +100,7 @@ def test_backend_convolutions():
                 backend = BackendRegistry.get_backend(backend_name)
                 try:
                     # Create convolution
-                    conv = backend.create_conv(conv_type, in_channels, out_channels, bias=True).to(device)
+                    conv = backend.create_conv(conv_type, feature_dim=feature_dim, bias=True).to(device)
 
                     graph = GraphSample(
                         backend=MODEL_BACKEND_TO_GRAPH_REPR[backend_name],
@@ -113,7 +113,7 @@ def test_backend_convolutions():
                     out = conv(x, graph)
 
                     # Check output
-                    assert out.shape == (num_nodes, out_channels), f"Wrong output shape: {out.shape}"
+                    assert out.shape == (num_nodes, feature_dim), f"Wrong output shape: {out.shape}"
                     assert not torch.isnan(out).any(), "NaN in output"
 
                     # Backward pass
