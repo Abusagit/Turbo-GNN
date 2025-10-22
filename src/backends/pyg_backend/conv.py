@@ -121,14 +121,8 @@ class PygBackend(BaseBackend):
             case "mean_aggr":
                 return _PygGCNConv(feature_dim, aggr="mean", normalize=False)
             case "sum_aggr":
-<<<<<<< HEAD
                 return _PygGCNConv(feature_dim, normalize=False)
-            case "gat":
-                heads = kwargs.pop("heads")
-                return _PygGATConv(feature_dim, heads=heads, **kwargs)
-=======
-                return _PygGCNConv(in_channels, out_channels, normalize=False, **kwargs)
             case "gat_v2":
-                return _PygGATv2Conv(in_channels, out_channels, **kwargs)
->>>>>>> b663137 (RENAME)
+                heads = kwargs.pop("heads")
+                return _PygGATv2Conv(feature_dim, heads=heads, **kwargs)
         raise KeyError(f"Unsupported conv_type for PyG backend: {conv_type}")

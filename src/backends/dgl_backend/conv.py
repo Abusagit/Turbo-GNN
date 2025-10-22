@@ -250,17 +250,11 @@ class DglBackend(BaseBackend):
             case "mean_aggr":
                 return _DglGraphConv(feature_dim=feature_dim, norm="right")
             case "sum_aggr":
-<<<<<<< HEAD
                 return _DglGraphConv(feature_dim=feature_dim, norm="none")
-            case "gat":
+            case "gat_v2":
                 heads = kwargs.pop("heads")
                 return _DGLGATv2Conv(feature_dim=feature_dim, heads=heads)
             case "gt":
                 heads = kwargs.pop("heads")
                 return _DglGraphTransformer(feature_dim=feature_dim, heads=heads)
-=======
-                return _DglGraphConv(in_channels, out_channels, norm="none", **kwargs)
-            case "gat_v2":
-                return _DGLGATv2Conv(in_channels, out_channels, **kwargs)
->>>>>>> b663137 (RENAME)
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
