@@ -137,7 +137,6 @@ class _DglGraphTransformer(BaseConvolution):
 
         hidden = ops.u_mul_e_sum(graph, v, attn_probs).view(n, -1)
 
-        torch.nn.functional.relu(hidden, inplace=True)
         return hidden
 
 
