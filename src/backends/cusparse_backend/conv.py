@@ -32,13 +32,13 @@ class _СuSparseMatMulConvFn(torch.autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, *grad_outputs):
         row_pointers, column_indices, edge_weight = ctx.saved_tensors
 
         grad_x = csr_SPMM_normalized(
             indptr=row_pointers,
             indices=column_indices,
-            features=grad_out,
+            features=grad_outputs[0],
             edge_weights=edge_weight,
             norm=ctx.norm_type,
             algorithm=ctx.cu_sparse_algorithm_id,
@@ -51,7 +51,7 @@ class _СuSparseMatMulConv(BaseConvolution):
     """CuSparse-backend MatMulConv wrapper."""
 
     def __init__(self, norm_type: str, cu_sparse_algorithm_id: int):
-        super().__init__(0, 0, False, 0)
+        super().__init__(bias=False, dropout=0.0)
 
         assert norm_type in ("none", "right", "left", "both")
         assert cu_sparse_algorithm_id in (-1, 0, 1, 2, 3)
@@ -87,8 +87,6 @@ class СuSparseBackend(BaseBackend):
     def create_conv(
         self,
         conv_type: str,
-        in_channels: int,
-        out_channels: int,
         cu_sparse_algorithm_id: int = -1,
         **kwargs: Any,
     ) -> BaseConvolution:
@@ -96,8 +94,6 @@ class СuSparseBackend(BaseBackend):
 
         Args:
             conv_type (str): 'sum', 'mean', 'random_walk', 'gcn'
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
             cu_sparse_algorithm_id (int): algorithm for CuSparse to use: -1 (default), 0, 1, 2, 3.
             **kwargs (Any): ignored.
 

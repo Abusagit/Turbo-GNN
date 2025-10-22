@@ -41,7 +41,6 @@ class TestCugraphBasicAggregation:
 
         data = karate_like_club_graph
         features = data["features"]
-        out_channels = data["in_channels"]
 
         dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
             data["device"]
@@ -66,7 +65,7 @@ class TestCugraphBasicAggregation:
                 dgl_op = dgl_ops.copy_u_max
 
         dgl_output = dgl_op(dgl_graph, features)
-        conv = create_conv_layer("cugraph", f"{aggr_type}_aggr", data["in_channels"], out_channels, bias=False)
+        conv = create_conv_layer("cugraph", f"{aggr_type}_aggr", feature_dim=data["in_channels"], bias=False)
         cugraph_output = conv(features, graph_sample.graph_repr)
 
         assert torch.allclose(
@@ -88,16 +87,16 @@ class TestCugraphGATv2:
 
         data = karate_like_club_graph
         features = data["features"]
-        in_channels = out_channels = data["in_channels"]
+        feature_dim = data["in_channels"]
 
-        dgl_conv = GATv2Conv(in_channels, out_channels, num_heads=heads, bias=False, allow_zero_in_degree=True).to(
-            data["device"]
-        )
+        dgl_conv = GATv2Conv(
+            in_feats=feature_dim, out_feats=feature_dim, num_heads=heads, bias=False, allow_zero_in_degree=True
+        ).to(data["device"])
 
         dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
             data["device"]
         )
-        cugraph_conv = create_conv_layer("cugraph", "gat", in_channels, out_channels, heads=heads, bias=False)
+        cugraph_conv = create_conv_layer("cugraph", "gat", feature_dim=feature_dim, heads=heads, bias=False)
 
         with torch.no_grad():
             cugraph_conv.linear_gat_projection.weight.data = dgl_conv.fc_src.weight.data.clone()
@@ -130,7 +129,7 @@ class TestCugraphGATv2:
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("cugraph", "gat", data["in_channels"], 16, heads=4, bias=False)
+        conv = create_conv_layer("cugraph", "gat", feature_dim=data["in_channels"], heads=4, bias=False)
 
         output = conv(features, graph_sample.graph_repr)
         assert output.shape == (data["num_nodes"], 16)
@@ -236,7 +235,7 @@ class TestCugraphGCN:
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("cugraph", "gcn", data["in_channels"], data["in_channels"], bias=False)
+        conv = create_conv_layer("cugraph", "gcn", feature_dim=data["in_channels"], bias=False)
 
         output = conv(features, graph_sample.graph_repr)
         assert output.shape == (data["num_nodes"], data["in_channels"])

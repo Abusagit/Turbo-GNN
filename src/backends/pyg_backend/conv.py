@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, TypedDict
 
 import torch
 import torch.nn as nn
@@ -16,18 +16,16 @@ PyG backend: wraps torch_geometric.nn layers and exposes them via BaseBackend.
 class _PygGCNConv(BaseConvolution):
     """PyG-backed GCNConv wrapper."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, **kwargs: Any) -> None:
+    def __init__(self, feature_dim: int, bias: bool = False, **kwargs: Any) -> None:
         """Initialize a GCN convolution using PyG.
 
         Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
             bias (bool): Whether to include bias.
             **kwargs (Any): Any torch_geometric.nn.GCNConv kwargs (e.g., normalize).
         """
-        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
+        super().__init__(bias=bias, **kwargs)
 
-        self._conv = _GCN(in_channels, out_channels, bias=bias, **kwargs)
+        self._conv = _GCN(in_channels=feature_dim, out_channels=feature_dim, bias=bias, **kwargs)
         self._conv.lin = torch.nn.Identity()  # disable weight
 
     def forward(
@@ -56,22 +54,21 @@ class _PygGCNConv(BaseConvolution):
 class _PygGATConv(BaseConvolution):
     """PyG-backed GAT (v2 if available)."""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
+    def __init__(self, feature_dim: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a GAT convolution using PyG.
 
         Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size per head or aggregated.
+            feature_dim (int): Input (and output) feature size.
             bias (bool): Include bias.
             heads (int): Number of attention heads.
             **kwargs (Any): PyG GAT conv kwargs (concat, dropout, etc.).
         """
-        super().__init__(in_channels, out_channels, bias=bias, heads=heads, **kwargs)
+        super().__init__(bias=bias, heads=heads, **kwargs)
 
-        self._conv = _GAT(in_channels, out_channels, heads=heads, bias=bias, **kwargs)
+        self._conv = _GAT(in_channels=feature_dim, out_channels=feature_dim, heads=heads, bias=bias, **kwargs)
         self._outer_proj = torch.nn.Linear(
-            out_channels * heads, out_channels, bias=bias
-        )  # NOTE GAT produces 3D tensor [*, heads, out_channels] --> Need to project it to [*, out_channels]
+            feature_dim * heads, feature_dim, bias=bias
+        )  # NOTE GAT produces 3D tensor [*, heads, feature_dim] --> Need to project it to [*, feature_dim]
 
     def forward(
         self,
@@ -103,29 +100,29 @@ class PygBackend(BaseBackend):
     def create_conv(
         self,
         conv_type: str,
-        in_channels: int,
-        out_channels: int,
         **kwargs: Any,
-    ):
+    ) -> BaseConvolution:
         """Factory for PyG convolution layers.
 
         Args:
             conv_type (str): 'gcn' | 'gat' | 'sage' | 'gin'.
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
+            feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments passed to the underlying PyG layer.
 
         Returns:
             BaseConvolution: An instance of the requested PyG conv.
         """
+        feature_dim = kwargs.pop("feature_dim")
+
         ct = conv_type.lower()
         match ct:
             case "gcn":
-                return _PygGCNConv(in_channels, out_channels, **kwargs)
+                return _PygGCNConv(feature_dim)
             case "mean_aggr":
-                return _PygGCNConv(in_channels, out_channels, aggr="mean", normalize=False, **kwargs)
+                return _PygGCNConv(feature_dim, aggr="mean", normalize=False)
             case "sum_aggr":
-                return _PygGCNConv(in_channels, out_channels, normalize=False, **kwargs)
+                return _PygGCNConv(feature_dim, normalize=False)
             case "gat":
-                return _PygGATConv(in_channels, out_channels, **kwargs)
+                heads = kwargs.pop("heads")
+                return _PygGATConv(feature_dim, heads=heads, **kwargs)
         raise KeyError(f"Unsupported conv_type for PyG backend: {conv_type}")

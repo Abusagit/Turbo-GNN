@@ -27,7 +27,7 @@ def test_pyg_vs_dgl_graph(karate_like_club_graph, heads):
     x = data["features"]
     edge_index = data["edge_index"].long()
     N = data["num_nodes"]
-    Fin = Fout = x.size(1)
+    feature_dim = x.size(1)
 
     from src.backends.registry import BackendRegistry
 
@@ -36,8 +36,7 @@ def test_pyg_vs_dgl_graph(karate_like_club_graph, heads):
 
     pyg_layer = pyg_backend.create_conv(
         "gat",
-        Fin,
-        Fout,
+        feature_dim=feature_dim,
         heads=heads,
         add_self_loops=False,
         dropout=0.0,
@@ -52,8 +51,7 @@ def test_pyg_vs_dgl_graph(karate_like_club_graph, heads):
 
     dgl_layer = dgl_backend.create_conv(
         "gat",
-        Fin,
-        Fout,
+        feature_dim=feature_dim,
         heads=heads,
         feat_drop=0.0,
         attn_drop=0.0,
@@ -72,7 +70,7 @@ def test_pyg_vs_dgl_graph(karate_like_club_graph, heads):
     y_pyg = pyg_layer(x, (edge_index, None))
     y_dgl = dgl_layer(x, g)
 
-    assert y_pyg.shape == y_dgl.shape == (N, Fout)
+    assert y_pyg.shape == y_dgl.shape == (N, feature_dim)
     assert torch.allclose(
         y_pyg, y_dgl, atol=1e-6, rtol=1e-6
     ), f"PyG vs DGL: max|Δ|={(y_pyg - y_dgl).abs().max().item():.3e}"
@@ -83,7 +81,7 @@ def test_dgl_matches_tiny_graph():
     torch.manual_seed(1234)
 
     N = 3
-    Fin = Fout = 2
+    feature_dim = 2
     heads = 1
     src = torch.tensor([0, 2], dtype=torch.long, device=device)
     dst = torch.tensor([1, 1], dtype=torch.long, device=device)
@@ -96,8 +94,7 @@ def test_dgl_matches_tiny_graph():
 
     dgl_layer = dgl_backend.create_conv(
         "gat",
-        Fin,
-        Fout,
+        feature_dim=feature_dim,
         heads=heads,
         feat_drop=0.0,
         attn_drop=0.0,
@@ -124,10 +121,10 @@ def test_dgl_matches_tiny_graph():
         a_0_1 = torch.exp(e_0_1) / (torch.exp(e_0_1) + torch.exp(e_2_1))
         a_2_1 = torch.exp(e_2_1) / (torch.exp(e_0_1) + torch.exp(e_2_1))
 
-        y_expected = torch.zeros(N, Fout, device=device)
+        y_expected = torch.zeros(N, feature_dim, device=device)
         y_expected[1] = a_0_1 * x[0] + a_2_1 * x[2]
 
-    assert y_dgl.shape == (N, Fout)
+    assert y_dgl.shape == (N, feature_dim)
     assert torch.allclose(
         y_dgl, y_expected, atol=1e-6, rtol=1e-6
     ), f"manual vs DGL: max|Δ|={(y_dgl - y_expected).abs().max().item():.3e}"

@@ -15,22 +15,21 @@ Cugraph Backend: implementations using `pylibcugraph` library.
 class _CugraphGATv2Conv(BaseConvolution):
     """GAT conv with CuGraph backend"""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
+    def __init__(self, feature_dim: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a Torch-native GCN.
 
         Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
+            feature_dim (int): Input (and output) feature size.
             bias (bool): Include bias in linear transform.
             **kwargs (Any): Reserved for future options.
         """
-        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
-        self.linear_gat_projection = nn.Linear(in_channels, heads * in_channels, bias=False)  # NOTE init from PyG
-        self.attn_weights = nn.Parameter(torch.empty(heads, in_channels))
+        super().__init__(bias=bias, **kwargs)
+        self.linear_gat_projection = nn.Linear(feature_dim, heads * feature_dim, bias=False)  # NOTE init from PyG
+        self.attn_weights = nn.Parameter(torch.empty(heads, feature_dim))
 
-        self.outer_projection = nn.Linear(heads * in_channels, out_channels)
+        self.outer_projection = nn.Linear(heads * feature_dim, feature_dim)
         self.heads = heads
-        self.out_channels = out_channels
+        self.feature_dim = feature_dim
 
         gain = nn.init.calculate_gain("relu")
         nn.init.xavier_normal_(self.attn_weights, gain=gain)
@@ -73,23 +72,21 @@ class _CugraphGATv2Conv(BaseConvolution):
 class _CugraphGraphTransfomerConv(BaseConvolution):
     """Graph Transformer conv with CuGraph backend"""
 
-    def __init__(self, in_channels: int, out_channels: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
+    def __init__(self, feature_dim: int, bias: bool = True, heads: int = 1, **kwargs: Any) -> None:
         """Initialize a Torch-native GCN.
 
         Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
+            feature_dim (int): Input (and output) feature size.
             bias (bool): Include bias in linear transform.
             **kwargs (Any): Reserved for future options.
         """
-        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
+        super().__init__(bias=bias, **kwargs)
 
         self.heads = heads
-        self.out_channels = out_channels
-        self.in_channels = self.head_dim = in_channels
+        self.feature_dim = self.head_dim = feature_dim
         self.hidden_dim = self.head_dim * self.heads
 
-        self.qkv_proj = nn.Linear(in_channels, 3 * heads * in_channels)
+        self.qkv_proj = nn.Linear(feature_dim, 3 * heads * feature_dim)
 
         self.outer_proj = nn.Linear()
 
@@ -141,8 +138,6 @@ class _SimpleAggrGraphConv(BaseConvolution):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
         bias: bool = True,
         use_edge_weights: bool = False,
         aggr_type: Literal["sum", "max", "min", "mean"] = "sum",
@@ -151,15 +146,12 @@ class _SimpleAggrGraphConv(BaseConvolution):
         """Initialize a Torch-native GCN.
 
         Args:
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
             bias (bool): Include bias in linear transform.
             **kwargs (Any): Reserved for future options.
         """
-        super().__init__(in_channels, out_channels, bias=bias, **kwargs)
+        super().__init__(bias=bias, **kwargs)
         self.use_edge_weights = use_edge_weights
         self.aggr_type = aggr_type
-        self.out_channels = out_channels
 
     def forward(
         self,
@@ -199,33 +191,32 @@ class CugraphBackend(BaseBackend):
     def create_conv(
         self,
         conv_type: str,
-        in_channels: int,
-        out_channels: int,
         **kwargs: Any,
     ):
         """Factory for Torch-native mean aggregation convs.
 
         Args:
             conv_type (str): supported convolution type.
-            in_channels (int): Input feature size.
-            out_channels (int): Output feature size.
+            feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra kwargs.
 
         Returns:
             BaseConvolution: Convolution layer for CuGraph backend
         """
+        feature_dim = kwargs.pop("feature_dim")
+
         if conv_type == "mean_aggr":
-            return _SimpleAggrGraphConv(in_channels, out_channels, aggr_type="mean", use_edge_weights=False, **kwargs)
+            return _SimpleAggrGraphConv(aggr_type="mean", use_edge_weights=False)
         if conv_type == "sum_aggr":
-            return _SimpleAggrGraphConv(in_channels, out_channels, aggr_type="sum", use_edge_weights=False, **kwargs)
+            return _SimpleAggrGraphConv(aggr_type="sum", use_edge_weights=False)
         if conv_type == "min_aggr":
-            return _SimpleAggrGraphConv(in_channels, out_channels, aggr_type="min", use_edge_weights=False, **kwargs)
+            return _SimpleAggrGraphConv(aggr_type="min", use_edge_weights=False)
         if conv_type == "max_aggr":
-            return _SimpleAggrGraphConv(in_channels, out_channels, aggr_type="max", use_edge_weights=False, **kwargs)
+            return _SimpleAggrGraphConv(aggr_type="max", use_edge_weights=False)
         if conv_type == "gcn":
-            return _SimpleAggrGraphConv(in_channels, out_channels, aggr_type="sum", use_edge_weights=True, **kwargs)
+            return _SimpleAggrGraphConv(aggr_type="sum", use_edge_weights=True)
         if conv_type == "gat":
-            return _CugraphGATv2Conv(in_channels, out_channels, **kwargs)
+            return _CugraphGATv2Conv(feature_dim)
         if conv_type == "graph_transformer":
             raise NotImplementedError("mha_simple_n2n is broken and doesn't work with correct inputs")
             # return _CugraphGraphTransfomerConv(in_channels, out_channels, **kwargs)
