@@ -1,0 +1,5 @@
+dataset:
+  source: pyg
+  name: amazon-photo
+  root: data
+  allow_random_split: true
