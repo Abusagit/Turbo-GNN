@@ -275,7 +275,6 @@ def main() -> int:
     trainer.scheduler = scheduler
     logger.info("Built Optimizer & Schedulers")
 
-    trainer.add_hook(MetricHook(log_dir=str(outdir / "logs"), log_interval=int(tcfg.get("log_interval", 10))))
     trainer.add_hook(
         CheckpointHook(
             checkpoint_dir=str(outdir / "ckpts"),
@@ -301,6 +300,15 @@ def main() -> int:
                 with_stack=bool(prof_cfg.get("with_stack", True)),
             )
         )
+
+    # should be at the end to log other hooks' metrics, e.g. memory
+    trainer.add_hook(
+        MetricHook(
+            log_dir=str(outdir / "logs"),
+            log_interval=int(tcfg.get("log_interval", 10)),
+            comet_config=merged_cfg.get("comet_ml"),
+        )
+    )
 
     # train
     logger.info("Starting training…")

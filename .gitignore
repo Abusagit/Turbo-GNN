@@ -15,3 +15,5 @@ runs/
 .venv/*
 
 *.egg-info
+
+.env

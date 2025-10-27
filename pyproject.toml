@@ -87,8 +87,7 @@ notebook = [
 ]
 
 tracking = [
-    "wandb>=0.15.0",
-    "mlflow>=2.0.0",
+    "comet_ml>=3.53.2",
 ]
 
 

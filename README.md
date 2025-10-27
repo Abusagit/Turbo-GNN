@@ -159,8 +159,9 @@ python setup.py develop
 ```bash
 python scripts/train.py \
     --dataset configs/datasets/pyg_cora.yaml \
-    --model configs/models/gcn.yaml \
+    --model configs/models/gcn_dgl.yaml \
     --config configs/training/base.yaml \
+    --config configs/comet/disabled.yaml \
     --out runs/gcn_cora
 ```
 

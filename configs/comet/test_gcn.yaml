@@ -1,0 +1,10 @@
+comet_ml:
+  ExperimentConfig:
+    name: test_gcn
+    tags:
+    - test
+    - gcn
+  start:
+    project_name: main
+    workspace: accelerating-gnns-2
+    mode: create
