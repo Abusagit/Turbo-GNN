@@ -377,6 +377,34 @@ def _masks_from_indices(
     return train_mask, val_mask, test_mask
 
 
+def _mask_from_indices_with_splits_creation(
+    num_nodes: int,
+) -> Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+    """Create boolean train/val/test masks by generating a random 60/20/20 split.
+
+    This helper samples a random permutation of node indices in [0, num_nodes)
+    and constructs split index tensors for train/val/test with ratios
+    0.6 / 0.2 / 0.2. It then delegates to `_masks_from_indices` to convert
+    those index tensors into boolean masks of shape [num_nodes].
+
+    Args:
+        num_nodes (int): Total number of nodes N in the single-graph dataset.
+
+    Returns:
+        Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+            (train_mask, val_mask, test_mask), each of shape [N] with dtype=bool.
+    """
+    perm = torch.randperm(num_nodes)
+    n_train = int(0.6 * num_nodes)
+    n_val = int(0.2 * num_nodes)
+    splits = {
+        "train": perm[:n_train],
+        "val": perm[n_train : n_train + n_val],
+        "test": perm[n_train + n_val :],
+    }
+    return _masks_from_indices(num_nodes, splits)
+
+
 # ------------------------------- OGBN loaders -------------------------------- #
 
 
@@ -530,16 +558,7 @@ def load_pyg_single_graph(
                 "set `allow_random_split: true` in your dataset YAML to auto-generate them."
             )
         print(f"Dataset '{name}' lacks masks -> creating random 60/20/20 split.")
-        N = y.size(0)
-        perm = torch.randperm(N)
-        n_train = int(0.6 * N)
-        n_val = int(0.2 * N)
-        splits = {
-            "train": perm[:n_train],
-            "val": perm[n_train : n_train + n_val],
-            "test": perm[n_train + n_val :],
-        }
-        train_mask, val_mask, test_mask = _masks_from_indices(N, splits)
+        train_mask, val_mask, test_mask = _mask_from_indices_with_splits_creation(y.size(0))
 
     return GraphSample(
         x=x,
