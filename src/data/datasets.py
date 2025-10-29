@@ -10,7 +10,7 @@ from dgl import graph as dgl_graph
 from ogb.nodeproppred import NodePropPredDataset
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
-from torch_geometric.datasets import Planetoid, Reddit
+from torch_geometric.datasets import Amazon, Coauthor, Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
@@ -377,6 +377,34 @@ def _masks_from_indices(
     return train_mask, val_mask, test_mask
 
 
+def _mask_from_indices_with_splits_creation(
+    num_nodes: int,
+) -> Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+    """Create boolean train/val/test masks by generating a random 60/20/20 split.
+
+    This helper samples a random permutation of node indices in [0, num_nodes)
+    and constructs split index tensors for train/val/test with ratios
+    0.6 / 0.2 / 0.2. It then delegates to `_masks_from_indices` to convert
+    those index tensors into boolean masks of shape [num_nodes].
+
+    Args:
+        num_nodes (int): Total number of nodes N in the single-graph dataset.
+
+    Returns:
+        Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+            (train_mask, val_mask, test_mask), each of shape [N] with dtype=bool.
+    """
+    perm = torch.randperm(num_nodes)
+    n_train = int(0.6 * num_nodes)
+    n_val = int(0.2 * num_nodes)
+    splits = {
+        "train": perm[:n_train],
+        "val": perm[n_train : n_train + n_val],
+        "test": perm[n_train + n_val :],
+    }
+    return _masks_from_indices(num_nodes, splits)
+
+
 # ------------------------------- OGBN loaders -------------------------------- #
 
 
@@ -427,7 +455,9 @@ def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") 
 # ------------------------------- PyG loaders --------------------------------- #
 
 
-def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
+def load_pyg_single_graph(
+    name: str, graph_backend: GraphBackendOption, root: str = "data", allow_random_split: bool = False
+) -> GraphSample:
     """Load a single-graph dataset from PyTorch Geometric.
 
     Supported (common) names:
@@ -475,11 +505,22 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         ):
             dset = GraphLandDataset(root=root, name=name, split="RL")
             data = dset[0]
+        elif name in ("amazon-photo", "amazon-computers"):
+            dset = Amazon(root=root, name=name.split("-")[1])
+            data = dset[0]
+        elif name in ("coauthor-cs", "coauthor-physics"):
+            dset = Coauthor(root=root, name=name.split("-")[1])
+            data = dset[0]
         else:
-            raise ValueError(
-                f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in "
-                "torch_geometric.datasets."
-            )
+            try:
+                cls = getattr(pyg_datasets, name)
+                try:
+                    dset = cls(root=root, name=name)
+                except TypeError:
+                    dset = cls(root=root)
+                data = dset[0]
+            except AttributeError:
+                raise ValueError(f"Unknown PyG dataset '{name}'.")
         return data
 
     data = _load_pyg_cpu()
@@ -497,8 +538,27 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
     val_mask = getattr(data, "val_mask", None)
     test_mask = getattr(data, "test_mask", None)
 
+    def _pick_split(mask: Optional[torch.Tensor], split_id: int = 0) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+        mask = mask.bool()
+        if mask.ndim == 2:
+            mask = mask[:, split_id]
+        return mask
+
+    split_id = 0
+    train_mask = _pick_split(train_mask, split_id)
+    val_mask = _pick_split(val_mask, split_id)
+    test_mask = _pick_split(test_mask, split_id)
+
     if train_mask is None or val_mask is None or test_mask is None:
-        raise ValueError(f"Dataset '{name}' does not provide standard masks; please construct custom splits.")
+        if not allow_random_split:
+            raise ValueError(
+                f"Dataset '{name}' does not provide standard masks; "
+                "set `allow_random_split: true` in your dataset YAML to auto-generate them."
+            )
+        print(f"Dataset '{name}' lacks masks -> creating random 60/20/20 split.")
+        train_mask, val_mask, test_mask = _mask_from_indices_with_splits_creation(y.size(0))
 
     return GraphSample(
         x=x,
@@ -546,7 +606,19 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         elif name == "reddit":
             dset = dgl_data.RedditDataset(raw_dir=root)
         else:
-            raise ValueError(f"Unknown DGL dataset '{name}'. Supported: cora/citeseer/pubmed/reddit.")
+            cls = None
+            if hasattr(dgl_data, name):
+                cls = getattr(dgl_data, name)
+            else:
+                for suffix in ("Dataset", "GraphDataset"):
+                    cand = name + suffix
+                    if hasattr(dgl_data, cand):
+                        cls = getattr(dgl_data, cand)
+                        break
+            if cls is None:
+                raise ValueError(f"Unknown DGL dataset '{name}'")
+
+            dset = cls(raw_dir=root)
         return dset
 
     dset = _load_dgl_cpu()
@@ -599,6 +671,7 @@ class DatasetConfig:
     name: str
     graph_backend: GraphBackendOption
     root: str = "data"
+    allow_random_split: bool = False
 
 
 def load_single_graph(cfg: DatasetConfig) -> GraphSample:
@@ -617,7 +690,12 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     if s == "ogbn":
         return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
     if s == "pyg":
-        return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+        return load_pyg_single_graph(
+            cfg.name,
+            root=cfg.root,
+            graph_backend=cfg.graph_backend,
+            allow_random_split=getattr(cfg, "allow_random_split", False),
+        )
     if s == "dgl":
         return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
     if s == "auto":

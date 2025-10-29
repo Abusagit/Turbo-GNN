@@ -151,9 +151,16 @@ def create_split_datasets_from_config_dict(
     source = str(ds_cfg.get("source", "auto"))
     name = str(ds_cfg.get("name"))
     root = str(ds_cfg.get("root", "data"))
+    allow_random_split = ds_cfg.get("allow_random_split", False)
 
     sample = load_single_graph(
-        DatasetConfig(source=source, name=name, root=root, graph_backend=cfg.get("graph_backend", "edge_index"))
+        DatasetConfig(
+            source=source,
+            name=name,
+            root=root,
+            graph_backend=cfg.get("graph_backend", "edge_index"),
+            allow_random_split=allow_random_split,
+        )
     )
 
     return (
@@ -209,9 +216,9 @@ def infer_graph_backend(model_config_path: str) -> GraphBackendOption:
             layers = value["layers"]
 
             backends = [layer["backend"] for layer in layers]
-            assert all(backends[i - 1] == backends[i] for i in range(1, len(backends))), (
-                f"So far single backend per run is supported, got multiple backends: {backends}"
-            )
+            assert all(
+                backends[i - 1] == backends[i] for i in range(1, len(backends))
+            ), f"So far single backend per run is supported, got multiple backends: {backends}"
 
             graph_representation_backend = MODEL_BACKEND_TO_GRAPH_REPR.get(backends[0])
             if graph_representation_backend is None:

@@ -1,0 +1,4 @@
+dataset:
+  source: ogbn
+  name: ogbn-products
+  root: data
