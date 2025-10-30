@@ -1,0 +1,10 @@
+comet_ml:
+  ExperimentConfig:
+    name: run
+    tags:
+    - exp
+    # add more tags (dynamically, not in yaml file), e.g. conv_type, backend, dataset
+  start:
+    project_name: main  # you can change it to start with a clean slate
+    workspace: accelerating-gnns-2
+    mode: create

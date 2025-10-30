@@ -165,6 +165,8 @@ python scripts/train.py \
     --out runs/gcn_cora
 ```
 
+For experiments use `configs/comet/exp_run.yaml` (probably with another `project_name`) to enable comet logging.
+
 ### 2. Benchmark GCN Layer Across Backends
 
 ```bash

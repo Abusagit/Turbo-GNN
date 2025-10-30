@@ -357,6 +357,7 @@ class MetricHook(Hook):
         log_dir: str = "./logs",
         log_interval: int = 10,
         comet_config: Optional[Dict[str, Any]] = None,
+        params_for_comet: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialize the metric hook.
 
@@ -371,6 +372,7 @@ class MetricHook(Hook):
 
         self.comet: Any = None
         self.comet_config = comet_config
+        self.params_for_comet = params_for_comet
         self.comet_experiment: Any = None
 
         self.metrics: dict[str, list[float]] = {}
@@ -402,6 +404,7 @@ class MetricHook(Hook):
             )
             if self.comet_experiment is not None:
                 self.comet_experiment.log_parameters(config.__dict__ if hasattr(config, "__dict__") else config)
+                self.comet_experiment.log_parameters(self.params_for_comet)
 
         logger.info("Metric tracking initialized")
 
