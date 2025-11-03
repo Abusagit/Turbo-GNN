@@ -159,10 +159,13 @@ python setup.py develop
 ```bash
 python scripts/train.py \
     --dataset configs/datasets/pyg_cora.yaml \
-    --model configs/models/gcn.yaml \
+    --model configs/models/gcn_dgl.yaml \
     --config configs/training/base.yaml \
+    --config configs/comet/disabled.yaml \
     --out runs/gcn_cora
 ```
+
+For experiments use `configs/comet/exp_run.yaml` (probably with another `project_name`) to enable comet logging.
 
 ### 2. Benchmark GCN Layer Across Backends
 

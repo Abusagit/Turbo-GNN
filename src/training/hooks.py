@@ -6,6 +6,7 @@ pipeline for monitoring, profiling, checkpointing, and other extensions.
 """
 
 import logging
+import os
 import pickle
 import time
 from abc import ABC, abstractmethod
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
+from dotenv import load_dotenv
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
@@ -36,6 +38,8 @@ for extensible monitoring and control. Hooks can be used for:
 The hook system follows an event-driven pattern where hooks respond to
 specific training events.
 """
+
+load_dotenv()  # load environment variables from .env
 
 logger = logging.getLogger(__name__)
 
@@ -352,35 +356,36 @@ class MetricHook(Hook):
         self,
         log_dir: str = "./logs",
         log_interval: int = 10,
-        use_wandb: bool = False,
-        wandb_project: str = "gnn-benchmark",  # TODO move from wandb
+        comet_config: Optional[Dict[str, Any]] = None,
+        params_for_comet: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialize the metric hook.
 
         Args:
             log_dir: Directory for saving logs
             log_interval: Interval for logging metrics
-            use_wandb: Whether to use Weights & Biases
-            wandb_project: W&B project name
+            comet_config: Comet config
         """
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_interval = log_interval
-        self.use_wandb = use_wandb
-        self.wandb_project = wandb_project
+
+        self.comet: Any = None
+        self.comet_config = comet_config
+        self.params_for_comet = params_for_comet
+        self.comet_experiment: Any = None
 
         self.metrics: dict[str, list[float]] = {}
         self.start_time: float | None = None
         self.epoch_start_time: float | None = None
 
-        if use_wandb:
+        if self.comet_config is not None:
             try:
-                import wandb
+                import comet_ml
 
-                self.wandb = wandb
+                self.comet = comet_ml
             except ImportError:
-                logger.warning("wandb not installed, disabling W&B logging")
-                self.use_wandb = False
+                logger.warning("comet_ml is not installed, disabling Comet logging")
 
     def on_training_start(self, model: nn.Module, config: Any) -> None:
         """Initialize metric tracking at training start.
@@ -391,11 +396,15 @@ class MetricHook(Hook):
         """
         self.start_time = time.time()
 
-        if self.use_wandb:
-            self.wandb.init(
-                project=self.wandb_project, config=config.__dict__ if hasattr(config, "__dict__") else config
+        # redundant check because of mypy
+        if self.comet_config is not None and self.comet is not None:
+            exp_config = self.comet.ExperimentConfig(**self.comet_config["ExperimentConfig"])
+            self.comet_experiment = self.comet.start(
+                api_key=os.getenv("COMET_TOKEN"), experiment_config=exp_config, **self.comet_config["start"]
             )
-            self.wandb.watch(model)
+            if self.comet_experiment is not None:
+                self.comet_experiment.log_parameters(config.__dict__ if hasattr(config, "__dict__") else config)
+                self.comet_experiment.log_parameters(self.params_for_comet)
 
         logger.info("Metric tracking initialized")
 
@@ -426,14 +435,13 @@ class MetricHook(Hook):
 
         self.metrics.setdefault("epoch_time", []).append(epoch_time)
 
-        if self.use_wandb:
+        if self.comet_experiment is not None:
             log_dict = {
-                "epoch": epoch,
                 "epoch_time": epoch_time,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
                 **{f"val/{k}": v for k, v in val_metrics.items()},
             }
-            self.wandb.log(log_dict)
+            self.comet_experiment.log_metrics(log_dict, epoch=epoch)
 
         if epoch % self.log_interval == 0:
             logger.info(f"Epoch {epoch} completed in {epoch_time:.2f}s")
@@ -453,8 +461,8 @@ class MetricHook(Hook):
         with open(metrics_file, "w") as f:
             json.dump(self.metrics, f, indent=2)
 
-        if self.use_wandb:
-            self.wandb.finish()
+        if self.comet_experiment is not None:
+            self.comet_experiment.end()
 
 
 class CheckpointHook(Hook):

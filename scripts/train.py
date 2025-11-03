@@ -275,7 +275,6 @@ def main() -> int:
     trainer.scheduler = scheduler
     logger.info("Built Optimizer & Schedulers")
 
-    trainer.add_hook(MetricHook(log_dir=str(outdir / "logs"), log_interval=int(tcfg.get("log_interval", 10))))
     trainer.add_hook(
         CheckpointHook(
             checkpoint_dir=str(outdir / "ckpts"),
@@ -301,6 +300,35 @@ def main() -> int:
                 with_stack=bool(prof_cfg.get("with_stack", True)),
             )
         )
+
+    comet_config = None
+    params_for_comet = None
+    if "comet_ml" in merged_cfg:
+        params_for_comet = {}
+        params_for_comet["dataset"] = read_yaml(args.dataset)["dataset"]["name"]
+        model_config = read_yaml(args.model)
+        params_for_comet["model"] = str(model_config)
+        params_for_comet["conv_type"] = model_config["encoder"]["layers"][0]["conv_type"]
+        params_for_comet["backend"] = model_config["encoder"]["layers"][0]["backend"]
+
+        comet_config = merged_cfg["comet_ml"]
+        comet_config["ExperimentConfig"]["tags"].extend(
+            [
+                f'dataset: {params_for_comet["dataset"]}',
+                f'conv_type: {params_for_comet["conv_type"]}',
+                f'backend: {params_for_comet["backend"]}',
+            ]
+        )
+
+    # should be at the end to log other hooks' metrics, e.g. memory
+    trainer.add_hook(
+        MetricHook(
+            log_dir=str(outdir / "logs"),
+            log_interval=int(tcfg.get("log_interval", 10)),
+            comet_config=comet_config,
+            params_for_comet=params_for_comet,
+        )
+    )
 
     # train
     logger.info("Starting training…")
