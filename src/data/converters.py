@@ -12,8 +12,10 @@ Graph format converters among edge list, CSR, and optional framework objects.
 - to_dgl_graph
 """
 
-EdgeList = Tuple[torch.Tensor, Optional[torch.Tensor]]   # (edge_index [2,E], edge_weight [E] or None)
-CSR = Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]  # (crow_indices [N+1], col_indices [E], values [E] or None)
+EdgeList = Tuple[torch.Tensor, Optional[torch.Tensor]]  # (edge_index [2,E], edge_weight [E] or None)
+CSR = Tuple[
+    torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+]  # (crow_indices [N+1], col_indices [E], values [E] or None)
 
 
 def to_csr_from_edge_list(
@@ -68,9 +70,7 @@ def to_edge_list_from_csr(
         raise ValueError("col_indices must be [E]")
 
     num_nodes = crow_indices.numel() - 1
-    row = torch.repeat_interleave(
-        torch.arange(num_nodes, device=crow_indices.device), crow_indices.diff()
-    )
+    row = torch.repeat_interleave(torch.arange(num_nodes, device=crow_indices.device), crow_indices.diff())
     edge_index = torch.vstack([row.long(), col_indices.long()])
     return edge_index, values
 
