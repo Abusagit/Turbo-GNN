@@ -8,11 +8,11 @@ NOTE all regression datasets are converted to classification via binning strateg
 import os
 import os.path as osp
 from functools import partial
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
-
+import yaml
 from torch_geometric.data import (
     Data,
     InMemoryDataset,
@@ -21,9 +21,6 @@ from torch_geometric.data import (
 )
 from torch_geometric.transforms import ToUndirected
 from torch_geometric.utils import subgraph
-import yaml
-
-from typing import Any
 
 
 def _load_yaml(path: str) -> dict[str, Any]:
@@ -201,22 +198,23 @@ class GraphLandDataset(InMemoryDataset):
           - True
           - regression
     """
-    _url = 'https://zenodo.org/records/16895532'
+
+    _url = "https://zenodo.org/records/16895532"
     GRAPHLAND_DATASETS = {
-        'hm-categories': 'multiclass_classification',
-        'pokec-regions': 'multiclass_classification',
-        'web-topics': 'multiclass_classification',
-        'tolokers-2': 'binary_classification',
-        'city-reviews': 'binary_classification',
-        'artnet-exp': 'binary_classification',
-        'web-fraud': 'binary_classification',
-        'hm-prices': 'regression',
-        'avazu-ctr': 'regression',
-        'city-roads-M': 'regression',
-        'city-roads-L': 'regression',
-        'twitch-views': 'regression',
-        'artnet-views': 'regression',
-        'web-traffic': 'regression',
+        "hm-categories": "multiclass_classification",
+        "pokec-regions": "multiclass_classification",
+        "web-topics": "multiclass_classification",
+        "tolokers-2": "binary_classification",
+        "city-reviews": "binary_classification",
+        "artnet-exp": "binary_classification",
+        "web-fraud": "binary_classification",
+        "hm-prices": "regression",
+        "avazu-ctr": "regression",
+        "city-roads-M": "regression",
+        "city-roads-L": "regression",
+        "twitch-views": "regression",
+        "artnet-views": "regression",
+        "web-traffic": "regression",
     }
 
     def __init__(
@@ -226,65 +224,55 @@ class GraphLandDataset(InMemoryDataset):
         split: str,
         convert_regression_to_classification: bool = True,
         num_classes_for_regression: int = 5,
-        binning_strategy: str = 'quantile',
-        numerical_features_transform: Optional[
-            str] = 'quantile_transform_normal',
+        binning_strategy: str = "quantile",
+        numerical_features_transform: Optional[str] = "quantile_transform_normal",
         fraction_features_transform: Optional[str] = None,
-        categorical_features_transform: Optional[str] = 'one_hot_encoding',
-        regression_targets_transform: Optional[str] = 'standard_scaler',
-        numerical_features_nan_imputation_strategy: Optional[
-            str] = 'most_frequent',
-        fraction_features_nan_imputation_strategy: Optional[
-            str] = 'most_frequent',
+        categorical_features_transform: Optional[str] = "one_hot_encoding",
+        regression_targets_transform: Optional[str] = "standard_scaler",
+        numerical_features_nan_imputation_strategy: Optional[str] = "most_frequent",
+        fraction_features_nan_imputation_strategy: Optional[str] = "most_frequent",
         to_undirected: bool = False,
         transform: Optional[Callable] = None,
         pre_transform: Optional[Callable] = None,
         force_reload: bool = False,
     ) -> None:
-        assert name in self.GRAPHLAND_DATASETS, (
-            f'Unsupported dataset name: {name}')
+        assert name in self.GRAPHLAND_DATASETS, f"Unsupported dataset name: {name}"
 
-        assert split in ['RL', 'RH', 'TH', 'THI'], \
-            f'Unsupported split name: {split}'
-        if split in ['TH', 'THI']:
+        assert split in ["RL", "RH", "TH", "THI"], f"Unsupported split name: {split}"
+        if split in ["TH", "THI"]:
             assert name not in [
-                'city-reviews',
-                'city-roads-M',
-                'city-roads-L',
-                'web-trafic',
-            ], ('Temporal split is not available for city-reviews, '
-                'city-roads-M, city-roads-L, web-trafic.')
-        assert binning_strategy in ['quantile', 'uniform'], \
-            f'Unsupported binning strategy: {binning_strategy}'
+                "city-reviews",
+                "city-roads-M",
+                "city-roads-L",
+                "web-trafic",
+            ], "Temporal split is not available for city-reviews, " "city-roads-M, city-roads-L, web-trafic."
+        assert binning_strategy in ["quantile", "uniform"], f"Unsupported binning strategy: {binning_strategy}"
 
         if numerical_features_transform is not None:
             assert numerical_features_transform in [
-                'standard_scaler',
-                'min_max_scaler',
-                'quantile_transform_normal',
-                'quantile_transform_uniform',
-            ], ('Unsupported numerical features transform: '
-                f'{numerical_features_transform}')
+                "standard_scaler",
+                "min_max_scaler",
+                "quantile_transform_normal",
+                "quantile_transform_uniform",
+            ], "Unsupported numerical features transform: " f"{numerical_features_transform}"
 
         if fraction_features_transform is not None:
             assert fraction_features_transform in [
-                'standard_scaler',
-                'min_max_scaler',
-                'quantile_transform_normal',
-                'quantile_transform_uniform',
-            ], ('Unsupported fraction features transform: '
-                f'{fraction_features_transform}')
+                "standard_scaler",
+                "min_max_scaler",
+                "quantile_transform_normal",
+                "quantile_transform_uniform",
+            ], "Unsupported fraction features transform: " f"{fraction_features_transform}"
 
         if categorical_features_transform is not None:
-            assert categorical_features_transform == 'one_hot_encoding', (
-                'Unsupported categorical features transform: '
-                f'{categorical_features_transform}')
+            assert categorical_features_transform == "one_hot_encoding", (
+                "Unsupported categorical features transform: " f"{categorical_features_transform}"
+            )
 
         if regression_targets_transform is not None:
-            assert regression_targets_transform in [
-                'standard_scaler', 'min_max_scaler'
-            ], ('Unsupported regression targets transform:'
-                f'{regression_targets_transform}')
+            assert regression_targets_transform in ["standard_scaler", "min_max_scaler"], (
+                "Unsupported regression targets transform:" f"{regression_targets_transform}"
+            )
 
         self.name = name
         self.split = split
@@ -293,9 +281,9 @@ class GraphLandDataset(InMemoryDataset):
         self.num_classes_for_regression = num_classes_for_regression
         self.binning_strategy = binning_strategy
 
-        if self.task == 'regression' and convert_regression_to_classification:
-            self.task = 'multiclass_classification'
-            self.original_task = 'regression'
+        if self.task == "regression" and convert_regression_to_classification:
+            self.task = "multiclass_classification"
+            self.original_task = "regression"
         else:
             self.original_task = self.task
 
@@ -314,33 +302,29 @@ class GraphLandDataset(InMemoryDataset):
             QuantileTransformer,
             StandardScaler,
         )
+
         self._transforms = {
-            'standard_scaler':
-            partial(StandardScaler, copy=False),
-            'min_max_scaler':
-            partial(MinMaxScaler, clip=False, copy=False),
-            'quantile_transform_normal':
-            partial(
+            "standard_scaler": partial(StandardScaler, copy=False),
+            "min_max_scaler": partial(MinMaxScaler, clip=False, copy=False),
+            "quantile_transform_normal": partial(
                 QuantileTransformer,
-                output_distribution='normal',
+                output_distribution="normal",
                 subsample=None,
                 random_state=0,
                 copy=False,
             ),
-            'quantile_transform_uniform':
-            partial(
+            "quantile_transform_uniform": partial(
                 QuantileTransformer,
-                output_distribution='uniform',
+                output_distribution="uniform",
                 subsample=None,
                 random_state=0,
                 copy=False,
             ),
-            'one_hot_encoding':
-            partial(
+            "one_hot_encoding": partial(
                 OneHotEncoder,
-                drop='if_binary',
+                drop="if_binary",
                 sparse_output=False,
-                handle_unknown='ignore',
+                handle_unknown="ignore",
                 dtype=np.float32,
             ),
         }
@@ -351,24 +335,27 @@ class GraphLandDataset(InMemoryDataset):
 
     @property
     def raw_dir(self) -> str:
-        return osp.join(self.root, self.name, 'raw')
+        return osp.join(self.root, self.name, "raw")
 
     @property
     def processed_dir(self) -> str:
-        specs = ''.join(f'__{str(arg).lower()}' for arg in [
-            self.split,
-            self._num_transform,
-            self._frac_transform,
-            self._cat_transform,
-            self._reg_transform,
-            self._num_imputation,
-            self._frac_imputation,
-            self._to_undirected,
-            self.convert_regression_to_classification,
-            self.num_classes_for_regression if self.convert_regression_to_classification else 'none',
-            self.binning_strategy if self.convert_regression_to_classification else 'none',
-        ])
-        return osp.join(self.root, self.name, 'processed', specs)
+        specs = "".join(
+            f"__{str(arg).lower()}"
+            for arg in [
+                self.split,
+                self._num_transform,
+                self._frac_transform,
+                self._cat_transform,
+                self._reg_transform,
+                self._num_imputation,
+                self._frac_imputation,
+                self._to_undirected,
+                self.convert_regression_to_classification,
+                self.num_classes_for_regression if self.convert_regression_to_classification else "none",
+                self.binning_strategy if self.convert_regression_to_classification else "none",
+            ]
+        )
+        return osp.join(self.root, self.name, "processed", specs)
 
     @property
     def raw_file_names(self) -> str:
@@ -376,10 +363,10 @@ class GraphLandDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self) -> str:
-        return 'data.pt'
+        return "data.pt"
 
     def download(self) -> None:
-        zip_url = osp.join(self._url, 'files', f'{self.name}.zip')
+        zip_url = osp.join(self._url, "files", f"{self.name}.zip")
         path = download_url(zip_url, self.raw_dir)
         extract_zip(path, self.raw_dir)
         os.unlink(path)
@@ -388,54 +375,50 @@ class GraphLandDataset(InMemoryDataset):
         import pandas as pd
 
         raw_data_dir = osp.join(self.raw_dir, self.name)
-        info = _load_yaml(osp.join(raw_data_dir, 'info.yaml'))
+        info = _load_yaml(osp.join(raw_data_dir, "info.yaml"))
 
         features_df = pd.read_csv(
-            osp.join(raw_data_dir, 'features.csv'),
+            osp.join(raw_data_dir, "features.csv"),
             index_col=0,
         )
         num_features_names = [
-            name for name in info['numerical_features_names']
-            if name not in info['fraction_features_names']
+            name for name in info["numerical_features_names"] if name not in info["fraction_features_names"]
         ]
         num_features = features_df[num_features_names].values
         num_features = num_features.astype(np.float32)
 
-        cat_features_names = info['categorical_features_names']
+        cat_features_names = info["categorical_features_names"]
         cat_features = features_df[cat_features_names].values
         cat_features = cat_features.astype(np.int32)
 
-        frac_features_names = info['fraction_features_names']
+        frac_features_names = info["fraction_features_names"]
         frac_features = features_df[frac_features_names].values
         frac_features = frac_features.astype(np.float32)
 
         targets_df = pd.read_csv(
-            osp.join(raw_data_dir, 'targets.csv'),
+            osp.join(raw_data_dir, "targets.csv"),
             index_col=0,
         )
-        targets = targets_df[info['target_name']].values
+        targets = targets_df[info["target_name"]].values
         targets = targets.astype(np.float32)
 
         masks_df = pd.read_csv(
-            osp.join(raw_data_dir, f'split_masks_{self.split[:2]}.csv'),
+            osp.join(raw_data_dir, f"split_masks_{self.split[:2]}.csv"),
             index_col=0,
         )
-        masks = {
-            k: np.array(v, dtype=bool)
-            for k, v in masks_df.to_dict('list').items()
-        }
+        masks = {k: np.array(v, dtype=bool) for k, v in masks_df.to_dict("list").items()}
 
-        edges_df = pd.read_csv(osp.join(raw_data_dir, 'edgelist.csv'))
+        edges_df = pd.read_csv(osp.join(raw_data_dir, "edgelist.csv"))
         edges = edges_df.values
 
         return {
-            'info': info,
-            'num_features': num_features,
-            'cat_features': cat_features,
-            'frac_features': frac_features,
-            'targets': targets,
-            'masks': masks,
-            'edges': edges,
+            "info": info,
+            "num_features": num_features,
+            "cat_features": cat_features,
+            "frac_features": frac_features,
+            "targets": targets,
+            "masks": masks,
+            "edges": edges,
         }
 
     def _convert_regression_to_classification(self, targets: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
@@ -453,15 +436,17 @@ class GraphLandDataset(InMemoryDataset):
         valid_targets = targets[~np.isnan(targets)]
         train_targets = targets[train_mask & ~np.isnan(targets)]
 
-        if self.binning_strategy == 'quantile':
+        if self.binning_strategy == "quantile":
             # Create equal-frequency bins based on training data
             quantiles = np.linspace(0, 1, self.num_classes_for_regression + 1)
             bin_edges = np.percentile(train_targets, quantiles * 100)
             # Ensure unique bin edges
             bin_edges = np.unique(bin_edges)
             if len(bin_edges) < self.num_classes_for_regression + 1:
-                print(f"Warning: Could not create {self.num_classes_for_regression} unique bins. "
-                      f"Created {len(bin_edges) - 1} bins instead.")
+                print(
+                    f"Warning: Could not create {self.num_classes_for_regression} unique bins. "
+                    f"Created {len(bin_edges) - 1} bins instead."
+                )
         else:  # uniform
             # Create equal-width bins based on training data
             min_val = train_targets.min()
@@ -478,11 +463,7 @@ class GraphLandDataset(InMemoryDataset):
         converted_targets[valid_mask] = np.digitize(targets[valid_mask], bin_edges) - 1
 
         # Clip to ensure values are in valid range [0, num_classes-1]
-        converted_targets[valid_mask] = np.clip(
-            converted_targets[valid_mask],
-            0,
-            len(bin_edges) - 2
-        )
+        converted_targets[valid_mask] = np.clip(converted_targets[valid_mask], 0, len(bin_edges) - 2)
 
         # Store bin edges for reference
         self.bin_edges = bin_edges
@@ -493,56 +474,55 @@ class GraphLandDataset(InMemoryDataset):
         raw_data = self._get_raw_data()
 
         # >>> process targets
-        targets = raw_data['targets']
+        targets = raw_data["targets"]
         labeled_mask = ~np.isnan(targets)
 
         # Convert regression to classification if needed
-        if raw_data['info']['task'] == 'regression' and self.convert_regression_to_classification:
-            targets = self._convert_regression_to_classification(targets, raw_data['masks']['train'])
-        elif raw_data['info']['task'] == 'regression' and self._reg_transform is not None:
+        if raw_data["info"]["task"] == "regression" and self.convert_regression_to_classification:
+            targets = self._convert_regression_to_classification(targets, raw_data["masks"]["train"])
+        elif raw_data["info"]["task"] == "regression" and self._reg_transform is not None:
             targets = targets.reshape(-1, 1)
             transform = self._transforms[self._reg_transform]()
-            transform.fit(targets[raw_data['masks']['train']])
+            transform.fit(targets[raw_data["masks"]["train"]])
             targets = transform.transform(targets).reshape(-1)
         targets = torch.from_numpy(targets).float()
 
         # Convert to long tensor for classification tasks
-        if self.task in ['binary_classification', 'multiclass_classification']:
+        if self.task in ["binary_classification", "multiclass_classification"]:
             targets = targets.long()
 
         # >>> process numerical features
-        num_features = raw_data['num_features']
+        num_features = raw_data["num_features"]
         if num_features.size > 0:
             if self._num_transform is not None:
                 transform = self._transforms[self._num_transform]()
                 transform.fit(num_features)
 
             num_features = self._imputer(
-                missing_values=np.nan, strategy=self._num_imputation,
-                copy=False).fit_transform(num_features)
+                missing_values=np.nan, strategy=self._num_imputation, copy=False
+            ).fit_transform(num_features)
 
             if self._num_transform is not None:
                 num_features = transform.transform(num_features)
 
         # >>> process fraction features
-        frac_features = raw_data['frac_features']
+        frac_features = raw_data["frac_features"]
         if frac_features.size > 0:
             if self._frac_transform is not None:
                 transform = self._transforms[self._frac_transform]()
                 transform.fit(frac_features)
 
             frac_features = self._imputer(
-                missing_values=np.nan, strategy=self._frac_imputation,
-                copy=False).fit_transform(frac_features)
+                missing_values=np.nan, strategy=self._frac_imputation, copy=False
+            ).fit_transform(frac_features)
 
             if self._frac_transform is not None:
                 frac_features = transform.transform(frac_features)
 
         # >>> process categorical features
-        cat_features = raw_data['cat_features']
+        cat_features = raw_data["cat_features"]
         if cat_features.size > 0 and self._cat_transform is not None:
-            cat_features = (self._transforms[self._cat_transform]
-                            ().fit_transform(cat_features))
+            cat_features = self._transforms[self._cat_transform]().fit_transform(cat_features)
 
         # >>> concatenate features and make features mask
         features = np.concatenate(
@@ -552,26 +532,26 @@ class GraphLandDataset(InMemoryDataset):
         features = torch.from_numpy(features).float()
 
         num_mask = torch.zeros(features.shape[1], dtype=torch.bool)
-        num_mask[:num_features.shape[1]] = True
+        num_mask[: num_features.shape[1]] = True
 
         frac_mask = torch.zeros(features.shape[1], dtype=torch.bool)
-        frac_mask[num_features.shape[1]:-cat_features.shape[1]] = True
+        frac_mask[num_features.shape[1] : -cat_features.shape[1]] = True
 
         cat_mask = torch.zeros(features.shape[1], dtype=torch.bool)
-        cat_mask[-cat_features.shape[1]:] = True
+        cat_mask[-cat_features.shape[1] :] = True
 
         # >>> update split masks
-        train_mask = raw_data['masks']['train'] & labeled_mask
+        train_mask = raw_data["masks"]["train"] & labeled_mask
         train_mask = torch.from_numpy(train_mask).bool()
 
-        val_mask = raw_data['masks']['val'] & labeled_mask
+        val_mask = raw_data["masks"]["val"] & labeled_mask
         val_mask = torch.from_numpy(val_mask).bool()
 
-        test_mask = raw_data['masks']['test'] & labeled_mask
+        test_mask = raw_data["masks"]["test"] & labeled_mask
         test_mask = torch.from_numpy(test_mask).bool()
 
         # >>> make edge index
-        edge_index = raw_data['edges'].T
+        edge_index = raw_data["edges"].T
         edge_index = torch.from_numpy(edge_index).long()
 
         # >>> construct Data object
@@ -587,40 +567,39 @@ class GraphLandDataset(InMemoryDataset):
             x_categorical_mask=cat_mask,
         )
         # Add metadata about conversion if applicable
-        if self.convert_regression_to_classification and hasattr(self, 'bin_edges'):
+        if self.convert_regression_to_classification and hasattr(self, "bin_edges"):
             data.bin_edges = torch.from_numpy(self.bin_edges).float()
 
         return [data]
 
     def _get_inductive_data(self) -> list[Data]:
         raw_data = self._get_raw_data()
-        transform_mask = raw_data['masks']['train']
+        transform_mask = raw_data["masks"]["train"]
 
         # >>> process targets
-        targets = raw_data['targets']
+        targets = raw_data["targets"]
         labeled_mask = ~np.isnan(targets)
         # Convert regression to classification if needed
-        if raw_data['info']['task'] == 'regression' and self.convert_regression_to_classification:
+        if raw_data["info"]["task"] == "regression" and self.convert_regression_to_classification:
             targets = self._convert_regression_to_classification(targets, transform_mask)
-        elif raw_data['info']['task'] == 'regression' and self._reg_transform is not None:
+        elif raw_data["info"]["task"] == "regression" and self._reg_transform is not None:
             targets = targets.reshape(-1, 1)
             transform = self._transforms[self._reg_transform]()
             transform.fit(targets[transform_mask])
             targets = transform.transform(targets).reshape(-1)
         targets = torch.from_numpy(targets).float()
         # Convert to long tensor for classification tasks
-        if self.task in ['binary_classification', 'multiclass_classification']:
+        if self.task in ["binary_classification", "multiclass_classification"]:
             targets = targets.long()
 
         # >>> process numerical features
-        num_features = raw_data['num_features']
+        num_features = raw_data["num_features"]
         if num_features.size > 0:
             if self._num_transform is not None:
                 transform = self._transforms[self._num_transform]()
                 transform.fit(num_features[transform_mask])
 
-            imputer = self._imputer(missing_values=np.nan,
-                                    strategy=self._num_imputation, copy=False)
+            imputer = self._imputer(missing_values=np.nan, strategy=self._num_imputation, copy=False)
             imputer.fit(num_features[transform_mask])
             num_features = imputer.transform(num_features)
 
@@ -628,14 +607,13 @@ class GraphLandDataset(InMemoryDataset):
                 num_features = transform.transform(num_features)
 
         # >>> process fraction features
-        frac_features = raw_data['frac_features']
+        frac_features = raw_data["frac_features"]
         if frac_features.size > 0:
             if self._frac_transform is not None:
                 transform = self._transforms[self._frac_transform]()
                 transform.fit(frac_features[transform_mask])
 
-            imputer = self._imputer(missing_values=np.nan,
-                                    strategy=self._frac_imputation, copy=False)
+            imputer = self._imputer(missing_values=np.nan, strategy=self._frac_imputation, copy=False)
             imputer.fit(frac_features[transform_mask])
             frac_features = imputer.transform(frac_features)
 
@@ -643,7 +621,7 @@ class GraphLandDataset(InMemoryDataset):
                 frac_features = transform.transform(frac_features)
 
         # >>> process categorical features
-        cat_features = raw_data['cat_features']
+        cat_features = raw_data["cat_features"]
         if cat_features.size > 0 and self._cat_transform is not None:
             transform = self._transforms[self._cat_transform]()
             transform.fit(cat_features[transform_mask])
@@ -657,23 +635,23 @@ class GraphLandDataset(InMemoryDataset):
         features = torch.from_numpy(features).float()
 
         num_mask = torch.zeros(features.shape[1], dtype=torch.bool)
-        num_mask[:num_features.shape[1]] = True
+        num_mask[: num_features.shape[1]] = True
 
         frac_mask = torch.zeros(features.shape[1], dtype=torch.bool)
-        frac_mask[num_features.shape[1]:-cat_features.shape[1]] = True
+        frac_mask[num_features.shape[1] : -cat_features.shape[1]] = True
 
         cat_mask = torch.zeros(features.shape[1], dtype=torch.bool)
-        cat_mask[-cat_features.shape[1]:] = True
+        cat_mask[-cat_features.shape[1] :] = True
 
         # >>> construct Data objects
-        edge_index = raw_data['edges'].T
+        edge_index = raw_data["edges"].T
         edge_index = torch.from_numpy(edge_index).long()
 
         # --- train
-        train_graph_mask = raw_data['masks']['train']
+        train_graph_mask = raw_data["masks"]["train"]
         train_graph_mask = torch.from_numpy(train_graph_mask).bool()
 
-        train_label_mask = raw_data['masks']['train'] & labeled_mask
+        train_label_mask = raw_data["masks"]["train"] & labeled_mask
         train_label_mask = torch.from_numpy(train_label_mask).bool()
 
         train_node_id = np.where(train_graph_mask)[0]
@@ -696,11 +674,10 @@ class GraphLandDataset(InMemoryDataset):
         )
 
         # --- val
-        val_graph_mask = (raw_data['masks']['train']
-                          | raw_data['masks']['val'])
+        val_graph_mask = raw_data["masks"]["train"] | raw_data["masks"]["val"]
         val_graph_mask = torch.from_numpy(val_graph_mask).bool()
 
-        val_label_mask = raw_data['masks']['val'] & labeled_mask
+        val_label_mask = raw_data["masks"]["val"] & labeled_mask
         val_label_mask = torch.from_numpy(val_label_mask).bool()
 
         val_node_id = np.where(val_graph_mask)[0]
@@ -723,12 +700,10 @@ class GraphLandDataset(InMemoryDataset):
         )
 
         # --- test
-        test_graph_mask = (raw_data['masks']['train']
-                           | raw_data['masks']['val']
-                           | raw_data['masks']['test'])
+        test_graph_mask = raw_data["masks"]["train"] | raw_data["masks"]["val"] | raw_data["masks"]["test"]
         test_graph_mask = torch.from_numpy(test_graph_mask).bool()
 
-        test_label_mask = raw_data['masks']['test'] & labeled_mask
+        test_label_mask = raw_data["masks"]["test"] & labeled_mask
         test_label_mask = torch.from_numpy(test_label_mask).bool()
 
         test_node_id = np.where(test_graph_mask)[0]
@@ -751,15 +726,14 @@ class GraphLandDataset(InMemoryDataset):
         )
 
         # Add metadata about conversion if applicable
-        if self.convert_regression_to_classification and hasattr(self, 'bin_edges'):
+        if self.convert_regression_to_classification and hasattr(self, "bin_edges"):
             for data in [train_data, val_data, test_data]:
                 data.bin_edges = torch.from_numpy(self.bin_edges).float()
 
         return [train_data, val_data, test_data]
 
     def process(self) -> None:
-        data = (self._get_transductive_data() if self.split
-                in ['RL', 'RH', 'TH'] else self._get_inductive_data())
+        data = self._get_transductive_data() if self.split in ["RL", "RH", "TH"] else self._get_inductive_data()
         if self._to_undirected:
             transform = ToUndirected()
             for idx, d in enumerate(data):
@@ -768,4 +742,4 @@ class GraphLandDataset(InMemoryDataset):
         self.save(data, self.processed_paths[0])
 
     def __repr__(self) -> str:
-        return f'{self.__class__.__name__}(name={self.name}, task={self.task})'
+        return f"{self.__class__.__name__}(name={self.name}, task={self.task})"

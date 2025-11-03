@@ -1,5 +1,5 @@
 microbench:
-  layer: gcn                 # gcn|gat_v2|sage|gin
+  layer: gcn
   backends: [pyg, dgl, torch_native]
   feature_dims: [64, 128, 256, 512]
   num_nodes: [5_000, 20_000, 100_000]
@@ -8,4 +8,4 @@ microbench:
   iters: 100
   warmup: 20
   amp_dtype: bf16            # null|bf16|fp16
-  seed: 17
+  seed: 42

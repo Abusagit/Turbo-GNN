@@ -209,7 +209,7 @@ def parse_args() -> argparse.Namespace:
         "--profile", type=str, default=None, help="Optional profiler YAML (configs/benchmarks/profile.yaml)."
     )
     p.add_argument("--out", type=str, default="runs/train", help="Output directory.")
-    p.add_argument("--no-record-snapshots", action="store_true", help="Flag to NOT record memory snapshots")
+    p.add_argument("--record-snapshots", action="store_true", help="Flag to record memory snapshots")
     return p.parse_args()
 
 
@@ -236,7 +236,7 @@ def main() -> int:
         log_every=5,
         track_cpu_rss=True,
         sync_cuda=True,
-        record_snapshots=args.no_record_snapshots,
+        record_snapshots=args.record_snapshots,
         snapshot_dir=str(outdir / "memory_snahphots"),
     )
 

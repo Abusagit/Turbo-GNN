@@ -100,7 +100,7 @@ def main() -> int:
 
     # conv to tune
     conv = backend.create_conv(
-        args.layer, args.in_ch, args.out_ch, heads=args.heads if args.layer == "gat_v2" else 1
+        args.layer, feature_dim=args.in_ch, heads=args.heads if args.layer == "gat_v2" else 1
     ).to(device)
 
     # measure function

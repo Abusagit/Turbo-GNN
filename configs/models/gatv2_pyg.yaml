@@ -1,7 +1,4 @@
-# 2-layer GATv2. Effective out of layer 1 = out_channels * heads (if concat=true).
 architecture: node_classifier
-num_classes: 0
-dropout: 0.5
 
 encoder:
   layers:

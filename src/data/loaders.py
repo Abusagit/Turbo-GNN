@@ -1,5 +1,6 @@
-from typing import List, Dict, Any
 from dataclasses import dataclass
+from typing import Any, Dict, List
+
 from torch.utils.data import DataLoader, Dataset
 
 doc = """
@@ -22,6 +23,7 @@ class LoaderConfig:
         drop_last (bool): Drop the last incomplete batch.
         shuffle (bool): Shuffle dataset each epoch.
     """
+
     batch_size: int = 1
     num_workers: int = 0
     pin_memory: bool = True
@@ -30,10 +32,11 @@ class LoaderConfig:
     drop_last: bool = False
     shuffle: bool = False
 
+
 def unwrap_singleton_list(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Unwraps singleton list and returns its contents
-    """
+    """Unwraps singleton list and returns its contents"""
     return batch[0]
+
 
 def build_dataloader(ds: Dataset, cfg: LoaderConfig) -> DataLoader:
     """Build a DataLoader with sensible defaults for GNNs.

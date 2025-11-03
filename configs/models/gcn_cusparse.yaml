@@ -1,7 +1,4 @@
-# 2-layer GCN with BatchNorm + ReLU + Dropout
 architecture: node_classifier
-num_classes: 0            # override at runtime from dataset
-dropout: 0.5              # dropout before final linear head
 
 encoder:
   layers:

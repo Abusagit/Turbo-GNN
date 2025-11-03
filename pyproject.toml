@@ -228,6 +228,8 @@ warn_unused_ignores = true
 warn_no_return = true
 warn_unreachable = true
 strict_equality = true
+exclude = "^(dev/|dev$)"
+
 
 [[tool.mypy.overrides]]
 module = [
@@ -295,6 +297,7 @@ exclude = [
     "runs",
     "experiments",
     "__examples",
+    "/dev",
 ]
 
 [tool.ruff.lint]

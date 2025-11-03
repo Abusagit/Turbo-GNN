@@ -17,3 +17,10 @@ runs/
 *.egg-info
 
 .env
+
+
+cutlass
+
+*.ptx
+
+*.cubin
