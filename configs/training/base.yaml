@@ -1,8 +1,6 @@
 training:
   # Trainer (maps to TrainingConfig)
   epochs: 200
-  learning_rate: 0.01          # initial LR (also mirrored in optimizer.lr below)
-  weight_decay: 0.0005
   batch_size: 1                 # single-graph datasets → batch=1
   accumulation_steps: 1
   use_amp: false                # trainer uses autocast(dtype=bfloat16)
@@ -17,8 +15,8 @@ training:
 
 optimizer:
   name: adamw
-  lr: 0.01
-  weight_decay: 0.0005
+  lr: 0.0003
+  weight_decay: 0.01
   betas: [0.9, 0.999]
   eps: 1.0e-8
   momentum: 0.9
@@ -29,7 +27,7 @@ optimizer:
   no_decay_norm_bias: true
 
 scheduler:
-  name: cosine_warmup        # options: none|step|multistep|exponential|cosine|cosine_warmup|warm_restarts|onecycle
+  name: none        # options: none|step|multistep|exponential|cosine|cosine_warmup|warm_restarts|onecycle
   warmup_epochs: 5
   T_max: 200                 # cosine period (epochs)
   eta_min: 0.0
