@@ -55,6 +55,8 @@ Notes:
 def load_model_spec_from_yaml(
     path: str,
     *,
+    backend_to_override: str,
+    conv_type_to_override: str,
     input_dim: int | None = None,
     override_num_classes: int | None = None,
 ) -> ClassifierSpec:
@@ -77,12 +79,21 @@ def load_model_spec_from_yaml(
     """
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    return classifier_spec_from_config(cfg, input_dim=input_dim, override_num_classes=override_num_classes)
+
+    return classifier_spec_from_config(
+        cfg,
+        backend_to_override=backend_to_override,
+        conv_type_to_override=conv_type_to_override,
+        input_dim=input_dim,
+        override_num_classes=override_num_classes,
+    )
 
 
 def build_model_from_yaml(
     path: str,
     *,
+    backend_to_override: str,
+    conv_type_to_override: str,
     input_dim: int | None = None,
     override_num_classes: int | None = None,
 ) -> nn.Module:
@@ -96,7 +107,14 @@ def build_model_from_yaml(
     Returns:
         nn.Module: Constructed model instance ready for training.
     """
-    spec = load_model_spec_from_yaml(path, input_dim=input_dim, override_num_classes=override_num_classes)
+    spec = load_model_spec_from_yaml(
+        path,
+        backend_to_override=backend_to_override,
+        conv_type_to_override=conv_type_to_override,
+        input_dim=input_dim,
+        override_num_classes=override_num_classes,
+    )
+
     arch_name = _read_architecture_name(
         {}, default="node_classifier"
     )  # spec defines the body; name controls registry key
@@ -106,6 +124,8 @@ def build_model_from_yaml(
 def classifier_spec_from_config(
     cfg: dict[str, Any],
     *,
+    backend_to_override: str,
+    conv_type_to_override: str,
     input_dim: int | None = None,
     override_num_classes: int | None = None,
 ) -> ClassifierSpec:
@@ -120,7 +140,15 @@ def classifier_spec_from_config(
         ClassifierSpec: A complete classifier specification.
     """
     enc_cfg = _read_encoder_config(cfg)
-    layers = [_parse_layer_dict(ld) for ld in enc_cfg.get("layers", [])]
+    layers = [
+        _parse_layer_dict(
+            ld,
+            backend_to_override=backend_to_override,
+            conv_type_to_override=conv_type_to_override,
+        )
+        for ld in enc_cfg.get("layers", [])
+    ]
+
     if not layers:
         raise ValueError("encoder.layers must contain at least one layer")
 
@@ -168,7 +196,7 @@ def _read_encoder_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return enc
 
 
-def _parse_layer_dict(d: dict[str, Any]) -> LayerSpec:
+def _parse_layer_dict(d: dict[str, Any], backend_to_override: str, conv_type_to_override: str) -> LayerSpec:
     """Parse a single layer dictionary into a LayerSpec.
 
     Args:
@@ -187,8 +215,11 @@ def _parse_layer_dict(d: dict[str, Any]) -> LayerSpec:
             raise KeyError(f"Layer is missing required key '{k}'")
 
     layer_type = str(d["layer_type"]).lower()
-    conv_type = str(d["conv_type"]).lower()
-    backend = str(d["backend"])
+    # conv_type = str(d["conv_type"]).lower()
+    # backend = str(d["backend"])
+
+    conv_type = conv_type_to_override
+    backend = backend_to_override
     out_channels = int(d["out_channels"])
 
     # in_channels may be provided or left for inference

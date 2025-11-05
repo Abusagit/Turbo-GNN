@@ -1,0 +1,26 @@
+architecture: node_classifier
+
+encoder:
+  layers:
+    - layer_type: residual_block
+      conv_type: null  # leave to null -- insert during runtime
+      backend: null    # leave to null -- insert during runtime
+      in_channels: auto
+      out_channels: 128
+      heads: 8         # used by graph attention-like convolutions (GAT/GATv2/Graph Transformer)
+      norm: layer
+      activation: silu
+      dropout: 0.6
+      residual: false
+      conv_kwargs: {}
+    - layer_type: residual_block
+      conv_type: null  # leave to null -- insert during runtime
+      backend: null    # leave to null -- insert during runtime
+      in_channels: auto
+      out_channels: 128
+      heads: 8         # used by graph attention-like convolutions (GAT/GATv2/Graph Transformer)
+      norm: layer
+      activation: silu
+      dropout: 0.0
+      residual: false
+      conv_kwargs: {}

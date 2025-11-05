@@ -109,25 +109,6 @@ def build_data(
     return train_loader, val_loader, test_loader, num_features, num_classes
 
 
-def build_model(
-    model_yaml: str | Path,
-    *,
-    input_dim: int,
-    num_classes: int,
-) -> torch.nn.Module:
-    """Build a model from YAML using the registry-backed loader.
-
-    Args:
-        model_yaml (str | Path): Path to model YAML.
-        input_dim (int): Feature dimension (for inferring first-layer input).
-        num_classes (int): Number of output classes (overrides YAML).
-
-    Returns:
-        torch.nn.Module: Instantiated model ready for training.
-    """
-    return build_model_from_yaml(str(model_yaml), input_dim=input_dim, override_num_classes=num_classes)
-
-
 def build_opt_and_sched(
     model: torch.nn.Module,
     merged_cfg: dict[str, Any],
@@ -210,6 +191,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out", type=str, default="runs/train", help="Output directory.")
     p.add_argument("--record-snapshots", action="store_true", help="Flag to record memory snapshots")
+
+    p.add_argument("--conv_type", type=str, required=True, help="Convolution type")
+    p.add_argument("--backend", type=str, required=True, help="Backend type")
+
     return p.parse_args()
 
 
@@ -248,7 +233,7 @@ def main() -> int:
 
     torch.set_default_device(tcfg["device"])
 
-    graph_backend = infer_graph_backend(model_config_path=args.model)
+    graph_backend = args.backend
     train_loader, val_loader, test_loader, in_dim, num_classes = build_data(
         args.dataset,
         batch_size=batch_size,
@@ -258,7 +243,14 @@ def main() -> int:
     )
 
     # build model
-    model = build_model(args.model, input_dim=in_dim, num_classes=num_classes)
+    model = build_model_from_yaml(
+        args.model,
+        backend_to_override=args.backend,
+        conv_type_to_override=args.conv_type,
+        input_dim=in_dim,
+        override_num_classes=num_classes,
+    )
+    print(model)
 
     # build trainer
     trainer = build_trainer(model, merged_cfg)
