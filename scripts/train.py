@@ -146,6 +146,8 @@ def build_opt_and_sched(
 def build_trainer(
     model: torch.nn.Module,
     merged_cfg: dict[str, Any],
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
 ) -> GNNTrainer:
     """Construct `GNNTrainer` from merged training config.
 
@@ -159,7 +161,7 @@ def build_trainer(
     tcfg_dict = _extract_training_cfg(merged_cfg)
     tcfg = TrainingConfig(**tcfg_dict) if tcfg_dict else TrainingConfig()
 
-    return GNNTrainer(model=model, config=tcfg)
+    return GNNTrainer(model=model, config=tcfg, optimizer=optimizer, scheduler=scheduler)
 
 
 # ------------------------------- CLI and main -------------------------------- #
@@ -252,20 +254,17 @@ def main() -> int:
     )
     print(model)
 
-    # build trainer
-    trainer = build_trainer(model, merged_cfg)
-
-    logger.info(f"Built data with graph representation: {graph_backend}\tBuilt Trainer\tBuild model")
-
     # Optimizer + Scheduler
     steps_per_epoch = len(train_loader)
     total_epochs = int(tcfg.get("epochs", 1))
     optimizer, scheduler = build_opt_and_sched(
         model, merged_cfg, steps_per_epoch=steps_per_epoch, total_epochs=total_epochs
     )
-    trainer.optimizer = optimizer
-    trainer.scheduler = scheduler
     logger.info("Built Optimizer & Schedulers")
+
+    # build trainer
+    trainer = build_trainer(model, merged_cfg=merged_cfg, optimizer=optimizer, scheduler=scheduler)
+    logger.info(f"Built data with graph representation: {graph_backend}\tBuilt Trainer\tBuild model")
 
     trainer.add_hook(
         CheckpointHook(
@@ -302,6 +301,7 @@ def main() -> int:
         params_for_comet["model"] = str(model_config)
         params_for_comet["conv_type"] = model_config["encoder"]["layers"][0]["conv_type"]
         params_for_comet["backend"] = model_config["encoder"]["layers"][0]["backend"]
+        params_for_comet.update(_extract_optimizer_cfg(merged_cfg))  # add optimizer parameters
 
         comet_config = merged_cfg["comet_ml"]
         comet_config["ExperimentConfig"]["tags"].extend(

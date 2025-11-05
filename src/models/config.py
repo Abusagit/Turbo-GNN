@@ -21,8 +21,8 @@ dropout: 0.5
 
 encoder:
   layers:
-    - conv_type: gcn
-      backend: pyg
+    - conv_type: null
+      backend: null
       in_channels: auto          # or omit / <= 0 to infer
       out_channels: 64
       norm: batch
@@ -31,8 +31,8 @@ encoder:
       residual: false
       conv_kwargs:
         cached: true             # (backend-specific optional arg)
-    - conv_type: gcn
-      backend: pyg
+    - conv_type: null
+      backend: null
       in_channels: auto
       out_channels: 64
       norm: batch
@@ -41,8 +41,6 @@ encoder:
       residual: true
 
 Notes:
-- For GAT layers, if the backend concatenates heads (often default), the
-  effective output dim for the *next* layer input is `out_channels * heads`.
 - If you specify `in_channels` <= 0 or "auto", the loader will infer it by:
     first layer: use `input_dim` arg from the dataset/features,
     next layers: previous layer *effective* output dim.
@@ -215,9 +213,6 @@ def _parse_layer_dict(d: dict[str, Any], backend_to_override: str, conv_type_to_
             raise KeyError(f"Layer is missing required key '{k}'")
 
     layer_type = str(d["layer_type"]).lower()
-    # conv_type = str(d["conv_type"]).lower()
-    # backend = str(d["backend"])
-
     conv_type = conv_type_to_override
     backend = backend_to_override
     out_channels = int(d["out_channels"])

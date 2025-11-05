@@ -39,7 +39,7 @@ class GNNEncoder(nn.Module):
                     backend=layer.backend,
                     in_channels=layer.in_channels,
                     out_channels=layer.out_channels,
-                    heads=layer.heads if hasattr(layer, "heads") else 1,
+                    heads=layer.heads,
                     bias=layer.bias,
                     activation=layer.activation,
                     norm=layer.norm,
