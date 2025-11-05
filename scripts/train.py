@@ -252,7 +252,7 @@ def main() -> int:
         input_dim=in_dim,
         override_num_classes=num_classes,
     )
-    print(model)
+    logger.info(f"Initialized model:\n{model}")
 
     # Optimizer + Scheduler
     steps_per_epoch = len(train_loader)
