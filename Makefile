@@ -28,10 +28,16 @@ install-dev: _install-dev setup-hooks test
 _install-dev:
 	$(PIP) install -e ".[dev]" $(FIND_LINKS)
 
-install-full: _install-full setup-hooks test
+install-full: _install-full _install-tcgnn setup-hooks test
 
 _install-full:
 	$(PIP) install -e ".[full]" $(FIND_LINKS)
+
+_install-tcgnn:
+	mkdir -p third_party
+	git clone https://github.com/MachineLearningSystem/ATC23-TCGNN-Pytorch third_party/tcgnn || true
+	cd thirdparty/tcgnn/TCGNN_conv && $(PYTHON) setup.py install
+	cd ../../.
 
 test:
 	$(PYTHON) -m pytest tests/ -v
