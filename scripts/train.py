@@ -299,9 +299,23 @@ def main() -> int:
         params_for_comet["dataset"] = read_yaml(args.dataset)["dataset"]["name"]
         model_config = read_yaml(args.model)
         params_for_comet["model"] = str(model_config)
-        params_for_comet["conv_type"] = model_config["encoder"]["layers"][0]["conv_type"]
-        params_for_comet["backend"] = model_config["encoder"]["layers"][0]["backend"]
-        params_for_comet.update(_extract_optimizer_cfg(merged_cfg))  # add optimizer parameters
+        params_for_comet["conv_type"] = args.conv_type
+        params_for_comet["backend"] = args.backend
+
+        optimizer_options = {
+            f"optimizer_{arg_name}": value for arg_name, value in _extract_optimizer_cfg(merged_cfg).items()
+        }
+        scheduler_options = {
+            f"lr_scheduler_{arg_name}": value for arg_name, value in _extract_scheduler_cfg(merged_cfg).items()
+        }
+
+        # training options are explicit, seems like we don't need a prefix for them:
+        training_options = _extract_training_cfg(merged_cfg)
+
+        # add optimizer/scheduler/training parameters
+        params_for_comet.update(optimizer_options)
+        params_for_comet.update(scheduler_options)
+        params_for_comet.update(training_options)
 
         comet_config = merged_cfg["comet_ml"]
         comet_config["ExperimentConfig"]["tags"].extend(
