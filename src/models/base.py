@@ -100,6 +100,8 @@ def activation_factory(name: str, *, dim: int | None = None) -> nn.Module:
         return nn.Tanh()
     if key == "sigmoid":
         return nn.Sigmoid()
+    if key == "silu":
+        return nn.SiLU()
     return nn.Identity()
 
 
