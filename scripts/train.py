@@ -309,13 +309,9 @@ def main() -> int:
             f"lr_scheduler_{arg_name}": value for arg_name, value in _extract_scheduler_cfg(merged_cfg).items()
         }
 
-        # training options are explicit, seems like we don't need a prefix for them:
-        training_options = _extract_training_cfg(merged_cfg)
-
-        # add optimizer/scheduler/training parameters
+        # add optimizer/scheduler parameters
         params_for_comet.update(optimizer_options)
         params_for_comet.update(scheduler_options)
-        params_for_comet.update(training_options)
 
         comet_config = merged_cfg["comet_ml"]
         comet_config["ExperimentConfig"]["tags"].extend(

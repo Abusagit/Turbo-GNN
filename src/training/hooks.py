@@ -403,7 +403,10 @@ class MetricHook(Hook):
                 api_key=os.getenv("COMET_TOKEN"), experiment_config=exp_config, **self.comet_config["start"]
             )
             if self.comet_experiment is not None:
-                self.comet_experiment.log_parameters(config.__dict__ if hasattr(config, "__dict__") else config)
+                config_dict = config.__dict__ if hasattr(config, "__dict__") else config
+                trainer_options = {f"trainer_{arg_name}": value for arg_name, value in config_dict.items()}
+
+                self.comet_experiment.log_parameters(trainer_options)
                 self.comet_experiment.log_parameters(self.params_for_comet)
 
         logger.info("Metric tracking initialized")
