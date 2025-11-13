@@ -95,10 +95,9 @@ class _GINConv(torch.nn.Module):
 class _GCNConv(torch.nn.Module):
     def __init__(self, input_dim, output_dim):
         super(_GCNConv, self).__init__()
-        torch.ones(5)
-        torch.randn(input_dim, output_dim)
+
         self.weights = torch.nn.Parameter(torch.randn(input_dim, output_dim))
-        # self.reset_parameters()
+        self.reset_parameters()
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.weights.size(1))

@@ -153,13 +153,13 @@ def to_tcgnn_data(
     BLK_W = 8
 
     num_row_windows = (num_nodes + BLK_H - 1) // BLK_H
-    block_partition = torch.zeros(num_row_windows, dtype=torch.int)
-    edge_to_column = torch.zeros(edge_index.size(1), dtype=torch.int)
-    edge_to_row = torch.zeros(edge_index.size(1), dtype=torch.int)
-    col_indices = col_indices.to(torch.int)
-    row_pointer = row_pointer.to(torch.int)
-    TCGNN.preprocess_gpu(
-        col_indices, row_pointer, num_nodes, BLK_H, BLK_W, block_partition, edge_to_column, edge_to_row
-    )
+    block_partition = torch.zeros(num_row_windows, dtype=torch.int).cpu()
+    edge_to_column = torch.zeros(edge_index.size(1), dtype=torch.int).cpu()
+    edge_to_row = torch.zeros(edge_index.size(1), dtype=torch.int).cpu()
+    col_indices = col_indices.to(torch.int).cpu()
+    row_pointer = row_pointer.to(torch.int).cpu()
 
+    TCGNN.preprocess(
+        col_indices.cpu(), row_pointer.cpu(), num_nodes, BLK_H, BLK_W, block_partition, edge_to_column, edge_to_row
+    )
     return row_pointer, col_indices, block_partition, edge_to_column, edge_to_row
