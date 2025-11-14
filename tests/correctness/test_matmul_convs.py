@@ -42,7 +42,7 @@ class TestMatMulConvCorrectness:
             aggr_type, backend, random_graph_data, create_graph_sample, create_conv_layer
         )
 
-    @pytest.mark.parametrize("aggr_type,backend", [("gcn", "torch_native"), ("gcn", "cusparse")])
+    @pytest.mark.parametrize("aggr_type,backend", [("gcn", "torch_native"), ("gcn", "cusparse"), ("gcn", "fusegnn")])
     def test_matmul_conv_matches_dgl_on_directed_graph2(
         self, aggr_type, backend, random_graph_data, create_graph_sample, create_conv_layer
     ):
