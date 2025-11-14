@@ -1,10 +1,4 @@
-// #include <torch/extension.h>
-// #include <cuda_runtime.h>
-// #include <cuda.h>
-// #include <vector>
 #include <cusparse.h>
-// #include <ATen/cuda/CUDAContext.h>
-
 #include "torch_minimal.h"
 
 std::vector<torch::Tensor> csr2csc_cuda(
