@@ -1,8 +1,6 @@
 from typing import Any, Optional
 
 import torch
-from dgl.nn.pytorch import GraphConv
-from dgl.nn.pytorch.conv import GATv2Conv as _GAT
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
@@ -111,4 +109,4 @@ class СuSparseBackend(BaseBackend):
             return _СuSparseMatMulConv(norm_type="left", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
         if conv_type == "gcn":
             return _СuSparseMatMulConv(norm_type="both", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
-        raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
+        raise KeyError(f"Unsupported conv_type for CuSparse backend: {conv_type}")

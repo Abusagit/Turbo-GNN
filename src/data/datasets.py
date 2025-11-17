@@ -59,6 +59,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cugraph": "cugraph",
     "torch_native_adj_mat": "adj_mat",
     "cusparse": "csr",
+    "fusegnn": "coo",
     "tcgnn": "tcgnn",
 }
 
@@ -187,7 +188,9 @@ class GraphSample:
             ).T.coalesce()
             graph = self._to_default_device(graph)
         elif self.backend == "coo":
-            ...  # TODO
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+            graph = (self.edge_index, self.edge_weight, self.num_nodes)
         elif self.backend == "csr":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
