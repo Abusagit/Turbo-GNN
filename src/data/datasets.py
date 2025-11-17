@@ -14,6 +14,8 @@ from torch_geometric.datasets import Amazon, Coauthor, Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
+from src.data.converters import to_tcgnn_data
+
 from .graphland_datasets import GraphLandDataset
 
 try:  # pragma: no cover
@@ -42,6 +44,7 @@ GraphBackendOption = Literal[
     "adj_mat_in_degree_normalized_transposed",
     "adj_mat_transposed",
     "cugraph",
+    "tcgnn",
 ]  # NOTE we can define cached formalizations via this option
 
 
@@ -56,6 +59,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cugraph": "cugraph",
     "torch_native_adj_mat": "adj_mat",
     "cusparse": "csr",
+    "tcgnn": "tcgnn",
 }
 
 
@@ -219,6 +223,17 @@ class GraphSample:
             edge_list = self.edge_index.T
             graph = (self._to_default_device(edge_list), self._to_default_device(self.edge_weight))
             # TODO: add self-loops
+        elif self.backend == "tcgnn":
+            row_pointer, col_indices, block_partition, edge_to_column, edge_to_row = to_tcgnn_data(
+                self.edge_index, self.num_nodes, self.edge_weight
+            )
+            graph = (
+                self._to_default_device(row_pointer),
+                self._to_default_device(col_indices),
+                self._to_default_device(block_partition),
+                self._to_default_device(edge_to_column),
+                self._to_default_device(edge_to_row),
+            )
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"
@@ -804,7 +819,7 @@ def get_cugraph_with_gcn_weights(
 
     """
     if not isinstance(edge_index, EdgeIndex):
-        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' " f"(got {type(edge_index)})")
+        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' (got {type(edge_index)})")
 
     edge_index = edge_index.sort_by("col")[0]
     num_src_nodes = edge_index.get_sparse_size(0)

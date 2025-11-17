@@ -125,3 +125,41 @@ def to_dgl_graph(
     if edge_weight is not None:
         g.edata["w"] = edge_weight
     return g
+
+
+def to_tcgnn_data(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    edge_weight: Optional[torch.Tensor] = None,
+) -> Any:
+    """Create a TC-GNN `Data` object lazily.
+
+    Args:
+        edge_index (torch.Tensor): [2, E] long.
+        num_nodes (int): Number of nodes.
+        edge_weight (Optional[torch.Tensor]): Edge weights [E].
+
+    Returns:
+        Any: tcgnn.Data instance.
+    """
+
+    try:
+        import TCGNN
+    except Exception as exc:
+        raise ImportError("TC-GNN is required for to_tcgnn_data()") from exc
+
+    row_pointer, col_indices, values = to_csr_from_edge_list(edge_index, num_nodes, edge_weight)
+    BLK_H = 16
+    BLK_W = 8
+
+    num_row_windows = (num_nodes + BLK_H - 1) // BLK_H
+    block_partition = torch.zeros(num_row_windows, dtype=torch.int).cpu()
+    edge_to_column = torch.zeros(edge_index.size(1), dtype=torch.int).cpu()
+    edge_to_row = torch.zeros(edge_index.size(1), dtype=torch.int).cpu()
+    col_indices = col_indices.to(torch.int).cpu()
+    row_pointer = row_pointer.to(torch.int).cpu()
+
+    TCGNN.preprocess(
+        col_indices.cpu(), row_pointer.cpu(), num_nodes, BLK_H, BLK_W, block_partition, edge_to_column, edge_to_row
+    )
+    return row_pointer, col_indices, block_partition, edge_to_column, edge_to_row
