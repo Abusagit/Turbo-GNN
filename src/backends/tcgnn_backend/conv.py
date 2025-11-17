@@ -11,23 +11,10 @@ from src.backends.registry import BackendRegistry
 class TCGNNFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow):
-        # X = torch.sparse.mm(edge_coo, X)
         ctx.save_for_backward(X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)
 
-        # GEMM node update
         X_prime = torch.mm(X, weights)
-
-        # X_prime_t = torch.ones_like(X_prime)
-        # X_prime_t = gen_test_tensor(X_prime)
-        # print("=========Before AggreAGNNion========")
-        # print(X_prime_t)
-        # sys.exit(0)
-
-        # SpMM: Neighbor AggreAGNNion.
         X_prime = TCGNN.forward(X_prime, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
-        # print("==========After Aggreation=========")
-        # print(X_prime)
-        # sys.exit(0)
 
         return X_prime
 
@@ -69,7 +56,6 @@ class TCGNNFunction_GIN(torch.autograd.Function):
         d_input = TCGNN.forward(d_X_prime, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
 
         return d_input, d_weights, None, None, None, None, None, None
-        # return None, d_weights, None, None, None, None, None, None
 
 
 class TCGNNFunction_AGNN(torch.autograd.Function):
