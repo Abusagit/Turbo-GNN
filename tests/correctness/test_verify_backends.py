@@ -217,8 +217,8 @@ def test_model_building():
             "layers": [
                 {
                     "layer_type": "residual_block",
-                    "conv_type": "gcn",
-                    "backend": "pyg",
+                    "conv_type": None,
+                    "backend": None,
                     "in_channels": 128,
                     "out_channels": 64,
                     "norm": "batch",
@@ -229,8 +229,8 @@ def test_model_building():
                 },
                 {
                     "layer_type": "residual_block",
-                    "conv_type": "gcn",
-                    "backend": "pyg",
+                    "conv_type": None,
+                    "backend": None,
                     "in_channels": 64,
                     "out_channels": 32,
                     "norm": "layer",
@@ -245,7 +245,9 @@ def test_model_building():
 
     try:
         # Build spec
-        spec = classifier_spec_from_config(config, input_dim=128)
+        spec = classifier_spec_from_config(
+            config, backend_to_override="pyg", conv_type_to_override="gcn", input_dim=128
+        )
         print(f"✓ Model spec created with {len(spec.encoder.layers)} layers")
 
         # Build model

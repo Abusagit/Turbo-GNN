@@ -1,4 +1,0 @@
-dataset:
-  source: dgl
-  name: reddit
-  root: data

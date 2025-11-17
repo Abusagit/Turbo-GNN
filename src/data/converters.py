@@ -12,8 +12,10 @@ Graph format converters among edge list, CSR, and optional framework objects.
 - to_dgl_graph
 """
 
-EdgeList = Tuple[torch.Tensor, Optional[torch.Tensor]]   # (edge_index [2,E], edge_weight [E] or None)
-CSR = Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]  # (crow_indices [N+1], col_indices [E], values [E] or None)
+EdgeList = Tuple[torch.Tensor, Optional[torch.Tensor]]  # (edge_index [2,E], edge_weight [E] or None)
+CSR = Tuple[
+    torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+]  # (crow_indices [N+1], col_indices [E], values [E] or None)
 
 
 def to_csr_from_edge_list(
@@ -68,9 +70,7 @@ def to_edge_list_from_csr(
         raise ValueError("col_indices must be [E]")
 
     num_nodes = crow_indices.numel() - 1
-    row = torch.repeat_interleave(
-        torch.arange(num_nodes, device=crow_indices.device), crow_indices.diff()
-    )
+    row = torch.repeat_interleave(torch.arange(num_nodes, device=crow_indices.device), crow_indices.diff())
     edge_index = torch.vstack([row.long(), col_indices.long()])
     return edge_index, values
 
@@ -125,3 +125,41 @@ def to_dgl_graph(
     if edge_weight is not None:
         g.edata["w"] = edge_weight
     return g
+
+
+def to_tcgnn_data(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    edge_weight: Optional[torch.Tensor] = None,
+) -> Any:
+    """Create a TC-GNN `Data` object lazily.
+
+    Args:
+        edge_index (torch.Tensor): [2, E] long.
+        num_nodes (int): Number of nodes.
+        edge_weight (Optional[torch.Tensor]): Edge weights [E].
+
+    Returns:
+        Any: tcgnn.Data instance.
+    """
+
+    try:
+        import TCGNN
+    except Exception as exc:
+        raise ImportError("TC-GNN is required for to_tcgnn_data()") from exc
+
+    row_pointer, col_indices, values = to_csr_from_edge_list(edge_index, num_nodes, edge_weight)
+    BLK_H = 16
+    BLK_W = 8
+
+    num_row_windows = (num_nodes + BLK_H - 1) // BLK_H
+    block_partition = torch.zeros(num_row_windows, dtype=torch.int).cpu()
+    edge_to_column = torch.zeros(edge_index.size(1), dtype=torch.int).cpu()
+    edge_to_row = torch.zeros(edge_index.size(1), dtype=torch.int).cpu()
+    col_indices = col_indices.to(torch.int).cpu()
+    row_pointer = row_pointer.to(torch.int).cpu()
+
+    TCGNN.preprocess(
+        col_indices.cpu(), row_pointer.cpu(), num_nodes, BLK_H, BLK_W, block_partition, edge_to_column, edge_to_row
+    )
+    return row_pointer, col_indices, block_partition, edge_to_column, edge_to_row

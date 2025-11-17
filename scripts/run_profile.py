@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--training", type=str, required=True, help="Training YAML path.")
     p.add_argument("--profile", type=str, required=True, help="Profiler YAML path.")
     p.add_argument("--out", type=str, default="runs/profile", help="Output directory.")
+    p.add_argument("--conv_type", type=str, required=True, help="Convolution type")
+    p.add_argument("--backend", type=str, required=True, help="Backend type")
+
     return p.parse_args()
 
 
@@ -74,7 +77,14 @@ def main() -> int:
     val_loader = build_dataloader(val_ds, lc)
 
     # Model
-    model = build_model_from_yaml(args.model, input_dim=in_dim, override_num_classes=num_classes)
+
+    model = build_model_from_yaml(
+        args.model,
+        backend_to_override=args.backend,
+        conv_type_to_override=args.conv_type,
+        input_dim=in_dim,
+        override_num_classes=num_classes,
+    )
 
     # Trainer/Opt/Sched
     trainer = GNNTrainer(model=model, config=tcfg)

@@ -1,4 +1,0 @@
-dataset:
-  source: dgl
-  name: cora
-  root: data
