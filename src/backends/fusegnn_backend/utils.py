@@ -24,7 +24,7 @@ build_path.mkdir(parents=True, exist_ok=True)
 
 extra_cflags = ["-O3", "-fPIC"]
 extra_cuda_cflags = [
-    "-O2",  # Use O2 for faster compilation, similar performance
+    "-O3",
     "--use_fast_math",
     "-arch=sm_80",
     "-Xcompiler",
