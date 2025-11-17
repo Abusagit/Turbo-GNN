@@ -5,10 +5,9 @@ MKFILE_PATH := $(realpath $(lastword $(MAKEFILE_LIST)))
 MKFILE_DIR  := $(dir $(MKFILE_PATH))
 
 # NOTE ONLY WORKS WITH .venv
-PYTHON     := python3
-PIP        := pip3
-
-
+VENV_DIR   := $(MKFILE_DIR)/.venv
+PYTHON     := $(VENV_DIR)/bin/python3
+PIP        := $(VENV_DIR)/bin/pip3
 
 CUDA_VERSION ?= cu124
 TORCH_VERSION := 2.4.1
@@ -34,9 +33,9 @@ _install-full:
 	$(PIP) install -e ".[full]" $(FIND_LINKS)
 
 _install-tcgnn:
-	mkdir -p third_party
-	git clone https://github.com/MachineLearningSystem/ATC23-TCGNN-Pytorch third_party/tcgnn || true
-	cd third_party/tcgnn/TCGNN_conv && $(PYTHON) setup.py install
+	mkdir -p thirdparty
+	git clone https://github.com/MachineLearningSystem/ATC23-TCGNN-Pytorch thirdparty/tcgnn || true
+	cd thirdparty/tcgnn/TCGNN_conv && $(PYTHON) setup.py install
 	cd ../../.
 
 test:
