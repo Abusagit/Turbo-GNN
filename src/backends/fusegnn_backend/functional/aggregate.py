@@ -2,9 +2,6 @@ import torch
 
 from src.backends.fusegnn_backend.utils import fgnn_agg
 
-# from fuseGNN.functional.format import csr2csc
-
-
 # fused Aggregation phase with GAR model
 
 
