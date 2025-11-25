@@ -158,7 +158,7 @@ def create_split_datasets_from_config_dict(
             source=source,
             name=name,
             root=root,
-            graph_backend=cfg.get("graph_backend", "edge_index"),
+            conv_backend=cfg.get("conv_backend", "edge_index"),
             allow_random_split=allow_random_split,
         )
     )
@@ -171,13 +171,13 @@ def create_split_datasets_from_config_dict(
 
 
 def create_split_datasets_from_yaml(
-    path: str, graph_backend: GraphBackendOption = "pyg"
+    path: str, conv_backend: str = "pyg"
 ) -> tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
     """Load a YAML config file (dataset) and return split datasets.
 
     Args:
         path (str): Path to YAML file.
-        graph_backend (GraphBackendOption): Graph backend option.
+        conv_backend (str): Conv backend option.
 
     Returns:
         Tuple[SingleGraphDataset, SingleGraphDataset, SingleGraphDataset]:
@@ -187,7 +187,7 @@ def create_split_datasets_from_yaml(
 
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    cfg["graph_backend"] = graph_backend
+    cfg["conv_backend"] = conv_backend
     return create_split_datasets_from_config_dict(cfg)
 
 

@@ -190,7 +190,11 @@ class GraphSample:
         elif self.backend == "coo":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
-            graph = (self.edge_index, self.edge_weight, self.num_nodes)
+            graph = (
+                self._to_default_device(self.edge_index),
+                self._to_default_device(self.edge_weight),
+                self.num_nodes,
+            )
         elif self.backend == "csr":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
@@ -681,13 +685,13 @@ class DatasetConfig:
     Attributes:
         source (str): 'ogbn' | 'pyg' | 'dgl' | 'auto'
         name (str): Dataset name (e.g., 'ogbn-arxiv', 'Cora', 'reddit').
-        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
+        conv_backend (str): Conv backend type.
         root (str): Download/cache directory.
     """
 
     source: str
     name: str
-    graph_backend: GraphBackendOption
+    conv_backend: str
     root: str = "data"
     allow_random_split: bool = False
 
@@ -704,26 +708,29 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     Raises:
         KeyError: If source is unsupported.
     """
+    assert cfg.conv_backend in MODEL_BACKEND_TO_GRAPH_REPR, f"Unknown conv backend: {cfg.conv_backend}"
+    graph_backend = MODEL_BACKEND_TO_GRAPH_REPR[cfg.conv_backend]
+
     s = cfg.source.lower()
     if s == "ogbn":
-        return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+        return load_ogbn(cfg.name, root=cfg.root, graph_backend=graph_backend)
     if s == "pyg":
         return load_pyg_single_graph(
             cfg.name,
             root=cfg.root,
-            graph_backend=cfg.graph_backend,
+            graph_backend=graph_backend,
             allow_random_split=getattr(cfg, "allow_random_split", False),
         )
     if s == "dgl":
-        return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+        return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=graph_backend)
     if s == "auto":
         # ogbn-* -> OGBN; else try PyG; then DGL.
         if cfg.name.lower().startswith("ogbn-"):
-            return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+            return load_ogbn(cfg.name, root=cfg.root, graph_backend=graph_backend)
         try:
-            return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+            return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=graph_backend)
         except Exception:
-            return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+            return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=graph_backend)
 
     raise KeyError(f"Unsupported dataset source '{cfg.source}'")
 

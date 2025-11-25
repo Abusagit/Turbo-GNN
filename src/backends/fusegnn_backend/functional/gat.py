@@ -1,8 +1,8 @@
-import fgnn_gat
 import torch
 import torch.nn.functional as F
 import torch_scatter
-from fuseGNN.functional.format import Coo2Csr
+
+from src.backends.fusegnn_backend.utils import fgnn_gat
 
 
 class GATGAREdgeWeight(torch.autograd.Function):

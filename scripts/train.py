@@ -84,7 +84,7 @@ def build_data(
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
-    graph_backend: GraphBackendOption,
+    conv_backend: str,
 ) -> tuple[Any, Any, Any, int, int]:
     """Create train/val/test loaders and infer dataset dimensions.
 
@@ -93,12 +93,12 @@ def build_data(
         batch_size (int): DataLoader batch size.
         num_workers (int): Number of DataLoader workers.
         pin_memory (bool): Whether to enable pinned memory.
-        graph_backend (GraphBackendOption): infered graph representation type
+        conv_backend (str): Backend type of conv.
     Returns:
         Tuple[Any, Any, Any, int, int]: Tuple of
             (train_loader, val_loader, test_loader, num_features, num_classes).
     """
-    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(str(dataset_yaml), graph_backend=graph_backend)
+    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(str(dataset_yaml), conv_backend=conv_backend)
     num_features = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
 
@@ -241,7 +241,7 @@ def main() -> int:
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        graph_backend=graph_backend,
+        conv_backend=graph_backend,
     )
 
     # build model

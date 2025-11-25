@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from dgl import ops
 from dgl.nn.pytorch import GraphConv
-from dgl.nn.pytorch.conv import GATv2Conv as _GAT
+from dgl.nn.pytorch.conv import GATConv, GATv2Conv
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
@@ -133,6 +133,49 @@ class _DGLMaxAggrConv(BaseConvolution):
         return x_aggregated
 
 
+class _DGLGATv1Conv(BaseConvolution):
+    """DGL-backed GATv1Conv (just GAT) wrapper."""
+
+    def __init__(self, feature_dim: int, bias: bool = False, heads: int = 1, **kwargs: Any) -> None:
+        """Initialize a GAT layer using DGL.
+
+        Args:
+            feature_dim (int): Input (and output) feature size.
+            bias (bool): Include bias.
+            **kwargs (Any): DGL GraphConv kwargs (norm, weight, ...).
+        """
+        super().__init__(num_heads=heads, bias=bias, **kwargs)
+
+        self._conv = GATConv(feature_dim, feature_dim, num_heads=heads, bias=bias, allow_zero_in_degree=True, **kwargs)
+        self._outer_proj = torch.nn.Linear(
+            feature_dim * heads, feature_dim, bias=bias
+        )  # NOTE GAT produces 3D tensor [*, heads, feature_dim] --> Need to project it to [*, feature_dim]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: Any,
+        *,
+        edge_weight: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Apply GATConv.
+
+        Args:
+            x (torch.Tensor): Node features [N, Fin].
+            graph (Any): dgl.DGLGraph or (edge_index, edge_weight, num_nodes).
+            edge_weight (Optional[torch.Tensor]): Edge weights [E].
+            **kwargs (Any): Extra kwargs (ignored).
+
+        Returns:
+            torch.Tensor: Output features [N, Fout].
+        """
+        x = self._conv(graph, x, get_attention=False)
+        x = x.view(x.shape[0], -1)
+        x = self._outer_proj(x)
+        return x
+
+
 class _DGLGATv2Conv(BaseConvolution):
     """DGL-backed GATv2Conv wrapper."""
 
@@ -146,7 +189,9 @@ class _DGLGATv2Conv(BaseConvolution):
         """
         super().__init__(num_heads=heads, bias=bias, **kwargs)
 
-        self._conv = _GAT(feature_dim, feature_dim, num_heads=heads, bias=bias, allow_zero_in_degree=True, **kwargs)
+        self._conv = GATv2Conv(
+            feature_dim, feature_dim, num_heads=heads, bias=bias, allow_zero_in_degree=True, **kwargs
+        )
         self._outer_proj = torch.nn.Linear(
             feature_dim * heads, feature_dim, bias=bias
         )  # NOTE GAT produces 3D tensor [*, heads, feature_dim] --> Need to project it to [*, feature_dim]
@@ -248,6 +293,9 @@ class DglBackend(BaseBackend):
                 return _DglGraphConv(feature_dim=feature_dim, norm="right")
             case "sum_aggr":
                 return _DglGraphConv(feature_dim=feature_dim, norm="none")
+            case "gat":
+                heads = kwargs.pop("heads")
+                return _DGLGATv1Conv(feature_dim=feature_dim, heads=heads)
             case "gat_v2":
                 heads = kwargs.pop("heads")
                 return _DGLGATv2Conv(feature_dim=feature_dim, heads=heads)
