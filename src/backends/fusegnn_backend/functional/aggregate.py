@@ -16,7 +16,7 @@ class fusedGARAggV1(torch.autograd.Function):
     def backward(ctx, grad_out):
         tar_index, src_ptr, edge_weight_b = ctx.saved_tensors
         grad_features, _ = fgnn_agg.fused_gar_b(grad_out, tar_index, tar_index, src_ptr, edge_weight_b, False)
-        return grad_features, None, None, None, None, None, None, None, None
+        return grad_features, None, None, None, None, None, None
 
 
 class fusedGARAggV2(torch.autograd.Function):
@@ -29,10 +29,10 @@ class fusedGARAggV2(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         tar_index, src_ptr, edge_weight_b, feature = ctx.saved_tensors
-        grad_features, grad_edge_weight, grad_weight_self = fgnn_agg.fused_gar_b(
+        grad_features, grad_edge_weight = fgnn_agg.fused_gar_b(
             grad_out, feature, tar_index, src_ptr, edge_weight_b, True
         )
-        return grad_features, None, None, None, grad_weight_self, None, None, grad_edge_weight, None
+        return grad_features, None, None, None, None, None, grad_edge_weight
 
 
 def fused_gar_agg(
