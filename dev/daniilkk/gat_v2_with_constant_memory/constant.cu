@@ -2,7 +2,7 @@
 
 #define CUDART_MINF_F __int_as_float(0xff800000)
 
-constexpr size_t kMaxThreadsInBlock = 1024;
+constexpr size_t kMaxThreadsInBlock = 32;
 constexpr size_t kThreadsInWarp = 32;
 constexpr int URF = 8;
 constexpr size_t kMaxConstantMemorySize = 1 * 1024;
