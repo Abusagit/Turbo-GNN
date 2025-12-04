@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Parsed args.
     """
     p = argparse.ArgumentParser(description="Microbenchmark graph conv layers.")
-    p.add_argument("--conv-type", type=str, required=True, help="Convolution name (mean_aggr|sum_aggr|...).")
+    p.add_argument("--conv_type", type=str, required=True, help="Convolution name (mean_aggr|sum_aggr|...).")
     p.add_argument("--backend", type=str, required=True, help="Backend name (cusparse|...).")
     p.add_argument("--dataset", type=str, required=True, help="Path to dataset YAML.")
     p.add_argument("--in-ch", type=int, default=128)

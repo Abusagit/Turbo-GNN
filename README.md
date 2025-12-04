@@ -204,7 +204,7 @@ python scripts/validate.py \
 
 ```bash
 python scripts/kernel_tune.py \
-    --conv-type mean_aggr \
+    --conv_type mean_aggr \
     --backend cusparse \
     --dataset configs/datasets/pyg_cora.yaml \
     --optuna-config configs/optuna/example_cusparse.yaml
