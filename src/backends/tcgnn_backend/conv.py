@@ -1,7 +1,12 @@
 import math
 from typing import Any
 
-import TCGNN
+try:
+    import TCGNN
+except ImportError:
+    print("TCGNN is not found!")
+    TCGNN = None
+
 import torch
 
 from src.backends.base import BaseBackend, BaseConvolution
