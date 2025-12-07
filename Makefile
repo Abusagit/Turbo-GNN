@@ -35,7 +35,7 @@ _install-full:
 _install-tcgnn:
 	mkdir -p thirdparty
 	git clone https://github.com/MachineLearningSystem/ATC23-TCGNN-Pytorch thirdparty/tcgnn || true
-	cd thirdparty/tcgnn/TCGNN_conv && $(PYTHON) setup.py install
+	cd thirdparty/tcgnn/TCGNN_conv && CUDA_HOME=/usr/local/cuda-12/ LD_LIBRARY_PATH=/usr/local/cuda-12/lib64/ $(PYTHON) setup.py install || true
 	cd ../../.
 
 test:
