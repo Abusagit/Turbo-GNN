@@ -13,10 +13,11 @@ CuSparse backend: wraps CuSparse matmul-based convolutions behind the BaseBacken
 
 class _СuSparseMatMulConvFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, graph, norm_type: str, cu_sparse_algorithm_id: int = -1):
+    def forward(ctx, x, graph, norm_type: str, cu_sparse_algorithm_id: int, block_dim: int):
         ctx.save_for_backward(*graph)
         ctx.norm_type = norm_type
         ctx.cu_sparse_algorithm_id = cu_sparse_algorithm_id
+        ctx.block_dim = block_dim
 
         row_pointers, column_indices, edge_weight = graph
         return csr_SPMM_normalized(
@@ -27,6 +28,7 @@ class _СuSparseMatMulConvFn(torch.autograd.Function):
             norm=norm_type,
             algorithm=cu_sparse_algorithm_id,
             do_transpose_a=False,
+            block_dim=block_dim,
         )
 
     @staticmethod
@@ -41,14 +43,15 @@ class _СuSparseMatMulConvFn(torch.autograd.Function):
             norm=ctx.norm_type,
             algorithm=ctx.cu_sparse_algorithm_id,
             do_transpose_a=True,
+            block_dim=ctx.block_dim,
         )
-        return grad_x, None, None, None
+        return grad_x, None, None, None, None
 
 
 class _СuSparseMatMulConv(BaseConvolution):
     """CuSparse-backend MatMulConv wrapper."""
 
-    def __init__(self, norm_type: str, cu_sparse_algorithm_id: int):
+    def __init__(self, norm_type: str, cu_sparse_algorithm_id: int, block_dim: int):
         super().__init__(bias=False, dropout=0.0)
 
         assert norm_type in ("none", "right", "left", "both")
@@ -56,6 +59,7 @@ class _СuSparseMatMulConv(BaseConvolution):
 
         self.norm_type = norm_type
         self.cu_sparse_algorithm_id = cu_sparse_algorithm_id
+        self.block_dim = block_dim
 
     def forward(
         self,
@@ -75,7 +79,7 @@ class _СuSparseMatMulConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
 
-        return _СuSparseMatMulConvFn.apply(x, graph, self.norm_type, self.cu_sparse_algorithm_id)
+        return _СuSparseMatMulConvFn.apply(x, graph, self.norm_type, self.cu_sparse_algorithm_id, self.block_dim)
 
 
 @BackendRegistry.register_backend("cusparse")
@@ -86,6 +90,7 @@ class СuSparseBackend(BaseBackend):
         self,
         conv_type: str,
         cu_sparse_algorithm_id: int = -1,
+        block_dim: int = 256,
         **kwargs: Any,
     ) -> BaseConvolution:
         """Factory for cusparse convolution layers.
@@ -102,11 +107,19 @@ class СuSparseBackend(BaseBackend):
         conv_type = conv_type.lower()
 
         if conv_type == "sum_aggr":
-            return _СuSparseMatMulConv(norm_type="none", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
+            return _СuSparseMatMulConv(
+                norm_type="none", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
+            )
         if conv_type == "mean_aggr":
-            return _СuSparseMatMulConv(norm_type="right", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
+            return _СuSparseMatMulConv(
+                norm_type="right", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
+            )
         if conv_type == "random_walk":
-            return _СuSparseMatMulConv(norm_type="left", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
+            return _СuSparseMatMulConv(
+                norm_type="left", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
+            )
         if conv_type == "gcn":
-            return _СuSparseMatMulConv(norm_type="both", cu_sparse_algorithm_id=cu_sparse_algorithm_id)
+            return _СuSparseMatMulConv(
+                norm_type="both", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
+            )
         raise KeyError(f"Unsupported conv_type for CuSparse backend: {conv_type}")

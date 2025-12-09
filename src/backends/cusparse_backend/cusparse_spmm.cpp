@@ -22,6 +22,8 @@
     }
 
 
+constexpr int BLOCK_DIM = 256;
+
 enum class NormType {
     NONE = 0,
     RIGHT = 1,
@@ -32,12 +34,12 @@ enum class NormType {
 
 
 void launch_compute_degrees(const torch::Tensor& indptr, const torch::Tensor& indices,
-                           torch::Tensor& in_degrees, torch::Tensor& out_degrees);
+                           torch::Tensor& in_degrees, torch::Tensor& out_degrees, int block_dim);
 
 void launch_compute_normalized_weights(const torch::Tensor& indptr, const torch::Tensor& indices,
                                       const torch::Tensor& edge_weights, torch::Tensor& normalized_weights,
                                       const torch::Tensor& in_degrees, const torch::Tensor& out_degrees,
-                                      NormType norm);
+                                      NormType norm, int block_dim);
 
 
 
@@ -89,7 +91,8 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
                                  const std::string &norm_str,
                                  int algorithm,
                                  bool use_cache,
-                                 bool do_transpose_a) {
+                                 bool do_transpose_a,
+                                 int block_dim) {
     CHECK_INPUT(indptr);
     CHECK_INPUT(indices);
     CHECK_INPUT(features);
@@ -162,12 +165,12 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
             cache->out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
 
 
-            launch_compute_degrees(indptr, indices, cache->in_degrees, cache->out_degrees);
+            launch_compute_degrees(indptr, indices, cache->in_degrees, cache->out_degrees, block_dim);
 
 
             cache->edge_values = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
             launch_compute_normalized_weights(indptr, indices, edge_weights, cache->edge_values,
-                                     cache->in_degrees, cache->out_degrees, norm);
+                                     cache->in_degrees, cache->out_degrees, norm, block_dim);
 
 
             CHECK_CUSPARSE(cusparseCreateCsr(
@@ -194,11 +197,11 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
         torch::Tensor in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
         torch::Tensor out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
 
-        launch_compute_degrees(indptr, indices, in_degrees, out_degrees);
+        launch_compute_degrees(indptr, indices, in_degrees, out_degrees, block_dim);
 
         normalized_weights = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
         launch_compute_normalized_weights(indptr, indices, edge_weights, normalized_weights,
-                                 in_degrees, out_degrees, norm);
+                                 in_degrees, out_degrees, norm, block_dim);
 
         CHECK_CUSPARSE(cusparseCreateCsr(
             &matA, m, m, nnz,
@@ -279,7 +282,8 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
                                   const torch::Tensor &indices,
                                   const torch::Tensor &features,
                                   const torch::Tensor &edge_weights,
-                                  const std::string &norm_str) {
+                                  const std::string &norm_str,
+                                  int block_dim) {
     auto handle = at::cuda::getCurrentCUDASparseHandle();
 
 
@@ -302,10 +306,10 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
     // Compute normalized weights
     torch::Tensor in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
     torch::Tensor out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
-    launch_compute_degrees(indptr, indices, in_degrees, out_degrees);
+    launch_compute_degrees(indptr, indices, in_degrees, out_degrees, block_dim);
 
     torch::Tensor normalized_weights = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
-    launch_compute_normalized_weights(indptr, indices, edge_weights, normalized_weights, in_degrees, out_degrees, norm);
+    launch_compute_normalized_weights(indptr, indices, edge_weights, normalized_weights, in_degrees, out_degrees, norm, block_dim);
 
     auto out = torch::empty({m, n}, features.options());
 
@@ -398,9 +402,10 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
 // ************************* BACKWARD COMPATIBILITY STARTS *************************
 int find_best_algorithm(const torch::Tensor &indptr,
                         const torch::Tensor &indices,
-                        const torch::Tensor &features) {
+                        const torch::Tensor &features,
+                        int block_dim) {
     torch::Tensor empty_weights = torch::empty({0}, features.options());
-    return find_best_algorithm_normalized(indptr, indices, features, empty_weights, "none");
+    return find_best_algorithm_normalized(indptr, indices, features, empty_weights, "none", block_dim);
 }
 
 
@@ -409,9 +414,10 @@ torch::Tensor csr_SPMM(const torch::Tensor &indptr,
                        const torch::Tensor &features,
                        int algorithm,
                        bool use_cache,
-                       bool do_transpose_a) {
+                       bool do_transpose_a,
+                       int block_dim) {
     torch::Tensor empty_weights = torch::empty({0}, features.options());
-    return csr_SPMM_normalized(indptr, indices, features, empty_weights, "none", algorithm, use_cache, do_transpose_a);
+    return csr_SPMM_normalized(indptr, indices, features, empty_weights, "none", algorithm, use_cache, do_transpose_a, block_dim);
 }
 
 // ************************* BACKWARD COMPATIBILITY ENDS *************************
@@ -425,19 +431,21 @@ void clear_graph_cache() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("csr_SPMM", &csr_SPMM, "Optimized and cached csr_SPMM (backward compatibility)",
           py::arg("indptr"), py::arg("indices"), py::arg("features"),
-          py::arg("algorithm") = -1, py::arg("use_cache") = true, py::arg("do_transpose_a") = false);
+          py::arg("algorithm") = -1, py::arg("use_cache") = true, py::arg("do_transpose_a") = false,
+          py::arg("block_dim") = BLOCK_DIM);
 
     m.def("csr_SPMM_normalized", &csr_SPMM_normalized, "Optimized and cached csr_SPMM with normalization",
           py::arg("indptr"), py::arg("indices"), py::arg("features"),
           py::arg("edge_weights"), py::arg("norm") = "none", py::arg("algorithm") = -1,
-          py::arg("use_cache") = true, py::arg("do_transpose_a") = false);
+          py::arg("use_cache") = true, py::arg("do_transpose_a") = false,
+          py::arg("block_dim") = BLOCK_DIM);
 
     m.def("find_best_algorithm", &find_best_algorithm, "Find best cuSPARSE algorithm for given graph (backward compatibility)");
 
     m.def("find_best_algorithm_normalized", &find_best_algorithm_normalized,
           "Find best cuSPARSE algorithm for given graph with normalization",
           py::arg("indptr"), py::arg("indices"), py::arg("features"), py::arg("edge_weights"),
-          py::arg("norm") = "none");
+          py::arg("norm") = "none", py::arg("block_dim") = BLOCK_DIM);
 
     m.def("clear_graph_cache", &clear_graph_cache, "Clear graph cache");
 }

@@ -200,6 +200,16 @@ python scripts/validate.py \
     --checkpoint runs/gcn_cora/ckpts/best_model.pth
 ```
 
+### 5. Kernel tune
+
+```bash
+python scripts/kernel_tune.py \
+    --conv_type mean_aggr \
+    --backend cusparse \
+    --dataset configs/datasets/pyg_cora.yaml \
+    --optuna-config configs/optuna/example_cusparse.yaml
+```
+
 ---
 
 ## Core Concepts
