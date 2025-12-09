@@ -10,7 +10,7 @@ from src.data.datasets import DatasetConfig, load_single_graph
 
 
 def plot_large_graph_thumbnail(
-    src_indices: torch.Tensor, dst_indices: torch.Tensor, block_num: int, out_path: Path
+    src_indices: torch.Tensor, dst_indices: torch.Tensor, block_size: int, out_path: Path
 ) -> None:
     """Plot a thumbnail of a large graph.
 
@@ -20,18 +20,20 @@ def plot_large_graph_thumbnail(
         out_path (str): Output path.
     """
 
-    num_original_nodes = max(src_indices.max(), dst_indices.max()) + 1
-    block_size = max(1, num_original_nodes // block_num)
+    _, axes = plt.subplots(1, 1, figsize=(5, 5))
 
     src_indices = src_indices.clone() // block_size
     dst_indices = dst_indices.clone() // block_size
     num_nodes = max(src_indices.max(), dst_indices.max()) + 1
     linear_indices = src_indices * num_nodes + dst_indices
-    counts = torch.bincount(linear_indices, minlength=num_nodes * num_nodes)
-    thumbnail_map = counts.reshape(num_nodes, num_nodes).to(torch.int32)
+    counts = torch.bincount(linear_indices, minlength=num_nodes * num_nodes) // block_size
 
-    sns.heatmap(thumbnail_map.cpu(), cmap="viridis")
-    plt.title(f"Scale: {block_size}")
+    unique_counts, counts_count = torch.unique(counts, return_counts=True)
+
+    counts_count = counts_count.to(torch.float32) / counts_count.sum()
+
+    sns.barplot(x=unique_counts.cpu(), y=counts_count.cpu(), ax=axes)
+    axes.set_title("Block-wise Histogram")
     print(f"Saving figure to {out_path}")
     plt.savefig(out_path)
     plt.close()
@@ -95,11 +97,11 @@ def process_datasets(output_path: Path) -> None:
         )
         graph = load_single_graph(dataset_config)
         src_indices, dst_indices = graph.edge_index[0].to("cuda"), graph.edge_index[1].to("cuda")
-        reorder_and_plot(src_indices, dst_indices, block_size=256, out_path=dataset_path)
+        reorder_and_plot(src_indices, dst_indices, block_size=16, out_path=dataset_path)
         del graph, src_indices, dst_indices
         torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    out_path = Path("dev/zen0no/plots/adjency_matrix").resolve()
+    out_path = Path("dev/zen0no/plots/blocksize_16x16_hist").resolve()
     process_datasets(out_path)
