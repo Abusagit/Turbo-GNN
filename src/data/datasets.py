@@ -30,6 +30,10 @@ except ImportError:
     except ImportError:
         pass
 
+
+DEG_HUGE = 128  # NOTE currently this is a workaround for additional hyperparameters
+# we need to modify the code so that we can pass it to the kernels & datasets
+
 GraphBackendOption = Literal[
     "pyg",
     "dgl",
@@ -42,6 +46,7 @@ GraphBackendOption = Literal[
     "adj_mat_in_degree_normalized_transposed",
     "adj_mat_transposed",
     "cugraph",
+    "cuda",
 ]  # NOTE we can define cached formalizations via this option
 
 
@@ -56,6 +61,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cugraph": "cugraph",
     "torch_native_adj_mat": "adj_mat",
     "cusparse": "csr",
+    "cuda": "cuda",
 }
 
 
@@ -187,31 +193,18 @@ class GraphSample:
         elif self.backend == "csr":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+            graph = self.edge_index_to_csr(edge_index=self.edge_index, edge_weight=self.edge_weight, transposed=True)
 
-            # Here we actually transpose adj matrix, that's why not
-            # rows = self.edge_index[0]
-            # cols = self.edge_index[1]
-            rows = self.edge_index[1]
-            cols = self.edge_index[0]
-            N = self.num_nodes
+        elif self.backend == "cuda":
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
 
-            # Sort edges by (row, col) for a canonical CSR
-            perm = (rows * N + cols).argsort()
-            rows = rows[perm]
-            cols = cols[perm]
-            w = self.edge_weight[perm] if self.edge_weight is not None else None
-
-            # Build CSR row pointers
-            counts = torch.bincount(rows, minlength=N)
-            row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
-            row_ptr[1:] = counts.cumsum(0)
-
-            # Store graph as (row_pointers, column_indices, edge_weight) on default device
-            graph = (
-                self._to_int32(self._to_default_device(row_ptr)),
-                self._to_int32(self._to_default_device(cols)),
-                self._to_int32(self._to_default_device(w)),
+            row_ptr, cols, _edge_weights = self.edge_index_to_csr(
+                edge_index=self.edge_index, edge_weight=self.edge_weight, transposed=True
             )
+            del _edge_weights
+            mid_nodes, huge_nodes = bucket_nodes(row_ptr, deg_huge=DEG_HUGE)
+            graph = (row_ptr, cols, mid_nodes, huge_nodes)
 
         elif self.backend == "csc":
             ...  # TODO
@@ -245,6 +238,35 @@ class GraphSample:
         except Exception:
             pass
         return item
+
+    def edge_index_to_csr(self, edge_index: torch.Tensor, edge_weight: torch.Tensor | None, transposed: bool = True):
+        if transposed:
+            rows = edge_index[1]
+            cols = edge_index[0]
+        else:
+            rows = edge_index[0]
+            cols = edge_index[1]
+
+        N = self.num_nodes
+
+        # Sort edges by (row, col) for a canonical CSR
+        perm = (rows * N + cols).argsort()
+        rows = rows[perm]
+        cols = cols[perm]
+        w = edge_weight[perm] if edge_weight is not None else None
+
+        # Build CSR row pointers
+        counts = torch.bincount(rows, minlength=N)
+        row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
+        row_ptr[1:] = counts.cumsum(0)
+
+        # Store graph as (row_pointers, column_indices, edge_weight) on default device
+        graph = (
+            self._to_int32(self._to_default_device(row_ptr)),
+            self._to_int32(self._to_default_device(cols)),
+            self._to_int32(self._to_default_device(w)),
+        )
+        return graph
 
     @property
     def num_nodes(self) -> int:
@@ -739,3 +761,23 @@ def get_cugraph_with_gcn_weights(
         return make_fg_csr(colptr, row)
 
     return CSC(colptr, row, num_src_nodes=num_src_nodes)
+
+
+def bucket_nodes(edge_ptr, deg_huge=DEG_HUGE):
+    """
+    Split nodes into buckets:
+      - mid_nodes: 0 < deg <= deg_huge
+      - huge_nodes: deg > deg_huge
+    Returns (mid_nodes:int32[cuda], huge_nodes:int32[cuda])
+    """
+    # deg[i] = number of inbound edges for node i
+    deg = (edge_ptr[1:] - edge_ptr[:-1]).to(torch.int32)  # cuda int32
+
+    mid_mask = (deg >= 0) & (deg <= deg_huge)
+    huge_mask = deg > deg_huge
+
+    mid_nodes = torch.nonzero(mid_mask, as_tuple=False).view(-1).to(torch.int32)
+    huge_nodes = torch.nonzero(huge_mask, as_tuple=False).view(-1).to(torch.int32)
+
+    # ensure contiguous for kernel argument passing
+    return mid_nodes.contiguous(), huge_nodes.contiguous()

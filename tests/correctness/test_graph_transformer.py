@@ -2,6 +2,15 @@ import pytest
 import torch
 import torch.nn as nn
 from dgl import DGLGraph
+from fixtures import (
+    create_conv_layer,
+    create_graph_sample,
+    device,
+    karate_like_club_graph,
+    random_graph_data,
+    set_default_device,
+    simple_graph_data,
+)
 
 from src.backends.registry import BackendRegistry
 
@@ -49,7 +58,7 @@ class TestGraphTransformer:
         assert out_dgl.shape == (num_nodes, hidden_dim)
 
         # calculate output manually
-        qkv = conv.qkv_proj(node_features)
+        qkv = conv.qkv_proj(nn.functional.layer_norm(node_features, (node_features.shape[-1],)))
         q, k, v = qkv.split(hidden_dim, -1)
 
         q = q.view(num_nodes, num_heads, -1)

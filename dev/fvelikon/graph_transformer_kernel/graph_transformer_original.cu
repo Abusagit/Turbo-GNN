@@ -5,29 +5,31 @@
 
 #define FULL_WARP_MASK 0xffffffff
 
-constexpr int WARPS_PER_BLOCK_HUGE   = 8;
-constexpr int THREADS_PER_BLOCK_HUGE = WARPS_PER_BLOCK_HUGE * 32;
-constexpr int TILE_D_HUGE            = 32;
-constexpr int kMaxThreadsInWarp      = 32;
+constexpr int THREADS_MID = 128;
 
-// utilities for warp-level reduction
+constexpr int WARPS_PER_BLOCK_MID    = 16;
+constexpr int WARPS_PER_BLOCK_HUGE   = 32;
+
+constexpr int THREADS_PER_BLOCK_MID  = WARPS_PER_BLOCK_MID  * 32;
+constexpr int THREADS_PER_BLOCK_HUGE = WARPS_PER_BLOCK_HUGE * 32;
+
+constexpr int TILE_D_HUGE            = 16;
+
+
 __device__ __forceinline__ float warp_reduce_sum(float x) {
-    #pragma unroll
-    for (int offset = kMaxThreadsInWarp / 2; offset > 0; offset >>= 1) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(FULL_WARP_MASK, x, offset);
     }
     return x;
 }
 
 __device__ __forceinline__ float warp_reduce_max(float x) {
-    #pragma unroll
-    for (int offset = kMaxThreadsInWarp / 2; offset > 0; offset >>= 1) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(FULL_WARP_MASK, x, offset));
     }
     return x;
 }
 
-// calculate dot-product using vectorized 128-bit loads
 __device__ __forceinline__ float dot_vec4(
     const float* __restrict__ k_ptr,
     const float* __restrict__ q_ptr,
@@ -58,26 +60,33 @@ __device__ __forceinline__ float dot_vec4(
 // ============================================================================
 template<int THREADS_PER_BLOCK>
 __device__ __forceinline__ float block_reduce_sum(float val) {
-    constexpr int NUM_WARPS = THREADS_PER_BLOCK / kMaxThreadsInWarp;
+    constexpr int NUM_WARPS = THREADS_PER_BLOCK / 32;
     __shared__ float warp_sums[NUM_WARPS];
 
-    const int lane = threadIdx.x % kMaxThreadsInWarp;
-    const int wid  = threadIdx.x / kMaxThreadsInWarp;
+    const int lane = threadIdx.x % 32;
+    const int wid = threadIdx.x / 32;
 
-    val = warp_reduce_sum(val);
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_xor_sync(FULL_WARP_MASK, val, offset);
+    }
 
-    // first lane of each warp writes to shared
+    // First lane of each warp writes to shared
     if (lane == 0) {
         warp_sums[wid] = val;
     }
     __syncthreads();
 
-    // first warp reduces across warp sums
+    // First warp reduces across warp sums
     if (wid == 0) {
         val = (lane < NUM_WARPS) ? warp_sums[lane] : 0.0f;
-        val = warp_reduce_sum(val);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_xor_sync(FULL_WARP_MASK, val, offset);
+        }
 
-        // broadcast result via shared memory
+        // Broadcast result via shared memory
         if (lane == 0) {
             warp_sums[0] = val;
         }
@@ -87,10 +96,7 @@ __device__ __forceinline__ float block_reduce_sum(float val) {
     return warp_sums[0];
 }
 
-// ============================================================================
-// Forward: huge-degree nodes, streaming softmax, feature-parallel
-// Stores per-edge logits into attn_logits[eid].
-// ============================================================================
+// single-pass streaming softmax for huge nodes
 template<int WARPS_PER_BLOCK, int TILE_D>
 __global__ void gt_kernel_forward_huge_nodes(
     const int* __restrict__ edge_ptr,
@@ -102,20 +108,29 @@ __global__ void gt_kernel_forward_huge_nodes(
     const float* __restrict__ V,
     float* __restrict__ out,
     float* __restrict__ logsumexp,
-    float* __restrict__ attn_logits,
     int d,
     float scale
 ) {
-    const int warp_id    = threadIdx.x / kMaxThreadsInWarp;
-    const int lane       = threadIdx.x % kMaxThreadsInWarp;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
     const int block_node = blockIdx.x;
     if (block_node >= num_huge) {
         return;
     }
 
-    const int dst       = huge_nodes[block_node];
+    const int dst = huge_nodes[block_node];
     const int row_start = edge_ptr[dst];
     const int row_end   = edge_ptr[dst + 1];
+    if (row_end - row_start == 0) {
+        // Write zeros to output
+        for (int f = threadIdx.x; f < d; f += blockDim.x) {
+            out[dst * d + f] = 0.0f;
+        }
+        if (threadIdx.x == 0) {
+            logsumexp[dst] = -INFINITY;
+        }
+        return;
+    }
 
     // shared memory layout:
     // [0..d-1]: k_dst (cached K[dst])
@@ -128,11 +143,6 @@ __global__ void gt_kernel_forward_huge_nodes(
     float* warp_max     = warp_partial + WARPS_PER_BLOCK * TILE_D;
     float* warp_denom   = warp_max + WARPS_PER_BLOCK;
 
-    if (threadIdx.x < WARPS_PER_BLOCK) {
-        warp_max[threadIdx.x]   = -INFINITY;
-        warp_denom[threadIdx.x] = 0.0f;
-    }
-
     // load K[dst] into shared (all threads cooperate)
     for (int f = threadIdx.x; f < d; f += blockDim.x) {
         k_dst[f] = K[dst * d + f];
@@ -143,7 +153,10 @@ __global__ void gt_kernel_forward_huge_nodes(
     const int feat_base  = warp_id * TILE_D;
     const int feat_limit = (feat_base + TILE_D <= d) ? TILE_D : (d - feat_base);
 
-    const bool warp_is_active = (feat_base < d);
+    if (feat_base >= d) {
+        // this warp has no features to process
+        return;
+    }
 
     // per-lane register accumulators for this warp's feature slice
     float acc_feat[TILE_D];
@@ -154,76 +167,78 @@ __global__ void gt_kernel_forward_huge_nodes(
 
     // per-lane running statistics for streaming softmax
     float running_max = -INFINITY;
-    float running_sum = 0.0f;
+    float running_sum = 0.f;
 
+    // ============================================================
     // single-pass streaming softmax over neighbors
-    if (warp_is_active) {
-        constexpr int TILE_SIZE = 32;
-        for (int tile_start = row_start; tile_start < row_end; tile_start += TILE_SIZE) {
-            // each lane handles one neighbor in this tile
-            const int eid = tile_start + lane;
-            const int nbr = (eid < row_end) ? edge_idx[eid] : -1;
+    // process neighbors in tiles (warp-strided iteration)
+    // ============================================================
 
-            // compute attention score for this lane's neighbor
-            float score = -INFINITY;
-            if (nbr >= 0) {
-                float dot = dot_vec4(k_dst, Q + nbr * d, d);
-                score = dot * scale;
+    constexpr int TILE_SIZE = 32;
+    for (int tile_start = row_start + warp_id * TILE_SIZE;
+         tile_start < row_end;
+         tile_start += WARPS_PER_BLOCK * TILE_SIZE) {
 
-                // store per-edge logit (only one warp to avoid races)
-                if (warp_id == 0) {
-                    attn_logits[eid] = score;
+        // each lane handles one neighbor in this tile
+        const int eid = tile_start + lane;
+        const int nbr = (eid < row_end) ? edge_idx[eid] : -1;
+
+        // compute attention score for this lane's neighbor
+        float score = -INFINITY;
+        if (nbr >= 0) {
+            float dot = dot_vec4(k_dst, Q + nbr * d, d);
+            score = dot * scale;
+        }
+
+        // warp-level max of this tile
+        float tile_max = warp_reduce_max(score);
+
+        // update running statistics (streaming softmax trick)
+        // see: "Online normalizer calculation for softmax" (Milakov & Gimelshein, 2018)
+        float old_max = running_max;
+        float new_max = fmaxf(running_max, tile_max);
+        float rescale_factor = __expf(old_max - new_max);
+
+        // rescale previous accumulator and denominator
+        #pragma unroll
+        for (int j = 0; j < TILE_D; ++j) {
+            acc_feat[j] *= rescale_factor;
+        }
+        running_sum *= rescale_factor;
+
+        // compute this neighbor's softmax weight (unnormalized)
+        float w = (nbr >= 0) ? __expf(score - new_max) : 0.f;
+        running_sum += w;
+        running_max = new_max;
+
+        // accumulate weighted values into per-lane registers
+        // vectorized load for V when possible
+        if (nbr >= 0 && feat_limit > 0) {
+            const float* v_ptr = V + nbr * d + feat_base;
+
+            // vectorized path: load 4 floats at once
+            int j = 0;
+            if (feat_limit >= 4 && (((size_t)v_ptr) & 15) == 0) {  // Check alignment
+                const float4* v4_ptr = reinterpret_cast<const float4*>(v_ptr);
+                for (; j + 4 <= feat_limit; j += 4) {
+                    float4 v4 = v4_ptr[j / 4];
+                    acc_feat[j + 0] += w * v4.x;
+                    acc_feat[j + 1] += w * v4.y;
+                    acc_feat[j + 2] += w * v4.z;
+                    acc_feat[j + 3] += w * v4.w;
                 }
             }
 
-            // warp-level max of this tile
-            float tile_max = warp_reduce_max(score);
-
-            // update running statistics (streaming softmax trick)
-            float old_max       = running_max;
-            float new_max       = fmaxf(running_max, tile_max);
-            float rescale_factor = __expf(old_max - new_max);
-
-            // rescale previous accumulator and denominator
-            #pragma unroll
-            for (int j = 0; j < TILE_D; ++j) {
-                acc_feat[j] *= rescale_factor;
-            }
-            running_sum *= rescale_factor;
-
-            // compute this neighbor's softmax weight (unnormalized)
-            float w = (nbr >= 0) ? __expf(score - new_max) : 0.0f;
-            running_sum = running_sum + w;
-            running_max = new_max;
-
-            // accumulate weighted values into per-lane registers
-            if (nbr >= 0 && feat_limit > 0) {
-                const float* v_ptr = V + nbr * d + feat_base;
-
-                // vectorized path: load 4 floats at once
-                int j = 0;
-                if (feat_limit >= 4 && (((size_t)v_ptr) & 15) == 0) {
-                    const float4* v4_ptr = reinterpret_cast<const float4*>(v_ptr);
-                    for (; j + 4 <= feat_limit; j += 4) {
-                        float4 v4 = v4_ptr[j / 4];
-                        acc_feat[j + 0] += w * v4.x;
-                        acc_feat[j + 1] += w * v4.y;
-                        acc_feat[j + 2] += w * v4.z;
-                        acc_feat[j + 3] += w * v4.w;
-                    }
-                }
-                // scalar tail
-                for (; j < feat_limit; ++j) {
-                    acc_feat[j] += w * v_ptr[j];
-                }
+            // scalar tail (or full scalar path if not aligned)
+            for (; j < feat_limit; ++j) {
+                acc_feat[j] += w * v_ptr[j];
             }
         }
     }
 
-    // reduce feature accumulators within warp and store to shared
     #pragma unroll
     for (int j = 0; j < TILE_D; ++j) {
-        float vj = (j < feat_limit && warp_is_active) ? acc_feat[j] : 0.0f;
+        float vj = (j < feat_limit) ? acc_feat[j] : 0.f;
         vj = warp_reduce_sum(vj);
         if (lane == 0) {
             warp_partial[warp_id * TILE_D + j] = vj;
@@ -231,25 +246,34 @@ __global__ void gt_kernel_forward_huge_nodes(
     }
 
     // store per-warp statistics
-    float warp_sum     = warp_reduce_sum(warp_is_active ? running_sum : 0.0f);
-    float warp_max_val = warp_reduce_max(warp_is_active ? running_max : -INFINITY);
+    float warp_sum = warp_reduce_sum(running_sum);
+    float warp_max_val = warp_reduce_max(running_max);
 
     if (lane == 0) {
-        warp_max[warp_id]   = warp_max_val;
+        warp_max[warp_id] = warp_max_val;
         warp_denom[warp_id] = warp_sum;
     }
     __syncthreads();
 
     // final reduction and logsumexp computation (warp 0 only)
     if (warp_id == 0) {
-        float global_max   = warp_max[0];
-        float global_denom = warp_denom[0];
+        // find global max across all warps
+        float global_max = (lane < WARPS_PER_BLOCK) ? warp_max[lane] : -INFINITY;
+        global_max = warp_reduce_max(global_max);
+
+        // accumulate denominator with max rescaling
+        float global_denom = 0.f;
+        if (lane < WARPS_PER_BLOCK) {
+            float rescale = __expf(warp_max[lane] - global_max);
+            global_denom = warp_denom[lane] * rescale;
+        }
+        global_denom = warp_reduce_sum(global_denom);
 
         if (lane == 0) {
             if (global_denom > 0.0f) {
                 logsumexp[dst] = global_max + logf(global_denom);
             } else {
-                logsumexp[dst] = -INFINITY;  // prevent log(0)
+                logsumexp[dst] = -INFINITY;  // Prevent log(0)
             }
         }
 
@@ -261,10 +285,10 @@ __global__ void gt_kernel_forward_huge_nodes(
                 if (base >= d) break;
 
                 float warp_rescale = __expf(warp_max[w] - global_max);
-                int   limit        = (base + TILE_D <= d) ? TILE_D : (d - base);
+                int limit = (base + TILE_D <= d) ? TILE_D : (d - base);
 
                 // coalesced strided writes across lanes
-                for (int j = lane; j < limit; j += kMaxThreadsInWarp) {
+                for (int j = lane; j < limit; j += 32) {
                     float val = warp_partial[w * TILE_D + j] * warp_rescale * inv_denom;
                     out[dst * d + (base + j)] = val;
                 }
@@ -274,8 +298,8 @@ __global__ void gt_kernel_forward_huge_nodes(
 }
 
 // ============================================================================
-// Forward: mid-degree nodes, feature-parallel, tiled over neighbors
-// Stores per-edge logits into attn_logits[eid].
+// optimized kernel: process NBR_TILE neighbors per reduction
+// warp loads consecutive features & computes partial dot products
 // ============================================================================
 template<int THREADS_PER_BLOCK, int NBR_TILE = 8>
 __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
@@ -287,8 +311,7 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ out,
-    float* __restrict__ logsumexp,
-    float* __restrict__ attn_logits,
+    float* __restrict__ logsumexp,  // <--- NEW
     int d,
     float scale
 ) {
@@ -298,18 +321,50 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
     }
     const int tid = threadIdx.x;
 
-    const int dst       = mid_nodes[block_idx];
+    const int dst = mid_nodes[block_idx];
     const int row_start = edge_ptr[dst];
-    const int row_end   = edge_ptr[dst + 1];
-    const int degree    = row_end - row_start;
+    const int row_end = edge_ptr[dst + 1];
+    const int degree = row_end - row_start;
 
-    if (degree == 0) {
+    if (row_end == row_start) {
+        // Isolated node
+        for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
+            out[dst * d + f] = 0.0f;
+        }
+        if (tid == 0) {
+            logsumexp[dst] = -INFINITY;
+        }
         return;
     }
+
+    bool has_nan = false;
+    if (tid == 0) {
+        // Check if K[dst] has NaN
+        for (int f = 0; f < d; f++) {
+            if (!isfinite(K[dst * d + f])) {
+                has_nan = true;
+                break;
+            }
+        }
+    }
+    __syncthreads();  // Broadcast the check result
+
+    if (has_nan) {
+        // Input has NaN - output zeros
+        for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
+            out[dst * d + f] = 0.0f;
+        }
+        if (tid == 0) {
+            logsumexp[dst] = -INFINITY;
+        }
+        return;
+    }
+
 
     extern __shared__ float smem[];
     float* K_dst = smem;
     float* O_acc = smem + d;
+
 
     // load K[dst] and initialize O
     #pragma unroll
@@ -323,45 +378,46 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
     float m_i = -INFINITY;
     float l_i = 0.0f;
 
-    // process neighbors in tiles to amortize block reduction cost
+    // process neighbors in tiles to amortize block reduction cost (optimal tile size can vary)
     for (int tile_start = row_start; tile_start < row_end; tile_start += NBR_TILE) {
-        const int tile_end   = min(tile_start + NBR_TILE, row_end);
-        const int tile_size  = tile_end - tile_start;
+        const int tile_end = min(tile_start + NBR_TILE, row_end);
+        const int tile_size = tile_end - tile_start;
 
         // --------------------------------------------------------------------
         // 1: Compute attention scores for all neighbors in tile
+        // each thread computes partial dots for NBR_TILE neighbors
         // --------------------------------------------------------------------
         float partial_dots[NBR_TILE];
-        int   nbrs[NBR_TILE];
+        int nbrs[NBR_TILE];
 
         #pragma unroll
         for (int i = 0; i < NBR_TILE; i++) {
             const int eid = tile_start + i;
-            nbrs[i]       = (eid < row_end) ? edge_idx[eid] : -1;
+            nbrs[i] = (eid < row_end) ? edge_idx[eid] : -1;
             partial_dots[i] = 0.0f;
         }
 
+        // partial dot products (vectorized when possible)
         const bool use_vec4 = (d % 4 == 0) && (((uintptr_t)K_dst & 15) == 0);
 
-        if (use_vec4) {
-            const float4* K_dst_vec4 = reinterpret_cast<const float4*>(K_dst);
-            const int     d4         = d / 4;
+    if (use_vec4) {
+        const float4* K_dst_vec4 = reinterpret_cast<const float4*>(K_dst);
+        const int d4 = d / 4;
 
-            for (int f4 = tid; f4 < d4; f4 += THREADS_PER_BLOCK) {
-                float4 k4 = K_dst_vec4[f4];
+        for (int f4 = tid; f4 < d4; f4 += THREADS_PER_BLOCK) {
+            float4 k4 = K_dst_vec4[f4];
 
-                #pragma unroll
-                for (int i = 0; i < NBR_TILE; i++) {
-                    if (nbrs[i] >= 0) {
-                        const float4* Q_vec4 =
-                            reinterpret_cast<const float4*>(Q + nbrs[i] * d);
-                        float4 q4 = Q_vec4[f4];
-                        partial_dots[i] += (q4.x * k4.x) + (q4.y * k4.y) +
-                                           (q4.z * k4.z) + (q4.w * k4.w);
-                    }
+            for (int i = 0; i < NBR_TILE; i++) {
+                if (nbrs[i] >= 0) {
+                    const float4* Q_vec4 = reinterpret_cast<const float4*>(Q + nbrs[i] * d);
+                    float4 q4 = Q_vec4[f4];
+
+                    partial_dots[i] += (q4.x * k4.x) + (q4.y * k4.y) +
+                                    (q4.z * k4.z) + (q4.w * k4.w);
                 }
             }
-        } else {
+        }
+}        else {
             #pragma unroll
             for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
                 float k_val = K_dst[f];
@@ -375,18 +431,12 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
         }
 
         // --------------------------------------------------------------------
-        // 2: block reductions for all neighbors in tile + store logits to global memory
+        // 2: block reductions for all neighbors in tile (amortized!)
         // --------------------------------------------------------------------
         float scores[NBR_TILE];
         #pragma unroll
         for (int i = 0; i < NBR_TILE; i++) {
-            float s = block_reduce_sum<THREADS_PER_BLOCK>(partial_dots[i]) * scale;
-            scores[i] = s;
-
-            const int eid = tile_start + i;
-            if (tid == 0 && nbrs[i] >= 0 && eid < row_end) {
-                attn_logits[eid] = s;
-            }
+            scores[i] = block_reduce_sum<THREADS_PER_BLOCK>(partial_dots[i]) * scale;
         }
 
         // --------------------------------------------------------------------
@@ -398,14 +448,14 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
             tile_max = fmaxf(tile_max, scores[i]);
         }
 
-        float alpha   = expf(m_i - tile_max);
+        float alpha = expf(m_i - tile_max);
         float new_sum = alpha * l_i;
 
         float exp_weights[NBR_TILE];
         #pragma unroll
         for (int i = 0; i < tile_size; i++) {
             exp_weights[i] = expf(scores[i] - tile_max);
-            new_sum       += exp_weights[i];
+            new_sum += exp_weights[i];
         }
 
         // --------------------------------------------------------------------
@@ -413,7 +463,7 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
         // --------------------------------------------------------------------
         if (use_vec4) {
             float4* O_acc_vec4 = reinterpret_cast<float4*>(O_acc);
-            const int d4       = d / 4;
+            const int d4 = d / 4;
 
             #pragma unroll
             for (int f4 = tid; f4 < d4; f4 += THREADS_PER_BLOCK) {
@@ -429,10 +479,9 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
                 #pragma unroll
                 for (int i = 0; i < tile_size; i++) {
                     if (nbrs[i] >= 0) {
-                        const float4* V_vec4 =
-                            reinterpret_cast<const float4*>(V + nbrs[i] * d);
+                        const float4* V_vec4 = reinterpret_cast<const float4*>(V + nbrs[i] * d);
                         float4 v4 = V_vec4[f4];
-                        float w   = exp_weights[i];
+                        float w = exp_weights[i];
 
                         o4.x += w * v4.x;
                         o4.y += w * v4.y;
@@ -470,19 +519,19 @@ __global__ void gt_kernel_forward_mid_nodes_feature_parallel_tiled(
     for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
         out[dst * d + f] = O_acc[f] * inv_l_i;
     }
+    // write logsumexp = m_i + log(l_i)
     if (tid == 0) {
         if (l_i > 0.0f) {
             logsumexp[dst] = m_i + logf(l_i);
         } else {
-            logsumexp[dst] = -INFINITY;  // prevent log(0)
+            logsumexp[dst] = -INFINITY;  // Prevent log(0)
         }
     }
 }
 
 
 // ============================================================================
-// BACKWARD PASS STARTS HERE
-// Kernel: Compute D = rowsum(dO * O)
+// Kernel: Compute D = rowsum(dO ⊙ O)
 // ============================================================================
 
 __global__ void compute_D_kernel(
@@ -492,58 +541,54 @@ __global__ void compute_D_kernel(
     int num_nodes,
     int d
 ) {
-    const int lane = threadIdx.x % kMaxThreadsInWarp;
-    const int wid  = threadIdx.x / kMaxThreadsInWarp;
-    __shared__ float warp_sums[kMaxThreadsInWarp];
+    const int node_idx = blockIdx.x;
+    if (node_idx >= num_nodes) return;
 
-    // grid-stride loop over nodes
-    for (int node_idx = blockIdx.x; node_idx < num_nodes; node_idx += gridDim.x) {
-        const float* dO_node = dO + node_idx * d;
-        const float* O_node  = O  + node_idx * d;
+    const float* dO_node = dO + node_idx * d;
+    const float* O_node = O + node_idx * d;
 
-        float sum = 0.0f;
+    float sum = 0.0f;
 
-        // vectorized path if aligned
-        if (d % 4 == 0 && (((uintptr_t)dO_node & 15) == 0) && (((uintptr_t)O_node  & 15) == 0)) {
-            const float4* dO_vec4 = reinterpret_cast<const float4*>(dO_node);
-            const float4* O_vec4  = reinterpret_cast<const float4*>(O_node);
-            const int d4 = d / 4;
+    if (d % 4 == 0 && (((uintptr_t)dO_node & 15) == 0) && (((uintptr_t)O_node & 15) == 0)) {
+        const float4* dO_vec4 = reinterpret_cast<const float4*>(dO_node);
+        const float4* O_vec4 = reinterpret_cast<const float4*>(O_node);
+        const int d4 = d / 4;
 
-            for (int f4 = threadIdx.x; f4 < d4; f4 += blockDim.x) {
-                float4 do4 = dO_vec4[f4];
-                float4 o4  = O_vec4[f4];
-                sum += do4.x * o4.x + do4.y * o4.y +
-                       do4.z * o4.z + do4.w * o4.w;
-            }
-        } else {
-            for (int f = threadIdx.x; f < d; f += blockDim.x) {
-                sum += dO_node[f] * O_node[f];
-            }
+        for (int f4 = threadIdx.x; f4 < d4; f4 += blockDim.x) {
+            float4 do4 = dO_vec4[f4];
+            float4 o4 = O_vec4[f4];
+            sum += do4.x * o4.x + do4.y * o4.y + do4.z * o4.z + do4.w * o4.w;
         }
+    } else {
+        for (int f = threadIdx.x; f < d; f += blockDim.x) {
+            sum += dO_node[f] * O_node[f];
+        }
+    }
 
+    sum = warp_reduce_sum(sum);
+
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x % 32;
+    const int wid = threadIdx.x / 32;
+
+    if (lane == 0) {
+        warp_sums[wid] = sum;
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+        sum = (lane < (blockDim.x / 32)) ? warp_sums[lane] : 0.0f;
         sum = warp_reduce_sum(sum);
-
         if (lane == 0) {
-            warp_sums[wid] = sum;
+            D[node_idx] = sum;
         }
-        __syncthreads();
-
-        if (wid == 0) {
-            float block_sum = (lane < (blockDim.x / kMaxThreadsInWarp)) ? warp_sums[lane] : 0.0f;
-            block_sum       = warp_reduce_sum(block_sum);
-            if (lane == 0) {
-                D[node_idx] = block_sum;
-            }
-        }
-        __syncthreads();
     }
 }
 
 // ============================================================================
 // Backward kernel: Mid-degree nodes with warp-cooperative atomics
-// NOTE Now reuses stored logits from attn_logits instead of recomputing dot(k, q)
-// as it doesn't introduce significant overhead compared to dense FlashAttention setup.
 // ============================================================================
+
 template<int THREADS_PER_BLOCK, int NBR_TILE = 8>
 __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
     const int* __restrict__ edge_ptr,
@@ -556,82 +601,130 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
     const float* __restrict__ dO,
     const float* __restrict__ logsumexp,
     const float* __restrict__ D,
-    const float* __restrict__ attn_logits,
     float* __restrict__ dQ,
     float* __restrict__ dK,
     float* __restrict__ dV,
     int d,
     float scale
 ) {
+
+
     const int block_idx = blockIdx.x;
     if (block_idx >= num_mid_degree_nodes) return;
 
-    const int dst       = mid_nodes[block_idx];
+    const int dst = mid_nodes[block_idx];
     const int row_start = edge_ptr[dst];
-    const int row_end   = edge_ptr[dst + 1];
+    const int row_end = edge_ptr[dst + 1];
 
     if (row_end == row_start) return;
 
     extern __shared__ float smem[];
-    float* K_dst  = smem;
+    float* K_dst = smem;
     float* dO_dst = smem + d;
-    float* dK_acc = dO_dst + d;
+    float* dK_acc = smem + 2 * d;
 
-    const int tid     = threadIdx.x;
-    const int lane    = tid % kMaxThreadsInWarp;
-    const int warp_id = tid / kMaxThreadsInWarp;
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp_id = tid / 32;
 
     #pragma unroll
     for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
-        K_dst[f]  = K[dst * d + f];
+        K_dst[f] = K[dst * d + f];
         dO_dst[f] = dO[dst * d + f];
         dK_acc[f] = 0.0f;
     }
     __syncthreads();
 
     const float lse_dst = logsumexp[dst];
-    const float D_dst   = D[dst];
+    const float D_dst = D[dst];
+
+    if (!isfinite(lse_dst) || row_end == row_start) {
+        // Isolated node: output was 0, so gradients are 0
+        // dK[dst] should be set to 0
+        for (int f = tid; f < d; f += blockDim.x) {
+            dK[dst * d + f] = 0.0f;
+        }
+        return;
+    }
 
     for (int tile_start = row_start; tile_start < row_end; tile_start += NBR_TILE) {
-        const int tile_end  = min(tile_start + NBR_TILE, row_end);
+        const int tile_end = min(tile_start + NBR_TILE, row_end);
         const int tile_size = tile_end - tile_start;
 
         // ====================================================================
-        // 1. Read neighbors and reuse logits to compute P
+        // 1. Compute attention weights P
         // ====================================================================
-        int   nbrs[NBR_TILE];
-        float P_weights[NBR_TILE];
+        float partial_dots[NBR_TILE];
+        int nbrs[NBR_TILE];
 
         #pragma unroll
         for (int i = 0; i < NBR_TILE; i++) {
             const int eid = tile_start + i;
-            if (eid < row_end) {
-                int nbr = edge_idx[eid];
-                nbrs[i] = nbr;
-                float score = attn_logits[eid];
-                P_weights[i] = expf(score - lse_dst);
-            } else {
-                nbrs[i]      = -1;
-                P_weights[i] = 0.0f;
+            nbrs[i] = (eid < row_end) ? edge_idx[eid] : -1;
+            partial_dots[i] = 0.0f;
+        }
+
+        const bool use_vec4 = (d % 4 == 0) && (((uintptr_t)K_dst & 15) == 0);
+
+        if (use_vec4) {
+            const float4* K_dst_vec4 = reinterpret_cast<const float4*>(K_dst);
+            const int d4 = d / 4;
+
+            #pragma unroll
+            for (int f4 = tid; f4 < d4; f4 += THREADS_PER_BLOCK) {
+                float4 k4 = K_dst_vec4[f4];
+
+                #pragma unroll
+                for (int i = 0; i < NBR_TILE; i++) {
+                    if (nbrs[i] >= 0) {
+                        const float4* Q_vec4 = reinterpret_cast<const float4*>(Q + nbrs[i] * d);
+                        float4 q4 = Q_vec4[f4];
+                        partial_dots[i] += (q4.x * k4.x) + (q4.y * k4.y) +
+                                          (q4.z * k4.z) + (q4.w * k4.w);
+                    }
+                }
             }
+        } else {
+            #pragma unroll
+            for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
+                float k_val = K_dst[f];
+                #pragma unroll
+                for (int i = 0; i < NBR_TILE; i++) {
+                    if (nbrs[i] >= 0) {
+                        partial_dots[i] += k_val * Q[nbrs[i] * d + f];
+                    }
+                }
+            }
+        }
+
+        float scores[NBR_TILE];
+        float P_weights[NBR_TILE];
+
+        #pragma unroll
+        for (int i = 0; i < NBR_TILE; i++) {
+            scores[i] = block_reduce_sum<THREADS_PER_BLOCK>(partial_dots[i]) * scale;
+            P_weights[i] = (nbrs[i] >= 0) ? expf(scores[i] - lse_dst) : 0.0f;
         }
 
         // ====================================================================
         // 2. Warp-cooperative atomic scatter for dV
+        // Each warp handles a partition of features to reduce contention
         // ====================================================================
-        constexpr int WARPS = THREADS_PER_BLOCK / kMaxThreadsInWarp;
+        constexpr int WARPS = THREADS_PER_BLOCK / 32;
 
         #pragma unroll
         for (int i = 0; i < tile_size; i++) {
             if (nbrs[i] >= 0) {
-                float p        = P_weights[i];
-                float* dV_nbr  = dV + nbrs[i] * d;
+                float p = P_weights[i];
+                float* dV_nbr = dV + nbrs[i] * d;
 
+                // Each warp processes d/WARPS features
                 int feat_per_warp = (d + WARPS - 1) / WARPS;
-                int feat_start    = warp_id * feat_per_warp;
-                int feat_end      = min(feat_start + feat_per_warp, d);
+                int feat_start = warp_id * feat_per_warp;
+                int feat_end = min(feat_start + feat_per_warp, d);
 
-                for (int f = feat_start + lane; f < feat_end; f += kMaxThreadsInWarp) {
+                // Warp-strided access within partition
+                for (int f = feat_start + lane; f < feat_end; f += 32) {
                     atomicAdd(&dV_nbr[f], p * dO_dst[f]);
                 }
             }
@@ -647,8 +740,6 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
             dP_vals[i] = 0.0f;
         }
 
-        const bool use_vec4 = (d % 4 == 0) && (((uintptr_t)dO_dst & 15) == 0);
-
         if (use_vec4) {
             const float4* dO_dst_vec4 = reinterpret_cast<const float4*>(dO_dst);
             const int d4 = d / 4;
@@ -660,11 +751,10 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
                 #pragma unroll
                 for (int i = 0; i < tile_size; i++) {
                     if (nbrs[i] >= 0) {
-                        const float4* V_vec4 =
-                            reinterpret_cast<const float4*>(V + nbrs[i] * d);
+                        const float4* V_vec4 = reinterpret_cast<const float4*>(V + nbrs[i] * d);
                         float4 v4 = V_vec4[f4];
                         dP_vals[i] += (do4.x * v4.x) + (do4.y * v4.y) +
-                                      (do4.z * v4.z) + (do4.w * v4.w);
+                                     (do4.z * v4.z) + (do4.w * v4.w);
                     }
                 }
             }
@@ -687,7 +777,7 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
         #pragma unroll
         for (int i = 0; i < NBR_TILE; i++) {
             float dP_full = block_reduce_sum<THREADS_PER_BLOCK>(dP_vals[i]);
-            dS_vals[i]    = P_weights[i] * (dP_full - D_dst);
+            dS_vals[i] = P_weights[i] * (dP_full - D_dst);
         }
 
         // ====================================================================
@@ -695,7 +785,7 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
         // ====================================================================
         if (use_vec4) {
             float4* dK_acc_vec4 = reinterpret_cast<float4*>(dK_acc);
-            const int d4        = d / 4;
+            const int d4 = d / 4;
 
             #pragma unroll
             for (int f4 = tid; f4 < d4; f4 += THREADS_PER_BLOCK) {
@@ -706,7 +796,7 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
                     if (nbrs[i] >= 0) {
                         const float4* Q_vec4 = reinterpret_cast<const float4*>(Q + nbrs[i] * d);
                         float4 q4 = Q_vec4[f4];
-                        float ds  = dS_vals[i] * scale;
+                        float ds = dS_vals[i] * scale;
 
                         dk4.x += ds * q4.x;
                         dk4.y += ds * q4.y;
@@ -740,14 +830,14 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
         for (int i = 0; i < tile_size; i++) {
             if (nbrs[i] >= 0) {
                 float ds_scaled = dS_vals[i] * scale;
-                float* dQ_nbr   = dQ + nbrs[i] * d;
+                float* dQ_nbr = dQ + nbrs[i] * d;
 
-                constexpr int WARPS2 = THREADS_PER_BLOCK / kMaxThreadsInWarp;
-                int feat_per_warp    = (d + WARPS2 - 1) / WARPS2;
-                int feat_start       = warp_id * feat_per_warp;
-                int feat_end         = min(feat_start + feat_per_warp, d);
+                constexpr int WARPS = THREADS_PER_BLOCK / 32;
+                int feat_per_warp = (d + WARPS - 1) / WARPS;
+                int feat_start = warp_id * feat_per_warp;
+                int feat_end = min(feat_start + feat_per_warp, d);
 
-                for (int f = feat_start + lane; f < feat_end; f += kMaxThreadsInWarp) {
+                for (int f = feat_start + lane; f < feat_end; f += 32) {
                     atomicAdd(&dQ_nbr[f], ds_scaled * K_dst[f]);
                 }
             }
@@ -762,8 +852,8 @@ __global__ void gt_kernel_backward_mid_nodes_tiled_warp_atomic(
 
 // ============================================================================
 // Backward kernel: Huge-degree nodes with warp-cooperative atomics
-// Reuses stored logits from attn_logits instead of recomputing k·q.
 // ============================================================================
+
 template<int WARPS_PER_BLOCK, int TILE_D>
 __global__ void gt_kernel_backward_huge_nodes_warp_atomic(
     const int* __restrict__ edge_ptr,
@@ -776,40 +866,39 @@ __global__ void gt_kernel_backward_huge_nodes_warp_atomic(
     const float* __restrict__ dO,
     const float* __restrict__ logsumexp,
     const float* __restrict__ D,
-    const float* __restrict__ attn_logits,  // NEW
     float* __restrict__ dQ,
     float* __restrict__ dK,
     float* __restrict__ dV,
     int d,
     float scale
 ) {
-    const int warp_id    = threadIdx.x / kMaxThreadsInWarp;
-    const int lane       = threadIdx.x % kMaxThreadsInWarp;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
     const int block_node = blockIdx.x;
 
     if (block_node >= num_huge) return;
 
-    const int dst       = huge_nodes[block_node];
+    const int dst = huge_nodes[block_node];
     const int row_start = edge_ptr[dst];
-    const int row_end   = edge_ptr[dst + 1];
-
+    const int row_end = edge_ptr[dst + 1];
     if (row_end == row_start) return;
 
+
     extern __shared__ float shmem[];
-    float* k_dst      = shmem;
-    float* do_dst     = k_dst + d;
+    float* k_dst = shmem;
+    float* do_dst = k_dst + d;
     float* dk_partial = do_dst + d;
 
     for (int f = threadIdx.x; f < d; f += blockDim.x) {
-        k_dst[f]  = K[dst * d + f];
+        k_dst[f] = K[dst * d + f];
         do_dst[f] = dO[dst * d + f];
     }
     __syncthreads();
 
-    const int feat_base  = warp_id * TILE_D;
-    const int feat_limit = (feat_base + TILE_D <= d) ? feat_base + TILE_D : (d - feat_base);
+    const int feat_base = warp_id * TILE_D;
+    const int feat_limit = (feat_base + TILE_D <= d) ? TILE_D : (d - feat_base);
 
-    const bool warp_is_active = (feat_base < d);
+    if (feat_base >= d) return;
 
     float dk_feat[TILE_D];
 
@@ -819,86 +908,82 @@ __global__ void gt_kernel_backward_huge_nodes_warp_atomic(
     }
 
     const float lse_dst = logsumexp[dst];
-    const float D_dst   = D[dst];
-    if (!isfinite(lse_dst)) {
-        goto finalize_output;
-    }
+    if (!isfinite(lse_dst)) return;
 
-    if (warp_is_active) {
-        constexpr int TILE_SIZE = 32;
+    const float D_dst = D[dst];
 
-        for (int tile_start = row_start; tile_start < row_end; tile_start += TILE_SIZE) {
-            // ====================================================================
-            // Step 1: Each lane loads its neighbor's score from attn_logits
-            // ====================================================================
-            const int eid = tile_start + lane;
-            const int nbr = (eid < row_end) ? edge_idx[eid] : -1;
+    constexpr int TILE_SIZE = 32;
+    for (int tile_start = row_start + warp_id * TILE_SIZE;
+         tile_start < row_end;
+         tile_start += WARPS_PER_BLOCK * TILE_SIZE) {
 
-            float P_weight  = 0.0f;
-            float dS_scaled = 0.0f;
+        const int eid = tile_start + lane;
+        const int nbr = (eid < row_end) ? edge_idx[eid] : -1;
 
-            if (nbr >= 0) {
-                float score = attn_logits[eid];
-                P_weight    = expf(score - lse_dst);
+        // Compute P weight
+        float score = -INFINITY;
+        if (nbr >= 0) {
+            score = dot_vec4(k_dst, Q + nbr * d, d) * scale;
+        }
+        float P_weight = (nbr >= 0) ? expf(score - lse_dst) : 0.0f;
 
-                float dP = dot_vec4(do_dst, V + nbr * d, d);
-                dS_scaled = P_weight * (dP - D_dst) * scale;
+        // ====================================================================
+        // Warp-cooperative atomic scatter for dV
+        // All lanes cooperate to write entire feature vector
+        // ====================================================================
+        if (nbr >= 0) {
+            float* dV_nbr = dV + nbr * d;
+
+            for (int f = lane; f < d; f += 32) {
+                atomicAdd(&dV_nbr[f], P_weight * do_dst[f]);
+            }
+        }
+
+        // Compute dP and dS
+        float dP = 0.0f;
+        if (nbr >= 0) {
+            dP = dot_vec4(do_dst, V + nbr * d, d);
+        }
+
+        float dS = P_weight * (dP - D_dst);
+        float dS_scaled = dS * scale;
+
+        // Accumulate dK (local to warp's feature tile)
+        if (nbr >= 0 && feat_limit > 0) {
+            const float* q_ptr = Q + nbr * d + feat_base;
+
+            int j = 0;
+            if (feat_limit >= 4 && (((size_t)q_ptr) & 15) == 0) {
+                const float4* q4_ptr = reinterpret_cast<const float4*>(q_ptr);
+                for (; j + 4 <= feat_limit; j += 4) {
+                    float4 q4 = q4_ptr[j / 4];
+                    dk_feat[j + 0] += dS_scaled * q4.x;
+                    dk_feat[j + 1] += dS_scaled * q4.y;
+                    dk_feat[j + 2] += dS_scaled * q4.z;
+                    dk_feat[j + 3] += dS_scaled * q4.w;
+                }
             }
 
-            // ====================================================================
-            // Step 2: Warp-cooperative scatter to ALL neighbors in this tile
-            // ====================================================================
-            #pragma unroll
-            for (int i = 0; i < TILE_SIZE; i++) {
-                if (tile_start + i >= row_end) break;
-
-                int   target_nbr = __shfl_sync(0xffffffff, nbr, i);
-                if (target_nbr < 0) continue;
-                float target_P   = __shfl_sync(0xffffffff, P_weight, i);
-                float target_dS  = __shfl_sync(0xffffffff, dS_scaled, i);
-
-                if (lane < TILE_D && (feat_base + lane) < d) {
-                    atomicAdd(&dV[target_nbr * d + feat_base + lane],
-                              target_P * do_dst[feat_base + lane]);
-
-                    atomicAdd(&dQ[target_nbr * d + feat_base + lane],
-                              target_dS * k_dst[feat_base + lane]);
-                }
+            for (; j < feat_limit; ++j) {
+                dk_feat[j] += dS_scaled * q_ptr[j];
             }
+        }
 
-            // ====================================================================
-            // Step 3: Accumulate dK locally (no atomics needed)
-            // ====================================================================
-            if (nbr >= 0) {
-                const float* q_ptr = Q + nbr * d + feat_base;
+        // Warp-cooperative atomic scatter for dQ
+        if (nbr >= 0) {
+            float* dq_ptr = dQ + nbr * d;
 
-                int feat_count = (feat_base + TILE_D <= d) ? TILE_D : (d - feat_base);
-
-                int j = 0;
-                if (feat_count >= 4 && (((size_t)q_ptr) & 15) == 0) {
-                    const float4* q4_ptr = reinterpret_cast<const float4*>(q_ptr);
-                    for (; j + 4 <= feat_count; j += 4) {
-                        float4 q4 = q4_ptr[j / 4];
-                        dk_feat[j + 0] += dS_scaled * q4.x;
-                        dk_feat[j + 1] += dS_scaled * q4.y;
-                        dk_feat[j + 2] += dS_scaled * q4.z;
-                        dk_feat[j + 3] += dS_scaled * q4.w;
-                    }
-                }
-
-                for (; j < feat_count; ++j) {
-                    dk_feat[j] += dS_scaled * q_ptr[j];
-                }
+            for (int f = lane; f < d; f += 32) {
+                atomicAdd(&dq_ptr[f], dS_scaled * k_dst[f]);
             }
         }
     }
 
-finalize_output:
     // Reduce dK within warp and write to shared
     #pragma unroll
     for (int j = 0; j < TILE_D; ++j) {
-        float dk_j = (j < feat_limit && warp_is_active) ? dk_feat[j] : 0.0f;
-        dk_j       = warp_reduce_sum(dk_j);
+        float dk_j = (j < feat_limit) ? dk_feat[j] : 0.0f;
+        dk_j = warp_reduce_sum(dk_j);
 
         if (lane == 0 && (feat_base + j) < d) {
             dk_partial[warp_id * TILE_D + j] = dk_j;
@@ -914,7 +999,7 @@ finalize_output:
 
             int limit = (base + TILE_D <= d) ? TILE_D : (d - base);
 
-            for (int j = lane; j < limit; j += kMaxThreadsInWarp) {
+            for (int j = lane; j < limit; j += 32) {
                 dK[dst * d + (base + j)] = dk_partial[w * TILE_D + j];
             }
         }
@@ -936,23 +1021,17 @@ graph_attention_backward_buckets_cuda(
     torch::Tensor V,
     torch::Tensor O,
     torch::Tensor dO,
-    torch::Tensor logsumexp,
-    torch::Tensor attn_logits
+    torch::Tensor logsumexp
 ) {
     TORCH_CHECK(dO.is_cuda() && O.is_cuda(), "gradients must be CUDA");
-    TORCH_CHECK(attn_logits.is_cuda(), "attn_logits must be CUDA");
-    TORCH_CHECK(attn_logits.dtype() == torch::kFloat32,
-                "attn_logits must be float32");
-    TORCH_CHECK(attn_logits.numel() == edge_idx.size(0),
-                "attn_logits size must match number of edges");
 
     int num_nodes = Q.size(0);
-    int d         = Q.size(1);
+    int d = Q.size(1);
 
     auto dQ = torch::zeros_like(Q);
     auto dK = torch::zeros_like(K);
     auto dV = torch::zeros_like(V);
-    auto D  = torch::zeros({num_nodes}, Q.options());
+    auto D = torch::zeros({num_nodes}, Q.options());
 
     float scale = 1.0f / std::sqrt((float)d);
 
@@ -961,9 +1040,7 @@ graph_attention_backward_buckets_cuda(
     // ========================================================================
     {
         constexpr int THREADS = 128;
-        const int max_blocks  = 4096;
-        int grid              = (num_nodes < max_blocks) ? num_nodes : max_blocks;
-        compute_D_kernel<<<grid, THREADS>>>(
+        compute_D_kernel<<<num_nodes, THREADS>>>(
             dO.data_ptr<float>(),
             O.data_ptr<float>(),
             D.data_ptr<float>(),
@@ -974,9 +1051,7 @@ graph_attention_backward_buckets_cuda(
 
     cudaDeviceSynchronize();
     cudaError_t err1 = cudaGetLastError();
-    TORCH_CHECK(err1 == cudaSuccess,
-                "Backward CUDA kernel failed on `compute_D_kernel`: ",
-                cudaGetErrorString(err1));
+    TORCH_CHECK(err1 == cudaSuccess, "Backward CUDA kernel failed on `compute_D_kernel`: ", cudaGetErrorString(err1));
 
     // ========================================================================
     // Step 2: Mid-degree backward with warp-cooperative atomics
@@ -984,9 +1059,9 @@ graph_attention_backward_buckets_cuda(
     int num_mid = mid_nodes.size(0);
     if (num_mid > 0) {
         if (d >= 256) {
-            constexpr int THREADS   = 128;
-            constexpr int NBR_TILE  = 4;
-            size_t smem             = 3 * d * sizeof(float);
+            constexpr int THREADS = 64;
+            constexpr int NBR_TILE = 4;
+            size_t smem = 3 * d * sizeof(float);
 
             gt_kernel_backward_mid_nodes_tiled_warp_atomic<THREADS, NBR_TILE>
                 <<<num_mid, THREADS, smem>>>(
@@ -1000,17 +1075,16 @@ graph_attention_backward_buckets_cuda(
                     dO.data_ptr<float>(),
                     logsumexp.data_ptr<float>(),
                     D.data_ptr<float>(),
-                    attn_logits.data_ptr<float>(),
                     dQ.data_ptr<float>(),
                     dK.data_ptr<float>(),
                     dV.data_ptr<float>(),
                     d,
                     scale
-                );
+            );
         } else if (d >= 128) {
-            constexpr int THREADS   = 64;
-            constexpr int NBR_TILE  = 4;
-            size_t smem             = 3 * d * sizeof(float);
+            constexpr int THREADS = 32;
+            constexpr int NBR_TILE = 2;
+            size_t smem = 3 * d * sizeof(float);
 
             gt_kernel_backward_mid_nodes_tiled_warp_atomic<THREADS, NBR_TILE>
                 <<<num_mid, THREADS, smem>>>(
@@ -1024,17 +1098,16 @@ graph_attention_backward_buckets_cuda(
                     dO.data_ptr<float>(),
                     logsumexp.data_ptr<float>(),
                     D.data_ptr<float>(),
-                    attn_logits.data_ptr<float>(),
                     dQ.data_ptr<float>(),
                     dK.data_ptr<float>(),
                     dV.data_ptr<float>(),
                     d,
                     scale
-                );
+            );
         } else {
-            constexpr int THREADS   = 32;
-            constexpr int NBR_TILE  = 2;
-            size_t smem             = 3 * d * sizeof(float);
+            constexpr int THREADS = 32;
+            constexpr int NBR_TILE = 1;
+            size_t smem = 3 * d * sizeof(float);
 
             gt_kernel_backward_mid_nodes_tiled_warp_atomic<THREADS, NBR_TILE>
                 <<<num_mid, THREADS, smem>>>(
@@ -1048,13 +1121,12 @@ graph_attention_backward_buckets_cuda(
                     dO.data_ptr<float>(),
                     logsumexp.data_ptr<float>(),
                     D.data_ptr<float>(),
-                    attn_logits.data_ptr<float>(),
                     dQ.data_ptr<float>(),
                     dK.data_ptr<float>(),
                     dV.data_ptr<float>(),
                     d,
                     scale
-                );
+            );
         }
     }
 
@@ -1063,8 +1135,8 @@ graph_attention_backward_buckets_cuda(
     // ========================================================================
     int num_huge = huge_nodes.size(0);
     if (num_huge > 0) {
-        constexpr int WARPS  = 8;
-        constexpr int TILE_D = 32;
+        constexpr int WARPS = 16;
+        constexpr int TILE_D = 16;
 
         TORCH_CHECK(d <= WARPS * TILE_D,
                     "d=", d, " too large for WARPS=", WARPS,
@@ -1087,25 +1159,22 @@ graph_attention_backward_buckets_cuda(
                 dO.data_ptr<float>(),
                 logsumexp.data_ptr<float>(),
                 D.data_ptr<float>(),
-                attn_logits.data_ptr<float>(),
                 dQ.data_ptr<float>(),
                 dK.data_ptr<float>(),
                 dV.data_ptr<float>(),
                 d,
                 scale
-            );
+        );
     }
     cudaDeviceSynchronize();
     cudaError_t err2 = cudaGetLastError();
-    TORCH_CHECK(err2 == cudaSuccess,
-                "Backward CUDA kernel failed: ", cudaGetErrorString(err2));
+    TORCH_CHECK(err2 == cudaSuccess, "Backward CUDA kernel failed: ", cudaGetErrorString(err2));
 
     return std::make_tuple(dQ, dK, dV);
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-graph_attention_forward_buckets_cuda(
+std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_buckets_cuda(
     torch::Tensor edge_ptr,
     torch::Tensor edge_idx,
     torch::Tensor mid_nodes,
@@ -1131,21 +1200,20 @@ graph_attention_forward_buckets_cuda(
     int  num_nodes = Q.size(0);
     int  d         = Q.size(1);
     auto out       = torch::zeros_like(V);
-    auto logsumexp = torch::full({num_nodes}, -INFINITY, torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
-
-    // per-edge logits (same number of elements as edge_idx)
-    auto attn_logits = torch::empty({edge_idx.size(0)}, torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
+    auto logsumexp = torch::full({num_nodes}, -INFINITY,
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
 
     float scale  = 1.0f / std::sqrt((float)d);
-    int   num_mid  = mid_nodes.size(0);
-    int   num_huge = huge_nodes.size(0);
+    int num_mid  = mid_nodes.size(0);
+    int num_huge = huge_nodes.size(0);
 
     if (num_mid > 0) {
         if (d >= 256) {
-            constexpr int THREADS   = 128;
-            constexpr int NBR_TILE  = 8;
-            constexpr int NUM_WARPS = 4;
-            size_t smem             = (2 * d + NUM_WARPS) * sizeof(float);
+            // THREADS=64, NBR_TILE=4 for large d
+            constexpr int THREADS = 64;
+            constexpr int NBR_TILE = 4;
+            constexpr int NUM_WARPS = 2;
+            size_t smem = (2 * d + NUM_WARPS) * sizeof(float);
 
             gt_kernel_forward_mid_nodes_feature_parallel_tiled<THREADS, NBR_TILE>
                 <<<num_mid, THREADS, smem>>>(
@@ -1158,16 +1226,16 @@ graph_attention_forward_buckets_cuda(
                     V.data_ptr<float>(),
                     out.data_ptr<float>(),
                     logsumexp.data_ptr<float>(),
-                    attn_logits.data_ptr<float>(),
                     d,
                     scale
-                );
+            );
 
         } else if (d >= 128) {
-            constexpr int THREADS   = 64;
-            constexpr int NBR_TILE  = 4;
+            // THREADS=32, NBR_TILE=1 for medium d
+            constexpr int THREADS = 32;
+            constexpr int NBR_TILE = 1;
             constexpr int NUM_WARPS = 1;
-            size_t smem             = (2 * d + NUM_WARPS) * sizeof(float);
+            size_t smem = (2 * d + NUM_WARPS) * sizeof(float);
 
             gt_kernel_forward_mid_nodes_feature_parallel_tiled<THREADS, NBR_TILE>
                 <<<num_mid, THREADS, smem>>>(
@@ -1180,16 +1248,16 @@ graph_attention_forward_buckets_cuda(
                     V.data_ptr<float>(),
                     out.data_ptr<float>(),
                     logsumexp.data_ptr<float>(),
-                    attn_logits.data_ptr<float>(),
                     d,
                     scale
-                );
+            );
 
         } else {
-            constexpr int THREADS   = 32;
-            constexpr int NBR_TILE  = 1;
+            // THREADS=32, NBR_TILE=1 for medium d
+            constexpr int THREADS = 32;
+            constexpr int NBR_TILE = 1;
             constexpr int NUM_WARPS = 1;
-            size_t smem             = (2 * d + NUM_WARPS) * sizeof(float);
+            size_t smem = (2 * d + NUM_WARPS) * sizeof(float);
 
             gt_kernel_forward_mid_nodes_feature_parallel_tiled<THREADS, NBR_TILE>
                 <<<num_mid, THREADS, smem>>>(
@@ -1202,18 +1270,17 @@ graph_attention_forward_buckets_cuda(
                     V.data_ptr<float>(),
                     out.data_ptr<float>(),
                     logsumexp.data_ptr<float>(),
-                    attn_logits.data_ptr<float>(),
                     d,
                     scale
-                );
+            );
         }
     }
 
     if (num_huge > 0) {
+        // Use more warps for better occupancy when huge_nodes is small
         TORCH_CHECK(d <= WARPS_PER_BLOCK_HUGE * TILE_D_HUGE,
                     "d=", d, " too large for WARPS=", WARPS_PER_BLOCK_HUGE,
-                    " TILE_D=", TILE_D_HUGE, " (max ",
-                    WARPS_PER_BLOCK_HUGE * TILE_D_HUGE, ")");
+                    " TILE_D=", TILE_D_HUGE, " (max ", WARPS_PER_BLOCK_HUGE * TILE_D_HUGE, ")");
 
         // Shared memory for streaming kernel:
         // k_dst[d] + warp_partial[WARPS*TILE_D] + warp_max[WARPS] + warp_denom[WARPS]
@@ -1234,18 +1301,14 @@ graph_attention_forward_buckets_cuda(
                 V.data_ptr<float>(),
                 out.data_ptr<float>(),
                 logsumexp.data_ptr<float>(),
-                attn_logits.data_ptr<float>(),
                 d,
                 scale
-            );
+        );
     }
-
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess,
-                "CUDA kernel launch failed: ", cudaGetErrorString(err));
-
-    return std::make_tuple(out, logsumexp, attn_logits);
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
+    return std::make_tuple(out, logsumexp);
 }
 
 
@@ -1253,7 +1316,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "forward_buckets",
         &graph_attention_forward_buckets_cuda,
-        "Graph Attention Forward - returns (out, logsumexp, attn_logits)",
+        "Graph Attention Forward - returns (out, logsumexp)",
         py::arg("edge_ptr"),
         py::arg("edge_indices"),
         py::arg("mid_nodes"),
@@ -1276,7 +1339,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("V"),
         py::arg("O"),
         py::arg("dO"),
-        py::arg("logsumexp"),
-        py::arg("attn_logits")
+        py::arg("logsumexp")
     );
 }

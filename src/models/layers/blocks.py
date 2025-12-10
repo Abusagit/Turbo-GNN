@@ -38,27 +38,28 @@ class ResidualBlock(torch.nn.Module):
             activation (str): Post-norm activation.
             norm (str): 'batch'|'layer'|'none'.
             dropout (float): Dropout after activation.
-            residual (bool): Residual if dims match.
+            residual (bool): Use residual.
             **conv_kwargs (Any): Extra kwargs forwarded to backend attention conv (concat, dropout, etc.).
 
         """
 
         super().__init__()
 
+        self.projection = nn.Linear(in_channels, out_channels)
+        self.out_channels = out_channels
         self.conv = create_conv_layer(
             conv_type,
             backend,
-            feature_dim=in_channels,
+            feature_dim=out_channels,
             heads=heads,
             bias=bias,
             **conv_kwargs,  # NOTE no projection, do it later
         )
-        self.projection = nn.Linear(in_channels, out_channels)
-        self.out_channels = out_channels
+
         self.norm = norm_factory(norm, self.out_channels)
         self.act = activation_factory(activation, dim=self.out_channels)
         self.drop = nn.Dropout(p=dropout) if dropout and dropout > 0.0 else nn.Identity()
-        self.use_residual = bool(residual and in_channels == self.out_channels)
+        self.use_residual = residual
 
     def forward(
         self,
@@ -77,11 +78,11 @@ class ResidualBlock(torch.nn.Module):
         Returns:
             torch.Tensor: Output features [N, Fout].
         """
-        out = self.conv(x, graph)
-        out = self.projection(x)
+        y = self.projection(x)
+        out = self.conv(y, graph)
         out = self.norm(out)
         out = self.act(out)
         out = self.drop(out)
         if self.use_residual:
-            out = out + x
+            out = out + y
         return out

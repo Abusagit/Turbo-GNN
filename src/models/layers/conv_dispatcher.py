@@ -24,7 +24,7 @@ def create_conv_layer(
         torch.nn.Module: A backend-specific convolution layer instance.
     """
 
-    if conv_type.lower() != "gat_v2":
+    if conv_type.lower() not in ("gt", "gat_v2", "gat"):
         kwargs.pop("heads", None)
         kwargs.pop("concat", None)
 

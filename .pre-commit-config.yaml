@@ -34,7 +34,7 @@ repos:
           - types-PyYAML
           - types-tqdm
         args: [--ignore-missing-imports, --scripts-are-modules]
-        exclude: ^(tests/|experiments/|__examples/)
+        exclude: ^(tests/|experiments/|__examples/|dev/)
 
   # local -- run tests
   - repo: local

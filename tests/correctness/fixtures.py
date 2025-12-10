@@ -239,6 +239,32 @@ def random_graph_data(device):
 
 
 @pytest.fixture
+def simple_graph_data(device):
+    """Simple graph with easily-traceable conections
+
+    Returns:
+        dict: Contains num_nodes, num_edges, edge_index, and features
+    """
+
+    num_nodes = 3
+    in_channels = 64
+    edge_index = torch.tensor([[0, 0, 1, 2, 1, 2], [1, 2, 2, 0, 0, 1]]).to(device)
+
+    num_edges = edge_index.shape[1]
+
+    features = (torch.arange(1, num_nodes + 1)[:, None] * torch.eye(num_nodes, in_channels)).to(device)
+
+    return {
+        "num_nodes": num_nodes,
+        "num_edges": num_edges,
+        "edge_index": edge_index,
+        "features": features,
+        "in_channels": in_channels,
+        "device": device,
+    }
+
+
+@pytest.fixture
 def karate_like_club_graph(device):
     """
     Create Zachary's Karate Club graph (classic small social network).
@@ -330,7 +356,7 @@ def karate_like_club_graph(device):
         (32, 33),
     ]
 
-    # Convert to directed (both directions)
+    # Convert to undirected
     src_list = []
     dst_list = []
     for u, v in edges:
