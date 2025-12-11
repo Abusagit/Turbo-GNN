@@ -153,6 +153,139 @@ std::tuple<torch::Tensor, torch::Tensor> gatv2_forward(
 
 CACHE = {}
 
+
+
+
+def load_real_graphs():
+    """
+    Load real-world benchmark graphs.
+
+    Returns dict:
+        name -> {
+            "graph": DGLGraph on CUDA,
+            "num_nodes": int,
+            "num_edges": int
+        }
+    """
+    graphs = {}
+    import sys
+    sys.path.append("/home/fvelikon/projects/cuda_exp/src")
+    from src.data.graphland_datasets import GraphLandDataset
+
+    for dataset_name in [
+            # "hm-categories",
+            # "pokec-regions",
+            # "web-topics",
+            "tolokers-2",
+            "city-reviews",
+            "artnet-exp",
+            # "web-fraud",
+            # "hm-prices",
+            # "avazu-ctr",
+            "city-roads-M",
+            "city-roads-L",
+            # "twitch-views",
+            "artnet-views",
+            # "web-traffic",
+]:
+        dataset  = GraphLandDataset(root="/home/fvelikon/projects/cuda_exp/data", name=dataset_name, split="RL")
+        g = dgl.graph((dataset[0].edge_index[0], dataset[0].edge_index[1]))
+        g = dgl.add_self_loop(g)
+        # g = dgl.to_bidirected(g)
+        graphs[dataset_name] = {
+            "graph": g,
+            "num_nodes": g.num_nodes(),
+            "num_edges": g.num_edges(),
+        }
+
+    # Cora
+    try:
+        from dgl.data import CoraGraphDataset
+
+        dataset = CoraGraphDataset("/home/fvelikon/projects/cuda_exp/data")
+        g = dataset[0]
+        g = dgl.add_self_loop(g)
+        # g = dgl.to_bidirected(g)
+        graphs["cora"] = {
+            "graph": g,
+            "num_nodes": g.num_nodes(),
+            "num_edges": g.num_edges(),
+        }
+    except Exception as e:
+        print(f"    Failed to load Cora: {e}")
+
+    # Citeseer
+    try:
+        from dgl.data import CiteseerGraphDataset
+
+        dataset = CiteseerGraphDataset("/home/fvelikon/projects/cuda_exp/data")
+        g = dataset[0]
+        g = dgl.add_self_loop(g)
+        # g = dgl.to_bidirected(g)
+        graphs["citeseer"] = {
+            "graph": g,
+            "num_nodes": g.num_nodes(),
+            "num_edges": g.num_edges(),
+        }
+    except Exception as e:
+        print(f"    Failed to load Citeseer: {e}")
+
+    # Pubmed
+    try:
+        from dgl.data import PubmedGraphDataset
+
+        dataset = PubmedGraphDataset("/home/fvelikon/projects/cuda_exp/data")
+        g = dataset[0]
+        g = dgl.add_self_loop(g)
+        # g = dgl.to_bidirected(g)
+        graphs["pubmed"] = {
+            "graph": g,
+            "num_nodes": g.num_nodes(),
+            "num_edges": g.num_edges(),
+        }
+    except Exception as e:
+        print(f"    Failed to load Pubmed: {e}")
+
+    # ogbn-arxiv
+    try:
+        from ogb.nodeproppred import DglNodePropPredDataset
+
+        dataset = DglNodePropPredDataset(name="ogbn-arxiv", root="/home/fvelikon/projects/cuda_exp/data")
+        g, _ = dataset[0]
+        g = dgl.add_self_loop(g)
+        # g = dgl.to_bidirected(g)
+        graphs["ogbn-arxiv"] = {
+            "graph": g,
+            "num_nodes": g.num_nodes(),
+            "num_edges": g.num_edges(),
+        }
+    except ImportError:
+        print("    ogbn-arxiv: OGB not installed (pip install ogb)")
+    except Exception as e:
+        print(f"    Failed to load ogbn-arxiv: {e}")
+
+    # ogbn-products
+    try:
+        from ogb.nodeproppred import DglNodePropPredDataset
+
+        dataset = DglNodePropPredDataset(name="ogbn-products", root="/home/fvelikon/projects/cuda_exp/data")
+        g, _ = dataset[0]
+        g = dgl.add_self_loop(g)
+        # g = dgl.to_bidirected(g)
+        graphs["ogbn-products"] = {
+            "graph": g,
+            "num_nodes": g.num_nodes(),
+            "num_edges": g.num_edges(),
+        }
+    except ImportError:
+        print("    ogbn-products: OGB not installed (pip install ogb)")
+    except Exception as e:
+        print(f"    Failed to load ogbn-products: {e}")
+
+    print()
+    return graphs
+
+
 def generate_random_graph(N: int, avg_degree: int, seed: int = 42) -> dgl.DGLGraph:
     """Generate random graph matching the CUDA kernel's generation"""
     global CACHE
@@ -218,13 +351,6 @@ def benchmark_comparison():
         has_custom = False
         print(f"✗ Custom kernel failed to load: {e}")
 
-    print("\n" + "-" * 100)
-    print(
-        f"{'N':>10} {'AvgDeg':>8} {'Edges':>10} {'z':>6} | "
-        f"{'DGL Ops (ms)':>14} {'Custom (ms)':>14} | "
-        f"{'Speedup':>10}"
-    )
-    print("-" * 100)
 
     test_cases = [
         # (N, avg_degree, z)
@@ -248,103 +374,130 @@ def benchmark_comparison():
         (100000, 16, 256),
     ]
 
+
+    test_cases = [
+        # (N, avg_degree, z)
+        # Varying z
+        (100000, 8, 32),
+        (100000, 8, 64),
+        (100000, 8, 128),
+        (100000, 8, 256),
+        (100000, 8, 512),
+    ]
+
     num_warmup = 3
     num_iters = 3
     negative_slope = 0.2
 
-    for N, avg_degree, z in test_cases:
-        torch.cuda.empty_cache()
+    graphs = load_real_graphs()
 
-        # Generate graph
-        g = generate_random_graph(N, avg_degree)
-        g = g.to("cuda")
-        E = g.num_edges()
+    print("\n" + "-" * 100)
+    print(
+        f"{'Graph':>10} {'N':>10} {'AvgDeg':>8} {'Edges':>10} {'z':>6} | "
+        f"{'DGL Ops (ms)':>14} {'Custom (ms)':>14} | "
+        f"{'Speedup':>10}"
+    )
+    print("-" * 100)
 
-        # Generate features
-        torch.manual_seed(42)
-        feat_l = torch.randn(N, z, device="cuda", dtype=torch.float32) * 0.1
-        feat_r = torch.randn(N, z, device="cuda", dtype=torch.float32) * 0.1
-        attn_vec = torch.randn(z, device="cuda", dtype=torch.float32) * 0.1
+    for name, info in graphs.items():
+        g = info["graph"].to("cuda")
+        num_nodes = info["num_nodes"]
+        num_edges = info["num_edges"]
 
-        # =====================================================================
-        # DGL Ops Baseline
-        # =====================================================================
-        dgl_ops = GATv2_DGL_Ops(attn_vec, negative_slope)
+        for _, _, z in test_cases:
+            torch.cuda.empty_cache()
+            N = num_nodes
 
-        # Warmup
-        for _ in range(num_warmup):
-            _ = dgl_ops.forward(g, feat_l, feat_r)
-        torch.cuda.synchronize()
+            # Generate graph
+            # g = generate_random_graph(N, avg_degree)
+            E = g.num_edges()
+            avg_degree = int(E / N * 2)
 
-        # Benchmark
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+            # Generate features
+            torch.manual_seed(42)
+            feat_l = torch.randn(N, z, device="cuda", dtype=torch.float32) * 0.1
+            feat_r = torch.randn(N, z, device="cuda", dtype=torch.float32) * 0.1
+            attn_vec = torch.randn(z, device="cuda", dtype=torch.float32) * 0.1
 
-        start.record()
-        for _ in range(num_iters):
-            h_dgl, alpha_dgl = dgl_ops.forward(g, feat_l, feat_r)
-        end.record()
-        torch.cuda.synchronize()
-
-        dgl_ops_time = start.elapsed_time(end) / num_iters
-
-        # =====================================================================
-        # Custom Kernel
-        # =====================================================================
-        if has_custom:
-            row_ptr, col_idx, max_degree = dgl_to_csr(g)
+            # =====================================================================
+            # DGL Ops Baseline
+            # =====================================================================
+            dgl_ops = GATv2_DGL_Ops(attn_vec, negative_slope)
 
             # Warmup
             for _ in range(num_warmup):
-                _ = custom_kernel.gatv2_forward(feat_l, feat_r, row_ptr, col_idx, attn_vec, negative_slope, max_degree)
+                _ = dgl_ops.forward(g, feat_l, feat_r)
             torch.cuda.synchronize()
 
             # Benchmark
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
             start.record()
             for _ in range(num_iters):
-                h_custom, alpha_custom = custom_kernel.gatv2_forward(
-                    feat_l, feat_r, row_ptr, col_idx, attn_vec, negative_slope, max_degree
-                )
+                h_dgl, alpha_dgl = dgl_ops.forward(g, feat_l, feat_r)
             end.record()
             torch.cuda.synchronize()
-            torch.cuda.synchronize()  # Force wait for kernel
-            # Check for errors
-            if torch.cuda.is_available():
-                torch.cuda.current_stream().synchronize()
+
+            dgl_ops_time = start.elapsed_time(end) / num_iters
+
+            # =====================================================================
+            # Custom Kernel
+            # =====================================================================
+            if has_custom:
+                row_ptr, col_idx, max_degree = dgl_to_csr(g)
+
+                # Warmup
+                for _ in range(num_warmup):
+                    _ = custom_kernel.gatv2_forward(feat_l, feat_r, row_ptr, col_idx, attn_vec, negative_slope, max_degree)
+                torch.cuda.synchronize()
+
+                # Benchmark
+                start.record()
+                for _ in range(num_iters):
+                    h_custom, alpha_custom = custom_kernel.gatv2_forward(
+                        feat_l, feat_r, row_ptr, col_idx, attn_vec, negative_slope, max_degree
+                    )
+                end.record()
+                torch.cuda.synchronize()
+                torch.cuda.synchronize()  # Force wait for kernel
+                # Check for errors
+                if torch.cuda.is_available():
+                    torch.cuda.current_stream().synchronize()
 
 
-            custom_time = start.elapsed_time(end) / num_iters
-            speedup = dgl_ops_time / custom_time
-        else:
-            custom_time = float("nan")
-            speedup = float("nan")
-
-        # Print results
-        print(
-            f"{N:>10} {avg_degree:>8} {E:>10} {z:>6} | "
-            f"{dgl_ops_time:>14.4f} {custom_time:>14.4f} | "
-            f"{speedup:>10.2f}x"
-        )
-
-        # Verify correctness (compare attention weights)
-        if has_custom and not torch.isnan(torch.tensor(custom_time)):
-            # Need to reorder alpha to match DGL's edge ordering
-            # This is tricky because DGL and our CSR might have different edge orders
-            # For now, just verify softmax property
-            alpha_sum_dgl = ops.copy_e_sum(g, alpha_dgl.unsqueeze(-1)).squeeze(-1)
-
-            # Check that alphas sum to 1 for each node with neighbors
-            in_degrees = g.in_degrees().float()
-            mask = in_degrees > 0
-            alpha_sum_check = alpha_sum_dgl[mask]
-
-            if torch.allclose(alpha_sum_check, torch.ones_like(alpha_sum_check), atol=1e-3):
-                verify_status = "✓"
+                custom_time = start.elapsed_time(end) / num_iters
+                speedup = dgl_ops_time / custom_time
             else:
-                verify_status = "✗"
-            # print(f"  Verification: {verify_status}")
+                custom_time = float("nan")
+                speedup = float("nan")
 
-    print("-" * 100)
+            # Print results
+            print(
+                f"{name:>10} {N:>10} {avg_degree:>8} {E:>10} {z:>6} | "
+                f"{dgl_ops_time:>14.4f} {custom_time:>14.4f} | "
+                f"{speedup:>10.2f}x"
+            )
+
+            # Verify correctness (compare attention weights)
+            if has_custom and not torch.isnan(torch.tensor(custom_time)):
+                # Need to reorder alpha to match DGL's edge ordering
+                # This is tricky because DGL and our CSR might have different edge orders
+                # For now, just verify softmax property
+                alpha_sum_dgl = ops.copy_e_sum(g, alpha_dgl.unsqueeze(-1)).squeeze(-1)
+
+                # Check that alphas sum to 1 for each node with neighbors
+                in_degrees = g.in_degrees().float()
+                mask = in_degrees > 0
+                alpha_sum_check = alpha_sum_dgl[mask]
+
+                if torch.allclose(alpha_sum_check, torch.ones_like(alpha_sum_check), atol=1e-3):
+                    verify_status = "✓"
+                else:
+                    verify_status = "✗"
+                # print(f"  Verification: {verify_status}")
+
+        print("-" * 100)
 
 
 def benchmark_dgl_ops_breakdown():
