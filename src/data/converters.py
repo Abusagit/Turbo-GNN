@@ -163,3 +163,116 @@ def to_tcgnn_data(
         col_indices.cpu(), row_pointer.cpu(), num_nodes, BLK_H, BLK_W, block_partition, edge_to_column, edge_to_row
     )
     return row_pointer, col_indices, block_partition, edge_to_column, edge_to_row
+
+
+def splot_by_rows(
+    src_indices: torch.Tensor, dst_indices: torch.Tensor, row_size: int
+) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+    """Split the edge index by block rows.
+
+    Args:
+        src_indices (torch.Tensor): [E] long.
+        dst_indices (torch.Tensor): [E] long.
+        row_size (int): Row size.
+
+    Returns:
+        list[tuple[int, torch.Tensor, torch.Tensor]]: List of (row_id, src_indices, dst_indices).
+    """
+    splitted = src_indices.clone() // row_size
+    boundaries = torch.cat([torch.tensor([True], device=src_indices.device), splitted[1:] != splitted[:-1]])
+    idx = boundaries.nonzero(as_tuple=True)[0]
+    idx = torch.cat([idx, torch.tensor([len(splitted)], device=src_indices.device)])
+    return [
+        (splitted[idx[i]], src_indices[idx[i] : idx[i + 1]], dst_indices[idx[i] : idx[i + 1]])
+        for i in range(len(idx) - 1)
+    ]
+
+
+def non_zero_column_ids(
+    src_indices_block: torch.Tensor,
+    dst_indices_block: torch.Tensor,
+    num_nodes: int,
+    row_index: int,
+    block_row_size: int,
+) -> torch.Tensor:
+    """Calculate the column remapping for a block of edges.
+
+    Args:
+        src_indices_block (torch.Tensor): [E] long.
+        dst_indices_block (torch.Tensor): [E] long.
+        num_nodes (int): Number of nodes.
+
+    Returns:
+        torch.Tensor: Column remapping.
+    """
+
+    row_start = row_index * block_row_size
+    src_indices_block = src_indices_block.clone() - row_start
+    coordinates = src_indices_block * num_nodes + dst_indices_block
+    column_index = coordinates / block_row_size
+
+    column_remapping = torch.unique(column_index)
+    return column_remapping
+
+
+def to_dense_matrix(
+    src_indices: torch.Tensor, dst_indices: torch.Tensor, row_index: int, num_nodes: int, block_row_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert CSR to dense matrix.
+
+    Args:
+        src_indices (torch.Tensor): [E] long.
+        dst_indices (torch.Tensor): [E] long.
+        row_index (int): Row index.
+        num_nodes (int): Number of nodes.
+        block_row_size (int): Block row size.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Dense matrix, column remapping.
+    """
+    non_zero_ids = non_zero_column_ids(src_indices, dst_indices, num_nodes, row_index, block_row_size)
+    dense_shape = (block_row_size, non_zero_ids.shape[0])
+    dense = torch.zeros(dense_shape, device=src_indices.device).view(-1)
+    index_unwrapped = (src_indices - src_indices.min()) * num_nodes + dst_indices
+    dense.scatter_(0, index_unwrapped, 1)
+    return dense.view(block_row_size, non_zero_ids.shape[0]), non_zero_ids
+
+
+def to_block_sparse_matrix(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    edge_weight: Optional[torch.Tensor] = None,
+    block_row_size: int = 16,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create a block sparse matrix lazily.
+
+    Args:
+        edge_index (torch.Tensor): [2, E] long.
+        num_nodes (int): Number of nodes.
+        edge_weight (Optional[torch.Tensor]): Edge weights [E].
+        block_row_size (int): Block row size.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Row pointer, column indices, values.
+    """
+
+    src_indices, dst_indices = edge_index[0], edge_index[1]
+    blocks = splot_by_rows(src_indices, dst_indices, block_row_size)
+
+    row_block_ids = torch.zeros(block_row_size, device=src_indices.device, dtype=torch.long)
+
+    dense_blocks = []
+    column_remappings = []
+
+    for row_id, src_indices_block, dst_indices_block in blocks:
+        dense_block, column_remapping = to_dense_matrix(
+            src_indices_block, dst_indices_block, row_id, num_nodes, block_row_size
+        )
+        row_block_ids[row_id] = row_id
+        dense_blocks.append(dense_block)
+        column_remappings.append(column_remapping)
+
+    dense_block = torch.cat(dense_blocks, dim=1)
+    column_remapping = torch.cat(column_remappings, dim=0)
+
+    return row_block_ids, dense_block, column_remapping
