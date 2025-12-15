@@ -35,9 +35,10 @@ std::vector<at::Tensor> min_aggr_forward_torch(
     TORCH_CHECK(num_nodes > 0, "num_nodes must be > 0");
     TORCH_CHECK(X.dim() == 2, "X must be 2D");
 
-    auto out = torch::empty({num_nodes, d}, X.options());
-    auto argmin = torch::empty({num_nodes, d}, edge_ptr.options());
-
+    // auto out = torch::empty({num_nodes, d}, X.options());
+    // auto argmin = torch::empty({num_nodes, d}, edge_ptr.options());
+    auto out = torch::full({num_nodes, d}, INFINITY, X.options());
+    auto argmin = torch::full({num_nodes, d}, -1, edge_ptr.options());
     min_aggr_forward_cuda(edge_ptr, edge_idx, X, out, argmin);
     return {out, argmin};
 }

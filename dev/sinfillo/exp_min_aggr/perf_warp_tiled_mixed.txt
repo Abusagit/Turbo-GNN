@@ -1,0 +1,113 @@
+ninja: no work to do.
+ninja: no work to do.
+TCGNN is not found!
+[1/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output min_aggr_cool.cuda.o.d -DTORCH_EXTENSION_NAME=min_aggr_cuda -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -I/usr/local/cuda/include -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include/TH -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /usr/local/include/python3.11d -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_80,code=sm_80 --compiler-options '-fPIC' -O3 --use_fast_math --generate-line-info -lcusparse -std=c++17 -c /home/fominada/Accelerating-GNNs/src/backends/cuda_backend/min_aggr/min_aggr_cool.cu -o min_aggr_cool.cuda.o
+/home/fominada/Accelerating-GNNs/src/backends/cuda_backend/min_aggr/min_aggr_cool.cu(13): warning #177-D: variable "F_TILE" was declared but never referenced
+  constexpr int F_TILE = 32;
+                ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[2/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output min_aggr_base.cuda.o.d -DTORCH_EXTENSION_NAME=min_aggr_cuda -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -I/usr/local/cuda/include -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include/TH -isystem /home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /usr/local/include/python3.11d -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_80,code=sm_80 --compiler-options '-fPIC' -O3 --use_fast_math --generate-line-info -lcusparse -std=c++17 -c /home/fominada/Accelerating-GNNs/src/backends/cuda_backend/min_aggr/min_aggr_base.cu -o min_aggr_base.cuda.o
+[3/3] c++ min_aggr_cool.cuda.o min_aggr_base.cuda.o -shared -L/home/fominada/Accelerating-GNNs/.venv/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o min_aggr_cuda.so
+Using device: cuda
+================================================================================================================================================================
+PERFORMANCE BENCHMARK: CUDA vs DGL (Synthetic Graphs)
+================================================================================================================================================================
+Nodes    Dim    Deg    Edges      | FWD CUDA     FWD DGL      Speedup    | BWD CUDA     BWD DGL      Speedup    | TOTAL CUDA   TOTAL DGL    Speedup
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+50       64     10     491        | 0.134        0.766        5.73       | 0.260        0.804        3.10       | 0.608        2.352        3.87
+5000     64     20     100071     | 0.164        0.899        5.49       | 0.255        0.785        3.08       | 0.554        2.370        4.28
+10000    64     30     300400     | 0.324        0.543        1.68       | 0.278        0.633        2.28       | 0.636        2.009        3.16
+10000    128    30     300400     | 0.585        0.838        1.43       | 0.378        0.831        2.19       | 1.318        2.369        1.80
+
+Time units: milliseconds
+
+========================================================================================================================================================================================================
+PERFORMANCE BENCHMARK: MIN-AGGR CUDA vs DGL (Real-World Graphs)
+========================================================================================================================================================================================================
+  NumNodes: 2708
+  NumEdges: 10556
+  NumFeats: 1433
+  NumClasses: 7
+  NumTrainingSamples: 140
+  NumValidationSamples: 500
+  NumTestSamples: 1000
+Done loading data from cached files.
+  NumNodes: 3327
+  NumEdges: 9228
+  NumFeats: 3703
+  NumClasses: 6
+  NumTrainingSamples: 120
+  NumValidationSamples: 500
+  NumTestSamples: 1000
+Done loading data from cached files.
+  NumNodes: 19717
+  NumEdges: 88651
+  NumFeats: 500
+  NumClasses: 3
+  NumTrainingSamples: 60
+  NumValidationSamples: 500
+  NumTestSamples: 1000
+Done loading data from cached files.
+
+Dataset         Nodes      Edges      Dim    | FWD CUDA     FWD DGL      Speedup    | BWD CUDA     BWD DGL      Speedup    | TOTAL CUDA   TOTAL DGL    Speedup    | MEM CUDA     MEM DGL      Ratio
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+hm-categories   46563      21508553   32     | 13.252       5.618        0.42       | 0.462        0.672        1.45       | 13.080       5.802        0.44       | 0.445        0.798        1.79      x
+hm-categories   46563      21508553   64     | 25.945       7.449        0.29       | 0.527        0.589        1.12       | 27.063       7.708        0.28       | 0.827        0.872        1.05      x
+hm-categories   46563      21508553   128    | 54.564       11.337       0.21       | 0.618        0.786        1.27       | 55.190       11.550       0.21       | 0.933        1.021        1.10      x
+hm-categories   46563      21508553   256    | 119.476      24.879       0.21       | 0.931        1.629        1.75       | 120.890      26.051       0.22       | 1.144        1.321        1.16      x
+tolokers-2      11758      1049758    32     | 0.754        1.142        1.52       | 0.368        0.737        2.00       | 1.204        2.062        1.71       | 0.807        0.056        0.07      x
+tolokers-2      11758      1049758    64     | 1.110        1.136        1.02       | 0.386        0.762        1.97       | 1.528        2.149        1.41       | 0.063        0.074        1.17      x
+tolokers-2      11758      1049758    128    | 1.897        1.251        0.66       | 0.420        0.756        1.80       | 2.404        2.254        0.94       | 0.089        0.113        1.28      x
+tolokers-2      11758      1049758    256    | 3.815        1.538        0.40       | 0.562        0.899        1.60       | 4.435        2.385        0.54       | 0.142        0.188        1.32      x
+city-reviews    148801     2479631    32     | 2.649        2.231        0.84       | 0.778        0.803        1.03       | 3.385        2.981        0.88       | 0.255        0.325        1.28      x
+city-reviews    148801     2479631    64     | 3.547        3.147        0.89       | 0.883        1.699        1.92       | 15.307       4.813        0.31       | 0.422        0.564        1.34      x
+city-reviews    148801     2479631    128    | 5.867        5.389        0.92       | 1.208        3.614        2.99       | 7.207        8.947        1.24       | 0.759        1.043        1.37      x
+city-reviews    148801     2479631    256    | 10.872       10.485       0.96       | 1.965        7.490        3.81       | 13.446       17.960       1.34       | 1.436        2.003        1.39      x
+artnet-exp      50405      611101     32     | 0.719        0.878        1.22       | 0.435        0.769        1.77       | 1.253        1.792        1.43       | 0.562        0.103        0.18      x
+artnet-exp      50405      611101     64     | 0.989        0.893        0.90       | 0.527        0.713        1.35       | 1.510        1.811        1.20       | 0.135        0.183        1.35      x
+artnet-exp      50405      611101     128    | 1.424        1.327        0.93       | 0.628        0.951        1.51       | 1.933        2.175        1.12       | 0.250        0.346        1.38      x
+artnet-exp      50405      611101     256    | 2.457        2.699        1.10       | 0.887        2.041        2.30       | 3.321        4.699        1.41       | 0.478        0.670        1.40      x
+hm-prices       46563      21508553   32     | 13.026       5.536        0.42       | 0.488        0.639        1.31       | 13.548       5.719        0.42       | 0.608        0.798        1.31      x
+hm-prices       46563      21508553   64     | 27.009       7.491        0.28       | 0.527        0.543        1.03       | 27.210       7.759        0.29       | 0.827        0.872        1.05      x
+hm-prices       46563      21508553   128    | 55.677       11.661       0.21       | 0.613        0.805        1.31       | 56.076       11.965       0.21       | 0.933        1.021        1.10      x
+hm-prices       46563      21508553   256    | 121.078      25.569       0.21       | 0.925        1.640        1.77       | 122.155      26.416       0.22       | 1.144        1.321        1.16      x
+avazu-ctr       76269      22044423   32     | 8.893        11.088       1.25       | 0.510        0.650        1.27       | 9.360        11.396       1.22       | 1.259        0.864        0.69      x
+avazu-ctr       76269      22044423   64     | 17.914       11.349       0.63       | 0.599        0.590        0.98       | 18.549       11.980       0.65       | 0.913        0.986        1.08      x
+avazu-ctr       76269      22044423   128    | 36.832       13.692       0.37       | 0.752        1.081        1.44       | 37.929       14.625       0.39       | 1.086        1.231        1.13      x
+avazu-ctr       76269      22044423   256    | 79.676       23.457       0.29       | 1.172        2.132        1.82       | 80.838       25.155       0.31       | 1.431        1.722        1.20      x
+city-roads-M    57073      271281     32     | 0.498        0.561        1.13       | 0.453        0.656        1.45       | 1.052        1.404        1.33       | 0.936        0.102        0.11      x
+city-roads-M    57073      271281     64     | 0.531        0.560        1.05       | 0.444        0.647        1.46       | 1.036        1.408        1.36       | 0.139        0.193        1.39      x
+city-roads-M    57073      271281     128    | 0.674        1.051        1.56       | 0.525        0.801        1.52       | 1.199        1.828        1.52       | 0.268        0.377        1.40      x
+city-roads-M    57073      271281     256    | 1.013        2.068        2.04       | 0.721        1.562        2.17       | 1.648        3.606        2.19       | 0.527        0.745        1.41      x
+city-roads-L    142257     605357     32     | 1.132        0.679        0.60       | 0.708        0.662        0.93       | 1.753        1.413        0.81       | 0.320        0.252        0.79      x
+city-roads-L    142257     605357     64     | 1.227        1.307        1.06       | 0.758        0.985        1.30       | 1.921        2.267        1.18       | 0.345        0.481        1.39      x
+city-roads-L    142257     605357     128    | 1.642        2.573        1.57       | 0.895        1.934        2.16       | 2.435        4.480        1.84       | 0.668        0.938        1.41      x
+city-roads-L    142257     605357     256    | 2.435        5.100        2.09       | 1.334        3.834        2.87       | 3.647        8.904        2.44       | 1.312        1.854        1.41      x
+twitch-views    168114     13763228   32     | 9.351        9.752        1.04       | 0.930        1.114        1.20       | 10.291       10.999       1.07       | 0.845        0.734        0.87      x
+twitch-views    168114     13763228   64     | 18.674       13.338       0.71       | 1.486        2.580        1.74       | 20.680       15.941       0.77       | 0.844        1.004        1.19      x
+twitch-views    168114     13763228   128    | 39.392       21.808       0.55       | 2.924        6.107        2.09       | 43.570       27.989       0.64       | 1.225        1.546        1.26      x
+twitch-views    168114     13763228   256    | 83.331       39.885       0.48       | 5.741        13.460       2.34       | 89.611       53.530       0.60       | 1.987        2.628        1.32      x
+artnet-views    50405      611101     32     | 0.633        0.562        0.89       | 0.448        0.656        1.46       | 1.140        1.396        1.22       | 0.952        0.102        0.11      x
+artnet-views    50405      611101     64     | 0.824        0.619        0.75       | 0.476        0.657        1.38       | 1.410        1.408        1.00       | 0.135        0.183        1.35      x
+artnet-views    50405      611101     128    | 1.269        1.259        0.99       | 0.560        0.939        1.68       | 1.824        2.170        1.19       | 0.250        0.346        1.38      x
+artnet-views    50405      611101     256    | 2.319        2.691        1.16       | 0.841        2.024        2.41       | 3.126        4.687        1.50       | 0.478        0.670        1.40      x
+cora            2708       13264      32     | 0.150        0.525        3.51       | 0.283        0.661        2.34       | 0.569        1.382        2.43       | 0.166        0.005        0.03      x
+cora            2708       13264      64     | 0.150        0.537        3.57       | 0.275        0.639        2.33       | 0.586        1.353        2.31       | 0.007        0.009        1.39      x
+cora            2708       13264      128    | 0.157        0.657        4.19       | 0.276        0.653        2.37       | 0.622        1.395        2.24       | 0.013        0.018        1.40      x
+cora            2708       13264      256    | 0.167        0.559        3.35       | 0.295        0.660        2.24       | 0.597        1.388        2.33       | 0.025        0.036        1.41      x
+citeseer        3327       12431      32     | 0.161        0.548        3.39       | 0.282        0.634        2.25       | 0.599        1.418        2.37       | 0.012        0.006        0.49      x
+citeseer        3327       12431      64     | 0.153        0.533        3.48       | 0.273        0.639        2.34       | 0.611        1.354        2.22       | 0.008        0.011        1.39      x
+citeseer        3327       12431      128    | 0.168        0.553        3.30       | 0.285        0.652        2.29       | 0.586        1.439        2.45       | 0.016        0.022        1.44      x
+citeseer        3327       12431      256    | 0.178        0.557        3.12       | 0.295        0.651        2.20       | 0.638        1.408        2.21       | 0.031        0.044        1.42      x
+pubmed          19717      108365     32     | 0.292        0.565        1.93       | 0.332        0.656        1.97       | 0.784        1.390        1.77       | 0.033        0.038        1.15      x
+pubmed          19717      108365     64     | 0.295        0.531        1.80       | 0.327        0.686        2.10       | 0.752        1.388        1.85       | 0.051        0.069        1.35      x
+pubmed          19717      108365     128    | 0.364        0.540        1.48       | 0.352        0.642        1.83       | 0.865        1.368        1.58       | 0.095        0.133        1.40      x
+pubmed          19717      108365     256    | 0.515        0.903        1.75       | 0.448        0.757        1.69       | 1.139        1.636        1.44       | 0.185        0.261        1.41      x
+ogbn-arxiv      169343     2484941    32     | 2.634        3.562        1.35       | 0.794        0.967        1.22       | 3.302        4.509        1.37       | 0.270        0.358        1.32      x
+ogbn-arxiv      169343     2484941    64     | 4.123        4.889        1.19       | 0.902        2.031        2.25       | 4.910        6.905        1.41       | 0.469        0.631        1.34      x
+ogbn-arxiv      169343     2484941    128    | 7.299        7.561        1.04       | 1.245        4.283        3.44       | 8.410        11.849       1.41       | 0.855        1.178        1.38      x
+ogbn-arxiv      169343     2484941    256    | 13.828       12.833       0.93       | 2.086        8.902        4.27       | 15.916       21.756       1.37       | 1.624        2.270        1.40      x
+
+Time units: milliseconds | Memory units: GB | Ratio: DGL/CUDA memory usage
