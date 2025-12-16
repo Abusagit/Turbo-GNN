@@ -83,7 +83,7 @@ def main() -> int:
             source=dataset_cfg["source"],
             name=dataset_cfg["name"],
             root=dataset_cfg["root"],
-            graph_backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
+            conv_backend=args.backend,
         )
     )
     x = torch.randn(graph.num_nodes, args.in_ch, device=device)

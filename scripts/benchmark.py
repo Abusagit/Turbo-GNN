@@ -9,7 +9,7 @@ import torch
 sys.path.append("./")
 
 from src.backends.registry import BackendRegistry
-from src.benchmarking.microbench import MicrobenchResult, time_callable
+from src.benchmarking.microbench import MicrobenchResult, get_gpu_info, time_callable
 from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, GraphSample
 
 doc = """
@@ -122,12 +122,23 @@ def main() -> int:
 
     fn = _fn_forward if args.mode == "forward" else _fn_train
     res: MicrobenchResult = time_callable(fn, warmup=args.warmup, iters=args.iters)
-    print(json.dumps({"iters": res.iters, "ms_per_iter": res.ms_per_iter, "device": res.device}, indent=2))
+
+    base_dict = {
+        "backend": args.backend,
+        "conv_type": args.layer,
+        "hidden_dim": args.in_ch,
+        "heads": args.heads,
+        "dataset": args.dataset,
+        "iters": res.iters,
+        "ms_per_iter": res.ms_per_iter,
+        "device": res.device,
+        "memory": res.memory_allocated,
+    } | get_gpu_info(device)  # NOTE added GPU info to the dump
+
+    print(json.dumps(base_dict, indent=4))
 
     if args.json_out:
-        Path(args.json_out).write_text(
-            json.dumps({"iters": res.iters, "ms_per_iter": res.ms_per_iter, "device": res.device}, indent=2)
-        )
+        Path(args.json_out).write_text(json.dumps(base_dict, indent=4))
 
     return 0
 

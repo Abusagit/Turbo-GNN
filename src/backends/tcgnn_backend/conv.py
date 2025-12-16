@@ -1,7 +1,11 @@
 import math
 from typing import Any
 
-import TCGNN
+try:
+    import TCGNN
+except ImportError:
+    TCGNN = None
+
 import torch
 
 from src.backends.base import BaseBackend, BaseConvolution
@@ -13,8 +17,8 @@ class TCGNNFunction(torch.autograd.Function):
     def forward(ctx, X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow):
         ctx.save_for_backward(X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)
 
-        X_prime = torch.mm(X, weights)
-        X_prime = TCGNN.forward(X_prime, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
+        # X_prime = torch.mm(X, weights)
+        X_prime = TCGNN.forward(X, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
 
         return X_prime
 
@@ -23,12 +27,15 @@ class TCGNNFunction(torch.autograd.Function):
         X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = ctx.saved_tensors
 
         # SPMM backward propaAGNNion.
-        d_input_prime = TCGNN.forward(d_output, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
 
-        # GEMM backward propaAGNNion.
-        d_input = torch.mm(d_input_prime, weights.transpose(0, 1))
-        d_weights = torch.mm(X.transpose(0, 1), d_input_prime)
-        return d_input, d_weights, None, None, None, None, None, None
+        d_input = TCGNN.forward(d_output, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
+
+        # TODO fix for directed graphs!!!!!!!
+
+        # # GEMM backward propaAGNNion.
+        # d_input = torch.mm(d_input_prime, weights.transpose(0, 1))
+        # d_weights = torch.mm(X.transpose(0, 1), d_input_prime)
+        return d_input, None, None, None, None, None, None, None
 
 
 class TCGNNFunction_GIN(torch.autograd.Function):
@@ -49,13 +56,15 @@ class TCGNNFunction_GIN(torch.autograd.Function):
         X_prime, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = ctx.saved_tensors
 
         # GEMM backward propaAGNNion.
-        d_X_prime = torch.mm(d_output, weights.transpose(0, 1))
-        d_weights = torch.mm(X_prime.transpose(0, 1), d_output)
+        # d_X_prime = torch.mm(d_output, weights.transpose(0, 1))
+        # d_weights = torch.mm(X_prime.transpose(0, 1), d_output)
 
         # SPMM backward propaAGNNion.
-        d_input = TCGNN.forward(d_X_prime, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
+        d_input = TCGNN.forward(
+            d_output.transpose(-1, -2), row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow
+        )[0]
 
-        return d_input, d_weights, None, None, None, None, None, None
+        return d_input, None, None, None, None, None, None, None
 
 
 class TCGNNFunction_AGNN(torch.autograd.Function):

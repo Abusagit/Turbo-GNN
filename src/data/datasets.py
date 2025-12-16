@@ -14,23 +14,9 @@ from torch_geometric.datasets import Amazon, Coauthor, Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
-from src.data.converters import to_tcgnn_data
+from src.data.converters import WSBFormat, get_cugraph_with_gcn_weights, normalize_adj, to_tcgnn_data
 
 from .graphland_datasets import GraphLandDataset
-
-try:  # pragma: no cover
-    LEGACY_MODE = False
-    from pylibcugraphops.pytorch import CSC, HeteroCSC
-
-    HAS_PYLIBCUGRAPHOPS = True
-except ImportError:
-    HAS_PYLIBCUGRAPHOPS = False
-    try:  # pragma: no cover
-        from pylibcugraphops import make_fg_csr
-
-        LEGACY_MODE = True
-    except ImportError:
-        pass
 
 GraphBackendOption = Literal[
     "pyg",
@@ -45,6 +31,7 @@ GraphBackendOption = Literal[
     "adj_mat_transposed",
     "cugraph",
     "tcgnn",
+    "weighted_sparse_block",
 ]  # NOTE we can define cached formalizations via this option
 
 
@@ -61,6 +48,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cusparse": "csr",
     "fusegnn": "coo",
     "tcgnn": "tcgnn",
+    "triton_block_sparse": "weighted_sparse_block",
 }
 
 
@@ -241,6 +229,15 @@ class GraphSample:
                 self._to_default_device(edge_to_column),
                 self._to_default_device(edge_to_row),
             )
+        elif self.backend == "weighted_sparse_block":
+            adj_sparse_csr = normalize_adj(
+                self.edge_index,
+                num_nodes=self.num_nodes,
+                how="both",  # TODO implement other normalization types for this backend
+                add_self_loops=self.add_self_loops,
+            ).to_sparse_csr()
+
+            graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"
@@ -733,112 +730,3 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
             return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=graph_backend)
 
     raise KeyError(f"Unsupported dataset source '{cfg.source}'")
-
-
-def normalize_adj(
-    edge_index: torch.Tensor, num_nodes: int, how: Literal["left", "right", "both", "none"], add_self_loops: bool = True
-) -> torch.Tensor:
-    """Compute symmetric normalized adjacency (A_hat) as sparse COO.
-
-    Args:
-        edge_index (torch.Tensor): [2, E] long tensor.
-        num_nodes (int): Number of nodes.
-
-    Returns:
-        torch.Tensor: Sparse COO adjacency with added self-loops and:
-            - D^{-1/2} A D^{-1/2} normalization if `how` == "both".
-            - D_in^{-1} A^T normalization if `how` == "right" -- normalization for mean-aggregation
-            - A if `how` == "none" -- normalization for adj-mat backend
-    """
-    device = edge_index.device
-    idx = edge_index
-
-    if add_self_loops:
-        self_loops = torch.arange(num_nodes, device=device)
-        loop_idx = torch.stack([self_loops, self_loops], dim=0)
-        idx = torch.cat([idx, loop_idx], dim=1)
-        edge_index = idx
-
-    if how == "both":
-        values = torch.ones(idx.size(1), device=device)
-        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes)).T.coalesce().to(values.device)
-
-        deg1 = torch.sparse.sum(adj, dim=1).to_dense()
-        D_inv_sqrt1 = torch.pow(deg1.clamp(min=1.0), -0.5)
-
-        deg0 = torch.sparse.sum(adj, dim=0).to_dense()
-        D_inv_sqrt0 = torch.pow(deg0.clamp(min=1.0), -0.5)
-
-        idx, values = adj.indices(), adj.values()
-        row, col = idx
-        norm_vals = D_inv_sqrt1[row] * values * D_inv_sqrt0[col]
-        return torch.sparse_coo_tensor(idx, norm_vals, (num_nodes, num_nodes)).coalesce()
-    elif how == "left":
-        raise NotImplementedError()
-    elif how == "right":
-        """
-            Computes A^T (transposed adjacency) and D_in^{-1} (inverse in-degree diagonal).
-            This matches DGL's copy_u_mean operation.
-        """
-        device = edge_index.device
-        src, dst = edge_index[0], edge_index[1]
-
-        values = torch.ones(edge_index.size(1), device=device)
-        adj_t_indices = torch.stack([dst, src], dim=0)
-        adj_t = torch.sparse_coo_tensor(adj_t_indices, values, (num_nodes, num_nodes)).coalesce()
-
-        in_degrees = torch.zeros(num_nodes, device=device)
-        in_degrees.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
-
-        # handle isolated nodes (in_degree = 0) by setting to 1 to avoid division by zero
-        in_degrees = in_degrees.clamp(min=1.0)
-
-        in_degree_inv = 1.0 / in_degrees
-        diag_indices = torch.arange(num_nodes, device=device).unsqueeze(0).repeat(2, 1)
-        in_degree_inv_diag = torch.sparse_coo_tensor(diag_indices, in_degree_inv, (num_nodes, num_nodes)).coalesce()
-
-        adj_t_normalized = in_degree_inv_diag @ adj_t
-        return adj_t_normalized
-    elif how == "none":
-        """
-            Computes A^T (transposed adjacency).
-            This matches DGL's copy_u_sum operation.
-        """
-        device = edge_index.device
-        src, dst = edge_index[0], edge_index[1]
-
-        values = torch.ones(edge_index.size(1), device=device)
-        adj_t_indices = torch.stack([dst, src], dim=0)
-        adj_t = torch.sparse_coo_tensor(adj_t_indices, values, (num_nodes, num_nodes)).coalesce()
-
-        return adj_t
-    else:
-        raise ValueError(f"Normalization type {how} is inappropriate")
-
-
-def get_cugraph_with_gcn_weights(
-    edge_index: EdgeIndex,
-) -> CSC:
-    """Constructs a :obj:`cugraph` graph object from CSC representation.
-        NOTE
-
-    Args:
-        edge_index (EdgeIndex): The edge indices.
-
-    Returns CSC graph and edge index which is used only in GCN computation
-
-    """
-    if not isinstance(edge_index, EdgeIndex):
-        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' (got {type(edge_index)})")
-
-    edge_index = edge_index.sort_by("col")[0]
-    num_src_nodes = edge_index.get_sparse_size(0)
-    (colptr, row), _ = edge_index.get_csc()
-
-    if not row.is_cuda:
-        raise RuntimeError("'get_cugraph' requires GPU-based processing (got CPU tensor)")
-
-    if LEGACY_MODE:
-        return make_fg_csr(colptr, row)
-
-    return CSC(colptr, row, num_src_nodes=num_src_nodes)
