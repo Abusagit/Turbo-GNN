@@ -226,6 +226,68 @@ __device__ __forceinline__ void min_aggr_forward_large(
     }
 }
 
+void min_aggr_forward_partitioned_cuda(
+    const at::Tensor& edge_ptr,
+    const at::Tensor& edge_idx,
+    const at::Tensor& X,
+    const at::Tensor& light_nodes,
+    const at::Tensor& heavy_nodes,
+    at::Tensor& out,
+    at::Tensor& argmin
+) {
+    const int d = X.size(1);
+
+    TORCH_CHECK(edge_ptr.is_cuda(), "edge_ptr must be CUDA");
+    TORCH_CHECK(edge_idx.is_cuda(), "edge_idx must be CUDA");
+    TORCH_CHECK(X.is_cuda(), "X must be CUDA");
+    TORCH_CHECK(light_nodes.is_cuda(), "light_nodes must be CUDA");
+    TORCH_CHECK(heavy_nodes.is_cuda(), "heavy_nodes must be CUDA");
+
+    TORCH_CHECK(edge_ptr.dtype() == torch::kInt32, "edge_ptr must be int32");
+    TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
+    TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
+    TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
+    TORCH_CHECK(X.dtype() == torch::kFloat32, "X must be float32");
+
+    if (light_nodes.numel() > 0) {
+        const int num_light = light_nodes.numel();
+        dim3 blocks(num_light);
+        dim3 threads(THREADS_PER_BLOCK);
+
+        min_aggr_forward_small<<<blocks, threads>>>(
+            light_nodes.data_ptr<int>(),
+            edge_ptr.data_ptr<int>(),
+            edge_idx.data_ptr<int>(),
+            X.data_ptr<float>(),
+            out.data_ptr<float>(),
+            argmin.data_ptr<int>(),
+            d
+        );
+    }
+
+    if (heavy_nodes.numel() > 0) {
+        const int num_heavy = heavy_nodes.numel();
+
+        dim3 blocks(num_heavy);
+        dim3 threads(THREADS_PER_BLOCK);
+
+        min_aggr_forward_large<<<blocks, threads>>>(
+            heavy_nodes.data_ptr<int>(),
+            edge_ptr.data_ptr<int>(),
+            edge_idx.data_ptr<int>(),
+            X.data_ptr<float>(),
+            out.data_ptr<float>(),
+            argmin.data_ptr<int>(),
+            d
+        );
+    }
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err)
+    );
+}
+
+
 __global__ void min_aggr_forward(
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
