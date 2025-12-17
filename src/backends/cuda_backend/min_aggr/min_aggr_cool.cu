@@ -16,8 +16,8 @@ constexpr int N_TILE = 32;
 __device__ __forceinline__ void warp_reduce_argmin(float &val, int &src) {
     #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-        float v2 = __shfl_down_sync(FULL_WARP_MASK, val, offset);
-        int s2 = __shfl_down_sync(FULL_WARP_MASK, src, offset);
+        float v2 = __shfl_xor_sync(FULL_WARP_MASK, val, offset);
+        int s2 = __shfl_xor_sync(FULL_WARP_MASK, src, offset);
         if (v2 < val) {
             val = v2;
             src = s2;

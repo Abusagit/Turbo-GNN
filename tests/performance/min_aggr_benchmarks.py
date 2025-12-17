@@ -4,7 +4,7 @@ import numpy as np
 import ogb
 import torch
 
-from src.backends.cuda_backend.min_aggr.utils import min_aggr, min_aggr_forward
+from src.backends.cuda_backend.min_aggr.utils import min_aggr, min_aggr_forward, min_aggr_forward_partitioned
 from src.data.datasets import load_pyg_single_graph
 
 
@@ -73,6 +73,14 @@ def csr_to_dgl_graph(edge_ptr, edge_indices, num_nodes):
 
     g = dgl.graph((src_list, dst_list), num_nodes=num_nodes)
     return g.to("cuda")
+
+
+def split_nodes_by_degree(edge_ptr, threshold=32):
+    deg = (edge_ptr[1:] - edge_ptr[:-1]).to(torch.int32)
+    nodes = torch.arange(deg.numel(), device=edge_ptr.device, dtype=torch.int32)
+    light = nodes[deg < threshold]
+    heavy = nodes[deg >= threshold]
+    return light, heavy
 
 
 def dgl_min_aggr(g, x):
@@ -254,10 +262,12 @@ def benchmark_performance(device):
 
         grad_output = torch.randn(num_nodes, d, device=device, dtype=torch.float32)
 
+        light, heavy = split_nodes_by_degree(edge_ptr, threshold=32)
+
         # Warm-up
         for _ in range(10):
             x_ours.grad = None
-            out_ours = min_aggr(edge_ptr, edge_idx, x_ours)
+            out_ours = min_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
             out_ours.backward(grad_output)
 
         torch.cuda.synchronize()
@@ -268,12 +278,12 @@ def benchmark_performance(device):
         start = time.time()
         for _ in range(num_iters):
             with torch.no_grad():
-                _ = min_aggr_forward(edge_ptr, edge_idx, x_ours.detach())
+                _ = min_aggr_forward_partitioned(edge_ptr, edge_idx, x_ours.detach(), light, heavy)
         torch.cuda.synchronize()
         cuda_fwd_time = (time.time() - start) / num_iters * 1000.0
 
         x_ours.grad = None
-        out_ours = min_aggr(edge_ptr, edge_idx, x_ours)
+        out_ours = min_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
@@ -286,7 +296,7 @@ def benchmark_performance(device):
         start = time.time()
         for _ in range(num_iters):
             x_ours.grad = None
-            out_ours = min_aggr(edge_ptr, edge_idx, x_ours)
+            out_ours = min_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
             out_ours.backward(grad_output)
         torch.cuda.synchronize()
         cuda_total_time = (time.time() - start) / num_iters * 1000.0
@@ -387,6 +397,8 @@ def benchmark_real_graphs(device):
         N = info["num_nodes"]
         num_edges = info["num_edges"]
 
+        light, heavy = split_nodes_by_degree(indptr, threshold=32)
+
         for d in test_dims:
             x = torch.randn(N, d, device=device, dtype=torch.float32)
             x_cuda = x.detach().clone().requires_grad_(True)
@@ -399,7 +411,7 @@ def benchmark_real_graphs(device):
             # Warm-up
             for _ in range(5):
                 x_cuda.grad = None
-                out_cuda = min_aggr(indptr, indices, x_cuda)
+                out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
                 out_cuda.backward(grad_output)
             torch.cuda.synchronize()
 
@@ -410,13 +422,13 @@ def benchmark_real_graphs(device):
             start = time.time()
             for _ in range(num_iters):
                 with torch.no_grad():
-                    _ = min_aggr_forward(indptr, indices, x_cuda.detach())
+                    _ = min_aggr_forward_partitioned(indptr, indices, x_cuda.detach(), light, heavy)
             torch.cuda.synchronize()
             cuda_fwd_time = (time.time() - start) / num_iters * 1000.0
 
             # Backward only
             x_cuda.grad = None
-            out_cuda = min_aggr(indptr, indices, x_cuda)
+            out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
 
             torch.cuda.synchronize()
             start = time.time()
@@ -433,7 +445,7 @@ def benchmark_real_graphs(device):
             start = time.time()
             for _ in range(num_iters):
                 x_cuda.grad = None
-                out_cuda = min_aggr(indptr, indices, x_cuda)
+                out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
                 out_cuda.backward(grad_output)
             torch.cuda.synchronize()
             cuda_total_time = (time.time() - start) / num_iters * 1000.0
