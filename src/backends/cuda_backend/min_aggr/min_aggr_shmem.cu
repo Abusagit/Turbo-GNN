@@ -47,73 +47,6 @@ constexpr int THREADS_PER_BLOCK = 64;
 //     }
 // }
 
-__device__ __forceinline__ void min_aggr_forward_large_impl(
-    int v,
-    int row_start,
-    int row_end,
-    const int* __restrict__ edge_idx,
-    const float* __restrict__ X,
-    float* __restrict__ out,
-    int* __restrict__ argmin,
-    int d
-) {
-    int f0 = blockIdx.y * F_TILE;
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int f = f0 + tx;
-
-    __shared__ float tile_vals[NEI_TILE][F_TILE];
-    __shared__ int   tile_src[NEI_TILE][F_TILE];
-
-    float best_val = INFINITY;
-    int best_src = -1;
-
-    for (int base = row_start; base < row_end; base += NEI_TILE) {
-        int eid = base + ty;
-        float val = INFINITY;
-        int src = -1;
-        if (eid < row_end && f < d) {
-            src = edge_idx[eid];
-            val = X[src * d + f];
-        }
-
-        tile_vals[ty][tx] = val;
-        tile_src[ty][tx]  = src;
-
-        __syncthreads();
-
-        for (int stride = NEI_TILE / 2; stride > 0; stride >>= 1) {
-            if (ty < stride) {
-                float v1 = tile_vals[ty][tx];
-                float v2 = tile_vals[ty + stride][tx];
-                int s1 = tile_src[ty][tx];
-                int s2 = tile_src[ty + stride][tx];
-                if (v2 < v1) {
-                    tile_vals[ty][tx] = v2;
-                    tile_src[ty][tx]  = s2;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (ty == 0 && f < d) {
-            float tile_best_val = tile_vals[0][tx];
-            int tile_best_src = tile_src[0][tx];
-            if (tile_best_val < best_val) {
-                best_val = tile_best_val;
-                best_src = tile_best_src;
-            }
-        }
-
-        __syncthreads();
-    }
-
-    if (ty == 0 && f < d) {
-        out[v * d + f] = best_val;
-        argmin[v * d + f] = best_src;
-    }
-}
 
 // __global__ void min_aggr_forward_light_kernel(
 //     const int* __restrict__ nodes,
@@ -180,7 +113,76 @@ __global__ void min_aggr_forward_heavy_kernel(
     int v = nodes[i];
     int row_start = edge_ptr[v];
     int row_end = edge_ptr[v + 1];
-    min_aggr_forward_large_impl(v, row_start, row_end, edge_idx, X, out, argmin, d);
+    int f0 = blockIdx.y * F_TILE;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int f = f0 + tx;
+
+    // __shared__ float tile_vals[NEI_TILE][F_TILE];
+    // __shared__ int   tile_src[NEI_TILE][F_TILE];
+
+
+    __shared__ float tile_vals[F_TILE][NEI_TILE];
+    __shared__ int   tile_src[F_TILE][NEI_TILE];
+
+    float best_val = INFINITY;
+    int best_src = -1;
+
+    for (int base = row_start; base < row_end; base += NEI_TILE) {
+        int eid = base + ty;
+        float val = INFINITY;
+        int src = -1;
+        if (eid < row_end && f < d) {
+            src = edge_idx[eid];
+            val = X[src * d + f];
+        }
+
+        // Steps to switch to warp-reduce
+        // 1) warp-reduce sum
+
+        // Transposed shared memory layout
+        tile_vals[tx][ty] = val;
+        tile_src[tx][ty]  = src;
+
+        // SHMEM layout:
+        // Neighbor_i_feature_j                | Neighbor_{i + 1}_feature_j                | ... | Neighbor_{i + NEI_TILE - 1}_feature_j
+        // ...
+        // Neighbor_i_feature_{j + F_TILE - 1} | Neighbor_{i + 1}_feature_{j + F_TILE - 1} | ... | Neighbor_{i + NEI_TILE - 1}_feature_{j + F_TILE - 1}
+
+        __syncthreads();
+
+
+        for (int stride = NEI_TILE / 2; stride > 0; stride >>= 1) {
+            if (tx < stride) {
+                float v1 = tile_vals[ty][tx];
+                float v2 = tile_vals[ty][tx + stride];
+                int s1 = tile_src[ty][tx];
+                int s2 = tile_src[ty][tx + stride];
+                if (v2 < v1) {
+                    tile_vals[ty][tx] = v2;
+                    tile_src[ty][tx]  = s2;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tx == 0 && f < d) {
+            float tile_best_val = tile_vals[ty][0];
+            int tile_best_src = tile_src[ty][0];
+            if (tile_best_val < best_val) {
+                best_val = tile_best_val;
+                best_src = tile_best_src;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (ty == 0 && f < d) {
+        out[v * d + f] = best_val;
+        argmin[v * d + f] = best_src;
+    }
 }
 
 void min_aggr_forward_partitioned_cuda(
