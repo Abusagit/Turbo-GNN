@@ -1,7 +1,9 @@
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from json import dumps
 from pathlib import Path
@@ -214,6 +216,21 @@ def generate_experiment_name(
     return experiment_name
 
 
+def load_results_to_comet(results_dict):
+    exp_config = comet_ml.ExperimentConfig(name=results_dict["experiment_name"])
+
+    experiment = comet_ml.start(
+        api_key=os.getenv("COMET_TOKEN"),
+        project_name=COMET_PROJECT_NAME,
+        workspace=COMET_WORKSPACE,
+        experiment_config=exp_config,
+        mode="create",
+    )
+
+    experiment.log_metrics(results_dict, step=0)
+    experiment.end()
+
+
 def main():
     args = parse_args()
 
@@ -280,31 +297,20 @@ def main():
                     "backend": backend,
                 }
 
+                experiment_name = generate_experiment_name(
+                    prefix=COMET_EXP_NAME,
+                    conv_type=args.conv_type,
+                    backend=backend,
+                    dataset_name=dataset_name,
+                    other_params=layer_parameters_dict_instance,
+                )
+
                 overall_dict = common_dict | layer_parameters_dict_instance | measurements_dict | get_gpu_info()
+                overall_dict["experiment_name"] = experiment_name
+
                 results_for_table.append(overall_dict)
 
-                print(dumps(results_for_table, indent=4))
-
-                if args.use_comet:
-                    experiment_name = generate_experiment_name(
-                        prefix=COMET_EXP_NAME,
-                        conv_type=CONV_TYPE,
-                        backend=backend,
-                        dataset_name=dataset_name,
-                        other_params=layer_parameters_dict_instance,
-                    )
-
-                    exp_config = comet_ml.ExperimentConfig(name=experiment_name)
-
-                    experiment = comet_ml.start(
-                        api_key=os.getenv("COMET_TOKEN"),
-                        project_name=COMET_PROJECT_NAME,
-                        workspace=COMET_WORKSPACE,
-                        experiment_config=exp_config,
-                        mode="create",
-                    )
-                    experiment.log_parameters(results_for_table)
-                    experiment.end()
+                print(dumps(overall_dict, indent=4))
 
             del graph_repr
             del x
@@ -322,7 +328,10 @@ def main():
     pd.set_option("display.max_rows", None)
     pd.set_option("display.max_columns", None)
 
-    df_without_constant_columns = df_for_dump.loc[:, (df_for_dump != df_for_dump.iloc[0]).any()]
+    df_without_constant_columns = df_for_dump.loc[:, (df_for_dump != df_for_dump.iloc[0]).any()].drop(
+        "experiment_name",
+        axis="columns",
+    )
 
     value_cols = [
         col for col in df_without_constant_columns.columns if col not in ["feature_dim", "dataset", "backend"]
@@ -335,6 +344,18 @@ def main():
     pivoted.columns = [f"{backend}_{col}" for col, backend in pivoted.columns]
     pivoted = pivoted.reset_index()
     print(pivoted.to_markdown())
+
+    if args.use_comet:
+        with ThreadPoolExecutor(max_workers=len(results_for_table)) as executor:
+            futures = {executor.submit(load_results_to_comet, d): d for d in results_for_table}
+            for future in concurrent.futures.as_completed(futures):
+                result_dict = futures[future]
+                try:
+                    data = future.result()
+                except Exception as exc:
+                    print("%r generated an exception: %s" % (result_dict["experiment_name"], exc))
+                else:
+                    print(f"Future for {result_dict['experiment_name']} is DONE")
 
 
 if __name__ == "__main__":
