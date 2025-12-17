@@ -95,12 +95,14 @@ def time_callable(fn: Callable[[], Any], warmup: int = 10, iters: int = 50) -> M
         return MicrobenchResult(iters=iters, ms_per_iter=ms / iters, device=device)
 
 
-def get_gpu_info(device) -> dict[str, Any]:
+def get_gpu_info(device=None) -> dict[str, Any]:
     """Return GPU info
 
     Returns:
         dict[str, Any]: gpu info for metrics
     """
+    device = device or torch.get_default_device()
+
     if torch.cuda.is_available():
         device_properties = torch.cuda.get_device_properties(device)
         return {
