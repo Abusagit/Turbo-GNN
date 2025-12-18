@@ -372,7 +372,7 @@ def benchmark_real_graphs(device):
     test_dims = [32, 64, 128, 256]
 
     header = (
-        f"{'Dataset':<15} {'Nodes':<10} {'Edges':<10} {'Dim':<6} | "
+        f"{'Dataset':<15} {'Nodes':<10} {'Edges':<10} {'Dim':<6} {'Thr':<6}| "
         f"{'FWD CUDA':<12} {'FWD DGL':<12} {'Speedup':<10} | "
         f"{'BWD CUDA':<12} {'BWD DGL':<12} {'Speedup':<10} | "
         f"{'TOTAL CUDA':<12} {'TOTAL DGL':<12} {'Speedup':<10} | "
@@ -397,120 +397,120 @@ def benchmark_real_graphs(device):
         N = info["num_nodes"]
         num_edges = info["num_edges"]
 
-        light, heavy = split_nodes_by_degree(indptr, threshold=32)
+        light, heavy = split_nodes_by_degree(indptr, threshold=64)
+        for thr in [32, 64, 128, 256]:
+            for d in test_dims:
+                x = torch.randn(N, d, device=device, dtype=torch.float32)
+                x_cuda = x.detach().clone().requires_grad_(True)
+                x_dgl = x.detach().clone().requires_grad_(True)
 
-        for d in test_dims:
-            x = torch.randn(N, d, device=device, dtype=torch.float32)
-            x_cuda = x.detach().clone().requires_grad_(True)
-            x_dgl = x.detach().clone().requires_grad_(True)
+                grad_output = torch.randn(N, d, device=device, dtype=torch.float32)
 
-            grad_output = torch.randn(N, d, device=device, dtype=torch.float32)
+                # ==================== CUDA TIMING ====================
 
-            # ==================== CUDA TIMING ====================
+                # Warm-up
+                for _ in range(5):
+                    x_cuda.grad = None
+                    out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
+                    out_cuda.backward(grad_output)
+                torch.cuda.synchronize()
 
-            # Warm-up
-            for _ in range(5):
+                num_iters = 10
+
+                # Forward only
+                torch.cuda.synchronize()
+                start = time.time()
+                for _ in range(num_iters):
+                    with torch.no_grad():
+                        _ = min_aggr_forward_partitioned(indptr, indices, x_cuda.detach(), light, heavy)
+                torch.cuda.synchronize()
+                cuda_fwd_time = (time.time() - start) / num_iters * 1000.0
+
+                # Backward only
                 x_cuda.grad = None
                 out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
-                out_cuda.backward(grad_output)
-            torch.cuda.synchronize()
 
-            num_iters = 10
+                torch.cuda.synchronize()
+                start = time.time()
+                for _ in range(num_iters):
+                    x_cuda.grad = None
+                    out_cuda.backward(grad_output, retain_graph=True)
+                torch.cuda.synchronize()
+                cuda_bwd_time = (time.time() - start) / num_iters * 1000.0
 
-            # Forward only
-            torch.cuda.synchronize()
-            start = time.time()
-            for _ in range(num_iters):
-                with torch.no_grad():
-                    _ = min_aggr_forward_partitioned(indptr, indices, x_cuda.detach(), light, heavy)
-            torch.cuda.synchronize()
-            cuda_fwd_time = (time.time() - start) / num_iters * 1000.0
+                # Forward + Backward combined (with memory tracking)
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
 
-            # Backward only
-            x_cuda.grad = None
-            out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
+                start = time.time()
+                for _ in range(num_iters):
+                    x_cuda.grad = None
+                    out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
+                    out_cuda.backward(grad_output)
+                torch.cuda.synchronize()
+                cuda_total_time = (time.time() - start) / num_iters * 1000.0
 
-            torch.cuda.synchronize()
-            start = time.time()
-            for _ in range(num_iters):
-                x_cuda.grad = None
-                out_cuda.backward(grad_output, retain_graph=True)
-            torch.cuda.synchronize()
-            cuda_bwd_time = (time.time() - start) / num_iters * 1000.0
+                cuda_peak_mem = torch.cuda.max_memory_allocated()
+                cuda_mem_usage = cuda_peak_mem / (1024**3)  # GB
 
-            # Forward + Backward combined (with memory tracking)
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.synchronize()
+                # ==================== DGL TIMING ====================
 
-            start = time.time()
-            for _ in range(num_iters):
-                x_cuda.grad = None
-                out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
-                out_cuda.backward(grad_output)
-            torch.cuda.synchronize()
-            cuda_total_time = (time.time() - start) / num_iters * 1000.0
+                # Warm-up
+                for _ in range(5):
+                    x_dgl.grad = None
+                    out_dgl = dgl_min_aggr(g, x_dgl)
+                    out_dgl.backward(grad_output)
+                torch.cuda.synchronize()
 
-            cuda_peak_mem = torch.cuda.max_memory_allocated()
-            cuda_mem_usage = cuda_peak_mem / (1024**3)  # GB
+                # Forward only
+                torch.cuda.synchronize()
+                start = time.time()
+                for _ in range(num_iters):
+                    with torch.no_grad():
+                        _ = dgl_min_aggr(g, x_dgl.detach())
+                torch.cuda.synchronize()
+                dgl_fwd_time = (time.time() - start) / num_iters * 1000.0
 
-            # ==================== DGL TIMING ====================
-
-            # Warm-up
-            for _ in range(5):
+                # Backward only
                 x_dgl.grad = None
                 out_dgl = dgl_min_aggr(g, x_dgl)
-                out_dgl.backward(grad_output)
-            torch.cuda.synchronize()
 
-            # Forward only
-            torch.cuda.synchronize()
-            start = time.time()
-            for _ in range(num_iters):
-                with torch.no_grad():
-                    _ = dgl_min_aggr(g, x_dgl.detach())
-            torch.cuda.synchronize()
-            dgl_fwd_time = (time.time() - start) / num_iters * 1000.0
+                torch.cuda.synchronize()
+                start = time.time()
+                for _ in range(num_iters):
+                    x_dgl.grad = None
+                    out_dgl.backward(grad_output, retain_graph=True)
+                torch.cuda.synchronize()
+                dgl_bwd_time = (time.time() - start) / num_iters * 1000.0
 
-            # Backward only
-            x_dgl.grad = None
-            out_dgl = dgl_min_aggr(g, x_dgl)
+                # Forward + Backward combined (with memory tracking)
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
 
-            torch.cuda.synchronize()
-            start = time.time()
-            for _ in range(num_iters):
-                x_dgl.grad = None
-                out_dgl.backward(grad_output, retain_graph=True)
-            torch.cuda.synchronize()
-            dgl_bwd_time = (time.time() - start) / num_iters * 1000.0
+                start = time.time()
+                for _ in range(num_iters):
+                    x_dgl.grad = None
+                    out_dgl = dgl_min_aggr(g, x_dgl)
+                    out_dgl.backward(grad_output)
+                torch.cuda.synchronize()
+                dgl_total_time = (time.time() - start) / num_iters * 1000.0
 
-            # Forward + Backward combined (with memory tracking)
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.synchronize()
+                dgl_peak_mem = torch.cuda.max_memory_allocated()
+                dgl_mem_usage = dgl_peak_mem / (1024**3)  # GB
 
-            start = time.time()
-            for _ in range(num_iters):
-                x_dgl.grad = None
-                out_dgl = dgl_min_aggr(g, x_dgl)
-                out_dgl.backward(grad_output)
-            torch.cuda.synchronize()
-            dgl_total_time = (time.time() - start) / num_iters * 1000.0
+                # Compute speedups and memory ratio
+                fwd_speedup = dgl_fwd_time / cuda_fwd_time
+                bwd_speedup = dgl_bwd_time / cuda_bwd_time
+                total_speedup = dgl_total_time / cuda_total_time
+                mem_ratio = dgl_mem_usage / cuda_mem_usage if cuda_mem_usage > 0 else 0.0
 
-            dgl_peak_mem = torch.cuda.max_memory_allocated()
-            dgl_mem_usage = dgl_peak_mem / (1024**3)  # GB
-
-            # Compute speedups and memory ratio
-            fwd_speedup = dgl_fwd_time / cuda_fwd_time
-            bwd_speedup = dgl_bwd_time / cuda_bwd_time
-            total_speedup = dgl_total_time / cuda_total_time
-            mem_ratio = dgl_mem_usage / cuda_mem_usage if cuda_mem_usage > 0 else 0.0
-
-            print(
-                f"{name:<15} {N:<10} {num_edges:<10} {d:<6} | "
-                f"{cuda_fwd_time:<12.3f} {dgl_fwd_time:<12.3f} {fwd_speedup:<10.2f} | "
-                f"{cuda_bwd_time:<12.3f} {dgl_bwd_time:<12.3f} {bwd_speedup:<10.2f} | "
-                f"{cuda_total_time:<12.3f} {dgl_total_time:<12.3f} {total_speedup:<10.2f} | "
-                f"{cuda_mem_usage:<12.3f} {dgl_mem_usage:<12.3f} {mem_ratio:<10.2f}x"
-            )
+                print(
+                    f"{name:<15} {N:<10} {num_edges:<10} {d:<6} {thr:<6} | "
+                    f"{cuda_fwd_time:<12.3f} {dgl_fwd_time:<12.3f} {fwd_speedup:<10.2f} | "
+                    f"{cuda_bwd_time:<12.3f} {dgl_bwd_time:<12.3f} {bwd_speedup:<10.2f} | "
+                    f"{cuda_total_time:<12.3f} {dgl_total_time:<12.3f} {total_speedup:<10.2f} | "
+                    f"{cuda_mem_usage:<12.3f} {dgl_mem_usage:<12.3f} {mem_ratio:<10.2f}x"
+                )
 
     print("\nTime units: milliseconds | Memory units: GB | Ratio: DGL/CUDA memory usage\n")
 
