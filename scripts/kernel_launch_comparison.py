@@ -210,10 +210,10 @@ def generate_experiment_name(
     dataset_name: str,
     other_params: dict[str, Any],
 ):
-    experiment_name = f"{prefix}_{conv_type}_{backend}_{dataset_name}".lstrip("_")
+    experiment_name = f"{prefix}_{conv_type}_{backend}_{dataset_name}_".lstrip("_")
     experiment_name += "_".join(f"{key}_{val}" for key, val in other_params.items()).strip("_")
 
-    return experiment_name
+    return experiment_name.strip("_")
 
 
 def load_results_to_comet(results_dict):
@@ -253,12 +253,13 @@ def main():
 
     results_for_table = []
 
+    print(f"Backends are: {args.backends}")
     for backend in args.backends:
         try:
             backend_module = BackendRegistry.get_backend(backend)
         except Exception as e:
-            print(f"Couldn't load backend={backend} for conv={args.conv_type}")
-            break
+            print(f"Couldn't load backend={backend} for conv={args.conv_type}. Exception: {e}")
+            continue
 
         for dataset_config in datasets_configs_to_load:
             dataset_name = dataset_config["name"]
@@ -280,6 +281,7 @@ def main():
 
             for layer_parameters_dict_instance in convolution_parameters_grid:
                 feature_dim = layer_parameters_dict_instance["feature_dim"]
+                x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
 
                 try:
                     conv = backend_module.create_conv(args.conv_type, **layer_parameters_dict_instance)
@@ -288,7 +290,6 @@ def main():
                     print(f"Couldnt create conv={args.conv_type} for {backend=}. Exception: {e}")
                     continue
 
-                x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
                 measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
 
                 common_dict = {
@@ -311,9 +312,10 @@ def main():
                 results_for_table.append(overall_dict)
 
                 print(dumps(overall_dict, indent=4))
+            else:
+                del x
 
             del graph_repr
-            del x
             torch.cuda.empty_cache()
 
     df_for_dump = (

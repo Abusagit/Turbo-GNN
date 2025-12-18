@@ -447,7 +447,7 @@ class AdjacencyForwardBackwardCSR:
 
     def to(self, device) -> "AdjacencyForwardBackwardCSR":
         adj_mat_csr_forward_device = self.adj_mat_csr_forward.to(device)
-        if self.adj_mat_csr_forward.data_ptr() == self.adj_mat_csr_backward.data_ptr():
+        if id(self.adj_mat_csr_forward) == id(self.adj_mat_csr_backward):
             adj_mat_csr_backward_device = adj_mat_csr_forward_device
         else:
             adj_mat_csr_backward_device = self.adj_mat_csr_backward.to(device)
@@ -672,7 +672,6 @@ class WSBFormat:
         num_tcbs = tcb_row_offset[-1]
         bitmap_array = np.array(all_bitmaps, dtype=np.uint64)
         bitmap_tensor = torch.from_numpy(bitmap_array.view(np.int64)).clone()
-
         return cls(
             tcb_row_offset=torch.tensor(tcb_row_offset, dtype=torch.int32),
             col_idx=torch.tensor(all_col_idx, dtype=torch.int32),
@@ -684,6 +683,6 @@ class WSBFormat:
             num_tcbs=num_tcbs,
             adjacency_matrices_meta=AdjacencyForwardBackwardCSR(
                 adj_mat_csr_forward=adj,
-                adj_mat_csr_backward=adj,
+                adj_mat_csr_backward=adj.to_sparse_coo().T.to_sparse_csr().to(adj.device),
             ),
         )

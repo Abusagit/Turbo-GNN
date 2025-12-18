@@ -6,6 +6,7 @@ from . import (
     pyg_backend,
     tcgnn_backend,
     torch_native_backend,
+    triton_backend,
 )
 
 doc = """
