@@ -2,13 +2,28 @@
 #include <cmath>
 #include <torch/extension.h>
 #include <torch/torch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
 
-constexpr int F_TILE   = 32;
-constexpr int NEI_TILE = 16;
-constexpr int WARP_SIZE = 32;
-constexpr int THREADS_PER_BLOCK = 64;
+#define FULL_WARP_MASK 0xffffffff
+
+constexpr int kWarpSize = 32;
+
+constexpr int WARPS_PER_BLOCK = 8;
+constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+constexpr int F_TILE = 32;
+constexpr int NEI_TILE = 32;
+
+__device__ __forceinline__ void warp_reduce_argmin(float &val, int &src) {
+    #pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        float v2 = __shfl_xor_sync(FULL_WARP_MASK, val, offset);
+        int s2 = __shfl_xor_sync(FULL_WARP_MASK, src, offset);
+        if (v2 < val) {
+            val = v2;
+            src = s2;
+        }
+    }
+}
 
 __global__ void min_aggr_forward_light_kernel_1d(
     const int* __restrict__ nodes,
@@ -45,7 +60,6 @@ __global__ void min_aggr_forward_light_kernel_1d(
     }
 }
 
-
 __global__ void min_aggr_forward_heavy_kernel(
     const int* __restrict__ nodes,
     const int* __restrict__ edge_ptr,
@@ -63,14 +77,18 @@ __global__ void min_aggr_forward_heavy_kernel(
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int f = f0 + tx;
+    int fx = f0 + tx;
+    int fy = f0 + ty;
 
     // __shared__ float tile_vals[NEI_TILE][F_TILE];
     // __shared__ int   tile_src[NEI_TILE][F_TILE];
 
 
-    __shared__ float tile_vals[F_TILE][NEI_TILE];
-    __shared__ int   tile_src[F_TILE][NEI_TILE];
+    __shared__ float tile_vals[F_TILE][NEI_TILE + 1];
+    __shared__ int   tile_src[NEI_TILE];
+
+    __shared__ float out_vals[F_TILE];
+    __shared__ int   out_srcs[F_TILE];
 
     float best_val = INFINITY;
     int best_src = -1;
@@ -79,17 +97,21 @@ __global__ void min_aggr_forward_heavy_kernel(
         int eid = base + ty;
         float val = INFINITY;
         int src = -1;
-        if (eid < row_end && f < d) {
+        if (eid < row_end && fx < d) {
             src = edge_idx[eid];
-            val = X[src * d + f];
+            val = X[src * d + fx];
         }
 
         // Steps to switch to warp-reduce
-        // 1) warp-reduce sum
+
+
 
         // Transposed shared memory layout
+        // ++++ !!!!!!!! (0.5) Reduce shared memory banck conflicts similar to matrix tranposition
         tile_vals[tx][ty] = val;
-        tile_src[tx][ty]  = src;
+        if (tx == 0) {
+            tile_src[ty]  = src;
+        }
 
         // SHMEM layout:
         // Neighbor_i_feature_j                | Neighbor_{i + 1}_feature_j                | ... | Neighbor_{i + NEI_TILE - 1}_feature_j
@@ -98,36 +120,31 @@ __global__ void min_aggr_forward_heavy_kernel(
 
         __syncthreads();
 
+        val = tile_vals[ty][tx];
+        src = tile_src[tx];
 
-        for (int stride = NEI_TILE / 2; stride > 0; stride >>= 1) {
-            if (tx < stride) {
-                float v1 = tile_vals[ty][tx];
-                float v2 = tile_vals[ty][tx + stride];
-                int s1 = tile_src[ty][tx];
-                int s2 = tile_src[ty][tx + stride];
-                if (v2 < v1) {
-                    tile_vals[ty][tx] = v2;
-                    tile_src[ty][tx]  = s2;
-                }
-            }
-            __syncthreads();
-        }
+        warp_reduce_argmin(val, src);
 
-        if (tx == 0 && f < d) {
-            float tile_best_val = tile_vals[ty][0];
-            int tile_best_src = tile_src[ty][0];
-            if (tile_best_val < best_val) {
-                best_val = tile_best_val;
-                best_src = tile_best_src;
+        if (tx == 0 && fy < d) {
+            if (val < best_val) {
+                best_val = val;
+                best_src = src;
             }
         }
 
         __syncthreads();
     }
 
-    if (ty == 0 && f < d) {
-        out[v * d + f] = best_val;
-        argmin[v * d + f] = best_src;
+    if (tx == 0) {
+        out_vals[ty] = best_val;
+        out_srcs[ty] = best_src;
+    }
+
+    __syncthreads();
+
+    if (ty == 0 && fx < d) {
+        out[v * d + fx] = out_vals[tx];
+        argmin[v * d + fx] = out_srcs[tx];
     }
 }
 
