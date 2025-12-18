@@ -87,14 +87,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
-        "--datasets",
-        type=str,
-        required=True,
-        nargs="+",
-        help="Paths to dataset YAML.",
-    )
-
-    p.add_argument(
         "--amp",
         type=str,
         default="none",
@@ -238,18 +230,30 @@ def main():
 
     datasets_configs_to_load: list[dict[str, str]] = []
 
-    for dataset_cfg_path in args.datasets:
-        with open(dataset_cfg_path, encoding="utf-8") as f:
-            datasets_configs_to_load.append(yaml.safe_load(f)["dataset"])
-
     with open(args.conv_params_grid, encoding="utf-8") as f:
-        kernels_parameters_dict = yaml.safe_load(f)
+        top_level_config = yaml.safe_load(f)
+        kernels_parameters_dict = top_level_config["params_grid"]
 
         keys = kernels_parameters_dict.keys()
         values = kernels_parameters_dict.values()
 
         convolution_parameters_grid = [dict(zip(keys, combo)) for combo in product(*values)]
         del keys, values
+
+        datasets_config = top_level_config["datasets"]
+        base_dir = Path(datasets_config["base_path"])
+        for dir_name, dir_params in datasets_config["dirs"].items():
+            load_all_configs = dir_params.get("all", True)
+            configs_dir = base_dir / dir_name
+            if load_all_configs:
+                all_files_in_current_dir: list[str] = list(map(str, configs_dir.glob("*.yaml")))
+            else:
+                all_files_in_current_dir = [
+                    configs_dir / f"{dataset_name}.yaml" for dataset_name in dir_params.get("choices", [])
+                ]
+            for cfg_path in all_files_in_current_dir:
+                with open(cfg_path, encoding="utf-8") as f_read:
+                    datasets_configs_to_load.append(yaml.safe_load(f_read)["dataset"])
 
     results_for_table = []
 
@@ -258,7 +262,7 @@ def main():
         try:
             backend_module = BackendRegistry.get_backend(backend)
         except Exception as e:
-            print(f"Couldn't load backend={backend} for conv={args.conv_type}. Exception: {e}")
+            print(f"Couldn't load backend={backend} for conv={CONV_TYPE}. Exception: {e}")
             continue
 
         for dataset_config in datasets_configs_to_load:
@@ -284,23 +288,23 @@ def main():
                 x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
 
                 try:
-                    conv = backend_module.create_conv(args.conv_type, **layer_parameters_dict_instance)
+                    conv = backend_module.create_conv(CONV_TYPE, **layer_parameters_dict_instance)
                     conv = conv.to(DEVICE)
                 except Exception as e:
-                    print(f"Couldnt create conv={args.conv_type} for {backend=}. Exception: {e}")
+                    print(f"Couldnt create conv={CONV_TYPE} for {backend=}. Exception: {e}")
                     continue
 
                 measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
 
                 common_dict = {
-                    "conv_type": args.conv_type,
+                    "conv_type": CONV_TYPE,
                     "dataset": dataset_name,
                     "backend": backend,
                 }
 
                 experiment_name = generate_experiment_name(
                     prefix=COMET_EXP_NAME,
-                    conv_type=args.conv_type,
+                    conv_type=CONV_TYPE,
                     backend=backend,
                     dataset_name=dataset_name,
                     other_params=layer_parameters_dict_instance,
@@ -353,7 +357,7 @@ def main():
             for future in concurrent.futures.as_completed(futures):
                 result_dict = futures[future]
                 try:
-                    data = future.result()
+                    _ = future.result()
                 except Exception as exc:
                     print("%r generated an exception: %s" % (result_dict["experiment_name"], exc))
                 else:
