@@ -230,12 +230,16 @@ class GraphSample:
                 self._to_default_device(edge_to_row),
             )
         elif self.backend == "weighted_sparse_block":
-            adj_sparse_csr = normalize_adj(
-                self.edge_index,
-                num_nodes=self.num_nodes,
-                how="both",  # TODO implement other normalization types for this backend
-                add_self_loops=self.add_self_loops,
-            ).to_sparse_csr()
+            adj_sparse_csr = (
+                normalize_adj(
+                    self.edge_index,
+                    num_nodes=self.num_nodes,
+                    how="both",  # TODO implement other normalization types for this backend
+                    add_self_loops=self.add_self_loops,
+                )
+                .to_sparse_csr()
+                .cpu()
+            )
 
             graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
 
