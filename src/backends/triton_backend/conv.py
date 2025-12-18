@@ -27,6 +27,7 @@ class _TritonBlockSparseGraphConv(BaseConvolution):
         super().__init__(bias=bias, **kwargs)
 
         self.norm = norm
+        self.feature_dim = feature_dim
 
     def forward(
         self,
@@ -70,15 +71,9 @@ class _TritonBlockSparseGraphTransformerConv(BaseConvolution):
         self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.feature_dim // self.num_heads))
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
-        # get node features
-        n = graph.num_nodes()
-
         qkv: torch.Tensor = self.qkv_proj(x)
         q, k, v = qkv.split(self.feature_dim, -1)
-
-        q = q.view(n, self.num_heads, -1)
-        k = k.view(n, self.num_heads, -1)
-        v = v.view(n, self.num_heads, -1)
+        # TODO add support for multiple heads
 
         return WSBGraphTransformer.apply(q, k, v, graph)
 

@@ -319,7 +319,7 @@ class WSBSpMM(torch.autograd.Function):
 
 
 @triton.jit
-def wsb_flashattn_tc_kernel(
+def wsb_flashattn_tc_forward_kernel(
     tcb_row_offset_ptr,  # int32 [num_row_windows + 1]
     col_idx_ptr,  # int32 [num_tcbs * 8]
     bitmap_ptr,  # int64 [num_tcbs * 2]
@@ -327,6 +327,7 @@ def wsb_flashattn_tc_kernel(
     K_ptr,  # fp16 [N, D]
     V_ptr,  # fp16 [N, D]
     O_ptr,  # fp32 [N, D]
+    L_ptr,  # fp32 [N] - logsumexp output
     num_nodes,
     D,
     stride_qn,
@@ -378,7 +379,7 @@ def wsb_flashattn_tc_kernel(
     row_offs = tl.arange(0, ROW_WINDOW_SIZE)
     k_offs = tl.arange(0, TILE_K)
 
-    for pair_idx in range(n_pairs):
+    for pair_idx in tl.range(n_pairs, num_stages=2, warp_specialize=True):
         # TCB indices
         tcb_idx_0 = tcb_start + pair_idx * 2
         tcb_idx_1 = tcb_idx_0 + 1
@@ -411,11 +412,11 @@ def wsb_flashattn_tc_kernel(
         k_ptrs = K_ptr + cols[:, None] * stride_kn + d_offs[None, :] * stride_kd
         v_ptrs = V_ptr + cols[:, None] * stride_vn + d_offs[None, :] * stride_vd
 
-        K_block = tl.load(k_ptrs, mask=valid_mask, other=0.0)  # .to(tl.float16)
-        V_block = tl.load(v_ptrs, mask=valid_mask, other=0.0)  # .to(tl.float16)
+        K_block = tl.load(k_ptrs, mask=valid_mask, other=0.0)
+        V_block = tl.load(v_ptrs, mask=valid_mask, other=0.0)
 
         # SDDMM: Q @ K^T [16, 16]
-        logits = tl.dot(Q_block, tl.trans(K_block)) * scale  # .to(tl.float32) * scale
+        logits = tl.dot(Q_block, tl.trans(K_block)).to(tl.float32) * scale
 
         # lolad bitmaps for both TCBs
         bm_lo_0 = tl.load(bitmap_ptr + safe_tcb_0 * 2 + 0)
@@ -439,7 +440,11 @@ def wsb_flashattn_tc_kernel(
         bit_pos = row_in_half * TCB_WIDTH + col_in_tcb
 
         # select appropriate bitmap
-        bm_val = tl.where(use_tcb_1, tl.where(use_hi_bm, bm_hi_1, bm_lo_1), tl.where(use_hi_bm, bm_hi_0, bm_lo_0))
+        bm_val = tl.where(
+            use_tcb_1,
+            tl.where(use_hi_bm, bm_hi_1, bm_lo_1),
+            tl.where(use_hi_bm, bm_hi_0, bm_lo_0),
+        )
 
         # check if edge exists
         edge_exists = ((bm_val >> bit_pos) & 1) == 1
@@ -454,31 +459,44 @@ def wsb_flashattn_tc_kernel(
         # apply mask
         logits = tl.where(full_mask, logits, -float("inf"))
 
-        # online softmax
+        # online softmax update (keep output unnormalized)
         m_block = tl.max(logits, axis=1)
         m_new = tl.maximum(m_i, m_block)
 
-        # Safe exp computation (handle -inf)
+        # compute exp scaling factor
         exp_scale = tl.exp(m_i - m_new)
         exp_scale = tl.where(m_i > -float("inf"), exp_scale, 0.0)
 
+        # compute exponential of logits with new max
         exp_logits = tl.exp(logits - m_new[:, None])
         l_block = tl.sum(exp_logits, axis=1)
+
+        # update sum of exponentials
         l_new = l_i * exp_scale + l_block
 
         # SpMM: exp(logits) @ V [16, 16] @ [16, BLOCK_D]
-        attn = exp_logits.to(tl.float16)
         acc *= exp_scale[:, None]
-        acc = tl.dot(attn, V_block, acc=acc)
+        acc = tl.dot(exp_logits.to(tl.float16), V_block, acc=acc)
 
+        # update statistics
         m_i = m_new
         l_i = l_new
 
+    # normalize output in the end
     acc = acc / l_i[:, None]
     acc = tl.where(l_i[:, None] > 0, acc, 0.0)
 
+    # write output
     out_ptrs = O_ptr + rows[:, None] * stride_on + d_offs[None, :] * stride_od
     tl.store(out_ptrs, acc, mask=row_mask[:, None] & d_mask[None, :])
+
+    # save logsumexp L = m + log(l) for backward pass
+    # !!!!! only the first `d_block` should write (to avoid race conditions)
+    if d_block == 0:
+        logsumexp = m_i + tl.log(l_i)
+        logsumexp = tl.where(l_i > 0, logsumexp, -float("inf"))
+        l_out_ptrs = L_ptr + rows
+        tl.store(l_out_ptrs, logsumexp, mask=row_mask)
 
 
 def wsb_flashattn_tc_forward(wsb, Q, K, V, scale=None, block_f=64):
@@ -501,15 +519,18 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale=None, block_f=64):
     assert Q.dtype == torch.float16, "Q must be fp16 for tensor cores"
     assert block_f >= 16, "block_f must be >= 16 for tensor cores"
 
+    # NOTE TODO Current implementation supports only single head,  need to expand it to arbitrary number of heads
+
     N, D = Q.shape
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
     output = torch.zeros((N, D), device=Q.device, dtype=torch.float32)
+    logsumexp = torch.full((N,), -float("inf"), device=Q.device, dtype=torch.float32)
 
     grid = (wsb.num_row_windows, triton.cdiv(D, block_f))
 
-    wsb_flashattn_tc_kernel[grid](
+    wsb_flashattn_tc_forward_kernel[grid](
         wsb.tcb_row_offset,
         wsb.col_idx,
         wsb.bitmap,
@@ -517,6 +538,7 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale=None, block_f=64):
         K,
         V,
         output,
+        logsumexp,
         N,
         D,
         Q.stride(0),
@@ -534,7 +556,246 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale=None, block_f=64):
         TILE_K=16,
     )
 
-    return output
+    return output, logsumexp
+
+
+@triton.jit
+def wsb_flashattn_tc_backward_kernel(
+    tcb_row_offset_ptr,  # int32 [num_row_windows + 1]
+    col_idx_ptr,  # int32 [num_tcbs * 8]
+    bitmap_ptr,  # int64 [num_tcbs * 2]
+    Q_ptr,  # fp16 [N, D]
+    K_ptr,  # fp16 [N, D]
+    V_ptr,  # fp16 [N, D]
+    O_ptr,  # fp32 [N, D]
+    L_ptr,  # fp32 [N] - logsumexp from forward
+    dO_ptr,  # fp32 [N, D] - gradient of output
+    dQ_ptr,  # fp32 [N, D] - gradient of Q (output)
+    dK_ptr,  # fp32 [N, D] - gradient of K (output)
+    dV_ptr,  # fp32 [N, D] - gradient of V (output)
+    num_nodes,
+    D,
+    stride_qn,
+    stride_qd,
+    stride_kn,
+    stride_kd,
+    stride_vn,
+    stride_vd,
+    stride_on,
+    stride_od,
+    stride_don,
+    stride_dod,
+    stride_dqn,
+    stride_dqd,
+    stride_dkn,
+    stride_dkd,
+    stride_dvn,
+    stride_dvd,
+    scale,
+    BLOCK_F: tl.constexpr,
+    ROW_WINDOW_SIZE: tl.constexpr,
+    TCB_WIDTH: tl.constexpr,
+    TILE_K: tl.constexpr,
+):
+    """
+    Backward pass parallelized over row windows
+    """
+
+    rw_id = tl.program_id(0)
+    d_block = tl.program_id(1)
+
+    row_start = rw_id * ROW_WINDOW_SIZE
+    rows = row_start + tl.arange(0, ROW_WINDOW_SIZE)
+    row_mask = rows < num_nodes
+
+    d_start = d_block * BLOCK_F
+    d_offs = d_start + tl.arange(0, BLOCK_F)
+    d_mask = d_offs < D
+
+    # load Q block [16, BLOCK_F]
+    q_ptrs = Q_ptr + rows[:, None] * stride_qn + d_offs[None, :] * stride_qd
+    Q_block = tl.load(q_ptrs, mask=row_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float16)
+
+    # load O, dO, L for this row window
+    o_ptrs = O_ptr + rows[:, None] * stride_on + d_offs[None, :] * stride_od
+    do_ptrs = dO_ptr + rows[:, None] * stride_don + d_offs[None, :] * stride_dod
+    O_block = tl.load(o_ptrs, mask=row_mask[:, None] & d_mask[None, :], other=0.0)
+    dO_block = tl.load(do_ptrs, mask=row_mask[:, None] & d_mask[None, :], other=0.0)
+
+    l_ptrs = L_ptr + rows
+    L_vec = tl.load(l_ptrs, mask=row_mask, other=-float("inf"))  # [16]
+
+    # compute D = rowsum(dO * O) [16]
+    D_vec = tl.sum(dO_block * O_block, axis=1)
+
+    # initialize dQ accumulator
+    dQ_acc = tl.zeros((ROW_WINDOW_SIZE, BLOCK_F), dtype=tl.float32)
+
+    # get TCB range for this row window
+    tcb_start = tl.load(tcb_row_offset_ptr + rw_id)
+    tcb_end = tl.load(tcb_row_offset_ptr + rw_id + 1)
+
+    n_tcb = tcb_end - tcb_start
+    n_pairs = (n_tcb + 1) // 2
+
+    row_offs = tl.arange(0, ROW_WINDOW_SIZE)
+    k_offs = tl.arange(0, TILE_K)
+
+    # loop over TCB pairs in current row window
+    for pair_idx in tl.range(n_pairs, num_stages=2, warp_specialize=True):
+        # TCB indices
+        tcb_idx_0 = tcb_start + pair_idx * 2
+        tcb_idx_1 = tcb_idx_0 + 1
+
+        # validity checks
+        has_tcb_0 = tcb_idx_0 < tcb_end
+        has_tcb_1 = tcb_idx_1 < tcb_end
+
+        safe_tcb_0 = tl.where(has_tcb_0, tcb_idx_0, tcb_start)
+        safe_tcb_1 = tl.where(has_tcb_1, tcb_idx_1, tcb_start)
+
+        # build column indices [16]
+        in_second_half = k_offs >= TCB_WIDTH
+        local_col = k_offs % TCB_WIDTH
+
+        cols_0 = tl.load(col_idx_ptr + safe_tcb_0 * TCB_WIDTH + local_col)
+        cols_1 = tl.load(col_idx_ptr + safe_tcb_1 * TCB_WIDTH + local_col)
+        cols = tl.where(in_second_half, cols_1, cols_0)
+
+        col_valid = tl.where(in_second_half, has_tcb_1, has_tcb_0)
+        valid_mask = col_valid[:, None] & d_mask[None, :]
+
+        # load K and V [16, BLOCK_F]
+        k_ptrs = K_ptr + cols[:, None] * stride_kn + d_offs[None, :] * stride_kd
+        v_ptrs = V_ptr + cols[:, None] * stride_vn + d_offs[None, :] * stride_vd
+
+        K_block = tl.load(k_ptrs, mask=valid_mask, other=0.0)
+        V_block = tl.load(v_ptrs, mask=valid_mask, other=0.0)
+
+        # recompute attention: S = Q @ K^T [16, 16]
+        S_block = tl.dot(Q_block, tl.trans(K_block)).to(tl.float32) * scale
+
+        # load bitmaps and apply mask (same as forward)
+        bm_lo_0 = tl.load(bitmap_ptr + safe_tcb_0 * 2 + 0)
+        bm_hi_0 = tl.load(bitmap_ptr + safe_tcb_0 * 2 + 1)
+        bm_lo_1 = tl.load(bitmap_ptr + safe_tcb_1 * 2 + 0)
+        bm_hi_1 = tl.load(bitmap_ptr + safe_tcb_1 * 2 + 1)
+
+        row_idx = row_offs[:, None]
+        col_idx_mat = k_offs[None, :]
+
+        use_hi_bm = row_idx >= 8
+        row_in_half = row_idx % 8
+        use_tcb_1 = col_idx_mat >= TCB_WIDTH
+        col_in_tcb = col_idx_mat % TCB_WIDTH
+
+        bit_pos = row_in_half * TCB_WIDTH + col_in_tcb
+        bm_val = tl.where(use_tcb_1, tl.where(use_hi_bm, bm_hi_1, bm_lo_1), tl.where(use_hi_bm, bm_hi_0, bm_lo_0))
+
+        edge_exists = ((bm_val >> bit_pos) & 1) == 1
+        col_valid_2d = tl.where(use_tcb_1, has_tcb_1, has_tcb_0)
+        full_mask = edge_exists & col_valid_2d & row_mask[:, None]
+
+        S_block = tl.where(full_mask, S_block, -float("inf"))
+
+        # recompute attention weights: P = exp(S - L) [16, 16]
+        P_block = tl.exp(S_block - L_vec[:, None])
+        P_block = tl.where(full_mask, P_block, 0.0)
+
+        # dV = P^T @ dO [16, BLOCK_F]
+        dV_block = tl.dot(tl.trans(P_block).to(tl.float16), dO_block.to(tl.float16)).to(tl.float32)
+
+        # atomica add dV to global memory
+        dv_ptrs = dV_ptr + cols[:, None] * stride_dvn + d_offs[None, :] * stride_dvd
+        atomic_mask_dv = col_valid[:, None] & d_mask[None, :]
+        tl.atomic_add(dv_ptrs, dV_block, mask=atomic_mask_dv)
+
+        # dP = dO @ V^T [16, 16]
+        dP_block = tl.dot(dO_block.to(tl.float16), tl.trans(V_block)).to(tl.float32)
+
+        # Softmax backward: dS = P * (dP - D) [16, 16]
+        dS_block = P_block * (dP_block - D_vec[:, None])
+        dS_block = tl.where(full_mask, dS_block, 0.0)
+
+        # dQ += dS @ K [16, BLOCK_F]
+        dQ_acc = tl.dot(dS_block.to(tl.float16), K_block, acc=dQ_acc).to(tl.float32)
+
+        # dK = dS^T @ Q [16, BLOCK_F]
+        dK_block = tl.dot(tl.trans(dS_block).to(tl.float16), Q_block).to(tl.float32)
+
+        # we need atomic add dK to global memory
+        dk_ptrs = dK_ptr + cols[:, None] * stride_dkn + d_offs[None, :] * stride_dkd
+        atomic_mask_dk = col_valid[:, None] & d_mask[None, :]
+        tl.atomic_add(dk_ptrs, dK_block, mask=atomic_mask_dk)
+
+    # write dQ for this row window (no atomics needed b.c. each row window owns its rows)
+    dq_ptrs = dQ_ptr + rows[:, None] * stride_dqn + d_offs[None, :] * stride_dqd
+    tl.store(dq_ptrs, dQ_acc, mask=row_mask[:, None] & d_mask[None, :])
+
+
+def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale=None, block_f=64):
+    """
+    Backward pass computing dQ, dK, dV.
+
+    Args:
+        L: Logsumexp [N] from forward pass
+        dO: Gradient of output [N, D]
+
+    Returns:
+        dQ, dK, dV: Gradients
+    """
+    assert Q.is_cuda and K.is_cuda and V.is_cuda and output.is_cuda
+    assert dO.is_cuda and L.is_cuda
+
+    N, D = Q.shape
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    dQ = torch.zeros_like(Q, dtype=torch.float32)
+    dK = torch.zeros_like(K, dtype=torch.float32)
+    dV = torch.zeros_like(V, dtype=torch.float32)
+
+    grid = (wsb.num_row_windows, triton.cdiv(D, block_f))
+
+    wsb_flashattn_tc_backward_kernel[grid](
+        wsb.tcb_row_offset,
+        wsb.col_idx,
+        wsb.bitmap,
+        Q,
+        K,
+        V,
+        output,
+        L,
+        dO,
+        dQ,
+        dK,
+        dV,
+        N,
+        D,
+        Q.stride(0),
+        Q.stride(1),
+        K.stride(0),
+        K.stride(1),
+        V.stride(0),
+        V.stride(1),
+        output.stride(0),
+        output.stride(1),
+        dO.stride(0),
+        dO.stride(1),
+        dQ.stride(0),
+        dQ.stride(1),
+        dK.stride(0),
+        dK.stride(1),
+        dV.stride(0),
+        dV.stride(1),
+        scale,
+        BLOCK_F=block_f,
+        ROW_WINDOW_SIZE=16,
+        TCB_WIDTH=8,
+        TILE_K=16,
+    )
+
+    return dQ, dK, dV
 
 
 class WSBGraphTransformer(torch.autograd.Function):
@@ -542,16 +803,24 @@ class WSBGraphTransformer(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, wsb: WSBFormat) -> torch.Tensor:
+        Q = Q.half()
+        K = K.half()
+        V = V.half()
+
         ctx.wsb = wsb
-        ctx.save_for_backward(Q, K, V)
-        output = wsb_flashattn_tc_forward(wsb, Q, K, V, scale=Q.shape[-1])  # TODO add logsumexp
+        ctx.scale = Q.shape[-1]
+
+        output, logsumexp = wsb_flashattn_tc_forward(wsb, Q, K, V, scale=ctx.scale)
+        ctx.save_for_backward(Q, K, V, logsumexp, output)
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        # TODO
-        raise NotImplementedError("TODO")
+        Q, K, V, logsumexp, output = ctx.saved_tensors
+
+        dQ, dK, dV = wsb_flashattn_tc_backward(ctx.wsb, Q, K, V, output, logsumexp, grad_output, scale=ctx.scale)
+        return dQ, dK, dV, None
 
 
 #####################################################

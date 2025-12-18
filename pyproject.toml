@@ -68,7 +68,7 @@ dgl = [
 ]
 
 triton = [
-    "triton>=2.0.0",
+    "triton",
 ]
 
 cuda = [
