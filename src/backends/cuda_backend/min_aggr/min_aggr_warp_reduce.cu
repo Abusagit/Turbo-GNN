@@ -148,6 +148,122 @@ __global__ void min_aggr_forward_heavy_kernel(
     }
 }
 
+
+
+// IDEA: process wedges via chunks in parallel
+constexpr int EDGES_PER_BLOCK = 128;
+constexpr int MAX_CHUNKS = 512;
+
+// pack float and int into uint64 for atomic updates
+__device__ __forceinline__ unsigned long long pack_val_idx(float val, int idx) {
+    return ((unsigned long long)__float_as_uint(val) << 32) | (unsigned long long)(unsigned int)idx;
+}
+
+// unpack float and int from uint64
+__device__ __forceinline__ void unpack_val_idx(unsigned long long packed, float& val, int& idx) {
+    val = __uint_as_float((unsigned int)(packed >> 32));
+    idx = (int)(unsigned int)(packed & 0xFFFFFFFFULL);
+}
+
+// initialize packed buffer for heavy nodes
+__global__ void init_packed_kernel(
+    unsigned long long* __restrict__ packed,
+    const int* __restrict__ nodes,
+    int num_nodes,
+    int d
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long init_val = pack_val_idx(INFINITY, -1);
+
+    for (int i = tid; i < num_nodes * d; i += gridDim.x * blockDim.x) {
+        int node_idx = i / d;
+        int f = i % d;
+        int v = nodes[node_idx];
+        packed[v * d + f] = init_val;
+    }
+}
+
+// 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
+__global__ void min_aggr_forward_heavy_kernel(
+    const int* __restrict__ nodes,
+    const int* __restrict__ edge_ptr,
+    const int* __restrict__ edge_idx,
+    const float* __restrict__ X,
+    unsigned long long* __restrict__ packed,
+    int d
+) {
+    int node_idx = blockIdx.x;
+    int chunk_idx = blockIdx.y;
+    int v = nodes[node_idx];
+
+    int row_start = edge_ptr[v];
+    int row_end = edge_ptr[v + 1];
+
+    int chunk_start = row_start + chunk_idx * EDGES_PER_BLOCK;
+    int chunk_end = min(chunk_start + EDGES_PER_BLOCK, row_end);
+
+    // exit for chunks beyond this node's edges
+    if (chunk_start >= row_end) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+
+    for (int f = tid; f < d; f += blockDim.x) {
+        float local_min = INFINITY;
+        int local_arg = -1;
+
+        // find local minimum in this chunk
+        for (int eid = chunk_start; eid < chunk_end; ++eid) {
+            int src = edge_idx[eid];
+            float val = X[src * d + f];
+            if (val < local_min) {
+                local_min = val;
+                local_arg = src;
+            }
+        }
+
+        // atomic update using 64-bit CAS
+        if (local_arg >= 0) {
+            unsigned long long* addr = &packed[v * d + f];
+            unsigned long long new_val = pack_val_idx(local_min, local_arg);
+            unsigned long long old = *addr;
+
+            while (new_val < old) {
+                unsigned long long assumed = old;
+                old = atomicCAS(addr, assumed, new_val);
+                if (old == assumed) break;
+            }
+        }
+    }
+}
+
+// unpack results back to separate arrays
+__global__ void unpack_results_kernel(
+    const unsigned long long* __restrict__ packed,
+    const int* __restrict__ nodes,
+    float* __restrict__ out,
+    int* __restrict__ argmin,
+    int num_nodes,
+    int d
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int i = tid; i < num_nodes * d; i += gridDim.x * blockDim.x) {
+        int node_idx = i / d;
+        int f = i % d;
+        int v = nodes[node_idx];
+
+        float val;
+        int idx;
+        unpack_val_idx(packed[v * d + f], val, idx);
+
+        out[v * d + f] = val;
+        argmin[v * d + f] = idx;
+    }
+}
+
+
 void min_aggr_forward_partitioned_cuda(
     const at::Tensor& edge_ptr,
     const at::Tensor& edge_idx,
@@ -158,7 +274,7 @@ void min_aggr_forward_partitioned_cuda(
     at::Tensor& argmin
 ) {
     const int d = X.size(1);
-    const int num_f_blocks = (d + F_TILE - 1) / F_TILE;
+    const int num_out_nodes = out.size(0);
 
     TORCH_CHECK(edge_ptr.is_cuda(), "edge_ptr must be CUDA");
     TORCH_CHECK(edge_idx.is_cuda(), "edge_idx must be CUDA");
@@ -172,17 +288,9 @@ void min_aggr_forward_partitioned_cuda(
     TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
     TORCH_CHECK(X.dtype() == torch::kFloat32, "X must be float32");
 
-    // const dim3 threads(F_TILE, NEI_TILE);
-
-    const dim3 heavy_threads(F_TILE, NEI_TILE);
-    const int LIGHT_THREADS = 256;
-
-    // std::cout << "light=" << light_nodes.numevl() << " heavy=" << heavy_nodes.numel() << " d=" << d << std::endl;
-
     if (light_nodes.numel() > 0) {
         const int num_light = light_nodes.numel();
-        const dim3 blocks(num_light);
-        min_aggr_forward_light_kernel_1d<<<blocks, LIGHT_THREADS>>>(
+        min_aggr_forward_light_kernel_1d<<<num_light, THREADS_PER_BLOCK>>>(
             light_nodes.data_ptr<int>(),
             edge_ptr.data_ptr<int>(),
             edge_idx.data_ptr<int>(),
@@ -195,21 +303,102 @@ void min_aggr_forward_partitioned_cuda(
 
     if (heavy_nodes.numel() > 0) {
         const int num_heavy = heavy_nodes.numel();
-        const dim3 blocks(num_heavy, num_f_blocks);
-        min_aggr_forward_heavy_kernel<<<blocks, heavy_threads>>>(
+
+        auto packed = at::empty({num_out_nodes, d},
+            torch::dtype(torch::kInt64).device(X.device()));
+
+        int init_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        init_packed_kernel<<<init_blocks, THREADS_PER_BLOCK>>>(
+            (unsigned long long*)packed.data_ptr<int64_t>(),
+            heavy_nodes.data_ptr<int>(),
+            num_heavy,
+            d
+        );
+
+        dim3 grid(num_heavy, MAX_CHUNKS);
+        min_aggr_forward_heavy_kernel<<<grid, THREADS_PER_BLOCK>>>(
             heavy_nodes.data_ptr<int>(),
             edge_ptr.data_ptr<int>(),
             edge_idx.data_ptr<int>(),
             X.data_ptr<float>(),
+            (unsigned long long*)packed.data_ptr<int64_t>(),
+            d
+        );
+        int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        unpack_results_kernel<<<unpack_blocks, THREADS_PER_BLOCK>>>(
+            (unsigned long long*)packed.data_ptr<int64_t>(),
+            heavy_nodes.data_ptr<int>(),
             out.data_ptr<float>(),
             argmin.data_ptr<int>(),
+            num_heavy,
             d
         );
     }
-
+    cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
 }
+
+// void min_aggr_forward_partitioned_cuda(
+//     const at::Tensor& edge_ptr,
+//     const at::Tensor& edge_idx,
+//     const at::Tensor& X,
+//     const at::Tensor& light_nodes,
+//     const at::Tensor& heavy_nodes,
+//     at::Tensor& out,
+//     at::Tensor& argmin
+// ) {
+//     const int d = X.size(1);
+//     const int num_f_blocks = (d + F_TILE - 1) / F_TILE;
+
+//     TORCH_CHECK(edge_ptr.is_cuda(), "edge_ptr must be CUDA");
+//     TORCH_CHECK(edge_idx.is_cuda(), "edge_idx must be CUDA");
+//     TORCH_CHECK(X.is_cuda(), "X must be CUDA");
+//     TORCH_CHECK(light_nodes.is_cuda(), "light_nodes must be CUDA");
+//     TORCH_CHECK(heavy_nodes.is_cuda(), "heavy_nodes must be CUDA");
+
+//     TORCH_CHECK(edge_ptr.dtype() == torch::kInt32, "edge_ptr must be int32");
+//     TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
+//     TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
+//     TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
+//     TORCH_CHECK(X.dtype() == torch::kFloat32, "X must be float32");
+
+
+//     if (light_nodes.numel() > 0) {
+//         const int num_light = light_nodes.numel();
+//         const dim3 blocks(num_light);
+//         min_aggr_forward_light_kernel_1d<<<blocks, THREADS_PER_BLOCK>>>(
+//             light_nodes.data_ptr<int>(),
+//             edge_ptr.data_ptr<int>(),
+//             edge_idx.data_ptr<int>(),
+//             X.data_ptr<float>(),
+//             out.data_ptr<float>(),
+//             argmin.data_ptr<int>(),
+//             d
+//         );
+//     }
+
+//     if (heavy_nodes.numel() > 0) {
+//         const dim3 heavy_threads(F_TILE, NEI_TILE);
+
+//         const int num_heavy = heavy_nodes.numel();
+//         const dim3 blocks(num_heavy, num_f_blocks);
+//         size_t shmem_size = (F_TILE * (NEI_TILE + 2)) * sizeof(float) + (F_TILE + NEI_TILE) * sizeof(int);
+//         min_aggr_forward_heavy_kernel<<<blocks, heavy_threads, shmem_size>>>(
+//             heavy_nodes.data_ptr<int>(),
+//             edge_ptr.data_ptr<int>(),
+//             edge_idx.data_ptr<int>(),
+//             X.data_ptr<float>(),
+//             out.data_ptr<float>(),
+//             argmin.data_ptr<int>(),
+//             d
+//         );
+//     }
+
+//     cudaDeviceSynchronize();
+//     cudaError_t err = cudaGetLastError();
+//     TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
+// }
 
 __global__ void min_aggr_backward(
     const float* __restrict__ grad_out,

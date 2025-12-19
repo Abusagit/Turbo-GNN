@@ -83,6 +83,15 @@ def split_nodes_by_degree(edge_ptr, threshold=32):
     return light, heavy
 
 
+def split_nodes_by_degree_quantile(edge_ptr, quantile=0.9):
+    deg = (edge_ptr[1:] - edge_ptr[:-1]).to(torch.int32)
+    nodes = torch.arange(deg.numel(), device=edge_ptr.device, dtype=torch.int32)
+    Q = torch.quantile(deg.float(), q=quantile) if quantile != -1 else 10000000000
+    light = nodes[deg < Q]
+    heavy = nodes[deg >= Q]
+    return light, heavy
+
+
 def dgl_min_aggr(g, x):
     out = dgl.ops.copy_u_min(g, x)
     out[out.isinf()] = 0
@@ -103,26 +112,26 @@ def load_real_graphs():
     graphs = {}
     import sys
 
-    sys.path.append("/home/fominada/Accelerating-GNNs/data")
+    sys.path.append("/home/fvelikon/projects/cuda_exp/data")
     from src.data.graphland_datasets import GraphLandDataset
 
     for dataset_name in [
         "hm-categories",
-        # "pokec-regions",
-        # "web-topics",
+        "pokec-regions",
+        "web-topics",
         "tolokers-2",
         "city-reviews",
         "artnet-exp",
-        # "web-fraud",
+        "web-fraud",
         "hm-prices",
         "avazu-ctr",
         "city-roads-M",
         "city-roads-L",
         "twitch-views",
         "artnet-views",
-        # "web-traffic",
+        "web-traffic",
     ]:
-        dataset = GraphLandDataset(root="/home/fominada/Accelerating-GNNs/data", name=dataset_name, split="RL")
+        dataset = GraphLandDataset(root="/home/fvelikon/projects/cuda_exp/data", name=dataset_name, split="RL")
         g = dgl.graph((dataset[0].edge_index[0], dataset[0].edge_index[1]))
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -136,7 +145,7 @@ def load_real_graphs():
     try:
         from dgl.data import CoraGraphDataset
 
-        dataset = CoraGraphDataset("/home/fominada/Accelerating-GNNs/data")
+        dataset = CoraGraphDataset("/home/fvelikon/projects/cuda_exp/data")
         g = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -152,7 +161,7 @@ def load_real_graphs():
     try:
         from dgl.data import CiteseerGraphDataset
 
-        dataset = CiteseerGraphDataset("/home/fominada/Accelerating-GNNs/data")
+        dataset = CiteseerGraphDataset("/home/fvelikon/projects/cuda_exp/data")
         g = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -168,7 +177,7 @@ def load_real_graphs():
     try:
         from dgl.data import PubmedGraphDataset
 
-        dataset = PubmedGraphDataset("/home/fominada/Accelerating-GNNs/data")
+        dataset = PubmedGraphDataset("/home/fvelikon/projects/cuda_exp/data")
         g = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -184,7 +193,7 @@ def load_real_graphs():
     try:
         from ogb.nodeproppred import DglNodePropPredDataset
 
-        dataset = DglNodePropPredDataset(name="ogbn-arxiv", root="/home/fominada/Accelerating-GNNs/data")
+        dataset = DglNodePropPredDataset(name="ogbn-arxiv", root="/home/fvelikon/projects/cuda_exp/data")
         g, _ = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -199,22 +208,22 @@ def load_real_graphs():
         print(f"    Failed to load ogbn-arxiv: {e}")
 
     # ogbn-products
-    # try:
-    #     from ogb.nodeproppred import DglNodePropPredDataset
+    try:
+        from ogb.nodeproppred import DglNodePropPredDataset
 
-    #     dataset = DglNodePropPredDataset(name="ogbn-products", root="/home/fominada/Accelerating-GNNs/data")
-    #     g, _ = dataset[0]
-    #     g = dgl.add_self_loop(g)
-    #     g = dgl.to_bidirected(g)
-    #     graphs["ogbn-products"] = {
-    #         "graph": g,
-    #         "num_nodes": g.num_nodes(),
-    #         "num_edges": g.num_edges(),
-    #     }
-    # except ImportError:
-    #     print("    ogbn-products: OGB not installed (pip install ogb)")
-    # except Exception as e:
-    #     print(f"    Failed to load ogbn-products: {e}")
+        dataset = DglNodePropPredDataset(name="ogbn-products", root="/home/fvelikon/projects/cuda_exp/data")
+        g, _ = dataset[0]
+        g = dgl.add_self_loop(g)
+        g = dgl.to_bidirected(g)
+        graphs["ogbn-products"] = {
+            "graph": g,
+            "num_nodes": g.num_nodes(),
+            "num_edges": g.num_edges(),
+        }
+    except ImportError:
+        print("    ogbn-products: OGB not installed (pip install ogb)")
+    except Exception as e:
+        print(f"    Failed to load ogbn-products: {e}")
 
     print()
     return graphs
@@ -372,7 +381,7 @@ def benchmark_real_graphs(device):
     test_dims = [32, 64, 128, 256]
 
     header = (
-        f"{'Dataset':<15} {'Nodes':<10} {'Edges':<10} {'Dim':<6} {'Thr':<6}| "
+        f"{'Dataset':<15} {'Nodes':<10} {'Edges':<10} {'Dim':<6} {'Thr':<6} {'Num heavy':<10}| "
         f"{'FWD CUDA':<12} {'FWD DGL':<12} {'Speedup':<10} | "
         f"{'BWD CUDA':<12} {'BWD DGL':<12} {'Speedup':<10} | "
         f"{'TOTAL CUDA':<12} {'TOTAL DGL':<12} {'Speedup':<10} | "
@@ -397,8 +406,12 @@ def benchmark_real_graphs(device):
         N = info["num_nodes"]
         num_edges = info["num_edges"]
 
-        light, heavy = split_nodes_by_degree(indptr, threshold=64)
-        for thr in [32, 64, 128, 256]:
+        # for thr in [32, 64, 100, 400, 500, 1000, 10000, 100000, 1000000000]:
+        for thr in [0.9, 0.95, 0.99, 0.995, 0.999, 1.0, -1]:
+            # for thr in [1000000000]:
+            # light, heavy = split_nodes_by_degree(indptr, threshold=thr)
+            light, heavy = split_nodes_by_degree_quantile(indptr, quantile=thr)
+
             for d in test_dims:
                 x = torch.randn(N, d, device=device, dtype=torch.float32)
                 x_cuda = x.detach().clone().requires_grad_(True)
@@ -505,7 +518,7 @@ def benchmark_real_graphs(device):
                 mem_ratio = dgl_mem_usage / cuda_mem_usage if cuda_mem_usage > 0 else 0.0
 
                 print(
-                    f"{name:<15} {N:<10} {num_edges:<10} {d:<6} {thr:<6} | "
+                    f"{name:<15} {N:<10} {num_edges:<10} {d:<6} {thr:<6} {len(heavy):<10}| "
                     f"{cuda_fwd_time:<12.3f} {dgl_fwd_time:<12.3f} {fwd_speedup:<10.2f} | "
                     f"{cuda_bwd_time:<12.3f} {dgl_bwd_time:<12.3f} {bwd_speedup:<10.2f} | "
                     f"{cuda_total_time:<12.3f} {dgl_total_time:<12.3f} {total_speedup:<10.2f} | "
@@ -526,7 +539,7 @@ def main():
 
     # mini_benchmark_synthetic(device)
 
-    benchmark_performance(device)
+    # benchmark_performance(device)
     benchmark_real_graphs(device)
 
 
