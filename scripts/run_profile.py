@@ -65,7 +65,7 @@ def main() -> int:
     prof_cfg: dict[str, Any] = read_yaml(args.profile).get("profiler", {})
 
     # Data
-    train_ds, val_ds, _ = create_split_datasets_from_yaml(args.dataset, graph_backend=infer_graph_backend(args.model))
+    train_ds, val_ds, _ = create_split_datasets_from_yaml(args.dataset, conv_backend=args.backend)
     in_dim = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
     lc = LoaderConfig(

@@ -164,8 +164,6 @@ def test_microbenchmarking():
     def test_fn():
         x = torch.randn(1000, 1000)
         y = torch.matmul(x, x)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
 
     try:
         result = time_callable(test_fn, warmup=5, iters=10)

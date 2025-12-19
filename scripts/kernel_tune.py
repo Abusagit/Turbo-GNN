@@ -12,7 +12,7 @@ sys.path.append("./")
 
 from src.backends.registry import BackendRegistry
 from src.benchmarking.microbench import MicrobenchResult, time_callable
-from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, load_single_graph
+from src.data.datasets import DatasetConfig, load_single_graph
 
 doc = """
 Kernel tuning microbenchmark launcher.
@@ -83,7 +83,7 @@ def main() -> int:
             source=dataset_cfg["source"],
             name=dataset_cfg["name"],
             root=dataset_cfg["root"],
-            graph_backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
+            conv_backend=args.backend,
         )
     )
     x = torch.randn(graph.num_nodes, args.in_ch, device=device)

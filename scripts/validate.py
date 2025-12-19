@@ -64,8 +64,7 @@ def main() -> int:
     device = tcfg.device
     torch.set_default_device(device)
 
-    graph_backend = args.backend
-    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(args.dataset, graph_backend=graph_backend)
+    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(args.dataset, conv_backend=args.backend)
     in_dim = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
     lc = LoaderConfig(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
