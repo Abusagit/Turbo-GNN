@@ -173,20 +173,20 @@ def load_real_graphs():
     from src.data.graphland_datasets import GraphLandDataset
 
     for dataset_name in [
-            # "hm-categories",
-            # "pokec-regions",
-            # "web-topics",
+            "hm-categories",
+            "pokec-regions",
+            "web-topics",
             "tolokers-2",
             "city-reviews",
             "artnet-exp",
-            # "web-fraud",
-            # "hm-prices",
-            # "avazu-ctr",
+            "web-fraud",
+            "hm-prices",
+            "avazu-ctr",
             "city-roads-M",
             "city-roads-L",
-            # "twitch-views",
+            "twitch-views",
             "artnet-views",
-            # "web-traffic",
+            "web-traffic",
 ]:
         dataset  = GraphLandDataset(root="/home/fvelikon/projects/cuda_exp/data", name=dataset_name, split="RL")
         g = dgl.graph((dataset[0].edge_index[0], dataset[0].edge_index[1]))
@@ -425,21 +425,25 @@ def benchmark_comparison():
             dgl_ops = GATv2_DGL_Ops(attn_vec, negative_slope)
 
             # Warmup
-            for _ in range(num_warmup):
-                _ = dgl_ops.forward(g, feat_l, feat_r)
-            torch.cuda.synchronize()
 
-            # Benchmark
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            try:
+                for _ in range(num_warmup):
+                    _ = dgl_ops.forward(g, feat_l, feat_r)
+                torch.cuda.synchronize()
 
-            start.record()
-            for _ in range(num_iters):
-                h_dgl, alpha_dgl = dgl_ops.forward(g, feat_l, feat_r)
-            end.record()
-            torch.cuda.synchronize()
+                # Benchmark
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
 
-            dgl_ops_time = start.elapsed_time(end) / num_iters
+                start.record()
+                for _ in range(num_iters):
+                    h_dgl, alpha_dgl = dgl_ops.forward(g, feat_l, feat_r)
+                end.record()
+                torch.cuda.synchronize()
+                dgl_ops_time = start.elapsed_time(end) / num_iters
+            except Exception as e:
+                dgl_ops_time = float("nan")
+                torch.cuda.empty_cache()
 
             # =====================================================================
             # Custom Kernel
@@ -467,7 +471,7 @@ def benchmark_comparison():
 
 
                 custom_time = start.elapsed_time(end) / num_iters
-                speedup = dgl_ops_time / custom_time
+                speedup = dgl_ops_time / custom_time if dgl_ops_time != float('nan') else float('nan')
             else:
                 custom_time = float("nan")
                 speedup = float("nan")
