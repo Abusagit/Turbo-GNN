@@ -48,7 +48,8 @@ def measure_memory(func):
     peak_memory = torch.cuda.max_memory_allocated() / 1024**2
 
     memory_allocated = end_memory - start_memory
-    return result, memory_allocated, peak_memory
+    # return result, memory_allocated, peak_memory
+    return result, end_memory, peak_memory
 
 
 def time_callable(fn: Callable[[], Any], warmup: int = 10, iters: int = 50) -> MicrobenchResult:

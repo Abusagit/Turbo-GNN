@@ -154,14 +154,27 @@ def measure_kernel_performance(
 
     grad_output = torch.randn_like(X)
 
-    Y = forward_function()
+    try:
+        Y = forward_function()
+    except (Exception, torch.OutOfMemoryError) as e:
+        print(f"Couldn't measure forward performance for convolution {conv}. Exception: {e}")
+        forward_results = {
+            "forward_ms": None,
+            "forward_memory_mb": None,
+        }
+        backward_results = {
+            "backward_ms": None,
+            "backward_memory_mb": None,
+        }
+        torch.cuda.empty_cache()
+        return forward_results | backward_results
 
     def backward_function():
         Y.backward(grad_output, retain_graph=True)
 
     try:
         forward_function_measurements: MicrobenchResult = time_callable(forward_function, warmup=3, iters=10)
-    except Exception as e:
+    except (Exception, torch.OutOfMemoryError) as e:
         print(f"Couldn't measure forward performance for convolution {conv}. Exception: {e}")
         forward_function_measurements = MicrobenchResult(
             iters=10,
@@ -169,15 +182,16 @@ def measure_kernel_performance(
             device="cuda",
             memory_allocated=None,
         )
+        torch.cuda.empty_cache()
 
     forward_results = {
-        "forward_ms": forward_function_measurements.ms_per_iter,
-        "forward_memory_mb": forward_function_measurements.memory_allocated,
+        "forward_ms": forward_function_measurements.ms_per_iter,  # type: ignore
+        "forward_memory_mb": forward_function_measurements.memory_allocated,  # type: ignore
     }
 
     try:
         backward_function_measurements: MicrobenchResult = time_callable(backward_function, warmup=3, iters=10)
-    except Exception as e:
+    except (Exception, torch.OutOfMemoryError) as e:
         print(f"Couldn't measure backward performance for convolution {conv}. Exception: {e}")
         backward_function_measurements = MicrobenchResult(
             iters=10,
@@ -185,10 +199,11 @@ def measure_kernel_performance(
             device="cuda",
             memory_allocated=None,
         )
+        torch.cuda.empty_cache()
 
     backward_results = {
-        "backward_ms": bwd_ms if (bwd_ms := backward_function_measurements.ms_per_iter) != float("nan") else None,
-        "backward_memory_mb": backward_function_measurements.memory_allocated,
+        "backward_ms": bwd_ms if (bwd_ms := backward_function_measurements.ms_per_iter) != float("nan") else None,  # type: ignore
+        "backward_memory_mb": backward_function_measurements.memory_allocated,  # type: ignore
     }
 
     overall_dict = forward_results | backward_results

@@ -1,4 +1,5 @@
 #include <cstddef>
+#include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <random>
 #include <cfloat>
+
 
 #define CUDA_CHECK(call) \
     do { \
@@ -20,12 +22,12 @@
 
 
 #define FULL_WARP_MASK 0xffffffff
+
 constexpr int kMaxThreadsInWarp = 32;
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
-
 
 __device__ __forceinline__ float leaky_relu_elementwise(float x, float negative_slope) {
     return  (x > 0.0f) ? x : negative_slope * x;
@@ -80,7 +82,7 @@ __global__ void GATv2Kernel_CSR(
     const float* __restrict__ d_attn_vec,   // [z] - attention vector
     float* __restrict__ d_h_out,            // [N, z] - output node features
     float* __restrict__ d_logits_out,       // [E] - attention weights per edge -- can be used for backward
-    float* __restrict__ d_logsumexp_out,        // [N] -- logsumexp values (used for backward pass)
+    float* __restrict__ d_logsumexp_out,    // [N] -- logsumexp values (used for backward pass)
     float negative_slope
 ) {
     // shared memory layout:
@@ -233,7 +235,6 @@ void GATv2Forward_CSR(
     float* d_logits_out,
     float* d_logsumexp_out,
     float negative_slope,
-    int max_neighbors,
     cudaStream_t stream = 0
 ) {
     dim3 nThreads(kMaxThreadsInWarp);
@@ -309,7 +310,7 @@ __global__ void PrecomputeG(
     const float4* grad_h_f4 = reinterpret_cast<const float4*>(grad_h_shared);
     float L_i = d_logsumexp[node_i];
 
-    // compute G_i = sum_j alpha_{ij} · (grad_h_i · r_j)
+    // compute G_i = sum_j alpha_{ij} * (grad_h_i · r_j)
     float G_i = 0.0f;
 
     for (int k = 0; k < num_neighbors; ++k) {
@@ -490,8 +491,8 @@ __global__ void GATv2Backward_R(
     const float* __restrict__ grad_h,
     const float* __restrict__ d_l,
     const float* __restrict__ d_r,
-    const int* __restrict__ d_row_ptr_T,    // Transposed graph
-    const int* __restrict__ d_col_idx_T,    // Source nodes (incoming edges)
+    const int* __restrict__ d_row_ptr_T,    // transposed graph
+    const int* __restrict__ d_col_idx_T,    // sounrce nodes (incoming edges)
     const float* __restrict__ d_attn_vec,
     const float* __restrict__ d_logsumexp,
     const float* __restrict__ d_G,          // G_i indexed by source node
@@ -501,7 +502,7 @@ __global__ void GATv2Backward_R(
     extern __shared__ float shared[];
     float* r_shared = shared;
 
-    int node_j = blockIdx.x;  // Current node receiving gradients
+    int node_j = blockIdx.x;  // current node receiving gradients
     int lane_id = threadIdx.x;
 
     if (node_j >= N) return;
@@ -513,7 +514,6 @@ __global__ void GATv2Backward_R(
     const float4* attn_ptr = reinterpret_cast<const float4*>(d_attn_vec);
     int num_float4 = z / 4;
 
-    // Load r_j into shared memory
     {
         const float4* r_ptr = reinterpret_cast<const float4*>(d_r + node_j * z);
         float4* r_shared_f4 = reinterpret_cast<float4*>(r_shared);
@@ -581,7 +581,7 @@ __global__ void GATv2Backward_R(
         // grad_e_ij = α_{ij} * (grad_h_i · r_j - G_i)
         float grad_e_ij = alpha_ij * (dot - G_i);
 
-        // Accumulate both gradient paths
+        // accumulate both gradient paths
         for (int i = 0; i < float4_per_thread; ++i) {
             int idx = lane_id + i * kMaxThreadsInWarp;
             if (idx < num_float4) {
@@ -633,6 +633,7 @@ __global__ void GATv2Backward_R(
     }
 }
 
+
 __global__ void GATv2Backward_A(
     size_t N, size_t z,
     const float* __restrict__ grad_h,
@@ -640,23 +641,22 @@ __global__ void GATv2Backward_A(
     const float* __restrict__ d_r,
     const int* __restrict__ d_row_ptr,
     const int* __restrict__ d_col_idx,
-    const float* __restrict__ d_attn_vec,    // Need this!
+    const float* __restrict__ d_attn_vec,
     const float* __restrict__ d_logsumexp,
     const float* __restrict__ d_G,
-    float* __restrict__ grad_a,              // [z] - OUTPUT
+    float* __restrict__ grad_a,
     float negative_slope
 ) {
     extern __shared__ float shared[];
     float* l_shared = shared;
     float* grad_h_shared = l_shared + z;
-    float* grad_a_local = grad_h_shared + z;  // [z] - local accumulator
+    float* grad_a_local = grad_h_shared + z;
 
     int node_i = blockIdx.x;
     int lane_id = threadIdx.x;
 
     int num_float4 = z / 4;
 
-    // Initialize local grad_a accumulator
     for (int i = lane_id; i < z; i += kMaxThreadsInWarp) {
         grad_a_local[i] = 0.0f;
     }
@@ -670,7 +670,6 @@ __global__ void GATv2Backward_A(
 
     const float4* attn_ptr = reinterpret_cast<const float4*>(d_attn_vec);
 
-    // Load l_i and grad_h_i
     {
         const float4* l_ptr = reinterpret_cast<const float4*>(d_l + node_i * z);
         const float4* gh_ptr = reinterpret_cast<const float4*>(grad_h + node_i * z);
@@ -689,17 +688,14 @@ __global__ void GATv2Backward_A(
     float L_i = d_logsumexp[node_i];
     float G_i = d_G[node_i];
 
-    // grad_a = Σ_{all edges} grad_e_ij · s_ij
-    // where grad_e_ij = α_{ij}(grad_h_i · r_j - G_i)
+    // grad_a = sum_{all edges} grad_e_ij * s_ij
 
     for (int k = 0; k < num_neighbors; ++k) {
         int neighbor_j = d_col_idx[edge_start + k];
         const float4* r_ptr = reinterpret_cast<const float4*>(d_r + neighbor_j * z);
 
-        // Compute e_ij and s_ij = LeakyReLU(l_i + r_j)
         float e_ij = 0.0f;
 
-        // First pass: compute e_ij
         for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
             float4 l_val = l_f4[i];
             float4 r_val = r_ptr[i];
@@ -721,10 +717,9 @@ __global__ void GATv2Backward_A(
         }
         e_ij = warp_reduce_sum(e_ij);
 
-        // Recompute α_{ij}
         float alpha_ij = recompute_alpha(e_ij, L_i);
 
-        // Compute grad_h_i * r_j
+        // grad_h_i * r_j
         float dot = 0.0f;
         for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
             float4 gh = grad_h_f4[i];
@@ -736,7 +731,7 @@ __global__ void GATv2Backward_A(
         // grad_e_ij
         float grad_e_ij = alpha_ij * (dot - G_i);
 
-        // Second pass: accumulate grad_e_ij · s_ij to grad_a_local
+        //  accumulate grad_e_ij * s_ij to grad_a_local
         for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
             float4 l_val = l_f4[i];
             float4 r_val = r_ptr[i];
@@ -752,7 +747,6 @@ __global__ void GATv2Backward_A(
             s.y = leaky_relu_elementwise(z.y, negative_slope);
             s.z = leaky_relu_elementwise(z.z, negative_slope);
             s.w = leaky_relu_elementwise(z.w, negative_slope);
-
 
             float* grad_a_ptr = grad_a_local + i * 4;
             atomicAdd(&grad_a_ptr[0], grad_e_ij * s.x);
@@ -794,7 +788,7 @@ void GATv2Backward_CSR(
     dim3 nThreads(kMaxThreadsInWarp);
     dim3 nBlocks(N);
 
-    // Step 1: Precompute G_i
+    // 1: precompute G_i
     float* d_G;
     CUDA_CHECK(cudaMalloc(&d_G, N * sizeof(float)));
 
@@ -804,21 +798,21 @@ void GATv2Backward_CSR(
         d_logsumexp, d_G, negative_slope
     );
 
-    // Step 2: Compute grad_l
+    // 2:  grad_l
     size_t shared_L = 2 * z * sizeof(float);
     GATv2Backward_L<<<nBlocks, nThreads, shared_L, stream>>>(
         N, z, grad_h, d_l, d_r, d_row_ptr, d_col_idx, d_attn_vec,
         d_logsumexp, d_G, grad_l, negative_slope
     );
 
-    // Step 3: Compute grad_r (uses transposed graph)
+    // 3:  grad_r (uses transposed graph)
     size_t shared_R = z * sizeof(float);  // r_j only
     GATv2Backward_R<<<nBlocks, nThreads, shared_R, stream>>>(
         N, z, grad_h, d_l, d_r, d_row_ptr_T, d_col_idx_T, d_attn_vec,
         d_logsumexp, d_G, grad_r, negative_slope
     );
 
-    // Step 4: Compute grad_a
+    // 4:  grad_a
     size_t shared_A = 3 * z * sizeof(float);  // l_i + grad_h_i + grad_a_local
     GATv2Backward_A<<<nBlocks, nThreads, shared_A, stream>>>(
         N, z, grad_h, d_l, d_r, d_row_ptr, d_col_idx, d_attn_vec,
@@ -826,4 +820,195 @@ void GATv2Backward_CSR(
     );
 
     CUDA_CHECK(cudaFree(d_G));
+}
+
+
+
+
+
+std::vector<torch::Tensor> gatv2_forward_cuda(
+    torch::Tensor l,              // [N, z] - left features
+    torch::Tensor r,              // [N, z] - right features
+    torch::Tensor row_ptr,        // [N+1] - CSR row pointers
+    torch::Tensor col_idx,        // [E] - CSR column indices
+    torch::Tensor attn_vec,       // [z] - attention vector
+    float negative_slope
+) {
+
+    TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
+    TORCH_CHECK(r.is_cuda(), "r must be a CUDA tensor");
+    TORCH_CHECK(row_ptr.is_cuda(), "row_ptr must be a CUDA tensor");
+    TORCH_CHECK(col_idx.is_cuda(), "col_idx must be a CUDA tensor");
+    TORCH_CHECK(attn_vec.is_cuda(), "attn_vec must be a CUDA tensor");
+
+    TORCH_CHECK(l.dtype() == torch::kFloat32, "l must be float32");
+    TORCH_CHECK(r.dtype() == torch::kFloat32, "r must be float32");
+    TORCH_CHECK(attn_vec.dtype() == torch::kFloat32, "attn_vec must be float32");
+    TORCH_CHECK(row_ptr.dtype() == torch::kInt32, "row_ptr must be int32");
+    TORCH_CHECK(col_idx.dtype() == torch::kInt32, "col_idx must be int32");
+
+    TORCH_CHECK(l.dim() == 2, "l must be 2D");
+    TORCH_CHECK(r.dim() == 2, "r must be 2D");
+    TORCH_CHECK(l.size(0) == r.size(0), "l and r must have same number of nodes");
+    TORCH_CHECK(l.size(1) == r.size(1), "l and r must have same feature dimension");
+    TORCH_CHECK(l.size(1) == attn_vec.size(0), "attn_vec dimension must match features");
+    TORCH_CHECK(l.size(1) % 4 == 0, "feature dimension must be divisible by 4");
+
+    TORCH_CHECK(l.is_contiguous(), "l must be contiguous");
+    TORCH_CHECK(r.is_contiguous(), "r must be contiguous");
+    TORCH_CHECK(attn_vec.is_contiguous(), "attn_vec must be contiguous");
+    TORCH_CHECK(row_ptr.is_contiguous(), "row_ptr must be contiguous");
+    TORCH_CHECK(col_idx.is_contiguous(), "col_idx must be contiguous");
+
+    const size_t N = l.size(0);
+    const size_t z = l.size(1);
+    const size_t E = col_idx.size(0);
+
+
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
+
+    torch::Tensor h_out = torch::empty({(long)N, (long)z}, options);
+    torch::Tensor logsumexp = torch::full((long)N, -INFINITY, options);
+
+    const float* d_l = l.data_ptr<float>();
+    const float* d_r = r.data_ptr<float>();
+    const int* d_row_ptr = row_ptr.data_ptr<int>();
+    const int* d_col_idx = col_idx.data_ptr<int>();
+    const float* d_attn_vec = attn_vec.data_ptr<float>();
+    float* d_h_out = h_out.data_ptr<float>();
+    float* d_logsumexp = logsumexp.data_ptr<float>();
+
+    // get CUDA stream from PyTorch
+    // cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = 0;
+
+    // launch kernel
+    GATv2Forward_CSR(
+        N, z,
+        d_l, d_r,
+        d_row_ptr, d_col_idx,
+        d_attn_vec,
+        d_h_out,
+        nullptr,  // logits_out - not needed, legacy
+        d_logsumexp,
+        negative_slope,
+        stream
+    );
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+
+    return {h_out, logsumexp};
+}
+
+
+std::vector<torch::Tensor> gatv2_backward_cuda(
+    torch::Tensor grad_h,         // [N, z] - gradient from output
+    torch::Tensor l,              // [N, z] - left features (saved)
+    torch::Tensor r,              // [N, z] - right features (saved)
+    torch::Tensor row_ptr,        // [N+1] - CSR row pointers
+    torch::Tensor col_idx,        // [E] - CSR column indices
+    torch::Tensor row_ptr_T,      // [N+1] - CSR^T row pointers
+    torch::Tensor col_idx_T,      // [E] - CSR^T column indices
+    torch::Tensor attn_vec,       // [z] - attention vector (saved)
+    torch::Tensor logsumexp,      // [N] - logsumexp (saved)
+    float negative_slope
+) {
+    TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
+    TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
+    TORCH_CHECK(r.is_cuda(), "r must be a CUDA tensor");
+    TORCH_CHECK(row_ptr.is_cuda(), "row_ptr must be a CUDA tensor");
+    TORCH_CHECK(col_idx.is_cuda(), "col_idx must be a CUDA tensor");
+    TORCH_CHECK(row_ptr_T.is_cuda(), "row_ptr_T must be a CUDA tensor");
+    TORCH_CHECK(col_idx_T.is_cuda(), "col_idx_T must be a CUDA tensor");
+    TORCH_CHECK(attn_vec.is_cuda(), "attn_vec must be a CUDA tensor");
+    TORCH_CHECK(logsumexp.is_cuda(), "logsumexp must be a CUDA tensor");
+
+    TORCH_CHECK(grad_h.dtype() == torch::kFloat32, "grad_h must be float32");
+    TORCH_CHECK(l.dtype() == torch::kFloat32, "l must be float32");
+    TORCH_CHECK(r.dtype() == torch::kFloat32, "r must be float32");
+    TORCH_CHECK(attn_vec.dtype() == torch::kFloat32, "attn_vec must be float32");
+    TORCH_CHECK(logsumexp.dtype() == torch::kFloat32, "logsumexp must be float32");
+    TORCH_CHECK(row_ptr.dtype() == torch::kInt32, "row_ptr must be int32");
+    TORCH_CHECK(col_idx.dtype() == torch::kInt32, "col_idx must be int32");
+    TORCH_CHECK(row_ptr_T.dtype() == torch::kInt32, "row_ptr_T must be int32");
+    TORCH_CHECK(col_idx_T.dtype() == torch::kInt32, "col_idx_T must be int32");
+
+    TORCH_CHECK(grad_h.is_contiguous(), "grad_h must be contiguous");
+    TORCH_CHECK(l.is_contiguous(), "l must be contiguous");
+    TORCH_CHECK(r.is_contiguous(), "r must be contiguous");
+    TORCH_CHECK(attn_vec.is_contiguous(), "attn_vec must be contiguous");
+    TORCH_CHECK(logsumexp.is_contiguous(), "logsumexp must be contiguous");
+    TORCH_CHECK(row_ptr.is_contiguous(), "row_ptr must be contiguous");
+    TORCH_CHECK(col_idx.is_contiguous(), "col_idx must be contiguous");
+    TORCH_CHECK(row_ptr_T.is_contiguous(), "row_ptr_T must be contiguous");
+    TORCH_CHECK(col_idx_T.is_contiguous(), "col_idx_T must be contiguous");
+
+    const size_t N = l.size(0);
+    const size_t z = l.size(1);
+
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
+
+    torch::Tensor grad_l = torch::zeros({(long)N, (long)z}, options);
+    torch::Tensor grad_r = torch::zeros({(long)N, (long)z}, options);
+    torch::Tensor grad_a = torch::zeros({(long)z}, options);
+
+    const float* d_grad_h = grad_h.data_ptr<float>();
+    const float* d_l = l.data_ptr<float>();
+    const float* d_r = r.data_ptr<float>();
+    const int* d_row_ptr = row_ptr.data_ptr<int>();
+    const int* d_col_idx = col_idx.data_ptr<int>();
+    const int* d_row_ptr_T = row_ptr_T.data_ptr<int>();
+    const int* d_col_idx_T = col_idx_T.data_ptr<int>();
+    const float* d_attn_vec = attn_vec.data_ptr<float>();
+    const float* d_logsumexp = logsumexp.data_ptr<float>();
+    float* d_grad_l = grad_l.data_ptr<float>();
+    float* d_grad_r = grad_r.data_ptr<float>();
+    float* d_grad_a = grad_a.data_ptr<float>();
+
+    // cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = 0;
+
+    GATv2Backward_CSR(
+        N, z,
+        d_grad_h,
+        d_l, d_r,
+        d_row_ptr, d_col_idx,
+        d_row_ptr_T, d_col_idx_T,
+        d_attn_vec,
+        d_logsumexp,
+        d_grad_l, d_grad_r, d_grad_a,
+        negative_slope,
+        stream
+    );
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+
+    return {grad_l, grad_r, grad_a};
+}
+
+
+
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)",
+          py::arg("l"),
+          py::arg("r"),
+          py::arg("row_ptr"),
+          py::arg("col_idx"),
+          py::arg("attn_vec"),
+          py::arg("negative_slope") = 0.2f);
+
+    m.def("backward", &gatv2_backward_cuda, "GATv2 backward pass (CUDA)",
+          py::arg("grad_h"),
+          py::arg("l"),
+          py::arg("r"),
+          py::arg("row_ptr"),
+          py::arg("col_idx"),
+          py::arg("row_ptr_T"),
+          py::arg("col_idx_T"),
+          py::arg("attn_vec"),
+          py::arg("logsumexp"),
+          py::arg("negative_slope") = 0.2f);
 }
