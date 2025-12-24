@@ -25,5 +25,6 @@ cutlass
 
 *.cubin
 
-
 thirdparty/*
+
+out/*
