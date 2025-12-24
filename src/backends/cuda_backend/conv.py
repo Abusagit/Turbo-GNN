@@ -83,11 +83,6 @@ class _CudaSimpleAggrConv(BaseConvolution):
 class CudaBackend(BaseBackend):
     """Backend instantiating custom CUDA-powered convolutions."""
 
-    # def __init__(self, *, light: torch.Tensor, heavy: torch.Tensor, **kwargs: Any) -> None:
-    #     super().__init__(**kwargs)
-    #     self.light = light.to(dtype=torch.int32, device=light.device)
-    #     self.heavy = heavy.to(dtype=torch.int32, device=heavy.device)
-
     def create_conv(self, conv_type: str, **kwargs: Any):
         """
         Factory for CUDA backend convs.

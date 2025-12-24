@@ -64,21 +64,3 @@ class MinAggrFunction(torch.autograd.Function):
 
 def min_aggr(edge_ptr: torch.Tensor, edge_idx: torch.Tensor, X: torch.Tensor, light, heavy):
     return MinAggrFunction.apply(edge_ptr, edge_idx, X, light, heavy)
-
-
-class MinAggr(torch.nn.Module):
-    """DGL-backed MinAggregation wrapper."""
-
-    def __init__(self, light, heavy, **kwargs) -> None:
-        """Initialize a MinAggr layer using DGL.
-
-        Args:
-            bias (bool): Include bias.
-            **kwargs (Any): Reserved for future options.
-        """
-        super().__init__(**kwargs)
-        self.register_buffer("light", light.to(torch.int32))
-        self.register_buffer("heavy", heavy.to(torch.int32))
-
-    def forward(self, edge_ptr: torch.Tensor, edge_idx: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
-        return min_aggr(edge_ptr, edge_idx, X, self.light, self.heavy)

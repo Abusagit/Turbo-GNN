@@ -10,20 +10,9 @@ constexpr int kWarpSize = 32;
 constexpr int WARPS_PER_BLOCK = 8;
 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-constexpr int F_TILE = 32;
-constexpr int NEI_TILE = 32;
-
-__device__ __forceinline__ void warp_reduce_argmin(float &val, int &src) {
-    #pragma unroll
-    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-        float v2 = __shfl_xor_sync(FULL_WARP_MASK, val, offset);
-        int s2 = __shfl_xor_sync(FULL_WARP_MASK, src, offset);
-        if (v2 < val) {
-            val = v2;
-            src = s2;
-        }
-    }
-}
+// process wedges via chunks in parallel
+constexpr int EDGES_PER_BLOCK = 128;
+constexpr int MAX_CHUNKS = 512;
 
 __global__ void min_aggr_forward_light_kernel_1d(
     const int* __restrict__ nodes,
@@ -60,128 +49,49 @@ __global__ void min_aggr_forward_light_kernel_1d(
     }
 }
 
-__global__ void min_aggr_forward_heavy_kernel(
-    const int* __restrict__ nodes,
-    const int* __restrict__ edge_ptr,
-    const int* __restrict__ edge_idx,
-    const float* __restrict__ X,
-    float* __restrict__ out,
-    int* __restrict__ argmin,
-    int d
-) {
-    int i = blockIdx.x;
-    int v = nodes[i];
-    int row_start = edge_ptr[v];
-    int row_end = edge_ptr[v + 1];
-    int f0 = blockIdx.y * F_TILE;
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int fx = f0 + tx;
-    int fy = f0 + ty;
-
-    // __shared__ float tile_vals[NEI_TILE][F_TILE];
-    // __shared__ int   tile_src[NEI_TILE][F_TILE];
-
-
-    __shared__ float tile_vals[F_TILE][NEI_TILE + 1];
-    __shared__ int   tile_src[NEI_TILE];
-
-    __shared__ float out_vals[F_TILE];
-    __shared__ int   out_srcs[F_TILE];
-
-    float best_val = INFINITY;
-    int best_src = -1;
-
-    for (int base = row_start; base < row_end; base += NEI_TILE) {
-        int eid = base + ty;
-        float val = INFINITY;
-        int src = -1;
-        if (eid < row_end && fx < d) {
-            src = edge_idx[eid];
-            val = X[src * d + fx];
-        }
-
-        // Steps to switch to warp-reduce
-
-
-
-        // Transposed shared memory layout
-        // ++++ !!!!!!!! (0.5) Reduce shared memory banck conflicts similar to matrix tranposition
-        tile_vals[tx][ty] = val;
-        if (tx == 0) {
-            tile_src[ty]  = src;
-        }
-
-        // SHMEM layout:
-        // Neighbor_i_feature_j                | Neighbor_{i + 1}_feature_j                | ... | Neighbor_{i + NEI_TILE - 1}_feature_j
-        // ...
-        // Neighbor_i_feature_{j + F_TILE - 1} | Neighbor_{i + 1}_feature_{j + F_TILE - 1} | ... | Neighbor_{i + NEI_TILE - 1}_feature_{j + F_TILE - 1}
-
-        __syncthreads();
-
-        val = tile_vals[ty][tx];
-        src = tile_src[tx];
-
-        warp_reduce_argmin(val, src);
-
-        if (tx == 0 && fy < d) {
-            if (val < best_val) {
-                best_val = val;
-                best_src = src;
-            }
-        }
-
-        __syncthreads();
-    }
-
-    if (tx == 0) {
-        out_vals[ty] = best_val;
-        out_srcs[ty] = best_src;
-    }
-
-    __syncthreads();
-
-    if (ty == 0 && fx < d) {
-        out[v * d + fx] = out_vals[tx];
-        argmin[v * d + fx] = out_srcs[tx];
+__device__ __forceinline__ unsigned int float_to_ordered_uint(float x) {
+    unsigned int bits = __float_as_uint(x);
+    if (bits & 0x80000000u) {
+        // negative: invert bits so ordering is preserved
+        return ~bits;
+    } else {
+        // non-negative: set sign bit so they come after all negatives
+        return bits | 0x80000000u;
     }
 }
 
-
-
-// IDEA: process wedges via chunks in parallel
-constexpr int EDGES_PER_BLOCK = 128;
-constexpr int MAX_CHUNKS = 512;
+__device__ __forceinline__ float ordered_uint_to_float(unsigned int key) {
+    unsigned int bits;
+    if (key & 0x80000000u) {
+        // non-negative branch
+        bits = key & 0x7fffffffu;
+    } else {
+        // negative branch
+        bits = ~key;
+    }
+    return __uint_as_float(bits);
+}
 
 // pack float and int into uint64 for atomic updates
 __device__ __forceinline__ unsigned long long pack_val_idx(float val, int idx) {
-    return ((unsigned long long)__float_as_uint(val) << 32) | (unsigned long long)(unsigned int)idx;
+    unsigned int key = float_to_ordered_uint(val);
+    return (static_cast<unsigned long long>(key) << 32) |
+           static_cast<unsigned int>(idx);
 }
 
 // unpack float and int from uint64
-__device__ __forceinline__ void unpack_val_idx(unsigned long long packed, float& val, int& idx) {
-    val = __uint_as_float((unsigned int)(packed >> 32));
-    idx = (int)(unsigned int)(packed & 0xFFFFFFFFULL);
-}
-
-// initialize packed buffer for heavy nodes
-__global__ void init_packed_kernel(
-    unsigned long long* __restrict__ packed,
-    const int* __restrict__ nodes,
-    int num_nodes,
-    int d
+__device__ __forceinline__ void unpack_val_idx(
+    unsigned long long packed,
+    float& val,
+    int& idx
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long init_val = pack_val_idx(INFINITY, -1);
+    unsigned int key  = static_cast<unsigned int>(packed >> 32);
+    unsigned int idxu = static_cast<unsigned int>(packed & 0xFFFFFFFFu);
 
-    for (int i = tid; i < num_nodes * d; i += gridDim.x * blockDim.x) {
-        int node_idx = i / d;
-        int f = i % d;
-        int v = nodes[node_idx];
-        packed[v * d + f] = init_val;
-    }
+    val = ordered_uint_to_float(key);
+    idx = static_cast<int>(idxu);
 }
+
 
 // 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
 __global__ void min_aggr_forward_heavy_kernel(
@@ -223,17 +133,10 @@ __global__ void min_aggr_forward_heavy_kernel(
             }
         }
 
-        // atomic update using 64-bit CAS
         if (local_arg >= 0) {
-            unsigned long long* addr = &packed[v * d + f];
+            unsigned long long* addr = &packed[node_idx * d + f];
             unsigned long long new_val = pack_val_idx(local_min, local_arg);
-            unsigned long long old = *addr;
-
-            while (new_val < old) {
-                unsigned long long assumed = old;
-                old = atomicCAS(addr, assumed, new_val);
-                if (old == assumed) break;
-            }
+            atomicMin(addr, new_val);
         }
     }
 }
@@ -256,7 +159,7 @@ __global__ void unpack_results_kernel(
 
         float val;
         int idx;
-        unpack_val_idx(packed[v * d + f], val, idx);
+        unpack_val_idx(packed[node_idx * d + f], val, idx);
 
         out[v * d + f] = val;
         argmin[v * d + f] = idx;
@@ -304,15 +207,12 @@ void min_aggr_forward_partitioned_cuda(
     if (heavy_nodes.numel() > 0) {
         const int num_heavy = heavy_nodes.numel();
 
-        auto packed = at::empty({num_heavy, d},
-            torch::dtype(torch::kInt64).device(X.device()));
-
-        int init_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        init_packed_kernel<<<init_blocks, THREADS_PER_BLOCK>>>(
-            (unsigned long long*)packed.data_ptr<int64_t>(),
-            heavy_nodes.data_ptr<int>(),
-            num_heavy,
-            d
+        // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
+        constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
+        auto packed = at::full(
+            {num_heavy, d},
+            static_cast<int64_t>(PACKED_INIT),
+            at::TensorOptions().dtype(torch::kInt64).device(X.device())
         );
 
         dim3 grid(num_heavy, MAX_CHUNKS);
@@ -324,6 +224,7 @@ void min_aggr_forward_partitioned_cuda(
             (unsigned long long*)packed.data_ptr<int64_t>(),
             d
         );
+
         int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         unpack_results_kernel<<<unpack_blocks, THREADS_PER_BLOCK>>>(
             (unsigned long long*)packed.data_ptr<int64_t>(),
@@ -338,67 +239,6 @@ void min_aggr_forward_partitioned_cuda(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
 }
-
-// void min_aggr_forward_partitioned_cuda(
-//     const at::Tensor& edge_ptr,
-//     const at::Tensor& edge_idx,
-//     const at::Tensor& X,
-//     const at::Tensor& light_nodes,
-//     const at::Tensor& heavy_nodes,
-//     at::Tensor& out,
-//     at::Tensor& argmin
-// ) {
-//     const int d = X.size(1);
-//     const int num_f_blocks = (d + F_TILE - 1) / F_TILE;
-
-//     TORCH_CHECK(edge_ptr.is_cuda(), "edge_ptr must be CUDA");
-//     TORCH_CHECK(edge_idx.is_cuda(), "edge_idx must be CUDA");
-//     TORCH_CHECK(X.is_cuda(), "X must be CUDA");
-//     TORCH_CHECK(light_nodes.is_cuda(), "light_nodes must be CUDA");
-//     TORCH_CHECK(heavy_nodes.is_cuda(), "heavy_nodes must be CUDA");
-
-//     TORCH_CHECK(edge_ptr.dtype() == torch::kInt32, "edge_ptr must be int32");
-//     TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
-//     TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
-//     TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
-//     TORCH_CHECK(X.dtype() == torch::kFloat32, "X must be float32");
-
-
-//     if (light_nodes.numel() > 0) {
-//         const int num_light = light_nodes.numel();
-//         const dim3 blocks(num_light);
-//         min_aggr_forward_light_kernel_1d<<<blocks, THREADS_PER_BLOCK>>>(
-//             light_nodes.data_ptr<int>(),
-//             edge_ptr.data_ptr<int>(),
-//             edge_idx.data_ptr<int>(),
-//             X.data_ptr<float>(),
-//             out.data_ptr<float>(),
-//             argmin.data_ptr<int>(),
-//             d
-//         );
-//     }
-
-//     if (heavy_nodes.numel() > 0) {
-//         const dim3 heavy_threads(F_TILE, NEI_TILE);
-
-//         const int num_heavy = heavy_nodes.numel();
-//         const dim3 blocks(num_heavy, num_f_blocks);
-//         size_t shmem_size = (F_TILE * (NEI_TILE + 2)) * sizeof(float) + (F_TILE + NEI_TILE) * sizeof(int);
-//         min_aggr_forward_heavy_kernel<<<blocks, heavy_threads, shmem_size>>>(
-//             heavy_nodes.data_ptr<int>(),
-//             edge_ptr.data_ptr<int>(),
-//             edge_idx.data_ptr<int>(),
-//             X.data_ptr<float>(),
-//             out.data_ptr<float>(),
-//             argmin.data_ptr<int>(),
-//             d
-//         );
-//     }
-
-//     cudaDeviceSynchronize();
-//     cudaError_t err = cudaGetLastError();
-//     TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
-// }
 
 __global__ void min_aggr_backward(
     const float* __restrict__ grad_out,
