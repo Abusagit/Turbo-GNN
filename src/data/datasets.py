@@ -32,6 +32,7 @@ GraphBackendOption = Literal[
     "cugraph",
     "tcgnn",
     "weighted_sparse_block",
+    "cuda",
 ]  # NOTE we can define cached formalizations via this option
 
 
@@ -49,6 +50,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "fusegnn": "coo",
     "tcgnn": "tcgnn",
     "triton_block_sparse": "weighted_sparse_block",
+    "cuda": "cuda",
 }
 
 
