@@ -4,6 +4,7 @@ from typing import Any
 try:
     import TCGNN
 except ImportError:
+    print("TCGNN is not found!")
     TCGNN = None
 
 import torch
