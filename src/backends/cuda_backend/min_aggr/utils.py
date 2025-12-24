@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import load
 
 path = __file__.replace("utils.py", "")
 # sources = ["min_aggr.cu", "min_aggr_base.cu"]
-sources = ["min_aggr_warp_reduce.cu", "min_aggr_base_warp_reduce.cu"]
+sources = ["min_aggr.cu", "min_aggr_base.cu"]
 repo_root_path = Path(__file__).parent.parent.parent.parent.parent
 build_path = repo_root_path / "build/min_aggr_warp_reduce"
 if not build_path.is_dir():

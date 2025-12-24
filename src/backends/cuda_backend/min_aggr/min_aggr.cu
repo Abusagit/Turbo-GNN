@@ -3,228 +3,169 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 
+#define FULL_WARP_MASK 0xffffffff
 
-constexpr int THREADS_PER_BLOCK = 64;
-constexpr int WARP_SIZE = 32;
+constexpr int kWarpSize = 32;
 
-__global__ void min_aggr_forward_base(
+constexpr int WARPS_PER_BLOCK = 8;
+constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+// process wedges via chunks in parallel
+constexpr int EDGES_PER_BLOCK = 128;
+constexpr int MAX_CHUNKS = 512;
+
+__global__ void min_aggr_forward_light_kernel_1d(
+    const int* __restrict__ nodes,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
     const float* __restrict__ X,
     float* __restrict__ out,
     int* __restrict__ argmin,
-    int num_nodes,
     int d
 ) {
-    int block_idx = blockIdx.x;
-    if (block_idx >= num_nodes) {
-        return;
-    }
+    int i = blockIdx.x;
+    int v = nodes[i];
+
+    int row_start = edge_ptr[v];
+    int row_end   = edge_ptr[v + 1];
 
     int tid = threadIdx.x;
-    int row_start = edge_ptr[block_idx];
-    int row_end = edge_ptr[block_idx + 1];
 
-    #pragma unroll
-    for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
+    for (int f = tid; f < d; f += blockDim.x) {
         float best_val = INFINITY;
         int best_src = -1;
+
         for (int eid = row_start; eid < row_end; ++eid) {
             int src = edge_idx[eid];
-            float v = X[src * d + f];
-            if (v < best_val) {
-                best_val = v;
+            float val = X[src * d + f];
+            if (val < best_val) {
+                best_val = val;
                 best_src = src;
             }
         }
 
-        out[block_idx * d + f] = best_val;
-        argmin[block_idx * d + f] = best_src;
+        out[v * d + f] = best_val;
+        argmin[v * d + f] = best_src;
     }
 }
 
-constexpr int F_TILE = 32; // признаки по иксу
-constexpr int NEI_TILE = 16; // соседи за один заход по игреку
+__device__ __forceinline__ unsigned int float_to_ordered_uint(float x) {
+    unsigned int bits = __float_as_uint(x);
+    if (bits & 0x80000000u) {
+        // negative: invert bits so ordering is preserved
+        return ~bits;
+    } else {
+        // non-negative: set sign bit so they come after all negatives
+        return bits | 0x80000000u;
+    }
+}
 
-__global__ void min_aggr_forward_upgrade(
+__device__ __forceinline__ float ordered_uint_to_float(unsigned int key) {
+    unsigned int bits;
+    if (key & 0x80000000u) {
+        // non-negative branch
+        bits = key & 0x7fffffffu;
+    } else {
+        // negative branch
+        bits = ~key;
+    }
+    return __uint_as_float(bits);
+}
+
+// pack float and int into uint64 for atomic updates
+__device__ __forceinline__ unsigned long long pack_val_idx(float val, int idx) {
+    unsigned int key = float_to_ordered_uint(val);
+    return (static_cast<unsigned long long>(key) << 32) |
+           static_cast<unsigned int>(idx);
+}
+
+// unpack float and int from uint64
+__device__ __forceinline__ void unpack_val_idx(
+    unsigned long long packed,
+    float& val,
+    int& idx
+) {
+    unsigned int key  = static_cast<unsigned int>(packed >> 32);
+    unsigned int idxu = static_cast<unsigned int>(packed & 0xFFFFFFFFu);
+
+    val = ordered_uint_to_float(key);
+    idx = static_cast<int>(idxu);
+}
+
+
+// 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
+__global__ void min_aggr_forward_heavy_kernel(
+    const int* __restrict__ nodes,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
     const float* __restrict__ X,
+    unsigned long long* __restrict__ packed,
+    int d
+) {
+    int node_idx = blockIdx.x;
+    int chunk_idx = blockIdx.y;
+    int v = nodes[node_idx];
+
+    int row_start = edge_ptr[v];
+    int row_end = edge_ptr[v + 1];
+
+    int chunk_start = row_start + chunk_idx * EDGES_PER_BLOCK;
+    int chunk_end = min(chunk_start + EDGES_PER_BLOCK, row_end);
+
+    // exit for chunks beyond this node's edges
+    if (chunk_start >= row_end) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+
+    for (int f = tid; f < d; f += blockDim.x) {
+        float local_min = INFINITY;
+        int local_arg = -1;
+
+        // find local minimum in this chunk
+        for (int eid = chunk_start; eid < chunk_end; ++eid) {
+            int src = edge_idx[eid];
+            float val = X[src * d + f];
+            if (val < local_min) {
+                local_min = val;
+                local_arg = src;
+            }
+        }
+
+        if (local_arg >= 0) {
+            unsigned long long* addr = &packed[node_idx * d + f];
+            unsigned long long new_val = pack_val_idx(local_min, local_arg);
+            atomicMin(addr, new_val);
+        }
+    }
+}
+
+// unpack results back to separate arrays
+__global__ void unpack_results_kernel(
+    const unsigned long long* __restrict__ packed,
+    const int* __restrict__ nodes,
     float* __restrict__ out,
     int* __restrict__ argmin,
     int num_nodes,
     int d
 ) {
-    int v = blockIdx.x; // блок на вершину
-    if (v >= num_nodes) {
-        return;
-    }
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    int f_block = blockIdx.y; // тайл по фичам
-    int f0 = f_block * F_TILE; // первый признак в тайле
+    for (int i = tid; i < num_nodes * d; i += gridDim.x * blockDim.x) {
+        int node_idx = i / d;
+        int f = i % d;
+        int v = nodes[node_idx];
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y; // текущий сосед в тайле
-    int f = f0 + tx; // текущий признак
+        float val;
+        int idx;
+        unpack_val_idx(packed[node_idx * d + f], val, idx);
 
-    int row_start = edge_ptr[v];
-    int row_end = edge_ptr[v + 1];
-
-    __shared__ float tile_vals[NEI_TILE][F_TILE]; // значение f у ty соседа в текущем тайле
-    __shared__ int tile_src[NEI_TILE][F_TILE]; // вершина сосед у которого взяли значение
-
-    float best_val = INFINITY;
-    int best_src = -1;
-
-    for (int base = row_start; base < row_end; base += NEI_TILE) {
-        int eid = base + ty; // номер ребра который щас обрабатываем
-        float val = INFINITY;
-        int src = -1;
-        if (eid < row_end && f < d) {
-            src = edge_idx[eid];
-            val = X[src * d + f];
-        }
-
-        tile_vals[ty][tx] = val;
-        tile_src[ty][tx] = src;
-
-        __syncthreads();
-
-        for (int stride = NEI_TILE / 2; stride > 0; stride /= 2) {
-            if (ty < stride) {
-                float v1 = tile_vals[ty][tx];
-                float v2 = tile_vals[ty + stride][tx];
-                int s1 = tile_src[ty][tx];
-                int s2 = tile_src[ty + stride][tx];
-                if (v2 < v1) {
-                    tile_vals[ty][tx] = v2;
-                    tile_src[ty][tx] = s2;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (ty == 0 && f < d) {
-            float tile_best_val = tile_vals[0][tx];
-            int tile_best_src = tile_src[0][tx];
-            if (tile_best_val < best_val) {
-                best_val = tile_best_val;
-                best_src = tile_best_src;
-            }
-        }
-
-        __syncthreads();
-    }
-
-    if (ty == 0 && f < d) {
-        out[v * d + f] = best_val;
-        argmin[v * d + f] = best_src;
+        out[v * d + f] = val;
+        argmin[v * d + f] = idx;
     }
 }
 
-__device__ __forceinline__ void min_aggr_forward_small(
-    int v,
-    int row_start,
-    int row_end,
-    const int* __restrict__ edge_idx,
-    const float* __restrict__ X,
-    float* __restrict__ out,
-    int* __restrict__ argmin,
-    int d
-) {
-    int f0 = blockIdx.y * F_TILE;
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    if (ty != 0) {
-        return;
-    }
-
-    int f = f0 + tx;
-    if (f >= d) return;
-
-    float best_val = INFINITY;
-    int best_src = -1;
-    for (int eid = row_start; eid < row_end; ++eid) {
-        int src = edge_idx[eid];
-        float val = X[src * d + f];
-        if (val < best_val) {
-            best_val = val;
-            best_src = src;
-        }
-    }
-
-    out[v * d + f] = best_val;
-    argmin[v * d + f] = best_src;
-}
-
-__device__ __forceinline__ void min_aggr_forward_large(
-    int v,
-    int row_start,
-    int row_end,
-    const int* __restrict__ edge_idx,
-    const float* __restrict__ X,
-    float* __restrict__ out,
-    int* __restrict__ argmin,
-    int d
-) {
-    int f0 = blockIdx.y * F_TILE;
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int f = f0 + tx;
-
-    __shared__ float tile_vals[NEI_TILE][F_TILE];
-    __shared__ int   tile_src[NEI_TILE][F_TILE];
-
-    float best_val = INFINITY;
-    int best_src = -1;
-
-    for (int base = row_start; base < row_end; base += NEI_TILE) {
-        int eid = base + ty;
-        float val = INFINITY;
-        int src = -1;
-        if (eid < row_end && f < d) {
-            src = edge_idx[eid];
-            val = X[src * d + f];
-        }
-
-        tile_vals[ty][tx] = val;
-        tile_src[ty][tx]  = src;
-
-        __syncthreads();
-
-        for (int stride = NEI_TILE / 2; stride > 0; stride >>= 1) {
-            if (ty < stride) {
-                float v1 = tile_vals[ty][tx];
-                float v2 = tile_vals[ty + stride][tx];
-                int s1 = tile_src[ty][tx];
-                int s2 = tile_src[ty + stride][tx];
-                if (v2 < v1) {
-                    tile_vals[ty][tx] = v2;
-                    tile_src[ty][tx]  = s2;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (ty == 0 && f < d) {
-            float tile_best_val = tile_vals[0][tx];
-            int tile_best_src = tile_src[0][tx];
-            if (tile_best_val < best_val) {
-                best_val = tile_best_val;
-                best_src = tile_best_src;
-            }
-        }
-
-        __syncthreads();
-    }
-
-    if (ty == 0 && f < d) {
-        out[v * d + f] = best_val;
-        argmin[v * d + f] = best_src;
-    }
-}
 
 void min_aggr_forward_partitioned_cuda(
     const at::Tensor& edge_ptr,
@@ -236,6 +177,7 @@ void min_aggr_forward_partitioned_cuda(
     at::Tensor& argmin
 ) {
     const int d = X.size(1);
+    const int num_out_nodes = out.size(0);
 
     TORCH_CHECK(edge_ptr.is_cuda(), "edge_ptr must be CUDA");
     TORCH_CHECK(edge_idx.is_cuda(), "edge_idx must be CUDA");
@@ -251,10 +193,7 @@ void min_aggr_forward_partitioned_cuda(
 
     if (light_nodes.numel() > 0) {
         const int num_light = light_nodes.numel();
-        dim3 blocks(num_light);
-        dim3 threads(THREADS_PER_BLOCK);
-
-        min_aggr_forward_small<<<blocks, threads>>>(
+        min_aggr_forward_light_kernel_1d<<<num_light, THREADS_PER_BLOCK>>>(
             light_nodes.data_ptr<int>(),
             edge_ptr.data_ptr<int>(),
             edge_idx.data_ptr<int>(),
@@ -268,52 +207,38 @@ void min_aggr_forward_partitioned_cuda(
     if (heavy_nodes.numel() > 0) {
         const int num_heavy = heavy_nodes.numel();
 
-        dim3 blocks(num_heavy);
-        dim3 threads(THREADS_PER_BLOCK);
+        // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
+        constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
+        auto packed = at::full(
+            {num_heavy, d},
+            static_cast<int64_t>(PACKED_INIT),
+            at::TensorOptions().dtype(torch::kInt64).device(X.device())
+        );
 
-        min_aggr_forward_large<<<blocks, threads>>>(
+        dim3 grid(num_heavy, MAX_CHUNKS);
+        min_aggr_forward_heavy_kernel<<<grid, THREADS_PER_BLOCK>>>(
             heavy_nodes.data_ptr<int>(),
             edge_ptr.data_ptr<int>(),
             edge_idx.data_ptr<int>(),
             X.data_ptr<float>(),
+            (unsigned long long*)packed.data_ptr<int64_t>(),
+            d
+        );
+
+        int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        unpack_results_kernel<<<unpack_blocks, THREADS_PER_BLOCK>>>(
+            (unsigned long long*)packed.data_ptr<int64_t>(),
+            heavy_nodes.data_ptr<int>(),
             out.data_ptr<float>(),
             argmin.data_ptr<int>(),
+            num_heavy,
             d
         );
     }
-
+    cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err)
-    );
+    TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
 }
-
-
-__global__ void min_aggr_forward(
-    const int* __restrict__ edge_ptr,
-    const int* __restrict__ edge_idx,
-    const float* __restrict__ X,
-    float* __restrict__ out,
-    int* __restrict__ argmin,
-    int num_nodes,
-    int d
-) {
-    int v = blockIdx.x;
-    if (v >= num_nodes) {
-        return;
-    }
-
-    int row_start = edge_ptr[v];
-    int row_end = edge_ptr[v + 1];
-    int degree = row_end - row_start;
-
-    if (degree <= WARP_SIZE) {
-        min_aggr_forward_small(v, row_start, row_end, edge_idx, X, out, argmin, d);
-    } else {
-        min_aggr_forward_large(v, row_start, row_end, edge_idx, X, out, argmin, d);
-    }
-}
-
-
 
 __global__ void min_aggr_backward(
     const float* __restrict__ grad_out,
@@ -329,7 +254,6 @@ __global__ void min_aggr_backward(
 
     int tid = threadIdx.x;
 
-    #pragma unroll
     for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
         int src = argmin[block_idx * d + f];
         if (src < 0) {
@@ -340,62 +264,6 @@ __global__ void min_aggr_backward(
         atomicAdd(&grad_x[src * d + f], grad);
     }
 }
-
-// void min_aggr_forward_cuda(
-//     const at::Tensor& edge_ptr,
-//     const at::Tensor& edge_idx,
-//     const at::Tensor& X,
-//     at::Tensor& out,
-//     at::Tensor& argmin
-// ) {
-//     const int num_nodes = X.size(0);
-//     const int d = X.size(1);
-
-//     const dim3 blocks(num_nodes);
-//     const dim3 threads(THREADS_PER_BLOCK);
-//     min_aggr_forward<<<blocks, threads>>>(
-//         edge_ptr.data_ptr<int>(),
-//         edge_idx.data_ptr<int>(),
-//         X.data_ptr<float>(),
-//         out.data_ptr<float>(),
-//         argmin.data_ptr<int>(),
-//         num_nodes,
-//         d
-//     );
-
-//     cudaDeviceSynchronize();
-//     cudaError_t err = cudaGetLastError();
-//     TORCH_CHECK(err == cudaSuccess, "forward kernel launch failed: ", cudaGetErrorString(err));
-// }
-
-void min_aggr_forward_cuda(
-    const at::Tensor& edge_ptr,
-    const at::Tensor& edge_idx,
-    const at::Tensor& X,
-    at::Tensor& out,
-    at::Tensor& argmin
-) {
-    const int num_nodes = out.size(0);
-    const int d = out.size(1);
-
-    const int num_f_blocks = (d + F_TILE - 1) / F_TILE;
-    const dim3 blocks(num_nodes, num_f_blocks);
-    const dim3 threads(F_TILE, NEI_TILE);
-    min_aggr_forward<<<blocks, threads>>>(
-        edge_ptr.data_ptr<int>(),
-        edge_idx.data_ptr<int>(),
-        X.data_ptr<float>(),
-        out.data_ptr<float>(),
-        argmin.data_ptr<int>(),
-        num_nodes,
-        d
-    );
-
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "forward kernel launch failed: ", cudaGetErrorString(err));
-}
-
 
 void min_aggr_backward_cuda(
     const at::Tensor& grad_out,
