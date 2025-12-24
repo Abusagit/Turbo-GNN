@@ -211,7 +211,40 @@ class GraphSample:
                 self._to_int32(self._to_default_device(cols)),
                 self._to_int32(self._to_default_device(w)),
             )
+        elif self.backend == "cuda":
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
 
+            # Here we actually transpose adj matrix, that's why not
+            # rows = self.edge_index[0]
+            # cols = self.edge_index[1]
+            rows = self.edge_index[1]
+            cols = self.edge_index[0]
+            N = self.num_nodes
+
+            # Sort edges by (row, col) for a canonical CSR
+            perm = (rows * N + cols).argsort()
+            rows = rows[perm]
+            cols = cols[perm]
+            w = self.edge_weight[perm] if self.edge_weight is not None else None
+
+            # Build CSR row pointers
+            counts = torch.bincount(rows, minlength=N)
+            row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
+            row_ptr[1:] = counts.cumsum(0)
+
+            deg = counts
+            threshold = 128
+            light = (deg < threshold).nonzero(as_tuple=False).view(-1).to(torch.int32)
+            heavy = (deg >= threshold).nonzero(as_tuple=False).view(-1).to(torch.int32)
+
+            # Store graph as (row_pointers, column_indices, edge_weight) on default device
+            graph = (
+                self._to_int32(self._to_default_device(row_ptr)),
+                self._to_int32(self._to_default_device(cols)),
+                self._to_int32(self._to_default_device(light)),
+                self._to_int32(self._to_default_device(heavy)),
+            )
         elif self.backend == "csc":
             ...  # TODO
         elif self.backend == "edge_list":

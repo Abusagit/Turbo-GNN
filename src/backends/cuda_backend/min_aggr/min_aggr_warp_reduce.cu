@@ -304,7 +304,7 @@ void min_aggr_forward_partitioned_cuda(
     if (heavy_nodes.numel() > 0) {
         const int num_heavy = heavy_nodes.numel();
 
-        auto packed = at::empty({num_out_nodes, d},
+        auto packed = at::empty({num_heavy, d},
             torch::dtype(torch::kInt64).device(X.device()));
 
         int init_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
