@@ -11,7 +11,7 @@ import torch
 from torch.utils.cpp_extension import load
 
 path = __file__.replace("utils.py", "")
-sources = ["gatv2_kernel.cu"]
+sources = ["gatv2_kernel2.cu"]
 
 repo_root_path = Path(__file__).parent.parent.parent.parent
 build_path = repo_root_path / "build/cuda_backend"

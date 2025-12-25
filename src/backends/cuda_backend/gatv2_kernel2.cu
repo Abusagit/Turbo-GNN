@@ -24,6 +24,7 @@
 #define FULL_WARP_MASK 0xffffffff
 
 constexpr int kMaxThreadsInWarp = 32;
+constexpr int grad_A_reduce_row_chunk_size = 8192;
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
@@ -444,6 +445,7 @@ __global__ void GATv2Backward_AL(
         }
     }
 
+    __syncthreads();
     // Write G_i to global memory (needed by R kernel)
     if (lane_id == 0) {
         d_G[node_i] = G_i;
@@ -600,6 +602,7 @@ __global__ void GATv2Backward_R(
         }
     }
 
+    __syncthreads();
     // Write grad_rj to global memory
     float4* grad_r_node_f4 = reinterpret_cast<float4*>(grad_r + node_j * z);
     for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
@@ -607,6 +610,58 @@ __global__ void GATv2Backward_R(
     }
 }
 
+
+__global__ void ReduceGradAKernel(
+    int N, int z,
+    const float* __restrict__ grad_a,
+    float* __restrict__ d_grad_a_reduced_out
+
+){
+
+    // define feature chunk and node chunk to reduce
+    int row_chunk_start = grad_A_reduce_row_chunk_size * blockIdx.x;
+    int feature_chunk_start = blockDim.y * blockIdx.y;
+
+
+    // define thread-specific indices and feature locations
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int fx = feature_chunk_start + tx;
+    int fy = feature_chunk_start + ty;
+
+
+    // define shared memory chunk and accumulatur
+    __shared__ float tile_reduce[kMaxThreadsInWarp][kMaxThreadsInWarp + 1];
+    __shared__ float result_accum[kMaxThreadsInWarp];
+
+    float accum = 0.0f;
+
+    // looped logic across row chunks:
+    for (int base_row_offset = row_chunk_start; base_row_offset < min(row_chunk_start + grad_A_reduce_row_chunk_size, N); base_row_offset += blockDim.y){
+
+        int row_to_load = base_row_offset + ty;
+        if (row_to_load < N && fx < z){
+            tile_reduce[tx][ty] = grad_a[row_to_load * z + fx];
+        } else {
+            tile_reduce[tx][ty] = 0.0f;
+        }
+        __syncthreads();
+
+        float value = tile_reduce[ty][tx];
+        accum += warp_reduce_sum(value);
+
+    }
+    // each first lane in a warp write its results into the sshared memory for the first warp to finally reduce it into HBM:
+    if (tx == 0){
+        result_accum[ty] = accum;
+    }
+
+    __syncthreads();
+    // write reduced result:
+    if (ty == 0 and fx < z){
+        atomicAdd(d_grad_a_reduced_out + fx, result_accum[tx]); // TODO for multihead attention, we will need more dimensions here
+    }
+}
 
 // =============================================================================
 // Launcher for backward pass
@@ -625,12 +680,13 @@ void GATv2Backward_CSR(
     const float* d_attn_vec,
     const float* d_logsumexp,
     float negative_slope,
-    cudaStream_t stream = 0,
+    cudaStream_t stream,
 
     // outputs
     float* grad_l,
     float* grad_r,
-    float* grad_a
+    float* grad_a,
+    float* d_grad_a_reduced
 ) {
     dim3 nThreads(kMaxThreadsInWarp);
     dim3 nBlocks(N);
@@ -655,11 +711,19 @@ void GATv2Backward_CSR(
     // Here we need to sum-reduce grad_a (N x z) tensor into (z) vector
     // (in current gatv2_backward_cuda call reduce into first row, but we can change this)
 
+    size_t shmem_gradA_reduce_size = (kMaxThreadsInWarp * (kMaxThreadsInWarp + 2)) * sizeof(float); // deal with shmem bank conflicts
+    dim3 grad_A_reduce_gridDim(
+        (N + grad_A_reduce_row_chunk_size - 1) / grad_A_reduce_row_chunk_size,
+        (z + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp
+    );
+    dim3 grad_A_reduce_blockDim(kMaxThreadsInWarp, kMaxThreadsInWarp);
+
+    ReduceGradAKernel<<<grad_A_reduce_gridDim, grad_A_reduce_blockDim, shmem_gradA_reduce_size>>>(
+        N, z, grad_a, d_grad_a_reduced
+    );
+
     CUDA_CHECK(cudaFree(d_G));
 }
-
-
-
 
 
 std::vector<torch::Tensor> gatv2_forward_cuda(
@@ -787,7 +851,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
     torch::Tensor grad_l = torch::zeros({(long)N, (long)z}, options);
     torch::Tensor grad_r = torch::zeros({(long)N, (long)z}, options);
-    torch::Tensor grad_a = torch::zeros({(long)N, (long)z}, options);
+    torch::Tensor grad_a = torch::zeros({(long)N, (long)z}, options); // used only inside the function
+    torch::Tensor grad_a_reduced = torch::zeros({(long)z}, options); // TODO for multihead,  we need replace z with head_dim * z and make it multidimensional
 
     const float* d_grad_h = grad_h.data_ptr<float>();
     const float* d_l = l.data_ptr<float>();
@@ -801,6 +866,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     float* d_grad_l = grad_l.data_ptr<float>();
     float* d_grad_r = grad_r.data_ptr<float>();
     float* d_grad_a = grad_a.data_ptr<float>();
+    float* d_grad_a_reduced = grad_a_reduced.data_ptr<float>();
 
     // cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     cudaStream_t stream = 0;
@@ -816,13 +882,13 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         negative_slope,
         stream,
 
-        d_grad_l, d_grad_r, d_grad_a
+        d_grad_l, d_grad_r, d_grad_a, d_grad_a_reduced
     );
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
 
-    return {grad_l, grad_r, grad_a[0]};
+    return {grad_l, grad_r, grad_a_reduced};
 }
 
 
