@@ -238,6 +238,14 @@ def load_results_to_comet(results_dict):
     experiment.end()
 
 
+def get_parameters_grid_from_config(parameters_dict: dict[str, list[Any]]):
+    keys = parameters_dict.keys()
+    values = parameters_dict.values()
+
+    parameters_grid = [dict(zip(keys, combo)) for combo in product(*values)]
+    return parameters_grid
+
+
 def main():
     args = parse_args()
 
@@ -247,13 +255,14 @@ def main():
 
     with open(args.conv_params_grid, encoding="utf-8") as f:
         top_level_config = yaml.safe_load(f)
-        kernels_parameters_dict = top_level_config["params_grid"]
 
-        keys = kernels_parameters_dict.keys()
-        values = kernels_parameters_dict.values()
+        conv_parameters_dict = top_level_config.get("params_grid")
+        kernel_specific_parameters_dict = top_level_config.get(
+            "kernel_related_kwargs", {"huge_degree_threshold_quantile": None}
+        )
 
-        convolution_parameters_grid = [dict(zip(keys, combo)) for combo in product(*values)]
-        del keys, values
+        convolution_parameters_grid = get_parameters_grid_from_config(conv_parameters_dict)
+        kernel_specific_parameters_grid_for_datasets = get_parameters_grid_from_config(kernel_specific_parameters_dict)
 
         datasets_config = top_level_config["datasets"]
         base_dir = Path(datasets_config["base_path"])
@@ -283,59 +292,67 @@ def main():
         for dataset_config in datasets_configs_to_load:
             dataset_name = dataset_config["name"]
 
-            graph = load_single_graph(
-                DatasetConfig(
-                    source=dataset_config["source"],
-                    name=dataset_config["name"],
-                    root=dataset_config["root"],
-                    conv_backend=backend,
-                )
-            )
-
-            num_nodes = graph.num_nodes
-            graph_repr = graph.graph_repr
-
-            del graph
-            torch.cuda.empty_cache()
-
-            for layer_parameters_dict_instance in convolution_parameters_grid:
-                feature_dim = layer_parameters_dict_instance["feature_dim"]
-                x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
-
-                try:
-                    conv = backend_module.create_conv(CONV_TYPE, **layer_parameters_dict_instance)
-                    conv = conv.to(DEVICE)
-                except Exception as e:
-                    print(f"Couldnt create conv={CONV_TYPE} for {backend=}. Exception: {e}")
-                    continue
-
-                measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
-
-                common_dict = {
-                    "conv_type": CONV_TYPE,
-                    "dataset": dataset_name,
-                    "backend": backend,
-                }
-
-                experiment_name = generate_experiment_name(
-                    prefix=COMET_EXP_NAME,
-                    conv_type=CONV_TYPE,
-                    backend=backend,
-                    dataset_name=dataset_name,
-                    other_params=layer_parameters_dict_instance,
+            for kernel_specific_dataset_config in kernel_specific_parameters_grid_for_datasets:
+                graph = load_single_graph(
+                    DatasetConfig(
+                        source=dataset_config["source"],
+                        name=dataset_config["name"],
+                        root=dataset_config["root"],
+                        conv_backend=backend,
+                        kernel_related_kwargs=kernel_specific_dataset_config,
+                    )
                 )
 
-                overall_dict = common_dict | layer_parameters_dict_instance | measurements_dict | get_gpu_info()
-                overall_dict["experiment_name"] = experiment_name
+                num_nodes = graph.num_nodes
+                graph_repr = graph.graph_repr
 
-                results_for_table.append(overall_dict)
+                del graph
+                torch.cuda.empty_cache()
 
-                print(dumps(overall_dict, indent=4))
-            else:
-                del x
+                for layer_parameters_dict_instance in convolution_parameters_grid:
+                    feature_dim = layer_parameters_dict_instance["feature_dim"]
+                    x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
 
-            del graph_repr
-            torch.cuda.empty_cache()
+                    try:
+                        conv = backend_module.create_conv(CONV_TYPE, **layer_parameters_dict_instance)
+                        conv = conv.to(DEVICE)
+                    except Exception as e:
+                        print(f"Couldnt create conv={CONV_TYPE} for {backend=}. Exception: {e}")
+                        continue
+
+                    measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
+
+                    common_dict = {
+                        "conv_type": CONV_TYPE,
+                        "dataset": dataset_name,
+                        "backend": backend,
+                    }
+
+                    experiment_name = generate_experiment_name(
+                        prefix=COMET_EXP_NAME,
+                        conv_type=CONV_TYPE,
+                        backend=backend,
+                        dataset_name=dataset_name,
+                        other_params=layer_parameters_dict_instance,
+                    )
+
+                    overall_dict = (
+                        common_dict
+                        | layer_parameters_dict_instance
+                        | measurements_dict
+                        | kernel_specific_dataset_config
+                        | get_gpu_info()
+                    )
+                    overall_dict["experiment_name"] = experiment_name
+
+                    results_for_table.append(overall_dict)
+
+                    print(dumps(overall_dict, indent=4))
+                else:
+                    del x
+
+                del graph_repr
+                torch.cuda.empty_cache()
 
     df_for_dump = (
         pd.DataFrame(results_for_table).sort_values(by=["dataset", "backend", "feature_dim"]).reset_index(drop=True)

@@ -1,5 +1,7 @@
 params_grid:
   feature_dim: [64, 128, 256, 512]
+kernel_related_kwargs:
+  huge_degree_threshold_quantile: [0.99, 0.999, none]
 datasets:
   base_path: configs/datasets
   dirs:

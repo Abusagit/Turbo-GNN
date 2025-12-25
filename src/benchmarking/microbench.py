@@ -109,7 +109,7 @@ def get_gpu_info(device=None) -> dict[str, Any]:
         return {
             "device_name": device_properties.name,
             "device_total_memory_mb": device_properties.total_memory / 2**20,
-            "sm_count": device_properties.name,
+            "sm_count": device_properties.multi_processor_count,
             "compute_capability": f"{device_properties.major}.{device_properties.minor}",
             "max_threads_per_sm": device_properties.max_threads_per_multi_processor,
             "registers_per_sm": device_properties.regs_per_multiprocessor,

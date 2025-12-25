@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Dict, Literal, Mapping, Optional, Tuple
 
@@ -122,6 +122,17 @@ class GraphSample:
     test_mask: Optional[torch.BoolTensor] = None
     _graph_repr: Any = None
     add_self_loops: bool = True
+    kernel_related_kwargs: dict[str, Any] = field(default_factory=lambda: {})
+
+    def update_graph_repr_with_new_hyperparameters(self, new_kernel_related_kwargs):
+        delattr(self, "_graph_repr")
+        torch.cuda.empty_cache()
+        setattr(self, "_graph_repr", None)
+
+        self.kernel_related_kwargs = new_kernel_related_kwargs
+        self.add_self_loops = False  # we have already added self-loops when needed, now we don' have to do it
+        self.__post_init__()
+        return self
 
     def __post_init__(self):
         """
@@ -466,7 +477,12 @@ def _mask_from_indices_with_splits_creation(
 # ------------------------------- OGBN loaders -------------------------------- #
 
 
-def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
+def load_ogbn(
+    name: str,
+    graph_backend: GraphBackendOption,
+    root: str = "data",
+    kernel_related_kwargs: dict[str, Any] = {},
+) -> GraphSample:
     """Load an ogbn-* node property prediction dataset as a single-graph sample.
 
     Args:
@@ -507,6 +523,7 @@ def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") 
         val_mask=val_mask,
         test_mask=test_mask,
         backend=graph_backend,
+        kernel_related_kwargs=kernel_related_kwargs,
     )
 
 
@@ -514,7 +531,11 @@ def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") 
 
 
 def load_pyg_single_graph(
-    name: str, graph_backend: GraphBackendOption, root: str = "data", allow_random_split: bool = False
+    name: str,
+    graph_backend: GraphBackendOption,
+    root: str = "data",
+    allow_random_split: bool = False,
+    kernel_related_kwargs: dict[str, Any] = {},
 ) -> GraphSample:
     """Load a single-graph dataset from PyTorch Geometric.
 
@@ -627,13 +648,16 @@ def load_pyg_single_graph(
         val_mask=val_mask.bool(),
         test_mask=test_mask.bool(),
         backend=graph_backend,
+        kernel_related_kwargs=kernel_related_kwargs,
     )
 
 
 # -------------------------------- DGL loaders -------------------------------- #
 
 
-def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
+def load_dgl_single_graph(
+    name: str, graph_backend: GraphBackendOption, root: str = "data", kernel_related_kwargs: dict[str, Any] = {}
+) -> GraphSample:
     """Load a single-graph dataset from DGL.
 
     Supported (common) names:
@@ -708,6 +732,7 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         val_mask=val_mask.bool(),
         test_mask=test_mask.bool(),
         backend=graph_backend,
+        kernel_related_kwargs=kernel_related_kwargs,
     )
 
 
@@ -730,6 +755,7 @@ class DatasetConfig:
     conv_backend: str
     root: str = "data"
     allow_random_split: bool = False
+    kernel_related_kwargs: dict[str, Any] = field(default_factory=lambda: {})
 
 
 def load_single_graph(cfg: DatasetConfig) -> GraphSample:
@@ -747,25 +773,38 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     assert cfg.conv_backend in MODEL_BACKEND_TO_GRAPH_REPR, f"Unknown conv backend: {cfg.conv_backend}"
     graph_backend = MODEL_BACKEND_TO_GRAPH_REPR[cfg.conv_backend]
 
+    kernel_related_kwargs = cfg.kernel_related_kwargs
+
     s = cfg.source.lower()
     if s == "ogbn":
-        return load_ogbn(cfg.name, root=cfg.root, graph_backend=graph_backend)
+        return load_ogbn(
+            cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+        )
     if s == "pyg":
         return load_pyg_single_graph(
             cfg.name,
             root=cfg.root,
             graph_backend=graph_backend,
             allow_random_split=getattr(cfg, "allow_random_split", False),
+            kernel_related_kwargs=kernel_related_kwargs,
         )
     if s == "dgl":
-        return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=graph_backend)
+        return load_dgl_single_graph(
+            cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+        )
     if s == "auto":
         # ogbn-* -> OGBN; else try PyG; then DGL.
         if cfg.name.lower().startswith("ogbn-"):
-            return load_ogbn(cfg.name, root=cfg.root, graph_backend=graph_backend)
+            return load_ogbn(
+                cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+            )
         try:
-            return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=graph_backend)
+            return load_pyg_single_graph(
+                cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+            )
         except Exception:
-            return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=graph_backend)
+            return load_dgl_single_graph(
+                cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+            )
 
     raise KeyError(f"Unsupported dataset source '{cfg.source}'")
