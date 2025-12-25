@@ -353,6 +353,13 @@ def main():
         "experiment_name",
         axis="columns",
     )
+    # add placeholders in canse of a single backend/dataset/feature_dim parameter
+    if "backend" not in df_without_constant_columns.columns:
+        df_without_constant_columns["backend"] = df_for_dump.loc[0, "backend"]
+    if "feature_dim" not in df_without_constant_columns.columns:
+        df_without_constant_columns["feature_dim"] = df_for_dump.loc[0, "feature_dim"]
+    if "dataset" not in df_without_constant_columns.columns:
+        df_without_constant_columns["dataset"] = df_for_dump.loc[0, "dataset"]
 
     value_cols = [
         col for col in df_without_constant_columns.columns if col not in ["feature_dim", "dataset", "backend"]

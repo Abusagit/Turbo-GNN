@@ -143,12 +143,12 @@ class GraphSample:
         elif self.backend == "normalized_adj_mat_gcn":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="both", add_self_loops=self.add_self_loops
-            )
+            ).to_sparse_csr()
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat_in_degree_normalized_transposed":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="right", add_self_loops=self.add_self_loops
-            )
+            ).to_sparse_csr()
             graph = self._to_default_device(graph)
         elif self.backend == "cugraph":
             normalized_gcn_adjacency = normalize_adj(
@@ -168,12 +168,12 @@ class GraphSample:
         elif self.backend == "adj_mat_transposed":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="none", add_self_loops=self.add_self_loops
-            )
+            ).to_sparse_csr()
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="none", add_self_loops=self.add_self_loops
-            ).T.coalesce()
+            ).T.coalesce()  # TODO make it CSR and compatible with tests!
             graph = self._to_default_device(graph)
         elif self.backend == "coo":
             if self.add_self_loops:
