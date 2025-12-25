@@ -14,7 +14,7 @@ from torch_geometric.datasets import Amazon, Coauthor, Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
-from src.data.converters import WSBFormat, get_cugraph_with_gcn_weights, normalize_adj, to_tcgnn_data
+from src.data.converters import WSBFormat, build_csr_as_is, get_cugraph_with_gcn_weights, normalize_adj, to_tcgnn_data
 
 from .graphland_datasets import GraphLandDataset
 
@@ -197,26 +197,9 @@ class GraphSample:
                 self.num_nodes,
             )
         elif self.backend == "csr":
-            if self.add_self_loops:
-                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
-
-            # Here we actually transpose adj matrix, that's why not
-            # rows = self.edge_index[0]
-            # cols = self.edge_index[1]
-            rows = self.edge_index[1]
-            cols = self.edge_index[0]
-            N = self.num_nodes
-
-            # Sort edges by (row, col) for a canonical CSR
-            perm = (rows * N + cols).argsort()
-            rows = rows[perm]
-            cols = cols[perm]
-            w = self.edge_weight[perm] if self.edge_weight is not None else None
-
-            # Build CSR row pointers
-            counts = torch.bincount(rows, minlength=N)
-            row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
-            row_ptr[1:] = counts.cumsum(0)
+            row_ptr, cols, w, _ = build_csr_as_is(
+                self.edge_index, self.edge_weight, num_nodes=self.num_nodes, add_self_loops=self.add_self_loops
+            )
 
             # Store graph as (row_pointers, column_indices, edge_weight) on default device
             graph = (
@@ -225,39 +208,26 @@ class GraphSample:
                 self._to_int32(self._to_default_device(w)),
             )
         elif self.backend == "cuda":
-            if self.add_self_loops:
-                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
-
-            # Here we actually transpose adj matrix, that's why not
-            # rows = self.edge_index[0]
-            # cols = self.edge_index[1]
-            rows = self.edge_index[1]
-            cols = self.edge_index[0]
-            N = self.num_nodes
-
-            # Sort edges by (row, col) for a canonical CSR
-            perm = (rows * N + cols).argsort()
-            rows = rows[perm]
-            cols = cols[perm]
-            w = self.edge_weight[perm] if self.edge_weight is not None else None
-
-            # Build CSR row pointers
-            counts = torch.bincount(rows, minlength=N)
-            row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
-            row_ptr[1:] = counts.cumsum(0)
+            row_ptr, cols, _w, counts = build_csr_as_is(
+                self.edge_index, self.edge_weight, num_nodes=self.num_nodes, add_self_loops=self.add_self_loops
+            )
 
             deg = counts
-            threshold = 128
-            light = (deg < threshold).nonzero(as_tuple=False).view(-1).to(torch.int32)
-            heavy = (deg >= threshold).nonzero(as_tuple=False).view(-1).to(torch.int32)
 
-            # Store graph as (row_pointers, column_indices, edge_weight) on default device
+            q = 0.9
+            huge_degree_threshold_quantile = torch.quantile(deg.float(), q).item()
+            if huge_degree_threshold_quantile is None:
+                huge_degree_threshold_quantile = max(counts) + 1
+            light = (deg < huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
+            heavy = (deg >= huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
+
             graph = (
                 self._to_int32(self._to_default_device(row_ptr)),
                 self._to_int32(self._to_default_device(cols)),
                 self._to_int32(self._to_default_device(light)),
                 self._to_int32(self._to_default_device(heavy)),
             )
+
         elif self.backend == "csc":
             ...  # TODO
         elif self.backend == "edge_list":

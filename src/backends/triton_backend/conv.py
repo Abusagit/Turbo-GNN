@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-from .kernels_impl import WSBFormat, WSBGraphTransformer, WSBSpMM
+from .kernels_impl import WSBGraphTransformer, WSBSpMM
 
 doc = """
 Triton backend currently support block-sparse format
@@ -32,7 +32,7 @@ class _TritonBlockSparseGraphConv(BaseConvolution):
     def forward(
         self,
         x: torch.Tensor,
-        graph: WSBFormat,
+        graph,
         *,
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.edge_index import EdgeIndex
+from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
 from src.backends.triton_backend.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
 
@@ -431,6 +432,43 @@ def get_cugraph_with_gcn_weights(
         return make_fg_csr(colptr, row)
 
     return CSC(colptr, row, num_src_nodes=num_src_nodes)
+
+
+def build_csr_as_is(
+    edge_index: torch.Tensor, edge_weight: Optional[torch.Tensor], num_nodes: int, add_self_loops: bool
+):
+    """
+    Build CSR exactly as in current code (diff = 0 in logic):
+      rows = edge_index[1], cols = edge_index[0]
+      perm = (rows * N + cols).argsort()
+      counts = bincount(rows)
+      row_ptr[1:] = counts.cumsum(0)
+
+    Returns:
+        row_ptr, cols, w, counts
+    """
+    if add_self_loops:
+        edge_index, edge_weight = add_self_loops_pyg(edge_index, edge_weight)
+
+    # Here we actually transpose adj matrix, that's why not
+    # rows = edge_index[0]
+    # cols = edge_index[1]
+    rows = edge_index[1]
+    cols = edge_index[0]
+    N = num_nodes
+
+    # Sort edges by (row, col) for a canonical CSR
+    perm = (rows * N + cols).argsort()
+    rows = rows[perm]
+    cols = cols[perm]
+    w = edge_weight[perm] if edge_weight is not None else None
+
+    # Build CSR row pointers
+    counts = torch.bincount(rows, minlength=N)
+    row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
+    row_ptr[1:] = counts.cumsum(0)
+
+    return row_ptr, cols, w, counts
 
 
 @dataclass

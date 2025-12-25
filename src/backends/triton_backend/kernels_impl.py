@@ -4,8 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from src.data.converters import WSBFormat
-
+# from src.data.converters import WSBFormat
 from .triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
 
 #####################################################
@@ -110,7 +109,7 @@ def wsb_spmm_kernel_tc(
     tl.store(y_ptrs, acc, mask=row_mask[:, None] & f_mask[None, :])
 
 
-def wsb_spmm_tc_forward(wsb: WSBFormat, X: torch.Tensor) -> torch.Tensor:
+def wsb_spmm_tc_forward(wsb, X: torch.Tensor) -> torch.Tensor:
     """SpMM with tensor cores using Weighted Block Sparse Format"""
     assert X.shape[0] == wsb.num_nodes
     assert X.is_contiguous()
@@ -244,7 +243,7 @@ def wsb_spmm_backward_kernel_tc(
             tl.atomic_add(dX_ptr + col_k * stride_dxn + global_f * stride_dxf, contrib_row_safe, mask=f_mask)
 
 
-def wsb_spmm_backward_tc(wsb: WSBFormat, grad_output: torch.Tensor) -> torch.Tensor:
+def wsb_spmm_backward_tc(wsb, grad_output: torch.Tensor) -> torch.Tensor:
     """
     Backward pass with tensor cores: dX = D^T @ G
     """
@@ -301,7 +300,7 @@ class WSBSpMM(torch.autograd.Function):
     """Autograd function for WSB SpMM"""
 
     @staticmethod
-    def forward(ctx, X: torch.Tensor, wsb: WSBFormat) -> torch.Tensor:
+    def forward(ctx, X: torch.Tensor, wsb) -> torch.Tensor:
         ctx.wsb = wsb
         ctx.save_for_backward(wsb.adjacency_matrices_meta.adj_mat_csr_backward)
         return wsb_spmm_tc_forward(wsb, X)
@@ -802,7 +801,7 @@ class WSBGraphTransformer(torch.autograd.Function):
     """Autograd function for WSB Graph Transformer"""
 
     @staticmethod
-    def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, wsb: WSBFormat) -> torch.Tensor:
+    def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, wsb) -> torch.Tensor:
         Q = Q.half()
         K = K.half()
         V = V.half()
