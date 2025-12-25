@@ -214,7 +214,8 @@ class GraphSample:
 
             deg = counts
 
-            q = 0.9
+            q = self.kernel_related_kwargs["huge_degree_threshold_quantile"]
+
             huge_degree_threshold_quantile = torch.quantile(deg.float(), q).item()
             if huge_degree_threshold_quantile is None:
                 huge_degree_threshold_quantile = max(counts) + 1
