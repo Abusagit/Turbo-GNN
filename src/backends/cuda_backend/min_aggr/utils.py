@@ -11,7 +11,7 @@ import torch
 from torch.utils.cpp_extension import load
 
 path = __file__.replace("utils.py", "")
-# sources = ["min_aggr.cu", "min_aggr_base.cu"]
+
 sources = ["min_aggr.cu", "min_aggr_base.cu"]
 repo_root_path = Path(__file__).parent.parent.parent.parent.parent
 build_path = repo_root_path / "build/min_aggr"
@@ -25,9 +25,7 @@ min_aggr_cuda = load(
     extra_cuda_cflags=[
         "-O3",
         "--use_fast_math",
-        # "-arch=sm_80",
         "--generate-line-info",
-        "-lcusparse",
     ],
     extra_include_paths=[
         # *glob.glob(str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True),
