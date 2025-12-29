@@ -60,5 +60,4 @@ class F3SBackend(BaseBackend):
 
         if conv_type == "graph_transformer":
             return F3SATConv(feature_dim)
-
         raise ValueError("Unkown conv type")
