@@ -7,7 +7,8 @@ from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-from .gatv2_aggr.utils import gatv2_function
+from .gatv2_aggr.utils import gatv2_aggr
+from .gt_aggr.utils import graph_transformer_aggr
 from .min_aggr.utils import min_aggr
 
 doc = """
@@ -144,7 +145,7 @@ class _CUDAGATv2Conv(BaseConvolution):
         indptr_backward = graph.backward_indptr
         indices_backward = graph.backward_indices
 
-        out = gatv2_function.apply(
+        out = gatv2_aggr(
             indptr_forward,
             indices_forward,
             indptr_backward,
@@ -155,6 +156,51 @@ class _CUDAGATv2Conv(BaseConvolution):
             self.negative_slope,
         )
         out = self._outer_proj(out)
+        return out
+
+
+class _CudaGraphTransformerConv(BaseConvolution):
+    """CUDA-based Fused graph transformer"""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        heads: int = 8,
+        **kwargs,
+    ):
+        super().__init__(bias=False, dropout=0.0)
+        if heads > 1:
+            raise NotImplementedError("Currently only single head attention is supported, work in progress")
+
+        self.feature_dim = feature_dim
+        self.num_heads = heads
+        self.qkv_proj = nn.Linear(self.feature_dim, 3 * self.feature_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Apply GraphConv.
+
+        Args:
+            x (torch.Tensor): Node features [N, Fin].
+            graph (Any): graph representation for current backend and convolution
+            **kwargs (Any): Extra kwargs (ignored).
+
+        Returns:
+            torch.Tensor: Output features [N, Fout].
+        """
+        x = torch.nn.functional.layer_norm(x, (x.shape[-1],))
+        qkv: torch.Tensor = self.qkv_proj(x)
+        q, k, v = qkv.split(self.feature_dim, -1)
+        edge_ptr = graph.forward_indptr
+        edge_idx = graph.forward_indices
+        mid_nodes = graph.light_nodes
+        huge_nodes = graph.heavy_nodes
+
+        out = graph_transformer_aggr(edge_ptr, edge_idx, mid_nodes, huge_nodes, q, k, v)
         return out
 
 
@@ -190,4 +236,8 @@ class CUDABackend(BaseBackend):
                     bias=False,
                     **kwargs,
                 )
+            case "gt":
+                heads = kwargs.pop("heads")
+                return _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
+
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")

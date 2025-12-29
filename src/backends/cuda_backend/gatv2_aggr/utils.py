@@ -102,3 +102,25 @@ class gatv2_function(torch.autograd.Function):
         )
 
         return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None
+
+
+def gatv2_aggr(
+    indptr_forward: torch.Tensor,
+    indices_forward: torch.Tensor,
+    indptr_backward: torch.Tensor,
+    indices_backward: torch.Tensor,
+    x_left: torch.Tensor,
+    x_right: torch.Tensor,
+    attention_weights: torch.Tensor,
+    negative_slope: float,
+):
+    return gatv2_function.apply(
+        indptr_forward,
+        indices_forward,
+        indptr_backward,
+        indices_backward,
+        x_left,
+        x_right,
+        attention_weights,
+        negative_slope,
+    )

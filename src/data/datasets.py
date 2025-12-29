@@ -211,6 +211,7 @@ class GraphSample:
         elif self.backend == "csr":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+            graph = self.edge_index_to_csr(edge_index=self.edge_index, edge_weight=self.edge_weight, transposed=True)
 
             row_ptr, cols, w, _ = build_csr_as_is(
                 self.edge_index, self.edge_weight, num_nodes=self.num_nodes, do_transpose=True
@@ -365,6 +366,35 @@ class GraphSample:
         except Exception:
             pass
         return item
+
+    def edge_index_to_csr(self, edge_index: torch.Tensor, edge_weight: torch.Tensor | None, transposed: bool = True):
+        if transposed:
+            rows = edge_index[1]
+            cols = edge_index[0]
+        else:
+            rows = edge_index[0]
+            cols = edge_index[1]
+
+        N = self.num_nodes
+
+        # Sort edges by (row, col) for a canonical CSR
+        perm = (rows * N + cols).argsort()
+        rows = rows[perm]
+        cols = cols[perm]
+        w = edge_weight[perm] if edge_weight is not None else None
+
+        # Build CSR row pointers
+        counts = torch.bincount(rows, minlength=N)
+        row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
+        row_ptr[1:] = counts.cumsum(0)
+
+        # Store graph as (row_pointers, column_indices, edge_weight) on default device
+        graph = (
+            self._to_int32(self._to_default_device(row_ptr)),
+            self._to_int32(self._to_default_device(cols)),
+            self._to_int32(self._to_default_device(w)),
+        )
+        return graph
 
     @property
     def num_nodes(self) -> int:

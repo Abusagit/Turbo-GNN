@@ -243,6 +243,7 @@ class _DglGraphTransformer(BaseConvolution):
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         # get node features
         n = graph.num_nodes()
+        x = torch.nn.functional.layer_norm(x, (x.shape[-1],))
 
         qkv: torch.Tensor = self.qkv_proj(x)
         q, k, v = qkv.split(self.feature_dim, -1)

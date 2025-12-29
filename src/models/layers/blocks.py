@@ -38,7 +38,7 @@ class ResidualBlock(torch.nn.Module):
             activation (str): Post-norm activation.
             norm (str): 'batch'|'layer'|'none'.
             dropout (float): Dropout after activation.
-            residual (bool): Residual if dims match.
+            residual (bool): Use residual.
             **conv_kwargs (Any): Extra kwargs forwarded to backend attention conv (concat, dropout, etc.).
 
         """
@@ -49,6 +49,8 @@ class ResidualBlock(torch.nn.Module):
         self.projection = nn.Linear(in_channels, out_channels)
         self.act = activation_factory(activation, dim=self.out_channels)
 
+        self.projection = nn.Linear(in_channels, out_channels)
+        self.out_channels = out_channels
         self.conv = create_conv_layer(
             conv_type,
             backend,
