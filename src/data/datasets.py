@@ -14,6 +14,8 @@ from torch_geometric.datasets import Amazon, Coauthor, Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
+
+from src.backends.fused3s_backend.bindings import f3s_preprocess
 from src.data.converters import WSBFormat, build_csr_as_is, get_cugraph_with_gcn_weights, normalize_adj, to_tcgnn_data
 
 from .graphland_datasets import GraphLandDataset
@@ -32,6 +34,7 @@ GraphBackendOption = Literal[
     "cugraph",
     "tcgnn",
     "weighted_sparse_block",
+    "f3s",
     "cuda",
     "cuda_weighted_sparse_block_with_meta",
 ]  # NOTE we can define cached formalizations via this option
@@ -51,6 +54,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "fusegnn": "coo",
     "tcgnn": "tcgnn",
     "triton_block_sparse": "weighted_sparse_block",
+    "f3s": "f3s",
     "cuda": "cuda",
 }
 
@@ -276,6 +280,9 @@ class GraphSample:
             # TODO speedud construction via GPU-based operation
             graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
             # TODO add light & heavy vertices
+
+        elif self.backend == "f3s":
+            graph = f3s_preprocess(self.edge_index)
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"

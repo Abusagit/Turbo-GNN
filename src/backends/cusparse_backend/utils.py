@@ -1,8 +1,9 @@
 import os
 
-os.environ["CUDA_HOME"] = "/usr/local/cuda"
-os.environ["CUDA_PATH"] = "/usr/local/cuda"
-os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
+if os.environ.get("CUDA_HOME") is None:
+    os.environ["CUDA_HOME"] = "/usr/local/cuda"
+    os.environ["CUDA_PATH"] = "/usr/local/cuda"
+    os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
 
 import glob
 from pathlib import Path
@@ -31,7 +32,7 @@ cuda_kernels = load(
     ],
     extra_include_paths=[
         # *glob.glob(str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True),
-        "/usr/local/cuda/include"
+        os.environ["CUDA_HOME"]
     ],
     sources=[path + s for s in sources],
     verbose=True,
