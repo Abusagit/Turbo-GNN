@@ -44,7 +44,7 @@ class F3SBackend(BaseBackend):
         """Factory for fused3s convolution layers.
 
         Args:
-            conv_type (str): "grap_transformer"
+            conv_type (str): "gt"
             **kwargs (Any): ignored.
         Returns:
             BaseConvolution: An instance of the requested Fused3S conv.
@@ -54,6 +54,6 @@ class F3SBackend(BaseBackend):
 
         conv_type = conv_type.lower()
 
-        if conv_type == "graph_transformer":
+        if conv_type == "gt":
             return F3SATConv(feature_dim)
         raise ValueError("Unkown conv type")
