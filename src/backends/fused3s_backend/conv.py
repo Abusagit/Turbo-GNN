@@ -48,7 +48,6 @@ class F3SBackend(BaseBackend):
 
         Args:
             conv_type (str): "grap_transformer"
-            cu_sparse_algorithm_id (int): algorithm for CuSparse to use: -1 (default), 0, 1, 2, 3.
             **kwargs (Any): ignored.
         Returns:
             BaseConvolution: An instance of the requested Fused3S conv.
