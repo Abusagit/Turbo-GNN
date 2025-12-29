@@ -14,7 +14,7 @@ from torch_geometric.datasets import Amazon, Coauthor, Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
-from src.backends.fused3s.bindings import f3s_preprocess
+from src.backends.fused3s_backend.bindings import f3s_preprocess
 from src.data.converters import WSBFormat, get_cugraph_with_gcn_weights, normalize_adj, to_tcgnn_data
 
 from .graphland_datasets import GraphLandDataset
@@ -247,7 +247,7 @@ class GraphSample:
             graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
 
         elif self.backend == "f3s":
-            graph = f3s_preprocess(self.edge_index, self.edge_weight)
+            graph = f3s_preprocess(self.edge_index)
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"

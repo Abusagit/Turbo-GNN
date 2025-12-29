@@ -32,7 +32,7 @@ class F3SATConv(BaseConvolution):
         self.block_w = block_w
 
     def forward(self, x, graph, **kwargs):
-        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q, k, v = self.q_proj(x).to(torch.half), self.k_proj(x).to(torch.half), self.v_proj(x).to(torch.half)
         return _F3SATConv.apply(q, k, v, graph, self.block_h, self.block_w)
 
     def backward(self, grad_output):

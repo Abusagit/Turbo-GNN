@@ -55,6 +55,5 @@ repos:
         name: Run pytest
         entry: make test
         language: system
-        args: ['-vv']
         pass_filenames: false
         always_run: true
