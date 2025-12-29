@@ -1,18 +1,21 @@
 from typing import Any, Literal
 
 import torch
+from torch import nn
+
+from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
+from .gatv2_aggr.utils import gatv2_function
 from .min_aggr.utils import min_aggr
 
 doc = """
-CUDA Backend: custom CUDA extensions (min_aggr + backward).
-Expects CSR graph representation: (edge_ptr, edge_idx).
+CUDA backend: wraps cuda-written kernels .
 """
 
 
-class _CudaMinAggrConv(BaseConvolution):
+class _CudaMinAggrConv(nn.Module):
     """
     Min-aggregation convolution using custom CUDA extension.
 
@@ -26,41 +29,28 @@ class _CudaMinAggrConv(BaseConvolution):
 
     def __init__(
         self,
-        *,
-        bias: bool = False,
-        **kwargs: Any,
+        /,
+        **kwargs,
     ) -> None:
-        super().__init__(bias=bias, **kwargs)
-        if bias:
-            raise NotImplementedError("bias=True is not supported for pure min aggregation in this backend.")
+        super().__init__()
         warps_per_block = kwargs.get("warps_per_block", 8)
         edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
 
         self.warps_per_block = warps_per_block
         self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
 
-        self.forward_meta = {
-            "warps_per_block": warps_per_block,
-            "edges_per_block_heavy_nodes": edges_per_block_heavy_nodes,
-        }
-        self.backward_meta = {"warps_per_block": warps_per_block}
-
     def forward(
         self,
         x: torch.Tensor,
-        graph: Any,
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
         *,
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if len(graph) >= 4:
-            edge_ptr, edge_idx, light, heavy = graph[0], graph[1], graph[2], graph[3]
-        elif len(graph) == 3:
-            edge_ptr, edge_idx, _w = graph
-            raise ValueError("cuda_backend needs (edge_ptr, edge_idx, light, heavy) in graph.")
-        else:
-            edge_ptr, edge_idx = graph
-            raise ValueError("cuda_backend needs (edge_ptr, edge_idx, light, heavy) in graph.")
+        edge_ptr = graph.forward_indptr
+        edge_idx = graph.forward_indices
+        light = graph.light_nodes
+        heavy = graph.heavy_nodes
 
         return min_aggr(edge_ptr, edge_idx, x, light, heavy, self.warps_per_block, self.edges_per_block_heavy_nodes)
 
@@ -76,51 +66,17 @@ class _CudaSimpleAggrConv(BaseConvolution):
         super().__init__(bias=bias, **kwargs)
         if aggr_type != "min":
             raise NotImplementedError(f"Only aggr_type='min' is implemented, got {aggr_type}")
-        self.conv = _CudaMinAggrConv(bias=bias)
+        self.conv = _CudaMinAggrConv(**kwargs)
 
     def forward(
         self,
         x: torch.Tensor,
-        graph: Any,
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
         *,
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         return self.conv(x, graph, edge_weight=edge_weight, **kwargs)
-
-
-@BackendRegistry.register_backend("cuda")
-class CudaBackend(BaseBackend):
-    """Backend instantiating custom CUDA-powered convolutions."""
-
-    def create_conv(self, conv_type: str, **kwargs: Any):
-        """
-        Factory for CUDA backend convs.
-
-        Supported:
-          - "min_aggr"
-        """
-        _ = kwargs.pop("feature_dim", None)
-
-        if conv_type == "min_aggr":
-            return _CudaSimpleAggrConv(
-                aggr_type="min",
-                bias=False,
-            )
-
-        raise KeyError(f"Unsupported conv_type for cuda backend: {conv_type}")
-from typing import Any
-
-import torch
-from torch import nn
-
-from ..base import BaseBackend, BaseConvolution
-from ..registry import BackendRegistry
-from .utils import gatv2_function
-
-doc = """
-CUDA backend: wraps cuda-written kernels .
-"""
 
 
 class _CUDAGATv2Conv(BaseConvolution):
@@ -144,7 +100,7 @@ class _CUDAGATv2Conv(BaseConvolution):
         super().__init__(num_heads=heads, bias=bias, **kwargs)
 
         self.left_projection = nn.Linear(feature_dim, feature_dim * heads, bias=bias)
-        self.rgith_projection = nn.Linear(feature_dim, feature_dim * heads, bias=bias)
+        self.right_projection = nn.Linear(feature_dim, feature_dim * heads, bias=bias)
 
         self._outer_proj = torch.nn.Linear(feature_dim * heads, feature_dim, bias=bias)
 
@@ -163,7 +119,7 @@ class _CUDAGATv2Conv(BaseConvolution):
     def forward(
         self,
         x: torch.Tensor,
-        graph: Any,
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
         *,
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
@@ -181,14 +137,12 @@ class _CUDAGATv2Conv(BaseConvolution):
         """
 
         x_left = self.left_projection(x)
-        x_right = self.rgith_projection(x)
+        x_right = self.right_projection(x)
 
-        (
-            indptr_forward,
-            indices_forward,
-            indptr_backward,
-            indices_backward,
-        ) = graph
+        indptr_forward = graph.forward_indptr
+        indices_forward = graph.forward_indices
+        indptr_backward = graph.backward_indptr
+        indices_backward = graph.backward_indices
 
         out = gatv2_function.apply(
             indptr_forward,
@@ -216,7 +170,7 @@ class CUDABackend(BaseBackend):
         """Factory for CUDA convolution layers.
 
         Args:
-            conv_type (str): 'gcn' or 'gat_v2' currently. (Extend with GIN/SAGE as needed.)
+            conv_type (str): 'gat_v2' or 'min_aggr' currently.
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments for CUDA layers.
 
@@ -229,5 +183,11 @@ class CUDABackend(BaseBackend):
         match ct:
             case "gat_v2":
                 heads = kwargs.pop("heads")
-                return _CUDAGATv2Conv(feature_dim=feature_dim, heads=heads)
+                return _CUDAGATv2Conv(feature_dim=feature_dim, heads=heads, **kwargs)
+            case "min_aggr":
+                return _CudaSimpleAggrConv(
+                    aggr_type="min",
+                    bias=False,
+                    **kwargs,
+                )
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")

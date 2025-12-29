@@ -1,3 +1,3 @@
-from .conv import CudaBackend
+from .conv import CUDABackend
 
-__all__ = ["CudaBackend"]
+__all__ = ["CUDABackend"]

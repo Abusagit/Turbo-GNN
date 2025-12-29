@@ -440,7 +440,10 @@ def get_cugraph_with_gcn_weights(
 
 
 def build_csr_as_is(
-    edge_index: torch.Tensor, edge_weight: Optional[torch.Tensor], num_nodes: int, add_self_loops: bool
+    edge_index: torch.Tensor,
+    edge_weight: Optional[torch.Tensor],
+    num_nodes: int,
+    do_transpose: bool = False,
 ):
     """
     Build CSR exactly as in current code (diff = 0 in logic):
@@ -452,23 +455,23 @@ def build_csr_as_is(
     Returns:
         row_ptr, cols, w, counts
     """
-    if add_self_loops:
-        edge_index, edge_weight = add_self_loops_pyg(edge_index, edge_weight)
 
-    # Here we actually transpose adj matrix, that's why not
-    # rows = edge_index[0]
-    # cols = edge_index[1]
-    rows = edge_index[1]
-    cols = edge_index[0]
+    if do_transpose:
+        rows = edge_index[1]
+        cols = edge_index[0]
+    else:
+        rows = edge_index[0]
+        cols = edge_index[1]
+
     N = num_nodes
 
-    # Sort edges by (row, col) for a canonical CSR
+    # sort edges by (row, col) for a canonical CSR
     perm = (rows * N + cols).argsort()
     rows = rows[perm]
     cols = cols[perm]
     w = edge_weight[perm] if edge_weight is not None else None
 
-    # Build CSR row pointers
+    # build CSR row pointers
     counts = torch.bincount(rows, minlength=N)
     row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
     row_ptr[1:] = counts.cumsum(0)
@@ -488,6 +491,15 @@ class AdjacencyForwardBackwardCSR:
     adj_mat_csr_forward: torch.Tensor
     adj_mat_csr_backward: torch.Tensor
 
+    _device: torch.device = torch.device("cpu")
+
+    def __post__init__(self):
+        self._device = self.adj_mat_csr_forward.device
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
     def to(self, device) -> "AdjacencyForwardBackwardCSR":
         adj_mat_csr_forward_device = self.adj_mat_csr_forward.to(device)
         if id(self.adj_mat_csr_forward) == id(self.adj_mat_csr_backward):
@@ -495,10 +507,41 @@ class AdjacencyForwardBackwardCSR:
         else:
             adj_mat_csr_backward_device = self.adj_mat_csr_backward.to(device)
 
-        return AdjacencyForwardBackwardCSR(
-            adj_mat_csr_forward=adj_mat_csr_forward_device,
-            adj_mat_csr_backward=adj_mat_csr_backward_device,
-        )
+        self.adj_mat_csr_forward = adj_mat_csr_forward_device
+        self.adj_mat_csr_forward = adj_mat_csr_backward_device
+        torch.cuda.empty_cache()
+        self._device = device
+        return self
+
+
+@dataclass
+class AdjacencyForwardBackwardWithNodeBuckets:
+    forward_indptr: torch.Tensor
+    forward_indices: torch.Tensor
+    backward_indptr: torch.Tensor
+    backward_indices: torch.Tensor
+    light_nodes: torch.Tensor
+    heavy_nodes: torch.Tensor
+
+    _device: torch.device = torch.device("cpu")
+
+    def __post__init__(self):
+        self._device = self.forward_indptr.device
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    def to(self, device) -> "AdjacencyForwardBackwardWithNodeBuckets":
+        self.forward_indptr = self.forward_indptr.to(device)
+        self.forward_indices = self.forward_indices.to(device)
+        self.backward_indptr = self.backward_indptr.to(device)
+        self.backward_indices = self.backward_indices.to(device)
+        self.light_nodes = self.light_nodes.to(device)
+        self.heavy_nodes = self.heavy_nodes.to(device)
+        torch.cuda.empty_cache()
+
+        return self
 
 
 @dataclass
