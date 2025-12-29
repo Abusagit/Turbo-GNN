@@ -6,13 +6,8 @@
 #define FULL_WARP_MASK 0xffffffff
 
 constexpr int kWarpSize = 32;
+constexpr int MAX_NUM_EDGES = 131072; // TODO we are limited by this constant
 
-constexpr int WARPS_PER_BLOCK = 8;
-constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
-
-// process wedges via chunks in parallel
-constexpr int EDGES_PER_BLOCK = 128;
-constexpr int MAX_CHUNKS = 512;
 
 __global__ void min_aggr_forward_light_kernel_1d(
     const int* __restrict__ nodes,
@@ -94,6 +89,7 @@ __device__ __forceinline__ void unpack_val_idx(
 
 
 // 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
+template<int EDGES_PER_BLOCK>
 __global__ void min_aggr_forward_heavy_kernel(
     const int* __restrict__ nodes,
     const int* __restrict__ edge_ptr,
@@ -124,6 +120,7 @@ __global__ void min_aggr_forward_heavy_kernel(
         int local_arg = -1;
 
         // find local minimum in this chunk
+        #pragma unroll
         for (int eid = chunk_start; eid < chunk_end; ++eid) {
             int src = edge_idx[eid];
             float val = X[src * d + f];
@@ -174,8 +171,28 @@ void min_aggr_forward_partitioned_cuda(
     const at::Tensor& light_nodes,
     const at::Tensor& heavy_nodes,
     at::Tensor& out,
-    at::Tensor& argmin
+    at::Tensor& argmin,
+    int warps_per_block = 8,
+    int edges_per_block_heavy_nodes = 128
 ) {
+    int THREADS_PER_BLOCK;
+
+    if (warps_per_block == 1){
+        THREADS_PER_BLOCK = 1 * kWarpSize;
+    } else if (warps_per_block == 2) {
+        THREADS_PER_BLOCK = 2 * kWarpSize;
+    } else if (warps_per_block == 4) {
+        THREADS_PER_BLOCK = 4 * kWarpSize;
+    } else if (warps_per_block == 8) {
+        THREADS_PER_BLOCK = 8 * kWarpSize;
+    } else if (warps_per_block == 16) {
+        THREADS_PER_BLOCK = 16 * kWarpSize;
+    } else if (warps_per_block == 32) {
+        THREADS_PER_BLOCK = 32 * kWarpSize;
+    } else {
+        THREADS_PER_BLOCK = 2048;
+    }
+
     const int d = X.size(1);
     const int num_out_nodes = out.size(0);
 
@@ -204,9 +221,9 @@ void min_aggr_forward_partitioned_cuda(
         );
     }
 
-    if (heavy_nodes.numel() > 0) {
-        const int num_heavy = heavy_nodes.numel();
+    const int num_heavy = heavy_nodes.numel();
 
+    if (num_heavy > 0) {
         // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
         constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
         auto packed = at::full(
@@ -215,15 +232,94 @@ void min_aggr_forward_partitioned_cuda(
             at::TensorOptions().dtype(torch::kInt64).device(X.device())
         );
 
-        dim3 grid(num_heavy, MAX_CHUNKS);
-        min_aggr_forward_heavy_kernel<<<grid, THREADS_PER_BLOCK>>>(
-            heavy_nodes.data_ptr<int>(),
-            edge_ptr.data_ptr<int>(),
-            edge_idx.data_ptr<int>(),
-            X.data_ptr<float>(),
-            (unsigned long long*)packed.data_ptr<int64_t>(),
-            d
-        );
+        ;
+        if (edges_per_block_heavy_nodes == 32){
+            constexpr int EDGES_PER_BLOCK = 32;
+            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<float>(),
+                (unsigned long long*)packed.data_ptr<int64_t>(),
+                d
+            );
+
+        } else if (edges_per_block_heavy_nodes == 64) {
+            constexpr int EDGES_PER_BLOCK = 64;
+            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<float>(),
+                (unsigned long long*)packed.data_ptr<int64_t>(),
+                d
+            );
+
+        } else if (edges_per_block_heavy_nodes == 128) {
+            constexpr int EDGES_PER_BLOCK = 128;
+            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<float>(),
+                (unsigned long long*)packed.data_ptr<int64_t>(),
+                d
+            );
+        } else if (edges_per_block_heavy_nodes == 256) {
+            constexpr int EDGES_PER_BLOCK = 256;
+            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<float>(),
+                (unsigned long long*)packed.data_ptr<int64_t>(),
+                d
+            );
+        } else if (edges_per_block_heavy_nodes == 512) {
+            constexpr int EDGES_PER_BLOCK = 512;
+            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<float>(),
+                (unsigned long long*)packed.data_ptr<int64_t>(),
+                d
+            );
+        } else if (edges_per_block_heavy_nodes == 1024) {
+            constexpr int EDGES_PER_BLOCK = 1024;
+            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<float>(),
+                (unsigned long long*)packed.data_ptr<int64_t>(),
+                d
+            );
+        } else {
+            constexpr int EDGES_PER_BLOCK = 2048;
+            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<float>(),
+                (unsigned long long*)packed.data_ptr<int64_t>(),
+                d
+            );
+        }
 
         int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         unpack_results_kernel<<<unpack_blocks, THREADS_PER_BLOCK>>>(
@@ -255,7 +351,7 @@ __global__ void min_aggr_backward(
     int tid = threadIdx.x;
 
     #pragma unroll
-    for (int f = tid; f < d; f += THREADS_PER_BLOCK) {
+    for (int f = tid; f < d; f += blockDim.x) {
         int src = argmin[block_idx * d + f];
         if (src < 0) {
             continue;
@@ -269,12 +365,31 @@ __global__ void min_aggr_backward(
 void min_aggr_backward_cuda(
     const at::Tensor& grad_out,
     const at::Tensor& argmin,
-    at::Tensor& grad_x
+    at::Tensor& grad_x,
+    int warps_per_block = 8
 ) {
+    int THREADS_PER_BLOCK;
     const int num_nodes = grad_out.size(0);
     const int d = grad_out.size(1);
 
     const dim3 blocks(num_nodes);
+
+    if (warps_per_block == 1){
+        THREADS_PER_BLOCK = 1 * kWarpSize;
+    } else if (warps_per_block == 2) {
+        THREADS_PER_BLOCK = 2 * kWarpSize;
+    } else if (warps_per_block == 4) {
+        THREADS_PER_BLOCK = 4 * kWarpSize;
+    } else if (warps_per_block == 8) {
+        THREADS_PER_BLOCK = 8 * kWarpSize;
+    } else if (warps_per_block == 16) {
+        THREADS_PER_BLOCK = 16 * kWarpSize;
+    } else if (warps_per_block == 32) {
+        THREADS_PER_BLOCK = 32 * kWarpSize;
+    } else {
+        THREADS_PER_BLOCK = 2048;
+    }
+
     const dim3 threads(THREADS_PER_BLOCK);
     min_aggr_backward<<<blocks, threads>>>(
         grad_out.data_ptr<float>(),

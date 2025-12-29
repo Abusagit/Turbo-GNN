@@ -214,12 +214,13 @@ class GraphSample:
             )
 
             deg = counts
+            quantile = self.kernel_related_kwargs.get("huge_degree_threshold_quantile", -1)
 
-            q = self.kernel_related_kwargs["huge_degree_threshold_quantile"]
-
-            huge_degree_threshold_quantile = torch.quantile(deg.float(), q).item()
-            if huge_degree_threshold_quantile is None:
+            if quantile != -1:
+                huge_degree_threshold_quantile = torch.quantile(deg.float(), quantile).item()
+            else:
                 huge_degree_threshold_quantile = max(counts) + 1
+
             light = (deg < huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
             heavy = (deg >= huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
 

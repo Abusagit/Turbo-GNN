@@ -11,7 +11,8 @@ namespace py = pybind11;
 void min_aggr_backward_cuda(
     const at::Tensor& grad_out,
     const at::Tensor& argmin,
-    at::Tensor& grad_x
+    at::Tensor& grad_x,
+    int warps_per_block = 8
 );
 
 void min_aggr_forward_partitioned_cuda(
@@ -21,13 +22,16 @@ void min_aggr_forward_partitioned_cuda(
     const at::Tensor& light_nodes,
     const at::Tensor& heavy_nodes,
     at::Tensor& out,
-    at::Tensor& argmin
+    at::Tensor& argmin,
+    int warps_per_block = 8,
+    int edges_per_block_heavy_nodes = 128
 );
 
 at::Tensor min_aggr_backward_torch(
     at::Tensor grad_out,
     at::Tensor argmin,
-    int64_t num_src_nodes
+    int64_t num_src_nodes,
+    int warps_per_block = 8
 ) {
     TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
     TORCH_CHECK(argmin.is_cuda(), "argmin must be CUDA");
@@ -40,7 +44,7 @@ at::Tensor min_aggr_backward_torch(
     const int64_t d = grad_out.size(1);
 
     auto grad_x = torch::zeros({num_src_nodes, d}, grad_out.options());
-    min_aggr_backward_cuda(grad_out, argmin, grad_x);
+    min_aggr_backward_cuda(grad_out, argmin, grad_x, warps_per_block);
 
     return grad_x;
 }
@@ -50,7 +54,9 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     at::Tensor edge_idx,
     at::Tensor X,
     at::Tensor light_nodes,
-    at::Tensor heavy_nodes
+    at::Tensor heavy_nodes,
+    int warps_per_block = 8,
+    int edges_per_block_heavy_nodes = 128
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
@@ -67,21 +73,22 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     auto out = torch::empty({num_nodes, d}, X.options());
     auto argmin = torch::empty({num_nodes, d}, edge_ptr.options());
 
-    min_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, out, argmin);
+    min_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, out, argmin, warps_per_block, edges_per_block_heavy_nodes);
     return {out, argmin};
 }
 
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // m.def("min_aggr_forward",  &min_aggr_forward_torch,
-    //       "Min aggregation forward",
-    //       py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("X"));
     m.def("min_aggr_backward", &min_aggr_backward_torch,
           "Min aggregation backward",
-          py::arg("grad_out"), py::arg("argmin"), py::arg("num_src_nodes"));
+          py::arg("grad_out"), py::arg("argmin"), py::arg("num_src_nodes"),
+          py::arg("warps_per_block") = 8
+        );
     m.def("min_aggr_forward_partitioned", &min_aggr_forward_partitioned_torch,
           "Min aggregation forward (partitioned)",
           py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("X"),
-          py::arg("light_nodes"), py::arg("heavy_nodes"));
+          py::arg("light_nodes"), py::arg("heavy_nodes"),
+          py::arg("warps_per_block") = 8, py::arg("edges_per_block_heavy_nodes") = 128
+        );
 }

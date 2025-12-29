@@ -257,12 +257,7 @@ def main():
         top_level_config = yaml.safe_load(f)
 
         conv_parameters_dict = top_level_config.get("params_grid")
-        kernel_specific_parameters_dict = top_level_config.get(
-            "kernel_related_kwargs", {"huge_degree_threshold_quantile": [None]}
-        )
-
-        convolution_parameters_grid = get_parameters_grid_from_config(conv_parameters_dict)
-        kernel_specific_parameters_grid_for_datasets = get_parameters_grid_from_config(kernel_specific_parameters_dict)
+        kernel_specific_parameters_dict = top_level_config.get("kernel_related_kwargs", {})
 
         datasets_config = top_level_config["datasets"]
         base_dir = Path(datasets_config["base_path"])
@@ -288,6 +283,16 @@ def main():
         except Exception as e:
             print(f"Couldn't load backend={backend} for conv={CONV_TYPE}. Exception: {e}")
             continue
+
+        convolution_parameters_grid = get_parameters_grid_from_config(
+            conv_parameters_dict.get("all", {}) | conv_parameters_dict.get(backend, {})
+        )
+
+        kernel_param_grid_for_backend = kernel_specific_parameters_dict.get(
+            backend, {"huge_degree_threshold_quantile": [-1]}
+        )
+
+        kernel_specific_parameters_grid_for_datasets = get_parameters_grid_from_config(kernel_param_grid_for_backend)
 
         for dataset_config in datasets_configs_to_load:
             dataset_name = dataset_config["name"]

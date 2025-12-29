@@ -33,7 +33,17 @@ class _CudaMinAggrConv(BaseConvolution):
         super().__init__(bias=bias, **kwargs)
         if bias:
             raise NotImplementedError("bias=True is not supported for pure min aggregation in this backend.")
-        self.op = None
+        warps_per_block = kwargs.get("warps_per_block", 8)
+        edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
+
+        self.warps_per_block = warps_per_block
+        self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
+
+        self.forward_meta = {
+            "warps_per_block": warps_per_block,
+            "edges_per_block_heavy_nodes": edges_per_block_heavy_nodes,
+        }
+        self.backward_meta = {"warps_per_block": warps_per_block}
 
     def forward(
         self,
@@ -52,7 +62,7 @@ class _CudaMinAggrConv(BaseConvolution):
             edge_ptr, edge_idx = graph
             raise ValueError("cuda_backend needs (edge_ptr, edge_idx, light, heavy) in graph.")
 
-        return min_aggr(edge_ptr, edge_idx, x, light, heavy)
+        return min_aggr(edge_ptr, edge_idx, x, light, heavy, self.warps_per_block, self.edges_per_block_heavy_nodes)
 
 
 class _CudaSimpleAggrConv(BaseConvolution):

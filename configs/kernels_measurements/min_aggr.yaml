@@ -1,7 +1,12 @@
 params_grid:
-  feature_dim: [64, 128, 256, 512]
+  all:
+    feature_dim: [64, 128, 256, 512]
+  cuda:
+    warps_per_block: [1, 4, 8]
+    edges_per_block_heavy_nodes: [128, 256, 512]
 kernel_related_kwargs:
-  huge_degree_threshold_quantile: [0.99, 0.999, none]
+  cuda:
+    huge_degree_threshold_quantile: [0.99, 0.999, -1]
 datasets:
   base_path: configs/datasets
   dirs:
