@@ -11,7 +11,8 @@ from .bindings import F3S_forward
 class _F3SATConv(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, graph, size, block_h=16, block_w=8):
-        return F3S_forward(q, k, v, graph, size, block_h, block_w)
+        time, output, sddm_result = F3S_forward(q, k, v, graph, size, block_h, block_w)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -25,9 +26,9 @@ class F3SATConv(BaseConvolution):
         out_channels = feature_dim
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.q_proj = nn.Linear(in_channels, out_channels)
-        self.k_proj = nn.Linear(in_channels, out_channels)
-        self.v_proj = nn.Linear(in_channels, out_channels)
+        self.q_proj = nn.Linear(feature_dim, feature_dim)
+        self.k_proj = nn.Linear(feature_dim, feature_dim)
+        self.v_proj = nn.Linear(feature_dim, feature_dim)
         self.block_h = block_h
         self.block_w = block_w
 

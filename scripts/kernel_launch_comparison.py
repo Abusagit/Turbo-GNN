@@ -334,6 +334,9 @@ def main():
                         "conv_type": CONV_TYPE,
                         "dataset": dataset_name,
                         "backend": backend,
+                        "num_nodes": graph.num_nodes,
+                        "num_edges": graph.edge_index.shape[1],
+                        "avg_node_degree": graph.num_nodes / graph.edge_index.shape[1],
                     }
 
                     experiment_name = generate_experiment_name(

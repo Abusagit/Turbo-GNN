@@ -46,26 +46,53 @@ f3s_ops = load(
 )
 
 
-def f3s_preprocess(edge_index, block_h=16, block_w=8):
+def f3s_preprocess(edge_index, block_h=16, block_w=16):
     A = torch.sparse_coo_tensor(edge_index, torch.ones(edge_index.shape[1])).to_sparse_csr()
-    size = edge_index.shape[0]
-    num_row_windows = (size + block_h - 1) // block_h
-    edgeToColumn = torch.zeros(size, dtype=torch.int, device="cuda")
-    edgeToRow = torch.zeros(size, dtype=torch.int, device="cuda")
-    block_partition = torch.zeros(num_row_windows, dtype=torch.int, device="cuda")
-    indices = A.crow_indices().int().cuda()
-    indptr = A.col_indices().int().cuda()
+
+    indptr = A.crow_indices().int().cuda()
+    indices = A.col_indices().int().cuda()
+
+    num_nodes = indptr.shape[0] - 1
+    num_edges = indices.shape[0]
+    num_row_windows = (num_nodes + block_h - 1) // block_h
+
+    blockPartition_cuda = torch.zeros(num_row_windows, dtype=torch.int).cuda()
+    edgeToColumn_cuda = torch.zeros(num_edges, dtype=torch.int).cuda()
+    edgeToRow_cuda = torch.zeros(num_edges, dtype=torch.int).cuda()
+
+    row_pointers = indptr.to(torch.int32).cuda()
+    column_index = indices.to(torch.int32).cuda()
+
     row_window_offset, sorted_row_windows, tcblock_rowid, _, _, sparse_a_to_index, tcblock_bit_map, _ = (
-        f3s_ops.preprocess_gpu(indices, indptr, size, block_h, block_w, block_partition, edgeToColumn, edgeToRow)
+        f3s_ops.preprocess_gpu(
+            column_index,
+            row_pointers,
+            num_nodes,
+            block_h,
+            block_w,
+            blockPartition_cuda,
+            edgeToColumn_cuda,
+            edgeToRow_cuda,
+        )
     )
 
-    return sorted_row_windows, row_window_offset, sparse_a_to_index, tcblock_bit_map, edge_index.shape[1]
+    return row_window_offset, sorted_row_windows, sparse_a_to_index, tcblock_bit_map, num_nodes
 
 
-def F3S_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, graph, block_h=16, block_w=8, n_warps_per_block=8):
-    sorted_row_windows, row_window_offset, sparse_a_to_index, tcblock_bit_map, size = graph
+def F3S_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, graph, block_h=16, block_w=16, n_warps_per_block=8):
+    sorted_row_windows, row_window_offset, sparse_a_to_index, tcblock_bit_map, num_nodes = graph
+
     x = f3s_ops.f3s_1tb1rw_scheduled_permuteV(
-        row_window_offset, sorted_row_windows, sparse_a_to_index, tcblock_bit_map, size, q, k, v, n_warps_per_block
+        row_window_offset,
+        sorted_row_windows,
+        sparse_a_to_index,
+        tcblock_bit_map,
+        num_nodes,
+        q,
+        k,
+        v,
+        1,
+        n_warps_per_block,
     )
 
     return x
