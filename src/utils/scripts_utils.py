@@ -147,12 +147,13 @@ def create_split_datasets_from_config_dict(
     Expected dict keys:
         - dataset: { source: 'ogbn'|'pyg'|'dgl'|'auto', name: str, root: str }
     """
-    ds_cfg = cfg.get("dataset") or {}
+    ds_cfg = cfg.get("dataset", {})
     source = str(ds_cfg.get("source", "auto"))
     name = str(ds_cfg.get("name"))
     root = str(ds_cfg.get("root", "data"))
     allow_random_split = ds_cfg.get("allow_random_split", False)
 
+    kernel_related_kwargs = cfg.get("kernel_related_kwargs", {})
     sample = load_single_graph(
         DatasetConfig(
             source=source,
@@ -160,6 +161,7 @@ def create_split_datasets_from_config_dict(
             root=root,
             conv_backend=cfg.get("conv_backend", "edge_index"),
             allow_random_split=allow_random_split,
+            kernel_related_kwargs=kernel_related_kwargs,
         )
     )
 

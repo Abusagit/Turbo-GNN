@@ -2,3 +2,5 @@ dataset:
   source: pyg
   name: cora
   root: data
+kernel_related_kwargs:
+  huge_degree_threshold_quantile: none
