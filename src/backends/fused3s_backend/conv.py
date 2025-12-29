@@ -35,16 +35,13 @@ class F3SATConv(BaseConvolution):
         q, k, v = self.q_proj(x).to(torch.half), self.k_proj(x).to(torch.half), self.v_proj(x).to(torch.half)
         return _F3SATConv.apply(q, k, v, graph, self.block_h, self.block_w)
 
-    def backward(self, grad_output):
-        raise NotImplementedError("Backward pass is not implemented for F3SATConv")
-
 
 @BackendRegistry.register_backend("f3s")
 class F3SBackend(BaseBackend):
     """Fused 3S backend implementation"""
 
     def create_conv(self, conv_type: str, **kwargs: Any) -> BaseConvolution:
-        """Factory for cusparse convolution layers.
+        """Factory for fused3s convolution layers.
 
         Args:
             conv_type (str): "grap_transformer"
