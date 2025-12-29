@@ -35,7 +35,7 @@ class LayerSpec:
     """
 
     layer_type: Literal["redisual_block"]
-    conv_type: Literal["gcn", "gat_v2", "sage", "gin"]
+    conv_type: Literal["gcn", "gat", "gat_v2", "sage", "gin"]
     backend: str
     in_channels: int
     out_channels: int
@@ -100,6 +100,8 @@ def activation_factory(name: str, *, dim: int | None = None) -> nn.Module:
         return nn.Tanh()
     if key == "sigmoid":
         return nn.Sigmoid()
+    if key == "silu":
+        return nn.SiLU()
     return nn.Identity()
 
 

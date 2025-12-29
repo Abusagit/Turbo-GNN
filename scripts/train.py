@@ -84,7 +84,7 @@ def build_data(
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
-    graph_backend: GraphBackendOption,
+    conv_backend: str,
 ) -> tuple[Any, Any, Any, int, int]:
     """Create train/val/test loaders and infer dataset dimensions.
 
@@ -93,12 +93,12 @@ def build_data(
         batch_size (int): DataLoader batch size.
         num_workers (int): Number of DataLoader workers.
         pin_memory (bool): Whether to enable pinned memory.
-        graph_backend (GraphBackendOption): infered graph representation type
+        conv_backend (str): Backend type of conv.
     Returns:
         Tuple[Any, Any, Any, int, int]: Tuple of
             (train_loader, val_loader, test_loader, num_features, num_classes).
     """
-    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(str(dataset_yaml), graph_backend=graph_backend)
+    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(str(dataset_yaml), conv_backend=conv_backend)
     num_features = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
 
@@ -107,25 +107,6 @@ def build_data(
     val_loader = build_dataloader(val_ds, lc)
     test_loader = build_dataloader(test_ds, lc)
     return train_loader, val_loader, test_loader, num_features, num_classes
-
-
-def build_model(
-    model_yaml: str | Path,
-    *,
-    input_dim: int,
-    num_classes: int,
-) -> torch.nn.Module:
-    """Build a model from YAML using the registry-backed loader.
-
-    Args:
-        model_yaml (str | Path): Path to model YAML.
-        input_dim (int): Feature dimension (for inferring first-layer input).
-        num_classes (int): Number of output classes (overrides YAML).
-
-    Returns:
-        torch.nn.Module: Instantiated model ready for training.
-    """
-    return build_model_from_yaml(str(model_yaml), input_dim=input_dim, override_num_classes=num_classes)
 
 
 def build_opt_and_sched(
@@ -165,6 +146,8 @@ def build_opt_and_sched(
 def build_trainer(
     model: torch.nn.Module,
     merged_cfg: dict[str, Any],
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
 ) -> GNNTrainer:
     """Construct `GNNTrainer` from merged training config.
 
@@ -178,7 +161,7 @@ def build_trainer(
     tcfg_dict = _extract_training_cfg(merged_cfg)
     tcfg = TrainingConfig(**tcfg_dict) if tcfg_dict else TrainingConfig()
 
-    return GNNTrainer(model=model, config=tcfg)
+    return GNNTrainer(model=model, config=tcfg, optimizer=optimizer, scheduler=scheduler)
 
 
 # ------------------------------- CLI and main -------------------------------- #
@@ -209,7 +192,11 @@ def parse_args() -> argparse.Namespace:
         "--profile", type=str, default=None, help="Optional profiler YAML (configs/benchmarks/profile.yaml)."
     )
     p.add_argument("--out", type=str, default="runs/train", help="Output directory.")
-    p.add_argument("--no-record-snapshots", action="store_true", help="Flag to NOT record memory snapshots")
+    p.add_argument("--record-snapshots", action="store_true", help="Flag to record memory snapshots")
+
+    p.add_argument("--conv_type", type=str, required=True, help="Convolution type")
+    p.add_argument("--backend", type=str, required=True, help="Backend type")
+
     return p.parse_args()
 
 
@@ -236,7 +223,7 @@ def main() -> int:
         log_every=5,
         track_cpu_rss=True,
         sync_cuda=True,
-        record_snapshots=args.no_record_snapshots,
+        record_snapshots=args.record_snapshots,
         snapshot_dir=str(outdir / "memory_snahphots"),
     )
 
@@ -248,22 +235,24 @@ def main() -> int:
 
     torch.set_default_device(tcfg["device"])
 
-    graph_backend = infer_graph_backend(model_config_path=args.model)
+    graph_backend = args.backend
     train_loader, val_loader, test_loader, in_dim, num_classes = build_data(
         args.dataset,
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        graph_backend=graph_backend,
+        conv_backend=graph_backend,
     )
 
     # build model
-    model = build_model(args.model, input_dim=in_dim, num_classes=num_classes)
-
-    # build trainer
-    trainer = build_trainer(model, merged_cfg)
-
-    logger.info(f"Built data with graph representation: {graph_backend}\tBuilt Trainer\tBuild model")
+    model = build_model_from_yaml(
+        args.model,
+        backend_to_override=args.backend,
+        conv_type_to_override=args.conv_type,
+        input_dim=in_dim,
+        override_num_classes=num_classes,
+    )
+    logger.info(f"Initialized model:\n{model}")
 
     # Optimizer + Scheduler
     steps_per_epoch = len(train_loader)
@@ -271,11 +260,12 @@ def main() -> int:
     optimizer, scheduler = build_opt_and_sched(
         model, merged_cfg, steps_per_epoch=steps_per_epoch, total_epochs=total_epochs
     )
-    trainer.optimizer = optimizer
-    trainer.scheduler = scheduler
     logger.info("Built Optimizer & Schedulers")
 
-    trainer.add_hook(MetricHook(log_dir=str(outdir / "logs"), log_interval=int(tcfg.get("log_interval", 10))))
+    # build trainer
+    trainer = build_trainer(model, merged_cfg=merged_cfg, optimizer=optimizer, scheduler=scheduler)
+    logger.info(f"Built data with graph representation: {graph_backend}\tBuilt Trainer\tBuild model")
+
     trainer.add_hook(
         CheckpointHook(
             checkpoint_dir=str(outdir / "ckpts"),
@@ -301,6 +291,46 @@ def main() -> int:
                 with_stack=bool(prof_cfg.get("with_stack", True)),
             )
         )
+
+    comet_config = None
+    params_for_comet = None
+    if "comet_ml" in merged_cfg:
+        params_for_comet = {}
+        params_for_comet["dataset"] = read_yaml(args.dataset)["dataset"]["name"]
+        model_config = read_yaml(args.model)
+        params_for_comet["model"] = str(model_config)
+        params_for_comet["conv_type"] = args.conv_type
+        params_for_comet["backend"] = args.backend
+
+        optimizer_options = {
+            f"optimizer_{arg_name}": value for arg_name, value in _extract_optimizer_cfg(merged_cfg).items()
+        }
+        scheduler_options = {
+            f"lr_scheduler_{arg_name}": value for arg_name, value in _extract_scheduler_cfg(merged_cfg).items()
+        }
+
+        # add optimizer/scheduler parameters
+        params_for_comet.update(optimizer_options)
+        params_for_comet.update(scheduler_options)
+
+        comet_config = merged_cfg["comet_ml"]
+        comet_config["ExperimentConfig"]["tags"].extend(
+            [
+                f'dataset: {params_for_comet["dataset"]}',
+                f'conv_type: {params_for_comet["conv_type"]}',
+                f'backend: {params_for_comet["backend"]}',
+            ]
+        )
+
+    # should be at the end to log other hooks' metrics, e.g. memory
+    trainer.add_hook(
+        MetricHook(
+            log_dir=str(outdir / "logs"),
+            log_interval=int(tcfg.get("log_interval", 10)),
+            comet_config=comet_config,
+            params_for_comet=params_for_comet,
+        )
+    )
 
     # train
     logger.info("Starting training…")

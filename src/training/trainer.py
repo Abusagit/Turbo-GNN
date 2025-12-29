@@ -54,8 +54,6 @@ class TrainingConfig:
     """
 
     epochs: int = 100
-    learning_rate: float = 0.01
-    weight_decay: float = 5e-4
     batch_size: int = 32
     accumulation_steps: int = 1
     use_amp: bool = False
@@ -113,13 +111,7 @@ class GNNTrainer:
         self.device = torch.device(config.device)
         self.model = self.model.to(self.device)
 
-        # Initialize optimizer if not provided
-        if optimizer is None:
-            self.optimizer = torch.optim.AdamW(
-                model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-            )
-        else:
-            self.optimizer = optimizer
+        self.optimizer = optimizer
 
         self.scheduler = scheduler
         self.criterion = criterion or nn.CrossEntropyLoss()
@@ -195,9 +187,9 @@ class GNNTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                self.optimizer.step()
+                self.optimizer.step()  # type: ignore
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad()  # type: ignore
             self.global_step += 1
 
     def train_epoch(

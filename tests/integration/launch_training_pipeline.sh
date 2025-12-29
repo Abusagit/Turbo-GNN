@@ -8,9 +8,10 @@ echo "==========================================="
 echo -e "\n[TEST 1] Training GCN on Cora (PyG backend)"
 python -W ignore scripts/train.py \
     --dataset configs/datasets/pyg_cora.yaml \
-    --model configs/models/gcn_dgl.yaml \
+    --model configs/models/node_classifier_128_hidden_8_heads.yaml \
     --config configs/training/base.yaml \
-    --out runs/test_pyg_cora
+    --out runs/test_pyg_cora \
+    --backend dgl --conv_type gcn
 
 # Test 2: Benchmark different backends on same dataset
 echo -e "\n[TEST 2] Benchmarking GCN layer across backends"
@@ -32,18 +33,20 @@ done
 echo -e "\n[TEST 3] Training with memory profiling"
 python -W ignore scripts/train.py \
     --dataset configs/datasets/pyg_cora.yaml \
-    --model configs/models/gcn_dgl.yaml \
+    --model configs/models/node_classifier_128_hidden_8_heads.yaml \
     --config configs/training/base.yaml \
     --profile configs/benchmarks/profile.yaml \
-    --out runs/test_profile
+    --out runs/test_profile \
+    --backend dgl --conv_type gcn
 
 # Test 4: Validate model checkpoint
 echo -e "\n[TEST 4] Validation from checkpoint"
 if [ -f "runs/test_pyg_cora/ckpts/best_model.pth" ]; then
     python scripts/validate.py \
         --dataset configs/datasets/pyg_cora.yaml \
-        --model configs/models/gcn_dgl.yaml \
-        --checkpoint runs/test_pyg_cora/ckpts/best_model.pth
+        --model configs/models/node_classifier_128_hidden_8_heads.yaml \
+        --checkpoint runs/test_pyg_cora/ckpts/best_model.pth \
+        --backend dgl --conv_type gcn
 else
     echo "No checkpoint found, skipping validation test"
 fi

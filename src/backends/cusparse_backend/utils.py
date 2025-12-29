@@ -1,8 +1,9 @@
 import os
 
-os.environ["CUDA_HOME"] = "/usr/local/cuda"
-os.environ["CUDA_PATH"] = "/usr/local/cuda"
-os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
+if os.environ.get("CUDA_HOME") is None:
+    os.environ["CUDA_HOME"] = "/usr/local/cuda"
+    os.environ["CUDA_PATH"] = "/usr/local/cuda"
+    os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
 
 import glob
 from pathlib import Path
@@ -31,7 +32,7 @@ cuda_kernels = load(
     ],
     extra_include_paths=[
         # *glob.glob(str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True),
-        "/usr/local/cuda/include"
+        os.environ["CUDA_HOME"]
     ],
     sources=[path + s for s in sources],
     verbose=True,
@@ -39,7 +40,15 @@ cuda_kernels = load(
 
 
 def csr_SPMM_normalized(
-    indptr, indices, features, edge_weights=None, norm="none", algorithm=-1, use_cache=True, do_transpose_a=False
+    indptr,
+    indices,
+    features,
+    edge_weights=None,
+    norm="none",
+    algorithm=-1,
+    use_cache=True,
+    do_transpose_a=False,
+    block_dim=256,
 ):
     """
     Normalized SpMM operation supporting different GCN normalization schemes.
@@ -57,7 +66,7 @@ def csr_SPMM_normalized(
         algorithm: cuSPARSE algorithm ID (-1 for auto)
         use_cache: Whether to use caching
         do_transpose_a: Whether to transpose A matrix before matmul.
-
+        block_dim: Block dimension for the kernel.
     Returns:
         Normalized result of A @ features
     """
@@ -68,7 +77,7 @@ def csr_SPMM_normalized(
         edge_weights_gpu = edge_weights.to(features.device).to(torch.float32)
 
     out = cuda_kernels.csr_SPMM_normalized(
-        indptr, indices, features.contiguous(), edge_weights_gpu, norm, algorithm, use_cache, do_transpose_a
+        indptr, indices, features.contiguous(), edge_weights_gpu, norm, algorithm, use_cache, do_transpose_a, block_dim
     )
 
     return out

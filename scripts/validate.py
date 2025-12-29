@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=1, help="Loader batch size (single-graph = 1).")
     p.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers.")
     p.add_argument("--pin-memory", action="store_true", help="Enable pinned memory.")
+    p.add_argument("--conv_type", type=str, required=True, help="Convolution type")
+    p.add_argument("--backend", type=str, required=True, help="Backend type")
+
     return p.parse_args()
 
 
@@ -61,15 +64,20 @@ def main() -> int:
     device = tcfg.device
     torch.set_default_device(device)
 
-    graph_backend = infer_graph_backend(args.model)
-    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(args.dataset, graph_backend=graph_backend)
+    train_ds, val_ds, test_ds = create_split_datasets_from_yaml(args.dataset, conv_backend=args.backend)
     in_dim = train_ds.sample.num_features
     num_classes = train_ds.sample.num_classes
     lc = LoaderConfig(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
     val_loader = build_dataloader(val_ds, lc)
     test_loader = build_dataloader(test_ds, lc)
 
-    model = build_model_from_yaml(args.model, input_dim=in_dim, override_num_classes=num_classes)
+    model = build_model_from_yaml(
+        args.model,
+        backend_to_override=args.backend,
+        conv_type_to_override=args.conv_type,
+        input_dim=in_dim,
+        override_num_classes=num_classes,
+    )
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     state_dict = ckpt.get("model_state_dict", ckpt)

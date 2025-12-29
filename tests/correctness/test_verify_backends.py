@@ -49,9 +49,9 @@ def test_dataset_loading():
     print("=" * 60)
 
     test_configs = [
-        DatasetConfig(source="pyg", name="cora", root="data", graph_backend="pyg"),
-        DatasetConfig(source="dgl", name="cora", root="data", graph_backend="pyg"),
-        DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data", graph_backend="pyg"),  # Large dataset
+        DatasetConfig(source="pyg", name="cora", root="data", conv_backend="pyg"),
+        DatasetConfig(source="dgl", name="cora", root="data", conv_backend="pyg"),
+        DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data", conv_backend="pyg"),  # Large dataset
     ]
 
     for cfg in test_configs:
@@ -164,8 +164,6 @@ def test_microbenchmarking():
     def test_fn():
         x = torch.randn(1000, 1000)
         y = torch.matmul(x, x)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
 
     try:
         result = time_callable(test_fn, warmup=5, iters=10)
@@ -217,8 +215,8 @@ def test_model_building():
             "layers": [
                 {
                     "layer_type": "residual_block",
-                    "conv_type": "gcn",
-                    "backend": "pyg",
+                    "conv_type": None,
+                    "backend": None,
                     "in_channels": 128,
                     "out_channels": 64,
                     "norm": "batch",
@@ -229,8 +227,8 @@ def test_model_building():
                 },
                 {
                     "layer_type": "residual_block",
-                    "conv_type": "gcn",
-                    "backend": "pyg",
+                    "conv_type": None,
+                    "backend": None,
                     "in_channels": 64,
                     "out_channels": 32,
                     "norm": "layer",
@@ -245,7 +243,9 @@ def test_model_building():
 
     try:
         # Build spec
-        spec = classifier_spec_from_config(config, input_dim=128)
+        spec = classifier_spec_from_config(
+            config, backend_to_override="pyg", conv_type_to_override="gcn", input_dim=128
+        )
         print(f"✓ Model spec created with {len(spec.encoder.layers)} layers")
 
         # Build model

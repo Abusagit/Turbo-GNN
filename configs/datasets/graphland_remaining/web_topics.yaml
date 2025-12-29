@@ -1,0 +1,4 @@
+dataset:
+  source: pyg
+  name: web-topics
+  root: data

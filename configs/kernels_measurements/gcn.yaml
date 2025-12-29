@@ -1,0 +1,15 @@
+params_grid:
+  feature_dim: [64, 128, 256, 512]
+datasets:
+  base_path: configs/datasets
+  dirs:
+    graphland_remaining:
+      all: true
+    main:
+      all: true
+    secondary:
+      all: false
+      choices:
+        - cora
+        - citeseer
+        - pubmed

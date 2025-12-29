@@ -1,0 +1,21 @@
+# read about suggest methods from https://optuna.readthedocs.io/en/stable/reference/generated/optuna.trial.Trial.html
+parameters:
+  block_dim:
+    type: categorical
+    choices: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+  cu_sparse_algorithm_id:  # it is actually a categorical parameter
+    type: int
+    low: -1
+    high: 3
+    # log: true
+  # field:
+  #   type: float
+  #   low: 0.0
+  #   high: 1.0
+  #   step: 0.1
+dataset_related_parameters:
+  huge_degree_threshold_quantile:
+    type: float
+    low: 0.9
+    high: 0.99
+    step: 0.01

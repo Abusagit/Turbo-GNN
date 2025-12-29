@@ -1,0 +1,5 @@
+dataset:
+  source: pyg
+  name: amazon-computers
+  root: data
+  allow_random_split: true

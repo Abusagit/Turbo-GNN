@@ -1,0 +1,3028 @@
+[1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output gatv2_kernel.cuda.o.d -DTORCH_EXTENSION_NAME=gatv2_kernels -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -I/usr/local/cuda/include -isystem /home/fvelikon/projects/cuda_exp/.venv/lib/python3.11/site-packages/torch/include -isystem /home/fvelikon/projects/cuda_exp/.venv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/fvelikon/projects/cuda_exp/.venv/lib/python3.11/site-packages/torch/include/TH -isystem /home/fvelikon/projects/cuda_exp/.venv/lib/python3.11/site-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /home/fvelikon/micromamba/envs/graph_ml/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_80,code=compute_80 -gencode=arch=compute_80,code=sm_80 --compiler-options '-fPIC' -O3 --use_fast_math -arch=sm_80 --generate-line-info -std=c++17 -c /home/fvelikon/projects/cuda_exp/src/backends/cuda_backend/gatv2_kernel.cu -o gatv2_kernel.cuda.o
+/home/fvelikon/projects/cuda_exp/src/backends/cuda_backend/gatv2_kernel.cu(175): warning #177-D: variable "old_max" was declared but never referenced
+          float old_max = softmax_state.max_val;
+                ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[2/2] c++ gatv2_kernel.cuda.o -shared -L/home/fvelikon/projects/cuda_exp/.venv/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o gatv2_kernels.so
+ninja: no work to do.
+ninja: no work to do.
+GLOBAL DEVICE IS SET: DEVICE=device(type='cuda', index=0)
+Backends are: ['cuda', 'dgl']
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 0.5649407863616943,
+    "forward_memory_mb": 75.10302734375,
+    "backward_ms": 2.510540771484375,
+    "backward_memory_mb": 64.58740234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-exp_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 0.6236159801483154,
+    "forward_memory_mb": 144.79150390625,
+    "backward_ms": 2.787123107910156,
+    "backward_memory_mb": 107.7275390625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-exp_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 0.9453568458557129,
+    "forward_memory_mb": 267.98876953125,
+    "backward_ms": 3.319091033935547,
+    "backward_memory_mb": 194.1484375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-exp_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 2.0224000930786135,
+    "forward_memory_mb": 522.43359375,
+    "backward_ms": 7.25770263671875,
+    "backward_memory_mb": 372.9912109375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-exp_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 0.5994495868682861,
+    "forward_memory_mb": 202.54833984375,
+    "backward_ms": 2.0990976333618163,
+    "backward_memory_mb": 148.01708984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-L_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 0.7907328128814697,
+    "forward_memory_mb": 369.89306640625,
+    "backward_ms": 3.045376014709473,
+    "backward_memory_mb": 265.2041015625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-L_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 1.4931967735290528,
+    "forward_memory_mb": 722.72412109375,
+    "backward_ms": 4.1645057678222654,
+    "backward_memory_mb": 512.36865234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-L_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 3.8774784088134764,
+    "forward_memory_mb": 1412.515625,
+    "backward_ms": 10.980249786376953,
+    "backward_memory_mb": 995.9541015625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-L_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 202.6366943359375,
+    "forward_memory_mb": 3709.8876953125,
+    "backward_ms": 2059.51953125,
+    "backward_memory_mb": 2640.40234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-topics_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 218.4933349609375,
+    "forward_memory_mb": 7241.685546875,
+    "backward_ms": 2197.9376953125,
+    "backward_memory_mb": 5112.70654296875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-topics_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 233.5225830078125,
+    "forward_memory_mb": 14301.826171875,
+    "backward_ms": 2343.2587890625,
+    "backward_memory_mb": 10054.98779296875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-topics_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 420.526513671875,
+    "forward_memory_mb": 28408.27783203125,
+    "backward_ms": 4072.709765625,
+    "backward_memory_mb": 19930.2353515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-topics_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 202.4742919921875,
+    "forward_memory_mb": 3709.8876953125,
+    "backward_ms": 2061.255078125,
+    "backward_memory_mb": 2640.40234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-traffic_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 218.250439453125,
+    "forward_memory_mb": 7241.685546875,
+    "backward_ms": 2203.1111328125,
+    "backward_memory_mb": 5112.70654296875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-traffic_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 233.546240234375,
+    "forward_memory_mb": 14301.826171875,
+    "backward_ms": 2341.5685546875,
+    "backward_memory_mb": 10054.98779296875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-traffic_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 420.742529296875,
+    "forward_memory_mb": 28408.27783203125,
+    "backward_ms": 4083.0515625,
+    "backward_memory_mb": 19930.2353515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-traffic_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 22.787583923339845,
+    "forward_memory_mb": 238.92529296875,
+    "backward_ms": 118.584521484375,
+    "backward_memory_mb": 221.70703125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-prices_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 23.707443237304688,
+    "forward_memory_mb": 299.71728515625,
+    "backward_ms": 129.48223876953125,
+    "backward_memory_mb": 263.58642578125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-prices_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 25.060762023925783,
+    "forward_memory_mb": 408.60498046875,
+    "backward_ms": 147.1279052734375,
+    "backward_memory_mb": 340.4072265625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-prices_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 42.51770935058594,
+    "forward_memory_mb": 641.8095703125,
+    "backward_ms": 257.59580078125,
+    "backward_memory_mb": 504.3818359375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-prices_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 18.647552490234375,
+    "forward_memory_mb": 2288.22314453125,
+    "backward_ms": 85.35132446289063,
+    "backward_memory_mb": 1682.005859375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pokec-regions_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 20.73139190673828,
+    "forward_memory_mb": 4274.59619140625,
+    "backward_ms": 98.25075073242188,
+    "backward_memory_mb": 3072.5126953125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pokec-regions_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 32.0837646484375,
+    "forward_memory_mb": 8268.39892578125,
+    "backward_ms": 127.19339599609376,
+    "backward_memory_mb": 5868.357421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pokec-regions_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 78.03699340820313,
+    "forward_memory_mb": 16234.3037109375,
+    "backward_ms": 285.5604248046875,
+    "backward_memory_mb": 11445.22216796875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pokec-regions_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 202.54454345703124,
+    "forward_memory_mb": 3709.8876953125,
+    "backward_ms": 2073.2611328125,
+    "backward_memory_mb": 2640.40234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-fraud_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 218.241015625,
+    "forward_memory_mb": 7241.685546875,
+    "backward_ms": 2204.5708984375,
+    "backward_memory_mb": 5112.70654296875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-fraud_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 233.5227783203125,
+    "forward_memory_mb": 14301.826171875,
+    "backward_ms": 2340.6443359375,
+    "backward_memory_mb": 10054.98779296875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-fraud_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 420.53828125,
+    "forward_memory_mb": 28408.27783203125,
+    "backward_ms": 4074.1171875,
+    "backward_memory_mb": 19930.2353515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_web-fraud_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 57.161627197265624,
+    "forward_memory_mb": 4005.75537109375,
+    "backward_ms": 345.0119140625,
+    "backward_memory_mb": 3099.56201171875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-products_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 64.15411376953125,
+    "forward_memory_mb": 6996.24951171875,
+    "backward_ms": 383.6603271484375,
+    "backward_memory_mb": 5192.95361328125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-products_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 90.28433837890626,
+    "forward_memory_mb": 12976.39013671875,
+    "backward_ms": 466.678173828125,
+    "backward_memory_mb": 9379.23486328125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-products_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 201.84443359375,
+    "forward_memory_mb": 24936.953125,
+    "backward_ms": 955.00390625,
+    "backward_memory_mb": 17752.3603515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-products_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 0.3554303884506226,
+    "forward_memory_mb": 88.25341796875,
+    "backward_ms": 1.1248640060424804,
+    "backward_memory_mb": 67.1455078125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-M_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 0.3614720106124878,
+    "forward_memory_mb": 158.2861328125,
+    "backward_ms": 1.315328025817871,
+    "backward_memory_mb": 116.115234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-M_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 0.6231040000915528,
+    "forward_memory_mb": 298.75634765625,
+    "backward_ms": 1.8717695236206056,
+    "backward_memory_mb": 214.72607421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-M_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 1.6392192840576172,
+    "forward_memory_mb": 579.3193359375,
+    "backward_ms": 4.689715194702148,
+    "backward_memory_mb": 411.8515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-roads-M_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 6.447309112548828,
+    "forward_memory_mb": 219.09814453125,
+    "backward_ms": 29.931109619140624,
+    "backward_memory_mb": 164.04833984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-reviews_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 6.191513442993164,
+    "forward_memory_mb": 400.77392578125,
+    "backward_ms": 33.39581298828125,
+    "backward_memory_mb": 291.26708984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-reviews_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 7.053107452392578,
+    "forward_memory_mb": 764.19580078125,
+    "backward_ms": 39.44826965332031,
+    "backward_memory_mb": 545.84521484375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-reviews_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 13.733273315429688,
+    "forward_memory_mb": 1498.19140625,
+    "backward_ms": 73.82302856445312,
+    "backward_memory_mb": 1060.37353515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_city-reviews_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 35.70411376953125,
+    "forward_memory_mb": 278.71826171875,
+    "backward_ms": 188.08402099609376,
+    "backward_memory_mb": 250.50732421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_avazu-ctr_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 37.21584777832031,
+    "forward_memory_mb": 371.85400390625,
+    "backward_ms": 204.8204833984375,
+    "backward_memory_mb": 315.748046875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_avazu-ctr_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 40.55439453125,
+    "forward_memory_mb": 565.78857421875,
+    "backward_ms": 232.7193603515625,
+    "backward_memory_mb": 451.68505859375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_avazu-ctr_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 74.14845581054688,
+    "forward_memory_mb": 931.166015625,
+    "backward_ms": 415.62900390625,
+    "backward_memory_mb": 708.1806640625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_avazu-ctr_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 22.881689453125,
+    "forward_memory_mb": 238.92529296875,
+    "backward_ms": 118.607568359375,
+    "backward_memory_mb": 221.70703125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-categories_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 23.671296691894533,
+    "forward_memory_mb": 299.71728515625,
+    "backward_ms": 129.25450439453124,
+    "backward_memory_mb": 263.58642578125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-categories_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 25.122714233398437,
+    "forward_memory_mb": 408.60498046875,
+    "backward_ms": 147.4186279296875,
+    "backward_memory_mb": 340.4072265625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-categories_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 42.807192993164065,
+    "forward_memory_mb": 641.8095703125,
+    "backward_ms": 256.9131103515625,
+    "backward_memory_mb": 504.3818359375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_hm-categories_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 0.551526403427124,
+    "forward_memory_mb": 83.22802734375,
+    "backward_ms": 2.2931455612182616,
+    "backward_memory_mb": 64.58740234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-views_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 0.6256639957427979,
+    "forward_memory_mb": 144.7919921875,
+    "backward_ms": 2.7835391998291015,
+    "backward_memory_mb": 107.72802734375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-views_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 0.9409536361694336,
+    "forward_memory_mb": 267.98876953125,
+    "backward_ms": 3.588710403442383,
+    "backward_memory_mb": 194.1484375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-views_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 2.224332809448242,
+    "forward_memory_mb": 522.43359375,
+    "backward_ms": 7.481651306152344,
+    "backward_memory_mb": 372.9912109375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_artnet-views_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 9.620172882080078,
+    "forward_memory_mb": 236.3818359375,
+    "backward_ms": 36.381387329101564,
+    "backward_memory_mb": 173.73193359375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-arxiv_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 9.982259368896484,
+    "forward_memory_mb": 449.6982421875,
+    "backward_ms": 41.43759460449219,
+    "backward_memory_mb": 323.09912109375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-arxiv_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 10.931097412109375,
+    "forward_memory_mb": 856.708984375,
+    "backward_ms": 50.730804443359375,
+    "backward_memory_mb": 608.189453125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-arxiv_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 21.1272705078125,
+    "forward_memory_mb": 1690.40185546875,
+    "backward_ms": 94.90687866210938,
+    "backward_memory_mb": 1192.505859375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_ogbn-arxiv_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 27.4039794921875,
+    "forward_memory_mb": 329.05419921875,
+    "backward_ms": 144.83056640625,
+    "backward_memory_mb": 266.8583984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_twitch-views_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 28.53734436035156,
+    "forward_memory_mb": 543.86962890625,
+    "backward_ms": 164.33714599609374,
+    "backward_memory_mb": 417.27490234375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_twitch-views_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 31.717681884765625,
+    "forward_memory_mb": 944.87939453125,
+    "backward_ms": 193.7448974609375,
+    "backward_memory_mb": 698.16455078125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_twitch-views_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 57.589349365234376,
+    "forward_memory_mb": 1766.3115234375,
+    "backward_ms": 349.583349609375,
+    "backward_memory_mb": 1273.8984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_twitch-views_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 1.7243135452270508,
+    "forward_memory_mb": 40.19189453125,
+    "backward_ms": 9.036595153808594,
+    "backward_memory_mb": 35.46142578125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_tolokers-2_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 1.8121728897094727,
+    "forward_memory_mb": 53.19287109375,
+    "backward_ms": 9.875968170166015,
+    "backward_memory_mb": 44.5830078125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_tolokers-2_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 1.8554880142211914,
+    "forward_memory_mb": 82.43212890625,
+    "backward_ms": 11.088486480712891,
+    "backward_memory_mb": 65.35107421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_tolokers-2_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 3.0732288360595703,
+    "forward_memory_mb": 143.5126953125,
+    "backward_ms": 19.392921447753906,
+    "backward_memory_mb": 108.2177734375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_tolokers-2_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 0.3079168081283569,
+    "forward_memory_mb": 19.71240234375,
+    "backward_ms": 1.0791935920715332,
+    "backward_memory_mb": 18.7216796875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_cora_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 0.2619391918182373,
+    "forward_memory_mb": 23.05322265625,
+    "backward_ms": 1.1362303733825683,
+    "backward_memory_mb": 21.10595703125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_cora_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 0.2684927940368652,
+    "forward_memory_mb": 31.10205078125,
+    "backward_ms": 1.4040063858032226,
+    "backward_memory_mb": 26.44775390625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_cora_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 0.35717120170593264,
+    "forward_memory_mb": 44.8876953125,
+    "backward_ms": 1.6910335540771484,
+    "backward_memory_mb": 37.693359375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_cora_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 0.22640640735626222,
+    "forward_memory_mb": 20.47119140625,
+    "backward_ms": 0.8484864234924316,
+    "backward_memory_mb": 19.25146484375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_citeseer_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 0.22507519721984864,
+    "forward_memory_mb": 24.56884765625,
+    "backward_ms": 0.8820735931396484,
+    "backward_memory_mb": 22.16552734375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_citeseer_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 0.2298880100250244,
+    "forward_memory_mb": 33.677734375,
+    "backward_ms": 0.9326592445373535,
+    "backward_memory_mb": 28.97900390625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_citeseer_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 0.3058687925338745,
+    "forward_memory_mb": 50.48583984375,
+    "backward_ms": 1.2283904075622558,
+    "backward_memory_mb": 41.47607421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_citeseer_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "cuda",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 0.33187839984893797,
+    "forward_memory_mb": 42.37158203125,
+    "backward_ms": 1.3117440223693848,
+    "backward_memory_mb": 35.0859375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pubmed_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "cuda",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 0.3568639993667603,
+    "forward_memory_mb": 67.21923828125,
+    "backward_ms": 1.4757887840270996,
+    "backward_memory_mb": 52.00439453125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pubmed_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "cuda",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 0.42188801765441897,
+    "forward_memory_mb": 116.82275390625,
+    "backward_ms": 1.6428031921386719,
+    "backward_memory_mb": 87.30712890625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pubmed_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "cuda",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 0.9109503746032714,
+    "forward_memory_mb": 218.130859375,
+    "backward_ms": 4.083302307128906,
+    "backward_memory_mb": 158.80517578125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_cuda_pubmed_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 2.167091178894043,
+    "forward_memory_mb": 388.4189453125,
+    "backward_ms": 1.781862449645996,
+    "backward_memory_mb": 233.46728515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-exp_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 2.5090047836303713,
+    "forward_memory_mb": 748.15625,
+    "backward_ms": 2.476134490966797,
+    "backward_memory_mb": 421.259765625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-exp_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 3.1920127868652344,
+    "forward_memory_mb": 1440.298828125,
+    "backward_ms": 3.8507518768310547,
+    "backward_memory_mb": 792.1533203125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-exp_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-exp",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 5.3793792724609375,
+    "forward_memory_mb": 2831.3125,
+    "backward_ms": 7.801548767089844,
+    "backward_memory_mb": 1537.72802734375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-exp_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 1.9884031295776368,
+    "forward_memory_mb": 384.0419921875,
+    "backward_ms": 1.7301504135131835,
+    "backward_memory_mb": 251.23046875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-L_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 2.296627235412598,
+    "forward_memory_mb": 730.78662109375,
+    "backward_ms": 2.4640512466430664,
+    "backward_memory_mb": 453.52099609375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-L_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 3.2090110778808594,
+    "forward_memory_mb": 1421.3271484375,
+    "backward_ms": 4.687564849853516,
+    "backward_memory_mb": 868.462890625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-L_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-L",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 6.555545806884766,
+    "forward_memory_mb": 2801.58154296875,
+    "backward_ms": 11.742515563964844,
+    "backward_memory_mb": 1698.357421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-L_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 122.47705078125,
+    "forward_memory_mb": 11170.94384765625,
+    "backward_ms": 495.504296875,
+    "backward_memory_mb": 6814.0830078125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-topics_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 133.850830078125,
+    "forward_memory_mb": 21964.63037109375,
+    "backward_ms": 517.673583984375,
+    "backward_memory_mb": 12785.1650390625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-topics_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 163.64298095703126,
+    "forward_memory_mb": 43025.94677734375,
+    "backward_ms": 576.68544921875,
+    "backward_memory_mb": 24727.328125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-topics_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.05 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.48 GiB is free. Including non-PyTorch memory, this process has 64.76 GiB memory in use. Of the allocated memory 50.23 GiB is allocated by PyTorch, and 14.04 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Couldn't measure backward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.05 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.48 GiB is free. Including non-PyTorch memory, this process has 64.76 GiB memory in use. Of the allocated memory 47.53 GiB is allocated by PyTorch, and 16.73 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-topics",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": NaN,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-topics_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 122.2224853515625,
+    "forward_memory_mb": 11170.94384765625,
+    "backward_ms": 493.924267578125,
+    "backward_memory_mb": 6814.0830078125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-traffic_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 133.718017578125,
+    "forward_memory_mb": 21964.63037109375,
+    "backward_ms": 519.914306640625,
+    "backward_memory_mb": 12785.1650390625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-traffic_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 163.437060546875,
+    "forward_memory_mb": 43025.94677734375,
+    "backward_ms": 576.37275390625,
+    "backward_memory_mb": 24727.328125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-traffic_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.05 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.48 GiB is free. Including non-PyTorch memory, this process has 64.76 GiB memory in use. Of the allocated memory 50.23 GiB is allocated by PyTorch, and 14.04 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Couldn't measure backward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.05 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.48 GiB is free. Including non-PyTorch memory, this process has 64.76 GiB memory in use. Of the allocated memory 47.53 GiB is allocated by PyTorch, and 16.73 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-traffic",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": NaN,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-traffic_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 49.59713134765625,
+    "forward_memory_mb": 11387.59326171875,
+    "backward_ms": 62.557080078125,
+    "backward_memory_mb": 6370.7392578125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-prices_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 58.4279052734375,
+    "forward_memory_mb": 22265.14501953125,
+    "backward_ms": 76.19542846679687,
+    "backward_memory_mb": 11656.4072265625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-prices_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 80.10782470703126,
+    "forward_memory_mb": 43356.61279296875,
+    "backward_ms": 105.69564208984374,
+    "backward_memory_mb": 22224.833984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-prices_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 20.51 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.19 GiB is free. Including non-PyTorch memory, this process has 65.05 GiB memory in use. Of the allocated memory 62.91 GiB is allocated by PyTorch, and 1.65 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Couldn't measure backward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 20.51 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.19 GiB is free. Including non-PyTorch memory, this process has 65.05 GiB memory in use. Of the allocated memory 62.94 GiB is allocated by PyTorch, and 1.61 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-prices",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": NaN,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-prices_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 47.41560363769531,
+    "forward_memory_mb": 18608.435546875,
+    "backward_ms": 53.287933349609375,
+    "backward_memory_mb": 10715.4052734375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pokec-regions_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 67.13466796875,
+    "forward_memory_mb": 36452.29248046875,
+    "backward_ms": 82.37393798828126,
+    "backward_memory_mb": 19782.3359375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pokec-regions_feature_dim_64_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=128, out_features=128, bias=False)
+    (fc_dst): Linear(in_features=128, out_features=128, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=128, out_features=128, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.38 GiB. GPU 0 has a total capacity of 79.25 GiB of which 9.01 GiB is free. Including non-PyTorch memory, this process has 70.24 GiB memory in use. Of the allocated memory 53.20 GiB is allocated by PyTorch, and 16.55 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Couldn't measure backward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=128, out_features=128, bias=False)
+    (fc_dst): Linear(in_features=128, out_features=128, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=128, out_features=128, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.38 GiB. GPU 0 has a total capacity of 79.25 GiB of which 9.01 GiB is free. Including non-PyTorch memory, this process has 70.24 GiB memory in use. Of the allocated memory 52.54 GiB is allocated by PyTorch, and 17.20 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": NaN,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pokec-regions_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 30.76 GiB. GPU 0 has a total capacity of 79.25 GiB of which 24.39 GiB is free. Including non-PyTorch memory, this process has 54.86 GiB memory in use. Of the allocated memory 38.47 GiB is allocated by PyTorch, and 15.89 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "pokec-regions",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": null,
+    "forward_memory_mb": null,
+    "backward_ms": null,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pokec-regions_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 122.1001220703125,
+    "forward_memory_mb": 11170.94384765625,
+    "backward_ms": 496.256591796875,
+    "backward_memory_mb": 6814.0830078125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-fraud_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 134.00555419921875,
+    "forward_memory_mb": 21964.63037109375,
+    "backward_ms": 517.92138671875,
+    "backward_memory_mb": 12785.1650390625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-fraud_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 163.530029296875,
+    "forward_memory_mb": 43025.94677734375,
+    "backward_ms": 577.422119140625,
+    "backward_memory_mb": 24727.328125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-fraud_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.05 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.48 GiB is free. Including non-PyTorch memory, this process has 64.76 GiB memory in use. Of the allocated memory 50.23 GiB is allocated by PyTorch, and 14.04 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Couldn't measure backward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.05 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.48 GiB is free. Including non-PyTorch memory, this process has 64.76 GiB memory in use. Of the allocated memory 47.53 GiB is allocated by PyTorch, and 16.73 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "web-fraud",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": NaN,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_web-fraud_feature_dim_256_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=32, out_features=32, bias=False)
+    (fc_dst): Linear(in_features=32, out_features=32, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=32, out_features=32, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 15.04 GiB. GPU 0 has a total capacity of 79.25 GiB of which 15.02 GiB is free. Including non-PyTorch memory, this process has 64.23 GiB memory in use. Of the allocated memory 51.43 GiB is allocated by PyTorch, and 12.30 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": 186.0737060546875,
+    "backward_memory_mb": 38908.14404296875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-products_feature_dim_32_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=64, out_features=64, bias=False)
+    (fc_dst): Linear(in_features=64, out_features=64, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=64, out_features=64, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 30.08 GiB. GPU 0 has a total capacity of 79.25 GiB of which 1.62 GiB is free. Including non-PyTorch memory, this process has 77.62 GiB memory in use. Of the allocated memory 68.19 GiB is allocated by PyTorch, and 8.94 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": null,
+    "forward_memory_mb": null,
+    "backward_ms": null,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-products_feature_dim_64_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=128, out_features=128, bias=False)
+    (fc_dst): Linear(in_features=128, out_features=128, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=128, out_features=128, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 60.16 GiB. GPU 0 has a total capacity of 79.25 GiB of which 1.62 GiB is free. Including non-PyTorch memory, this process has 77.62 GiB memory in use. Of the allocated memory 70.53 GiB is allocated by PyTorch, and 6.60 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": null,
+    "forward_memory_mb": null,
+    "backward_ms": null,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-products_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 120.32 GiB. GPU 0 has a total capacity of 79.25 GiB of which 1.62 GiB is free. Including non-PyTorch memory, this process has 77.62 GiB memory in use. Of the allocated memory 15.04 GiB is allocated by PyTorch, and 62.09 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-products",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": null,
+    "forward_memory_mb": null,
+    "backward_ms": null,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-products_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 1.8553855895996094,
+    "forward_memory_mb": 175.67333984375,
+    "backward_ms": 1.4737407684326171,
+    "backward_memory_mb": 116.6337890625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-M_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 1.9713024139404296,
+    "forward_memory_mb": 324.2490234375,
+    "backward_ms": 1.5870976448059082,
+    "backward_memory_mb": 203.10498046875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-M_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 2.2142976760864257,
+    "forward_memory_mb": 621.05517578125,
+    "backward_ms": 2.457907295227051,
+    "backward_memory_mb": 379.5859375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-M_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-roads-M",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 3.5852287292480467,
+    "forward_memory_mb": 1218.1630859375,
+    "backward_ms": 5.373030471801758,
+    "backward_memory_mb": 734.7197265625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-roads-M_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 7.002726745605469,
+    "forward_memory_mb": 1468.765625,
+    "backward_ms": 11.306598663330078,
+    "backward_memory_mb": 857.51171875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-reviews_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 8.48373794555664,
+    "forward_memory_mb": 2867.25732421875,
+    "backward_ms": 13.413682556152343,
+    "backward_memory_mb": 1573.18798828125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-reviews_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 11.625062561035156,
+    "forward_memory_mb": 5576.2978515625,
+    "backward_ms": 18.681240844726563,
+    "backward_memory_mb": 3000.1982421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-reviews_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "city-reviews",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 20.37708740234375,
+    "forward_memory_mb": 11003.08544921875,
+    "backward_ms": 31.167486572265624,
+    "backward_memory_mb": 5859.75,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_city-reviews_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 47.07276916503906,
+    "forward_memory_mb": 11696.13916015625,
+    "backward_ms": 69.10689086914063,
+    "backward_memory_mb": 6548.45166015625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_avazu-ctr_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 58.5860107421875,
+    "forward_memory_mb": 22871.72998046875,
+    "backward_ms": 83.60447998046875,
+    "backward_memory_mb": 11986.44287109375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_avazu-ctr_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 81.75421142578125,
+    "forward_memory_mb": 44548.83154296875,
+    "backward_ms": 115.21484375,
+    "backward_memory_mb": 22862.44482421875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_avazu-ctr_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 21.02 GiB. GPU 0 has a total capacity of 79.25 GiB of which 12.59 GiB is free. Including non-PyTorch memory, this process has 66.65 GiB memory in use. Of the allocated memory 64.66 GiB is allocated by PyTorch, and 1.49 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Couldn't measure backward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 21.02 GiB. GPU 0 has a total capacity of 79.25 GiB of which 12.59 GiB is free. Including non-PyTorch memory, this process has 66.65 GiB memory in use. Of the allocated memory 64.67 GiB is allocated by PyTorch, and 1.48 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "avazu-ctr",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": NaN,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_avazu-ctr_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 49.654476928710935,
+    "forward_memory_mb": 11387.59326171875,
+    "backward_ms": 62.9444580078125,
+    "backward_memory_mb": 6370.7392578125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-categories_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 58.381927490234375,
+    "forward_memory_mb": 22265.14501953125,
+    "backward_ms": 76.14678955078125,
+    "backward_memory_mb": 11656.4072265625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-categories_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 80.04618530273437,
+    "forward_memory_mb": 43356.61279296875,
+    "backward_ms": 105.69349365234375,
+    "backward_memory_mb": 22224.833984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-categories_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 20.51 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.19 GiB is free. Including non-PyTorch memory, this process has 65.05 GiB memory in use. Of the allocated memory 62.91 GiB is allocated by PyTorch, and 1.65 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Couldn't measure backward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 20.51 GiB. GPU 0 has a total capacity of 79.25 GiB of which 14.19 GiB is free. Including non-PyTorch memory, this process has 65.05 GiB memory in use. Of the allocated memory 62.94 GiB is allocated by PyTorch, and 1.61 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "hm-categories",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": NaN,
+    "backward_memory_mb": null,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_hm-categories_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 2.162585639953613,
+    "forward_memory_mb": 388.4189453125,
+    "backward_ms": 1.802137565612793,
+    "backward_memory_mb": 233.46728515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-views_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 2.5824256896972657,
+    "forward_memory_mb": 748.15625,
+    "backward_ms": 2.446847915649414,
+    "backward_memory_mb": 421.259765625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-views_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 3.195801544189453,
+    "forward_memory_mb": 1440.298828125,
+    "backward_ms": 3.9341056823730467,
+    "backward_memory_mb": 792.1533203125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-views_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "artnet-views",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 5.466419219970703,
+    "forward_memory_mb": 2831.3125,
+    "backward_ms": 7.930572509765625,
+    "backward_memory_mb": 1537.72802734375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_artnet-views_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 7.507762908935547,
+    "forward_memory_mb": 889.91650390625,
+    "backward_ms": 10.676428985595702,
+    "backward_memory_mb": 537.19775390625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-arxiv_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 8.314163208007812,
+    "forward_memory_mb": 1725.31787109375,
+    "backward_ms": 12.071014404296875,
+    "backward_memory_mb": 985.44091796875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-arxiv_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 10.393702697753906,
+    "forward_memory_mb": 3360.48779296875,
+    "backward_ms": 15.96374969482422,
+    "backward_memory_mb": 1885.92333984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-arxiv_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "ogbn-arxiv",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 16.372940063476562,
+    "forward_memory_mb": 6631.11328125,
+    "backward_ms": 26.377828979492186,
+    "backward_memory_mb": 3687.45458984375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_ogbn-arxiv_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 32.401406860351564,
+    "forward_memory_mb": 7429.259765625,
+    "backward_ms": 48.07843933105469,
+    "backward_memory_mb": 4187.05078125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_twitch-views_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 40.010955810546875,
+    "forward_memory_mb": 14525.28173828125,
+    "backward_ms": 58.4342529296875,
+    "backward_memory_mb": 7670.4130859375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_twitch-views_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 55.15550537109375,
+    "forward_memory_mb": 28294.42236328125,
+    "backward_ms": 81.324853515625,
+    "backward_memory_mb": 14637.28125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_twitch-views_feature_dim_128_heads_1"
+}
+Couldn't measure forward performance for convolution _DGLGATv2Conv(
+  (_conv): GATv2Conv(
+    (fc_src): Linear(in_features=256, out_features=256, bias=False)
+    (fc_dst): Linear(in_features=256, out_features=256, bias=False)
+    (feat_drop): Dropout(p=0.0, inplace=False)
+    (attn_drop): Dropout(p=0.0, inplace=False)
+    (leaky_relu): LeakyReLU(negative_slope=0.2)
+  )
+  (_outer_proj): Linear(in_features=256, out_features=256, bias=False)
+). Exception: CUDA out of memory. Tried to allocate 13.13 GiB. GPU 0 has a total capacity of 79.25 GiB of which 11.18 GiB is free. Including non-PyTorch memory, this process has 68.06 GiB memory in use. Of the allocated memory 54.31 GiB is allocated by PyTorch, and 13.26 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+{
+    "conv_type": "gat_v2",
+    "dataset": "twitch-views",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": NaN,
+    "forward_memory_mb": null,
+    "backward_ms": 131.82269287109375,
+    "backward_memory_mb": 28571.5810546875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_twitch-views_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 3.378483200073242,
+    "forward_memory_mb": 583.13671875,
+    "backward_ms": 3.9384063720703124,
+    "backward_memory_mb": 335.25244140625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_tolokers-2_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 3.9100414276123048,
+    "forward_memory_mb": 1122.06982421875,
+    "backward_ms": 4.732108688354492,
+    "backward_memory_mb": 599.7939453125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_tolokers-2_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 4.974182510375977,
+    "forward_memory_mb": 2170.3740234375,
+    "backward_ms": 6.507110595703125,
+    "backward_memory_mb": 1129.92041015625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_tolokers-2_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "tolokers-2",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 7.477043151855469,
+    "forward_memory_mb": 4269.61474609375,
+    "backward_ms": 11.080294036865235,
+    "backward_memory_mb": 2191.39599609375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_tolokers-2_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 1.8888704299926757,
+    "forward_memory_mb": 26.77734375,
+    "backward_ms": 1.4320639610290526,
+    "backward_memory_mb": 22.19921875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_cora_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 1.868492889404297,
+    "forward_memory_mb": 35.29345703125,
+    "backward_ms": 1.416806411743164,
+    "backward_memory_mb": 27.4912109375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_cora_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 1.859379196166992,
+    "forward_memory_mb": 54.78857421875,
+    "backward_ms": 1.4995455741882324,
+    "backward_memory_mb": 38.6484375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_cora_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "cora",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 1.8799615859985352,
+    "forward_memory_mb": 92.1298828125,
+    "backward_ms": 1.4325759887695313,
+    "backward_memory_mb": 61.634765625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_cora_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 1.8746368408203125,
+    "forward_memory_mb": 26.08544921875,
+    "backward_ms": 1.4195712089538575,
+    "backward_memory_mb": 22.41796875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_citeseer_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 1.8775039672851563,
+    "forward_memory_mb": 35.73974609375,
+    "backward_ms": 1.430732822418213,
+    "backward_memory_mb": 27.9609375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_citeseer_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 1.847091293334961,
+    "forward_memory_mb": 55.4462890625,
+    "backward_ms": 1.4224384307861329,
+    "backward_memory_mb": 40.96337890625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_citeseer_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "citeseer",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 1.8783231735229493,
+    "forward_memory_mb": 93.11865234375,
+    "backward_ms": 1.4736384391784667,
+    "backward_memory_mb": 63.04443359375,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_citeseer_feature_dim_256_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "dgl",
+    "feature_dim": 32,
+    "heads": 1,
+    "forward_ms": 1.8627584457397461,
+    "forward_memory_mb": 96.71484375,
+    "backward_ms": 1.4238719940185547,
+    "backward_memory_mb": 65.30419921875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pubmed_feature_dim_32_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "dgl",
+    "feature_dim": 64,
+    "heads": 1,
+    "forward_ms": 1.8732032775878906,
+    "forward_memory_mb": 167.6357421875,
+    "backward_ms": 1.4217215538024903,
+    "backward_memory_mb": 104.728515625,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pubmed_feature_dim_64_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "dgl",
+    "feature_dim": 128,
+    "heads": 1,
+    "forward_ms": 1.9371007919311523,
+    "forward_memory_mb": 311.20068359375,
+    "backward_ms": 1.7285120010375976,
+    "backward_memory_mb": 185.89501953125,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pubmed_feature_dim_128_heads_1"
+}
+{
+    "conv_type": "gat_v2",
+    "dataset": "pubmed",
+    "backend": "dgl",
+    "feature_dim": 256,
+    "heads": 1,
+    "forward_ms": 2.3213056564331054,
+    "forward_memory_mb": 601.1328125,
+    "backward_ms": 3.420774459838867,
+    "backward_memory_mb": 350.96044921875,
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "device_total_memory_mb": 81152.75,
+    "sm_count": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "max_threads_per_sm": 2048,
+    "registers_per_sm": 65536,
+    "experiment_name": "gat_v2_dgl_pubmed_feature_dim_256_heads_1"
+}
+=============== DONE ===============
+RESULTS:
+|    | dataset       |   feature_dim |   cuda_backward_memory_mb |   dgl_backward_memory_mb |   cuda_backward_ms |   dgl_backward_ms |   cuda_forward_memory_mb |   dgl_forward_memory_mb |   cuda_forward_ms |   dgl_forward_ms |
+|---:|:--------------|--------------:|--------------------------:|-------------------------:|-------------------:|------------------:|-------------------------:|------------------------:|------------------:|-----------------:|
+|  0 | artnet-exp    |            32 |                   64.5874 |                 233.467  |           2.51054  |           1.78186 |                  75.103  |                388.419  |          0.564941 |          2.16709 |
+|  1 | artnet-exp    |            64 |                  107.728  |                 421.26   |           2.78712  |           2.47613 |                 144.792  |                748.156  |          0.623616 |          2.509   |
+|  2 | artnet-exp    |           128 |                  194.148  |                 792.153  |           3.31909  |           3.85075 |                 267.989  |               1440.3    |          0.945357 |          3.19201 |
+|  3 | artnet-exp    |           256 |                  372.991  |                1537.73   |           7.2577   |           7.80155 |                 522.434  |               2831.31   |          2.0224   |          5.37938 |
+|  4 | artnet-views  |            32 |                   64.5874 |                 233.467  |           2.29315  |           1.80214 |                  83.228  |                388.419  |          0.551526 |          2.16259 |
+|  5 | artnet-views  |            64 |                  107.728  |                 421.26   |           2.78354  |           2.44685 |                 144.792  |                748.156  |          0.625664 |          2.58243 |
+|  6 | artnet-views  |           128 |                  194.148  |                 792.153  |           3.58871  |           3.93411 |                 267.989  |               1440.3    |          0.940954 |          3.1958  |
+|  7 | artnet-views  |           256 |                  372.991  |                1537.73   |           7.48165  |           7.93057 |                 522.434  |               2831.31   |          2.22433  |          5.46642 |
+|  8 | avazu-ctr     |            32 |                  250.507  |                6548.45   |         188.084    |          69.1069  |                 278.718  |              11696.1    |         35.7041   |         47.0728  |
+|  9 | avazu-ctr     |            64 |                  315.748  |               11986.4    |         204.82     |          83.6045  |                 371.854  |              22871.7    |         37.2158   |         58.586   |
+| 10 | avazu-ctr     |           128 |                  451.685  |               22862.4    |         232.719    |         115.215   |                 565.789  |              44548.8    |         40.5544   |         81.7542  |
+| 11 | avazu-ctr     |           256 |                  708.181  |                 nan      |         415.629    |         nan       |                 931.166  |                nan      |         74.1485   |        nan       |
+| 12 | citeseer      |            32 |                   19.2515 |                  22.418  |           0.848486 |           1.41957 |                  20.4712 |                 26.0854 |          0.226406 |          1.87464 |
+| 13 | citeseer      |            64 |                   22.1655 |                  27.9609 |           0.882074 |           1.43073 |                  24.5688 |                 35.7397 |          0.225075 |          1.8775  |
+| 14 | citeseer      |           128 |                   28.979  |                  40.9634 |           0.932659 |           1.42244 |                  33.6777 |                 55.4463 |          0.229888 |          1.84709 |
+| 15 | citeseer      |           256 |                   41.4761 |                  63.0444 |           1.22839  |           1.47364 |                  50.4858 |                 93.1187 |          0.305869 |          1.87832 |
+| 16 | city-reviews  |            32 |                  164.048  |                 857.512  |          29.9311   |          11.3066  |                 219.098  |               1468.77   |          6.44731  |          7.00273 |
+| 17 | city-reviews  |            64 |                  291.267  |                1573.19   |          33.3958   |          13.4137  |                 400.774  |               2867.26   |          6.19151  |          8.48374 |
+| 18 | city-reviews  |           128 |                  545.845  |                3000.2    |          39.4483   |          18.6812  |                 764.196  |               5576.3    |          7.05311  |         11.6251  |
+| 19 | city-reviews  |           256 |                 1060.37   |                5859.75   |          73.823    |          31.1675  |                1498.19   |              11003.1    |         13.7333   |         20.3771  |
+| 20 | city-roads-L  |            32 |                  148.017  |                 251.23   |           2.0991   |           1.73015 |                 202.548  |                384.042  |          0.59945  |          1.9884  |
+| 21 | city-roads-L  |            64 |                  265.204  |                 453.521  |           3.04538  |           2.46405 |                 369.893  |                730.787  |          0.790733 |          2.29663 |
+| 22 | city-roads-L  |           128 |                  512.369  |                 868.463  |           4.16451  |           4.68756 |                 722.724  |               1421.33   |          1.4932   |          3.20901 |
+| 23 | city-roads-L  |           256 |                  995.954  |                1698.36   |          10.9802   |          11.7425  |                1412.52   |               2801.58   |          3.87748  |          6.55555 |
+| 24 | city-roads-M  |            32 |                   67.1455 |                 116.634  |           1.12486  |           1.47374 |                  88.2534 |                175.673  |          0.35543  |          1.85539 |
+| 25 | city-roads-M  |            64 |                  116.115  |                 203.105  |           1.31533  |           1.5871  |                 158.286  |                324.249  |          0.361472 |          1.9713  |
+| 26 | city-roads-M  |           128 |                  214.726  |                 379.586  |           1.87177  |           2.45791 |                 298.756  |                621.055  |          0.623104 |          2.2143  |
+| 27 | city-roads-M  |           256 |                  411.852  |                 734.72   |           4.68972  |           5.37303 |                 579.319  |               1218.16   |          1.63922  |          3.58523 |
+| 28 | cora          |            32 |                   18.7217 |                  22.1992 |           1.07919  |           1.43206 |                  19.7124 |                 26.7773 |          0.307917 |          1.88887 |
+| 29 | cora          |            64 |                   21.106  |                  27.4912 |           1.13623  |           1.41681 |                  23.0532 |                 35.2935 |          0.261939 |          1.86849 |
+| 30 | cora          |           128 |                   26.4478 |                  38.6484 |           1.40401  |           1.49955 |                  31.1021 |                 54.7886 |          0.268493 |          1.85938 |
+| 31 | cora          |           256 |                   37.6934 |                  61.6348 |           1.69103  |           1.43258 |                  44.8877 |                 92.1299 |          0.357171 |          1.87996 |
+| 32 | hm-categories |            32 |                  221.707  |                6370.74   |         118.608    |          62.9445  |                 238.925  |              11387.6    |         22.8817   |         49.6545  |
+| 33 | hm-categories |            64 |                  263.586  |               11656.4    |         129.255    |          76.1468  |                 299.717  |              22265.1    |         23.6713   |         58.3819  |
+| 34 | hm-categories |           128 |                  340.407  |               22224.8    |         147.419    |         105.693   |                 408.605  |              43356.6    |         25.1227   |         80.0462  |
+| 35 | hm-categories |           256 |                  504.382  |                 nan      |         256.913    |         nan       |                 641.81   |                nan      |         42.8072   |        nan       |
+| 36 | hm-prices     |            32 |                  221.707  |                6370.74   |         118.585    |          62.5571  |                 238.925  |              11387.6    |         22.7876   |         49.5971  |
+| 37 | hm-prices     |            64 |                  263.586  |               11656.4    |         129.482    |          76.1954  |                 299.717  |              22265.1    |         23.7074   |         58.4279  |
+| 38 | hm-prices     |           128 |                  340.407  |               22224.8    |         147.128    |         105.696   |                 408.605  |              43356.6    |         25.0608   |         80.1078  |
+| 39 | hm-prices     |           256 |                  504.382  |                 nan      |         257.596    |         nan       |                 641.81   |                nan      |         42.5177   |        nan       |
+| 40 | ogbn-arxiv    |            32 |                  173.732  |                 537.198  |          36.3814   |          10.6764  |                 236.382  |                889.917  |          9.62017  |          7.50776 |
+| 41 | ogbn-arxiv    |            64 |                  323.099  |                 985.441  |          41.4376   |          12.071   |                 449.698  |               1725.32   |          9.98226  |          8.31416 |
+| 42 | ogbn-arxiv    |           128 |                  608.189  |                1885.92   |          50.7308   |          15.9637  |                 856.709  |               3360.49   |         10.9311   |         10.3937  |
+| 43 | ogbn-arxiv    |           256 |                 1192.51   |                3687.45   |          94.9069   |          26.3778  |                1690.4    |               6631.11   |         21.1273   |         16.3729  |
+| 44 | ogbn-products |            32 |                 3099.56   |               38908.1    |         345.012    |         186.074   |                4005.76   |                nan      |         57.1616   |        nan       |
+| 45 | ogbn-products |            64 |                 5192.95   |                 nan      |         383.66     |         nan       |                6996.25   |                nan      |         64.1541   |        nan       |
+| 46 | ogbn-products |           128 |                 9379.23   |                 nan      |         466.678    |         nan       |               12976.4    |                nan      |         90.2843   |        nan       |
+| 47 | ogbn-products |           256 |                17752.4    |                 nan      |         955.004    |         nan       |               24937      |                nan      |        201.844    |        nan       |
+| 48 | pokec-regions |            32 |                 1682.01   |               10715.4    |          85.3513   |          53.2879  |                2288.22   |              18608.4    |         18.6476   |         47.4156  |
+| 49 | pokec-regions |            64 |                 3072.51   |               19782.3    |          98.2508   |          82.3739  |                4274.6    |              36452.3    |         20.7314   |         67.1347  |
+| 50 | pokec-regions |           128 |                 5868.36   |                 nan      |         127.193    |         nan       |                8268.4    |                nan      |         32.0838   |        nan       |
+| 51 | pokec-regions |           256 |                11445.2    |                 nan      |         285.56     |         nan       |               16234.3    |                nan      |         78.037    |        nan       |
+| 52 | pubmed        |            32 |                   35.0859 |                  65.3042 |           1.31174  |           1.42387 |                  42.3716 |                 96.7148 |          0.331878 |          1.86276 |
+| 53 | pubmed        |            64 |                   52.0044 |                 104.729  |           1.47579  |           1.42172 |                  67.2192 |                167.636  |          0.356864 |          1.8732  |
+| 54 | pubmed        |           128 |                   87.3071 |                 185.895  |           1.6428   |           1.72851 |                 116.823  |                311.201  |          0.421888 |          1.9371  |
+| 55 | pubmed        |           256 |                  158.805  |                 350.96   |           4.0833   |           3.42077 |                 218.131  |                601.133  |          0.91095  |          2.32131 |
+| 56 | tolokers-2    |            32 |                   35.4614 |                 335.252  |           9.0366   |           3.93841 |                  40.1919 |                583.137  |          1.72431  |          3.37848 |
+| 57 | tolokers-2    |            64 |                   44.583  |                 599.794  |           9.87597  |           4.73211 |                  53.1929 |               1122.07   |          1.81217  |          3.91004 |
+| 58 | tolokers-2    |           128 |                   65.3511 |                1129.92   |          11.0885   |           6.50711 |                  82.4321 |               2170.37   |          1.85549  |          4.97418 |
+| 59 | tolokers-2    |           256 |                  108.218  |                2191.4    |          19.3929   |          11.0803  |                 143.513  |               4269.61   |          3.07323  |          7.47704 |
+| 60 | twitch-views  |            32 |                  266.858  |                4187.05   |         144.831    |          48.0784  |                 329.054  |               7429.26   |         27.404    |         32.4014  |
+| 61 | twitch-views  |            64 |                  417.275  |                7670.41   |         164.337    |          58.4343  |                 543.87   |              14525.3    |         28.5373   |         40.011   |
+| 62 | twitch-views  |           128 |                  698.165  |               14637.3    |         193.745    |          81.3249  |                 944.879  |              28294.4    |         31.7177   |         55.1555  |
+| 63 | twitch-views  |           256 |                 1273.9    |               28571.6    |         349.583    |         131.823   |                1766.31   |                nan      |         57.5893   |        nan       |
+| 64 | web-fraud     |            32 |                 2640.4    |                6814.08   |        2073.26     |         496.257   |                3709.89   |              11170.9    |        202.545    |        122.1     |
+| 65 | web-fraud     |            64 |                 5112.71   |               12785.2    |        2204.57     |         517.921   |                7241.69   |              21964.6    |        218.241    |        134.006   |
+| 66 | web-fraud     |           128 |                10055      |               24727.3    |        2340.64     |         577.422   |               14301.8    |              43025.9    |        233.523    |        163.53    |
+| 67 | web-fraud     |           256 |                19930.2    |                 nan      |        4074.12     |         nan       |               28408.3    |                nan      |        420.538    |        nan       |
+| 68 | web-topics    |            32 |                 2640.4    |                6814.08   |        2059.52     |         495.504   |                3709.89   |              11170.9    |        202.637    |        122.477   |
+| 69 | web-topics    |            64 |                 5112.71   |               12785.2    |        2197.94     |         517.674   |                7241.69   |              21964.6    |        218.493    |        133.851   |
+| 70 | web-topics    |           128 |                10055      |               24727.3    |        2343.26     |         576.685   |               14301.8    |              43025.9    |        233.523    |        163.643   |
+| 71 | web-topics    |           256 |                19930.2    |                 nan      |        4072.71     |         nan       |               28408.3    |                nan      |        420.527    |        nan       |
+| 72 | web-traffic   |            32 |                 2640.4    |                6814.08   |        2061.26     |         493.924   |                3709.89   |              11170.9    |        202.474    |        122.222   |
+| 73 | web-traffic   |            64 |                 5112.71   |               12785.2    |        2203.11     |         519.914   |                7241.69   |              21964.6    |        218.25     |        133.718   |
+| 74 | web-traffic   |           128 |                10055      |               24727.3    |        2341.57     |         576.373   |               14301.8    |              43025.9    |        233.546    |        163.437   |
+| 75 | web-traffic   |           256 |                19930.2    |                 nan      |        4083.05     |         nan       |               28408.3    |                nan      |        420.743    |        nan       |

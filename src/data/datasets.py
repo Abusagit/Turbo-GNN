@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Dict, Literal, Mapping, Optional, Tuple
 
@@ -10,29 +10,21 @@ from dgl import graph as dgl_graph
 from ogb.nodeproppred import NodePropPredDataset
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
-from torch_geometric.datasets import Planetoid, Reddit
+from torch_geometric.datasets import Amazon, Coauthor, Planetoid, Reddit
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
+from src.backends.fused3s_backend.bindings import f3s_preprocess
+from src.data.converters import (
+    AdjacencyForwardBackwardWithNodeBuckets,
+    WSBFormat,
+    build_csr_as_is,
+    get_cugraph_with_gcn_weights,
+    normalize_adj,
+    to_tcgnn_data,
+)
+
 from .graphland_datasets import GraphLandDataset
-
-try:  # pragma: no cover
-    LEGACY_MODE = False
-    from pylibcugraphops.pytorch import CSC, HeteroCSC
-
-    HAS_PYLIBCUGRAPHOPS = True
-except ImportError:
-    HAS_PYLIBCUGRAPHOPS = False
-    try:  # pragma: no cover
-        from pylibcugraphops import make_fg_csr
-
-        LEGACY_MODE = True
-    except ImportError:
-        pass
-
-
-DEG_HUGE = 128  # NOTE currently this is a workaround for additional hyperparameters
-# we need to modify the code so that we can pass it to the kernels & datasets
 
 GraphBackendOption = Literal[
     "pyg",
@@ -46,7 +38,12 @@ GraphBackendOption = Literal[
     "adj_mat_in_degree_normalized_transposed",
     "adj_mat_transposed",
     "cugraph",
+    "tcgnn",
+    "weighted_sparse_block",
+    "csr_and_csr_transposed",
+    "f3s",
     "cuda",
+    "cuda_weighted_sparse_block_with_meta",
 ]  # NOTE we can define cached formalizations via this option
 
 
@@ -61,7 +58,11 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cugraph": "cugraph",
     "torch_native_adj_mat": "adj_mat",
     "cusparse": "csr",
-    "cuda": "cuda",
+    "fusegnn": "coo",
+    "tcgnn": "tcgnn",
+    "triton_block_sparse": "weighted_sparse_block",
+    "cuda": "csr_and_csr_transposed",
+    "f3s": "f3s",
 }
 
 
@@ -133,6 +134,17 @@ class GraphSample:
     test_mask: Optional[torch.BoolTensor] = None
     _graph_repr: Any = None
     add_self_loops: bool = True
+    kernel_related_kwargs: dict[str, Any] = field(default_factory=lambda: {})
+
+    def update_graph_repr_with_new_hyperparameters(self, new_kernel_related_kwargs):
+        delattr(self, "_graph_repr")
+        torch.cuda.empty_cache()
+        setattr(self, "_graph_repr", None)
+
+        self.kernel_related_kwargs = new_kernel_related_kwargs
+        self.add_self_loops = False  # we have already added self-loops when needed, now we don' have to do it
+        self.__post_init__()
+        return self
 
     def __post_init__(self):
         """
@@ -156,12 +168,12 @@ class GraphSample:
         elif self.backend == "normalized_adj_mat_gcn":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="both", add_self_loops=self.add_self_loops
-            )
+            ).to_sparse_csr()
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat_in_degree_normalized_transposed":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="right", add_self_loops=self.add_self_loops
-            )
+            ).to_sparse_csr()
             graph = self._to_default_device(graph)
         elif self.backend == "cugraph":
             normalized_gcn_adjacency = normalize_adj(
@@ -181,30 +193,64 @@ class GraphSample:
         elif self.backend == "adj_mat_transposed":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="none", add_self_loops=self.add_self_loops
-            )
+            ).to_sparse_csr()
             graph = self._to_default_device(graph)
         elif self.backend == "adj_mat":
             graph = normalize_adj(
                 edge_index=self.edge_index, num_nodes=self.num_nodes, how="none", add_self_loops=self.add_self_loops
-            ).T.coalesce()
+            ).T.coalesce()  # TODO make it CSR and compatible with tests!
             graph = self._to_default_device(graph)
         elif self.backend == "coo":
-            ...  # TODO
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+            graph = (
+                self._to_default_device(self.edge_index),
+                self._to_default_device(self.edge_weight),
+                self.num_nodes,
+            )
         elif self.backend == "csr":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
             graph = self.edge_index_to_csr(edge_index=self.edge_index, edge_weight=self.edge_weight, transposed=True)
 
+            row_ptr, cols, w, _ = build_csr_as_is(
+                self.edge_index, self.edge_weight, num_nodes=self.num_nodes, do_transpose=True
+            )
+
+            # Store graph as (row_pointers, column_indices, edge_weight) on default device
+            graph = (
+                self._to_int32(self._to_default_device(row_ptr)),
+                self._to_int32(self._to_default_device(cols)),
+                self._to_int32(self._to_default_device(w)),
+            )
         elif self.backend == "cuda":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
 
-            row_ptr, cols, _edge_weights = self.edge_index_to_csr(
-                edge_index=self.edge_index, edge_weight=self.edge_weight, transposed=True
+            row_ptr, cols, _w, counts = build_csr_as_is(
+                self.edge_index,
+                self.edge_weight,
+                num_nodes=self.num_nodes,
+                do_transpose=True,
             )
-            del _edge_weights
-            mid_nodes, huge_nodes = bucket_nodes(row_ptr, deg_huge=DEG_HUGE)
-            graph = (row_ptr, cols, mid_nodes, huge_nodes)
+
+            deg = counts
+            quantile = self.kernel_related_kwargs.get("huge_degree_threshold_quantile", -1)
+
+            if quantile != -1:
+                huge_degree_threshold_quantile = torch.quantile(deg.float(), quantile).item()
+            else:
+                huge_degree_threshold_quantile = max(counts) + 1
+
+            light = (deg < huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
+            heavy = (deg >= huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
+
+            graph = (
+                self._to_int32(self._to_default_device(row_ptr)),
+                self._to_int32(self._to_default_device(cols)),
+                self._to_int32(self._to_default_device(light)),
+                self._to_int32(self._to_default_device(heavy)),
+            )
 
         elif self.backend == "csc":
             ...  # TODO
@@ -212,6 +258,88 @@ class GraphSample:
             edge_list = self.edge_index.T
             graph = (self._to_default_device(edge_list), self._to_default_device(self.edge_weight))
             # TODO: add self-loops
+        elif self.backend == "tcgnn":
+            row_pointer, col_indices, block_partition, edge_to_column, edge_to_row = to_tcgnn_data(
+                self.edge_index, self.num_nodes, self.edge_weight
+            )
+            graph = (
+                self._to_default_device(row_pointer),
+                self._to_default_device(col_indices),
+                self._to_default_device(block_partition),
+                self._to_default_device(edge_to_column),
+                self._to_default_device(edge_to_row),
+            )
+        elif self.backend == "weighted_sparse_block":
+            adj_sparse_csr = (
+                normalize_adj(
+                    self.edge_index,
+                    num_nodes=self.num_nodes,
+                    how="both",  # TODO implement other normalization types for this backend
+                    add_self_loops=self.add_self_loops,
+                )
+                .to_sparse_csr()
+                .cpu()
+            )
+
+            graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
+        elif self.backend == "csr_and_csr_transposed":
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+
+            row_ptr_fwd, cols_fwd, _w, counts_fwd = build_csr_as_is(
+                edge_index=self.edge_index,
+                edge_weight=self.edge_weight,
+                num_nodes=self.num_nodes,
+                do_transpose=True,
+            )
+
+            row_ptr_bwd, cols_bwd, _w, counts_bwd = build_csr_as_is(
+                edge_index=self.edge_index,
+                edge_weight=self.edge_weight,
+                num_nodes=self.num_nodes,
+                do_transpose=False,
+            )
+
+            deg = counts_fwd
+            quantile = self.kernel_related_kwargs.get("huge_degree_threshold_quantile", -1)
+
+            if quantile != -1:
+                huge_degree_threshold_quantile = torch.quantile(deg.float(), quantile).item()
+            else:
+                huge_degree_threshold_quantile = max(counts_fwd) + 1
+
+            light = (deg < huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1)
+            heavy = (deg >= huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1)
+
+            graph = self._to_default_device(
+                AdjacencyForwardBackwardWithNodeBuckets(
+                    forward_indptr=self._to_int32(row_ptr_fwd),
+                    forward_indices=self._to_int32(cols_fwd),
+                    backward_indptr=self._to_int32(row_ptr_bwd),
+                    backward_indices=self._to_int32(cols_bwd),
+                    light_nodes=self._to_int32(light),
+                    heavy_nodes=self._to_int32(heavy),
+                )
+            )
+
+        elif self.backend == "cuda_weighted_sparse_block_with_meta":
+            adj_sparse_csr = (
+                normalize_adj(
+                    self.edge_index,
+                    num_nodes=self.num_nodes,
+                    how="both",  # TODO implement other normalization types for this backend
+                    add_self_loops=self.add_self_loops,
+                )
+                .to_sparse_csr()
+                .cpu()
+            )
+
+            # TODO speedud construction via GPU-based operation
+            graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
+            # TODO add light & heavy vertices
+
+        elif self.backend == "f3s":
+            graph = f3s_preprocess(self.edge_index)
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"
@@ -399,10 +527,43 @@ def _masks_from_indices(
     return train_mask, val_mask, test_mask
 
 
+def _mask_from_indices_with_splits_creation(
+    num_nodes: int,
+) -> Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+    """Create boolean train/val/test masks by generating a random 60/20/20 split.
+
+    This helper samples a random permutation of node indices in [0, num_nodes)
+    and constructs split index tensors for train/val/test with ratios
+    0.6 / 0.2 / 0.2. It then delegates to `_masks_from_indices` to convert
+    those index tensors into boolean masks of shape [num_nodes].
+
+    Args:
+        num_nodes (int): Total number of nodes N in the single-graph dataset.
+
+    Returns:
+        Tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+            (train_mask, val_mask, test_mask), each of shape [N] with dtype=bool.
+    """
+    perm = torch.randperm(num_nodes)
+    n_train = int(0.6 * num_nodes)
+    n_val = int(0.2 * num_nodes)
+    splits = {
+        "train": perm[:n_train],
+        "val": perm[n_train : n_train + n_val],
+        "test": perm[n_train + n_val :],
+    }
+    return _masks_from_indices(num_nodes, splits)
+
+
 # ------------------------------- OGBN loaders -------------------------------- #
 
 
-def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
+def load_ogbn(
+    name: str,
+    graph_backend: GraphBackendOption,
+    root: str = "data",
+    kernel_related_kwargs: dict[str, Any] = {},
+) -> GraphSample:
     """Load an ogbn-* node property prediction dataset as a single-graph sample.
 
     Args:
@@ -443,13 +604,20 @@ def load_ogbn(name: str, graph_backend: GraphBackendOption, root: str = "data") 
         val_mask=val_mask,
         test_mask=test_mask,
         backend=graph_backend,
+        kernel_related_kwargs=kernel_related_kwargs,
     )
 
 
 # ------------------------------- PyG loaders --------------------------------- #
 
 
-def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
+def load_pyg_single_graph(
+    name: str,
+    graph_backend: GraphBackendOption,
+    root: str = "data",
+    allow_random_split: bool = False,
+    kernel_related_kwargs: dict[str, Any] = {},
+) -> GraphSample:
     """Load a single-graph dataset from PyTorch Geometric.
 
     Supported (common) names:
@@ -497,11 +665,22 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         ):
             dset = GraphLandDataset(root=root, name=name, split="RL")
             data = dset[0]
+        elif name in ("amazon-photo", "amazon-computers"):
+            dset = Amazon(root=root, name=name.split("-")[1])
+            data = dset[0]
+        elif name in ("coauthor-cs", "coauthor-physics"):
+            dset = Coauthor(root=root, name=name.split("-")[1])
+            data = dset[0]
         else:
-            raise ValueError(
-                f"Unknown PyG dataset '{name}'. Supported: Cora/CiteSeer/PubMed/Reddit or provide a known class in "
-                "torch_geometric.datasets."
-            )
+            try:
+                cls = getattr(pyg_datasets, name)
+                try:
+                    dset = cls(root=root, name=name)
+                except TypeError:
+                    dset = cls(root=root)
+                data = dset[0]
+            except AttributeError:
+                raise ValueError(f"Unknown PyG dataset '{name}'.")
         return data
 
     data = _load_pyg_cpu()
@@ -519,8 +698,27 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
     val_mask = getattr(data, "val_mask", None)
     test_mask = getattr(data, "test_mask", None)
 
+    def _pick_split(mask: Optional[torch.Tensor], split_id: int = 0) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+        mask = mask.bool()
+        if mask.ndim == 2:
+            mask = mask[:, split_id]
+        return mask
+
+    split_id = 0
+    train_mask = _pick_split(train_mask, split_id)
+    val_mask = _pick_split(val_mask, split_id)
+    test_mask = _pick_split(test_mask, split_id)
+
     if train_mask is None or val_mask is None or test_mask is None:
-        raise ValueError(f"Dataset '{name}' does not provide standard masks; please construct custom splits.")
+        if not allow_random_split:
+            raise ValueError(
+                f"Dataset '{name}' does not provide standard masks; "
+                "set `allow_random_split: true` in your dataset YAML to auto-generate them."
+            )
+        print(f"Dataset '{name}' lacks masks -> creating random 60/20/20 split.")
+        train_mask, val_mask, test_mask = _mask_from_indices_with_splits_creation(y.size(0))
 
     return GraphSample(
         x=x,
@@ -531,13 +729,16 @@ def load_pyg_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         val_mask=val_mask.bool(),
         test_mask=test_mask.bool(),
         backend=graph_backend,
+        kernel_related_kwargs=kernel_related_kwargs,
     )
 
 
 # -------------------------------- DGL loaders -------------------------------- #
 
 
-def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: str = "data") -> GraphSample:
+def load_dgl_single_graph(
+    name: str, graph_backend: GraphBackendOption, root: str = "data", kernel_related_kwargs: dict[str, Any] = {}
+) -> GraphSample:
     """Load a single-graph dataset from DGL.
 
     Supported (common) names:
@@ -568,7 +769,19 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         elif name == "reddit":
             dset = dgl_data.RedditDataset(raw_dir=root)
         else:
-            raise ValueError(f"Unknown DGL dataset '{name}'. Supported: cora/citeseer/pubmed/reddit.")
+            cls = None
+            if hasattr(dgl_data, name):
+                cls = getattr(dgl_data, name)
+            else:
+                for suffix in ("Dataset", "GraphDataset"):
+                    cand = name + suffix
+                    if hasattr(dgl_data, cand):
+                        cls = getattr(dgl_data, cand)
+                        break
+            if cls is None:
+                raise ValueError(f"Unknown DGL dataset '{name}'")
+
+            dset = cls(raw_dir=root)
         return dset
 
     dset = _load_dgl_cpu()
@@ -600,6 +813,7 @@ def load_dgl_single_graph(name: str, graph_backend: GraphBackendOption, root: st
         val_mask=val_mask.bool(),
         test_mask=test_mask.bool(),
         backend=graph_backend,
+        kernel_related_kwargs=kernel_related_kwargs,
     )
 
 
@@ -613,14 +827,16 @@ class DatasetConfig:
     Attributes:
         source (str): 'ogbn' | 'pyg' | 'dgl' | 'auto'
         name (str): Dataset name (e.g., 'ogbn-arxiv', 'Cora', 'reddit').
-        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
+        conv_backend (str): Conv backend type.
         root (str): Download/cache directory.
     """
 
     source: str
     name: str
-    graph_backend: GraphBackendOption
+    conv_backend: str
     root: str = "data"
+    allow_random_split: bool = False
+    kernel_related_kwargs: dict[str, Any] = field(default_factory=lambda: {})
 
 
 def load_single_graph(cfg: DatasetConfig) -> GraphSample:
@@ -635,149 +851,41 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     Raises:
         KeyError: If source is unsupported.
     """
+    assert cfg.conv_backend in MODEL_BACKEND_TO_GRAPH_REPR, f"Unknown conv backend: {cfg.conv_backend}"
+    graph_backend = MODEL_BACKEND_TO_GRAPH_REPR[cfg.conv_backend]
+
+    kernel_related_kwargs = cfg.kernel_related_kwargs
+
     s = cfg.source.lower()
     if s == "ogbn":
-        return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+        return load_ogbn(
+            cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+        )
     if s == "pyg":
-        return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+        return load_pyg_single_graph(
+            cfg.name,
+            root=cfg.root,
+            graph_backend=graph_backend,
+            allow_random_split=getattr(cfg, "allow_random_split", False),
+            kernel_related_kwargs=kernel_related_kwargs,
+        )
     if s == "dgl":
-        return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+        return load_dgl_single_graph(
+            cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+        )
     if s == "auto":
         # ogbn-* -> OGBN; else try PyG; then DGL.
         if cfg.name.lower().startswith("ogbn-"):
-            return load_ogbn(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+            return load_ogbn(
+                cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+            )
         try:
-            return load_pyg_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+            return load_pyg_single_graph(
+                cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+            )
         except Exception:
-            return load_dgl_single_graph(cfg.name, root=cfg.root, graph_backend=cfg.graph_backend)
+            return load_dgl_single_graph(
+                cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+            )
 
     raise KeyError(f"Unsupported dataset source '{cfg.source}'")
-
-
-def normalize_adj(
-    edge_index: torch.Tensor, num_nodes: int, how: Literal["left", "right", "both", "none"], add_self_loops: bool = True
-) -> torch.Tensor:
-    """Compute symmetric normalized adjacency (A_hat) as sparse COO.
-
-    Args:
-        edge_index (torch.Tensor): [2, E] long tensor.
-        num_nodes (int): Number of nodes.
-
-    Returns:
-        torch.Tensor: Sparse COO adjacency with added self-loops and:
-            - D^{-1/2} A D^{-1/2} normalization if `how` == "both".
-            - D_in^{-1} A^T normalization if `how` == "right" -- normalization for mean-aggregation
-            - A if `how` == "none" -- normalization for adj-mat backend
-    """
-    device = edge_index.device
-    idx = edge_index
-
-    if add_self_loops:
-        self_loops = torch.arange(num_nodes, device=device)
-        loop_idx = torch.stack([self_loops, self_loops], dim=0)
-        idx = torch.cat([idx, loop_idx], dim=1)
-        edge_index = idx
-
-    if how == "both":
-        values = torch.ones(idx.size(1), device=device)
-        adj = torch.sparse_coo_tensor(idx, values, (num_nodes, num_nodes)).T.coalesce().to(values.device)
-
-        deg1 = torch.sparse.sum(adj, dim=1).to_dense()
-        D_inv_sqrt1 = torch.pow(deg1.clamp(min=1.0), -0.5)
-
-        deg0 = torch.sparse.sum(adj, dim=0).to_dense()
-        D_inv_sqrt0 = torch.pow(deg0.clamp(min=1.0), -0.5)
-
-        idx, values = adj.indices(), adj.values()
-        row, col = idx
-        norm_vals = D_inv_sqrt1[row] * values * D_inv_sqrt0[col]
-        return torch.sparse_coo_tensor(idx, norm_vals, (num_nodes, num_nodes)).coalesce()
-    elif how == "left":
-        raise NotImplementedError()
-    elif how == "right":
-        """
-            Computes A^T (transposed adjacency) and D_in^{-1} (inverse in-degree diagonal).
-            This matches DGL's copy_u_mean operation.
-        """
-        device = edge_index.device
-        src, dst = edge_index[0], edge_index[1]
-
-        values = torch.ones(edge_index.size(1), device=device)
-        adj_t_indices = torch.stack([dst, src], dim=0)
-        adj_t = torch.sparse_coo_tensor(adj_t_indices, values, (num_nodes, num_nodes)).coalesce()
-
-        in_degrees = torch.zeros(num_nodes, device=device)
-        in_degrees.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
-
-        # handle isolated nodes (in_degree = 0) by setting to 1 to avoid division by zero
-        in_degrees = in_degrees.clamp(min=1.0)
-
-        in_degree_inv = 1.0 / in_degrees
-        diag_indices = torch.arange(num_nodes, device=device).unsqueeze(0).repeat(2, 1)
-        in_degree_inv_diag = torch.sparse_coo_tensor(diag_indices, in_degree_inv, (num_nodes, num_nodes)).coalesce()
-
-        adj_t_normalized = in_degree_inv_diag @ adj_t
-        return adj_t_normalized
-    elif how == "none":
-        """
-            Computes A^T (transposed adjacency).
-            This matches DGL's copy_u_sum operation.
-        """
-        device = edge_index.device
-        src, dst = edge_index[0], edge_index[1]
-
-        values = torch.ones(edge_index.size(1), device=device)
-        adj_t_indices = torch.stack([dst, src], dim=0)
-        adj_t = torch.sparse_coo_tensor(adj_t_indices, values, (num_nodes, num_nodes)).coalesce()
-
-        return adj_t
-    else:
-        raise ValueError(f"Normalization type {how} is inappropriate")
-
-
-def get_cugraph_with_gcn_weights(
-    edge_index: EdgeIndex,
-) -> CSC:
-    """Constructs a :obj:`cugraph` graph object from CSC representation.
-        NOTE
-
-    Args:
-        edge_index (EdgeIndex): The edge indices.
-
-    Returns CSC graph and edge index which is used only in GCN computation
-
-    """
-    if not isinstance(edge_index, EdgeIndex):
-        raise ValueError(f"'edge_index' needs to be of type 'EdgeIndex' " f"(got {type(edge_index)})")
-
-    edge_index = edge_index.sort_by("col")[0]
-    num_src_nodes = edge_index.get_sparse_size(0)
-    (colptr, row), _ = edge_index.get_csc()
-
-    if not row.is_cuda:
-        raise RuntimeError("'get_cugraph' requires GPU-based processing (got CPU tensor)")
-
-    if LEGACY_MODE:
-        return make_fg_csr(colptr, row)
-
-    return CSC(colptr, row, num_src_nodes=num_src_nodes)
-
-
-def bucket_nodes(edge_ptr, deg_huge=DEG_HUGE):
-    """
-    Split nodes into buckets:
-      - mid_nodes: 0 < deg <= deg_huge
-      - huge_nodes: deg > deg_huge
-    Returns (mid_nodes:int32[cuda], huge_nodes:int32[cuda])
-    """
-    # deg[i] = number of inbound edges for node i
-    deg = (edge_ptr[1:] - edge_ptr[:-1]).to(torch.int32)  # cuda int32
-
-    mid_mask = (deg >= 0) & (deg <= deg_huge)
-    huge_mask = deg > deg_huge
-
-    mid_nodes = torch.nonzero(mid_mask, as_tuple=False).view(-1).to(torch.int32)
-    huge_nodes = torch.nonzero(huge_mask, as_tuple=False).view(-1).to(torch.int32)
-
-    # ensure contiguous for kernel argument passing
-    return mid_nodes.contiguous(), huge_nodes.contiguous()
