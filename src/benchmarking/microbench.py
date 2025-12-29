@@ -49,7 +49,7 @@ def measure_memory(func):
 
     memory_allocated = end_memory - start_memory
     # return result, memory_allocated, peak_memory
-    return result, end_memory, peak_memory
+    return result, peak_memory, peak_memory
 
 
 def time_callable(fn: Callable[[], Any], warmup: int = 10, iters: int = 50) -> MicrobenchResult:
@@ -109,7 +109,7 @@ def get_gpu_info(device=None) -> dict[str, Any]:
         return {
             "device_name": device_properties.name,
             "device_total_memory_mb": device_properties.total_memory / 2**20,
-            "sm_count": device_properties.name,
+            "sm_count": device_properties.multi_processor_count,
             "compute_capability": f"{device_properties.major}.{device_properties.minor}",
             "max_threads_per_sm": device_properties.max_threads_per_multi_processor,
             "registers_per_sm": device_properties.regs_per_multiprocessor,

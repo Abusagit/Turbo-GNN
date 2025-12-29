@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-from .kernels_impl import WSBFormat, WSBGraphTransformer, WSBSpMM
+from .kernels_impl import WSBGraphTransformer, WSBSpMM
 
 doc = """
 Triton backend currently support block-sparse format
@@ -32,7 +32,7 @@ class _TritonBlockSparseGraphConv(BaseConvolution):
     def forward(
         self,
         x: torch.Tensor,
-        graph: WSBFormat,
+        graph,
         *,
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
@@ -68,14 +68,14 @@ class _TritonBlockSparseGraphTransformerConv(BaseConvolution):
 
         self.qkv_proj = nn.Linear(self.feature_dim, 3 * self.feature_dim)
 
-        self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.feature_dim // self.num_heads))
+        self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.feature_dim // self.num_heads)).item()
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         qkv: torch.Tensor = self.qkv_proj(x)
         q, k, v = qkv.split(self.feature_dim, -1)
         # TODO add support for multiple heads
 
-        return WSBGraphTransformer.apply(q, k, v, graph)
+        return WSBGraphTransformer.apply(q, k, v, graph, self.attn_scores_multiplier)
 
 
 @BackendRegistry.register_backend("triton_block_sparse")
