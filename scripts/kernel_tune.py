@@ -76,7 +76,13 @@ def main() -> int:
     torch.set_default_device(device)
 
     with open(args.dataset, encoding="utf-8") as f:
-        dataset_cfg = yaml.safe_load(f)["dataset"]
+        dataset_cfg_top_level = yaml.safe_load(f)
+        dataset_cfg = dataset_cfg_top_level["dataset"]
+
+    with open(args.optuna_config, encoding="utf-8") as f:
+        param_config: dict[str, dict[str, Any]] = yaml.safe_load(f)
+        kernel_parameters = param_config["parameters"]
+        dataset_parameters = param_config.get("dataset_related_parameters", None)
 
     graph = load_single_graph(
         DatasetConfig(
@@ -88,9 +94,6 @@ def main() -> int:
     )
     x = torch.randn(graph.num_nodes, args.in_ch, device=device)
 
-    with open(args.optuna_config, encoding="utf-8") as f:
-        param_config: dict[str, dict[str, Any]] = yaml.safe_load(f)
-
     backend = BackendRegistry.get_backend(args.backend)
 
     amp_dtype = None
@@ -100,12 +103,21 @@ def main() -> int:
         amp_dtype = torch.float16
 
     def objective(trial: optuna.Trial) -> float:
+        nonlocal graph
         """Optuna objective function that creates a conv with suggested params and times it."""
         cfg: dict[str, Any] = {}
-        for param_name, param_spec in param_config.items():
+        for param_name, param_spec in kernel_parameters.items():
             cfg[param_name] = getattr(trial, f"suggest_{param_spec['type']}")(
                 param_name, **{k: v for k, v in param_spec.items() if k != "type"}
             )
+
+        if dataset_parameters is not None:
+            dataset_rebuild_cfg = {}
+            for param_name, param_spec in dataset_parameters.items():
+                dataset_rebuild_cfg[param_name] = getattr(trial, f"suggest_{param_spec['type']}")(
+                    param_name, **{k: v for k, v in param_spec.items() if k != "type"}
+                )
+            graph = graph.update_graph_repr_with_new_hyperparameters(new_kernel_related_kwargs=dataset_rebuild_cfg)
 
         conv = backend.create_conv(args.conv_type, feature_dim=args.in_ch, **cfg)
         conv = conv.to(device)

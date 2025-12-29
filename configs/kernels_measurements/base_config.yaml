@@ -1,6 +1,7 @@
 params_grid:
-  feature_dim: [64, 128, 256, 512]
-  heads: [1, 2, 4, 8]
+  all:
+    feature_dim: [64, 128, 256, 512]
+    heads: [1, 2, 4, 8]
 datasets:
   base_path: configs/datasets
   dirs:

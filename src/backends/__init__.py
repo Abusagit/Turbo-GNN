@@ -1,4 +1,5 @@
 from . import (
+    cuda_backend,
     cugraph_backend,
     cusparse_backend,
     dgl_backend,
