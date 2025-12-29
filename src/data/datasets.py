@@ -34,6 +34,7 @@ GraphBackendOption = Literal[
     "cugraph",
     "tcgnn",
     "weighted_sparse_block",
+    "csr_and_csr_transposed",
     "f3s",
     "cuda",
     "cuda_weighted_sparse_block_with_meta",
@@ -54,6 +55,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "fusegnn": "coo",
     "tcgnn": "tcgnn",
     "triton_block_sparse": "weighted_sparse_block",
+    "cuda": "csr_and_csr_transposed",
     "f3s": "f3s",
     "cuda": "cuda",
 }
@@ -265,6 +267,37 @@ class GraphSample:
             )
 
             graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
+        elif self.backend == "csr_and_csr_transposed":
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+
+            # Here we actually transpose adj matrix, that's why not
+            # rows = self.edge_index[0]
+            # cols = self.edge_index[1]
+
+            graph = []
+
+            for do_transpose in [True, False]:
+                if do_transpose:
+                    rows = self.edge_index[1]
+                    cols = self.edge_index[0]
+                else:
+                    rows = self.edge_index[0]
+                    cols = self.edge_index[1]
+                N = self.num_nodes
+
+                # Sort edges by (row, col) for a canonical CSR
+                perm = (rows * N + cols).argsort()
+                rows = rows[perm]
+                cols = cols[perm]
+
+                # Build CSR row pointers
+                counts = torch.bincount(rows, minlength=N)
+                row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
+                row_ptr[1:] = counts.cumsum(0)
+                graph.extend(
+                    [self._to_int32(self._to_default_device(row_ptr)), self._to_int32(self._to_default_device(cols))]
+                )
         elif self.backend == "cuda_weighted_sparse_block_with_meta":
             adj_sparse_csr = (
                 normalize_adj(

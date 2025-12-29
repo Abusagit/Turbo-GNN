@@ -7,7 +7,7 @@ from torch_geometric.data import Data
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
-from src.backends.triton_backend.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
+from src.utils.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
 
 try:  # pragma: no cover
     LEGACY_MODE = False

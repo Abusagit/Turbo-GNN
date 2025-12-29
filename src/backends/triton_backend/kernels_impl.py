@@ -5,8 +5,7 @@ import triton
 import triton.language as tl
 
 from src.data.converters import WSBFormat
-
-from .triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
+from src.utils.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
 
 #####################################################
 ################# GraphConv Kernels #################
