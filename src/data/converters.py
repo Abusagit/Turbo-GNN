@@ -23,6 +23,11 @@ except ImportError:
     except ImportError:
         pass
 
+from torch.utils.cpp_extension import load
+
+wsb_cuda = load(
+    name="wsb_cuda", sources=[__file__.replace("converters.py", "") + "wsb_format.cu"], extra_cuda_cflags=["-O3"]
+)
 
 doc = """
 Graph format converters among edge list, CSR, and optional framework objects.
@@ -511,6 +516,8 @@ class WSBFormat:
     num_tcbs: int
 
     adjacency_matrices_meta: AdjacencyForwardBackwardCSR
+    light_nodes: torch.Tensor | None = None
+    heavy_nodes: torch.Tensor | None = None
 
     def to(self, device: str | torch.device) -> "WSBFormat":
         """Move tensors to device"""
@@ -524,6 +531,8 @@ class WSBFormat:
             num_row_windows=self.num_row_windows,
             num_tcbs=self.num_tcbs,
             adjacency_matrices_meta=self.adjacency_matrices_meta.to(device),
+            light_nodes=self.light_nodes,
+            heavy_nodes=self.heavy_nodes,
         )
 
     def cuda(self) -> "WSBFormat":
@@ -611,116 +620,147 @@ class WSBFormat:
             WSBFormat with all tensors ready for CUDA kernel
         """
 
+        # N = adj.shape[0]
+        # assert adj.shape[0] == adj.shape[1], "Adjacency must be square"
+
+        # indptr = adj.crow_indices()
+        # indices = adj.col_indices()
+        # weights = adj.values()
+
+        # num_row_windows = (N + ROW_WINDOW_SIZE - 1) // ROW_WINDOW_SIZE
+        # num_edges = len(indices)
+
+        # tcb_row_offset = [0]
+        # all_col_idx = []  # 8 columns per TCB
+        # all_bitmaps = []  # 2 uint64 per TCB
+        # all_weights = []  # 128 floats per TCB
+
+        # # process each row window
+        # for rw in range(num_row_windows):
+        #     row_start = rw * ROW_WINDOW_SIZE
+        #     row_end = min(row_start + ROW_WINDOW_SIZE, N)
+        #     num_rows_in_window = row_end - row_start
+
+        #     # collect all (local_row, col, weight) for this row window
+        #     edges_in_window = []
+        #     for local_row in range(num_rows_in_window):
+        #         global_row = row_start + local_row
+        #         for idx in range(indptr[global_row], indptr[global_row + 1]):
+        #             col = indices[idx].item()
+        #             w = weights[idx].item()
+        #             # print(f"{rw=} {idx=} {global_row=} {col=} {w=}")
+        #             edges_in_window.append((local_row, col, w))
+
+        #     if len(edges_in_window) == 0:
+        #         tcb_row_offset.append(tcb_row_offset[-1])
+        #         continue
+
+        #     # get unique columns and sort them
+        #     unique_cols = sorted({e[1] for e in edges_in_window})
+        #     num_unique_cols = len(unique_cols)
+
+        #     # column -> local index mapping
+        #     col_to_local = {c: i for i, c in enumerate(unique_cols)}
+
+        #     # edge lookup: (local_row, local_col) -> weight
+        #     edge_map = {}
+        #     for local_row, col, w in edges_in_window:
+        #         local_col = col_to_local[col]
+        #         edge_map[(local_row, local_col)] = w
+
+        #     # number of TCBs for this row window
+        #     num_tcbs_in_rw = (num_unique_cols + TCB_WIDTH - 1) // TCB_WIDTH
+
+        #     # process each TCB
+        #     for tcb_idx in range(num_tcbs_in_rw):
+        #         col_start = tcb_idx * TCB_WIDTH
+        #         col_end = min(col_start + TCB_WIDTH, num_unique_cols)
+
+        #         # column indices for this TCB (pad with 0 if fewer than 8)
+        #         tcb_cols = unique_cols[col_start:col_end]
+        #         while len(tcb_cols) < TCB_WIDTH:
+        #             tcb_cols.append(0)  # padding
+        #         all_col_idx.extend(tcb_cols)
+
+        #         # build bitmap and weights for this TCB
+        #         # bitmap layout: bits 0-63 for rows 0-7 (first uint64)
+        #         #                bits 0-63 for rows 8-15 (second uint64)
+        #         # within each uint64: bit = row * 8 + col_in_tcb
+        #         bitmap_lo = np.uint64(0)  # Rows 0-7
+        #         bitmap_hi = np.uint64(0)  # Rows 8-15
+        #         tcb_weights = np.zeros(TCB_SIZE, dtype=np.float32)
+
+        #         for local_row in range(ROW_WINDOW_SIZE):
+        #             for local_col_in_tcb in range(TCB_WIDTH):
+        #                 global_local_col = col_start + local_col_in_tcb
+
+        #                 if global_local_col >= num_unique_cols:
+        #                     continue
+
+        #                 key = (local_row, global_local_col)
+        #                 if key in edge_map:
+        #                     # set bit in bitmap
+        #                     bit_pos = (local_row % 8) * TCB_WIDTH + local_col_in_tcb
+        #                     if local_row < 8:
+        #                         bitmap_lo |= np.uint64(1) << np.uint64(bit_pos)
+        #                     else:
+        #                         bitmap_hi |= np.uint64(1) << np.uint64(bit_pos)
+
+        #                     # store weight (row-major within TCB)
+        #                     weight_idx = local_row * TCB_WIDTH + local_col_in_tcb
+        #                     tcb_weights[weight_idx] = edge_map[key]
+
+        #         all_bitmaps.extend([bitmap_lo, bitmap_hi])
+        #         all_weights.extend(tcb_weights.tolist())
+
+        #     tcb_row_offset.append(tcb_row_offset[-1] + num_tcbs_in_rw)
+
+        # # convert to tensors
+        # num_tcbs = tcb_row_offset[-1]
+        # bitmap_array = np.array(all_bitmaps, dtype=np.uint64)
+        # bitmap_tensor = torch.from_numpy(bitmap_array.view(np.int64)).clone()
+
+        # return cls(
+        #     tcb_row_offset=torch.tensor(tcb_row_offset, dtype=torch.int32),
+        #     col_idx=torch.tensor(all_col_idx, dtype=torch.int32),
+        #     bitmap=bitmap_tensor,
+        #     weights=torch.tensor(all_weights, dtype=dtype),
+        #     num_nodes=N,
+        #     num_edges=num_edges,
+        #     num_row_windows=num_row_windows,
+        #     num_tcbs=num_tcbs,
+        #     adjacency_matrices_meta=AdjacencyForwardBackwardCSR(
+        #         adj_mat_csr_forward=adj,
+        #         adj_mat_csr_backward=adj.to_sparse_coo().T.to_sparse_csr().to(adj.device),
+        #     ),
+        #     light_nodes=...,
+        #     heavy_nodes=...,
+        # )
+
+        # TODO ADD LIGHT-HEAVY PARTITION!
+
         N = adj.shape[0]
         assert adj.shape[0] == adj.shape[1], "Adjacency must be square"
 
-        indptr = adj.crow_indices()
-        indices = adj.col_indices()
-        weights = adj.values()
-
         num_row_windows = (N + ROW_WINDOW_SIZE - 1) // ROW_WINDOW_SIZE
-        num_edges = len(indices)
+        num_edges = adj._nnz()
 
-        tcb_row_offset = [0]
-        all_col_idx = []  # 8 columns per TCB
-        all_bitmaps = []  # 2 uint64 per TCB
-        all_weights = []  # 128 floats per TCB
+        tcb_row_offset, col_idx, bitmap, weights = wsb_cuda.build_wsb_format_cpu(adj, dtype)
 
-        # process each row window
-        for rw in range(num_row_windows):
-            row_start = rw * ROW_WINDOW_SIZE
-            row_end = min(row_start + ROW_WINDOW_SIZE, N)
-            num_rows_in_window = row_end - row_start
-
-            # collect all (local_row, col, weight) for this row window
-            edges_in_window = []
-            for local_row in range(num_rows_in_window):
-                global_row = row_start + local_row
-                for idx in range(indptr[global_row], indptr[global_row + 1]):
-                    col = indices[idx].item()
-                    w = weights[idx].item()
-                    # print(f"{rw=} {idx=} {global_row=} {col=} {w=}")
-                    edges_in_window.append((local_row, col, w))
-
-            if len(edges_in_window) == 0:
-                tcb_row_offset.append(tcb_row_offset[-1])
-                continue
-
-            # get unique columns and sort them
-            unique_cols = sorted({e[1] for e in edges_in_window})
-            num_unique_cols = len(unique_cols)
-
-            # column -> local index mapping
-            col_to_local = {c: i for i, c in enumerate(unique_cols)}
-
-            # edge lookup: (local_row, local_col) -> weight
-            edge_map = {}
-            for local_row, col, w in edges_in_window:
-                local_col = col_to_local[col]
-                edge_map[(local_row, local_col)] = w
-
-            # number of TCBs for this row window
-            num_tcbs_in_rw = (num_unique_cols + TCB_WIDTH - 1) // TCB_WIDTH
-
-            # process each TCB
-            for tcb_idx in range(num_tcbs_in_rw):
-                col_start = tcb_idx * TCB_WIDTH
-                col_end = min(col_start + TCB_WIDTH, num_unique_cols)
-
-                # column indices for this TCB (pad with 0 if fewer than 8)
-                tcb_cols = unique_cols[col_start:col_end]
-                while len(tcb_cols) < TCB_WIDTH:
-                    tcb_cols.append(0)  # padding
-                all_col_idx.extend(tcb_cols)
-
-                # build bitmap and weights for this TCB
-                # bitmap layout: bits 0-63 for rows 0-7 (first uint64)
-                #                bits 0-63 for rows 8-15 (second uint64)
-                # within each uint64: bit = row * 8 + col_in_tcb
-                bitmap_lo = np.uint64(0)  # Rows 0-7
-                bitmap_hi = np.uint64(0)  # Rows 8-15
-                tcb_weights = np.zeros(TCB_SIZE, dtype=np.float32)
-
-                for local_row in range(ROW_WINDOW_SIZE):
-                    for local_col_in_tcb in range(TCB_WIDTH):
-                        global_local_col = col_start + local_col_in_tcb
-
-                        if global_local_col >= num_unique_cols:
-                            continue
-
-                        key = (local_row, global_local_col)
-                        if key in edge_map:
-                            # set bit in bitmap
-                            bit_pos = (local_row % 8) * TCB_WIDTH + local_col_in_tcb
-                            if local_row < 8:
-                                bitmap_lo |= np.uint64(1) << np.uint64(bit_pos)
-                            else:
-                                bitmap_hi |= np.uint64(1) << np.uint64(bit_pos)
-
-                            # store weight (row-major within TCB)
-                            weight_idx = local_row * TCB_WIDTH + local_col_in_tcb
-                            tcb_weights[weight_idx] = edge_map[key]
-
-                all_bitmaps.extend([bitmap_lo, bitmap_hi])
-                all_weights.extend(tcb_weights.tolist())
-
-            tcb_row_offset.append(tcb_row_offset[-1] + num_tcbs_in_rw)
-
-        # convert to tensors
-        num_tcbs = tcb_row_offset[-1]
-        bitmap_array = np.array(all_bitmaps, dtype=np.uint64)
-        bitmap_tensor = torch.from_numpy(bitmap_array.view(np.int64)).clone()
+        num_tcbs = tcb_row_offset[-1].item()
         return cls(
-            tcb_row_offset=torch.tensor(tcb_row_offset, dtype=torch.int32),
-            col_idx=torch.tensor(all_col_idx, dtype=torch.int32),
-            bitmap=bitmap_tensor,
-            weights=torch.tensor(all_weights, dtype=dtype),
+            tcb_row_offset=tcb_row_offset,
+            col_idx=col_idx,
+            bitmap=bitmap,
+            weights=weights,
             num_nodes=N,
             num_edges=num_edges,
             num_row_windows=num_row_windows,
             num_tcbs=num_tcbs,
             adjacency_matrices_meta=AdjacencyForwardBackwardCSR(
                 adj_mat_csr_forward=adj,
-                adj_mat_csr_backward=adj.to_sparse_coo().T.to_sparse_csr().to(adj.device),
+                adj_mat_csr_backward=adj.to_sparse_coo().T.to_sparse_csr(),
             ),
+            light_nodes=...,
+            heavy_nodes=...,
         )

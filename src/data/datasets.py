@@ -33,6 +33,7 @@ GraphBackendOption = Literal[
     "tcgnn",
     "weighted_sparse_block",
     "cuda",
+    "cuda_weighted_sparse_block_with_meta",
 ]  # NOTE we can define cached formalizations via this option
 
 
@@ -259,6 +260,21 @@ class GraphSample:
             )
 
             graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
+        elif self.backend == "cuda_weighted_sparse_block_with_meta":
+            adj_sparse_csr = (
+                normalize_adj(
+                    self.edge_index,
+                    num_nodes=self.num_nodes,
+                    how="both",  # TODO implement other normalization types for this backend
+                    add_self_loops=self.add_self_loops,
+                )
+                .to_sparse_csr()
+                .cpu()
+            )
+
+            # TODO speedud construction via GPU-based operation
+            graph = WSBFormat.build_wsb_format(adj=adj_sparse_csr).to(torch.get_default_device())
+            # TODO add light & heavy vertices
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"

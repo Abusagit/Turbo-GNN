@@ -13,59 +13,36 @@ from src.backends.base import BaseBackend, BaseConvolution
 from src.backends.registry import BackendRegistry
 
 
+def transpose_csr(row_pointers: torch.Tensor, column_indices: torch.Tensor):
+    row_pointers_transposed = torch.zeros_like(row_pointers)
+    reverse_degrees = column_indices.bincount()
+    row_pointers_transposed[1:] = reverse_degrees.cumsum()
+
+    column_indices_transposed = torch.zeros_like(column_indices)
+
+    return row_pointers_transposed, column_indices_transposed
+
+
 class TCGNNFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow):
-        ctx.save_for_backward(X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)
+    def forward(ctx, X, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow):
+        ctx.save_for_backward(X, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)
 
-        # X_prime = torch.mm(X, weights)
         X_prime = TCGNN.forward(X, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
 
         return X_prime
 
     @staticmethod
     def backward(ctx, d_output):
-        X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = ctx.saved_tensors
+        X, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = ctx.saved_tensors
 
-        # SPMM backward propaAGNNion.
-
-        d_input = TCGNN.forward(d_output, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
-
-        # TODO fix for directed graphs!!!!!!!
-
-        # # GEMM backward propaAGNNion.
-        # d_input = torch.mm(d_input_prime, weights.transpose(0, 1))
-        # d_weights = torch.mm(X.transpose(0, 1), d_input_prime)
-        return d_input, None, None, None, None, None, None, None
-
-
-class TCGNNFunction_GIN(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, X, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow):
-        # SpMM: Neighbor AggreAGNNion.
-        X_prime = TCGNN.forward(X, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
-
-        ctx.save_for_backward(X_prime, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)
-
-        # GEMM node update
-        X_prime = torch.mm(X_prime, weights)
-
-        return X_prime
-
-    @staticmethod
-    def backward(ctx, d_output):
-        X_prime, weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = ctx.saved_tensors
-
-        # GEMM backward propaAGNNion.
-        # d_X_prime = torch.mm(d_output, weights.transpose(0, 1))
-        # d_weights = torch.mm(X_prime.transpose(0, 1), d_output)
-
+        row_pointers_transposed, column_indices_transposed = transpose_csr(row_pointers, column_index)
         # SPMM backward propaAGNNion.
         d_input = TCGNN.forward(
-            d_output.transpose(-1, -2), row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow
+            d_output, row_pointers_transposed, column_indices_transposed, blockPartition, edgeToColumn, edgeToRow
         )[0]
 
-        return d_input, None, None, None, None, None, None, None
+        return d_input, None, None, None, None, None
 
 
 class TCGNNFunction_AGNN(torch.autograd.Function):
@@ -85,6 +62,7 @@ class TCGNNFunction_AGNN(torch.autograd.Function):
         X_prime, weights, attention_w, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = (
             ctx.saved_tensors
         )
+        row_pointers_transposed, column_indices_transposed = transpose_csr(row_pointers, column_index)
 
         # GEMM backward propaAGNNion.
         d_X_prime = torch.mm(d_output, weights.transpose(0, 1))
@@ -92,42 +70,17 @@ class TCGNNFunction_AGNN(torch.autograd.Function):
         d_attention_w = torch.mm(X_prime.transpose(0, 1), d_output)
 
         # SPMM backward propaAGNNion.
-        d_input = TCGNN.forward(d_X_prime, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)[0]
+        d_input = TCGNN.forward(
+            d_X_prime, row_pointers_transposed, column_indices_transposed, blockPartition, edgeToColumn, edgeToRow
+        )[0]
 
         return d_input, d_weights, d_attention_w, None, None, None, None, None, None
-
-
-class _GINConv(torch.nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(_GINConv, self).__init__()
-        self.weights = torch.nn.Parameter(torch.randn(input_dim, output_dim))
-
-    def forward(self, X, graph: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
-        """
-        @param:
-        X:  the input tensor of the graph node embedding, shape: [n_nodes, n_dim].
-        A:  the CSR node pointer of the graph, shape: [node, 1].
-        edges: the CSR edge list of the graph, shape: [edge, 1].
-        partitioin: for the graph with the part-based optimziation.
-        """
-        row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = graph
-
-        return TCGNNFunction_GIN.apply(
-            X, self.weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow
-        )
 
 
 class _GCNConv(torch.nn.Module):
     def __init__(self, input_dim, output_dim):
         super(_GCNConv, self).__init__()
 
-        self.weights = torch.nn.Parameter(torch.randn(input_dim, output_dim))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        stdv = 1.0 / math.sqrt(self.weights.size(1))
-        self.weights.data.uniform_(-stdv, stdv)
-
     def forward(self, X, graph: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
         """
         @param:
@@ -137,7 +90,7 @@ class _GCNConv(torch.nn.Module):
         partitioin: for the graph with the part-based optimziation.
         """
         row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow = graph
-        return TCGNNFunction.apply(X, self.weights, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)
+        return TCGNNFunction.apply(X, row_pointers, column_index, blockPartition, edgeToColumn, edgeToRow)
 
 
 class _AGNNConv(torch.nn.Module):
@@ -189,8 +142,6 @@ class TcgnnBackend(BaseBackend):
         match conv_type:
             case "gcn":
                 return _GCNConv(feature_dim, feature_dim)
-            case "gin":
-                return _GINConv(feature_dim, feature_dim)
             case "agnn":
                 return _AGNNConv(feature_dim, feature_dim)
             case _:

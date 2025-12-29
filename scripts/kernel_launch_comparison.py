@@ -258,7 +258,7 @@ def main():
 
         conv_parameters_dict = top_level_config.get("params_grid")
         kernel_specific_parameters_dict = top_level_config.get(
-            "kernel_related_kwargs", {"huge_degree_threshold_quantile": None}
+            "kernel_related_kwargs", {"huge_degree_threshold_quantile": [None]}
         )
 
         convolution_parameters_grid = get_parameters_grid_from_config(conv_parameters_dict)
@@ -292,28 +292,26 @@ def main():
         for dataset_config in datasets_configs_to_load:
             dataset_name = dataset_config["name"]
 
-            for kernel_specific_dataset_config in kernel_specific_parameters_grid_for_datasets:
-                try:
-                    graph = load_single_graph(
-                        DatasetConfig(
-                            source=dataset_config["source"],
-                            name=dataset_config["name"],
-                            root=dataset_config["root"],
-                            conv_backend=backend,
-                            kernel_related_kwargs=kernel_specific_dataset_config,
-                        )
+            try:
+                graph = load_single_graph(
+                    DatasetConfig(
+                        source=dataset_config["source"],
+                        name=dataset_config["name"],
+                        root=dataset_config["root"],
+                        conv_backend=backend,
                     )
-                except Exception as e:
-                    print(f"Couldn't load graph {dataset_name}, exception: {e}")
-                    torch.cuda.empty_cache()
-                    break
+                )
+            except Exception as e:
+                print(f"Couldn't load graph {dataset_name}, exception: {e}")
+                break
+
+            for kernel_specific_dataset_config in kernel_specific_parameters_grid_for_datasets:
+                graph = graph.update_graph_repr_with_new_hyperparameters(
+                    new_kernel_related_kwargs=kernel_specific_dataset_config,
+                )
 
                 num_nodes = graph.num_nodes
                 graph_repr = graph.graph_repr
-
-                del graph
-                torch.cuda.empty_cache()
-
                 for layer_parameters_dict_instance in convolution_parameters_grid:
                     feature_dim = layer_parameters_dict_instance["feature_dim"]
                     x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
@@ -341,56 +339,27 @@ def main():
                         other_params=layer_parameters_dict_instance,
                     )
 
-                    num_nodes = graph.num_nodes
-                    graph_repr = graph.graph_repr
+                    overall_dict = (
+                        common_dict
+                        | layer_parameters_dict_instance
+                        | measurements_dict
+                        | kernel_specific_dataset_config
+                        | get_gpu_info()
+                    )
+                    overall_dict["experiment_name"] = experiment_name
 
-                    del graph
+                    results_for_table.append(overall_dict)
+
+                    print(dumps(overall_dict, indent=4))
+                else:
+                    del x
                     torch.cuda.empty_cache()
 
-                    for layer_parameters_dict_instance in convolution_parameters_grid:
-                        feature_dim = layer_parameters_dict_instance["feature_dim"]
-                        x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
+                del graph_repr
+                torch.cuda.empty_cache()
 
-                        try:
-                            conv = backend_module.create_conv(CONV_TYPE, **layer_parameters_dict_instance)
-                            conv = conv.to(DEVICE)
-                        except Exception as e:
-                            print(f"Couldnt create conv={CONV_TYPE} for {backend=}. Exception: {e}")
-                            continue
-
-                        measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
-
-                        common_dict = {
-                            "conv_type": CONV_TYPE,
-                            "dataset": dataset_name,
-                            "backend": backend,
-                        }
-
-                        experiment_name = generate_experiment_name(
-                            prefix=COMET_EXP_NAME,
-                            conv_type=CONV_TYPE,
-                            backend=backend,
-                            dataset_name=dataset_name,
-                            other_params=layer_parameters_dict_instance,
-                        )
-
-                        overall_dict = (
-                            common_dict
-                            | layer_parameters_dict_instance
-                            | measurements_dict
-                            | kernel_specific_dataset_config
-                            | get_gpu_info()
-                        )
-                        overall_dict["experiment_name"] = experiment_name
-
-                        results_for_table.append(overall_dict)
-
-                        print(dumps(overall_dict, indent=4))
-                    else:
-                        del x
-
-                    del graph_repr
-                    torch.cuda.empty_cache()
+            del graph
+            torch.cuda.empty_cache()
 
     df_for_dump = (
         pd.DataFrame(results_for_table).sort_values(by=["dataset", "backend", "feature_dim"]).reset_index(drop=True)
