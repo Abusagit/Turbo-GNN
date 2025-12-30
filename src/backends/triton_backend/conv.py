@@ -65,17 +65,22 @@ class _TritonBlockSparseGraphTransformerConv(BaseConvolution):
         assert feature_dim % heads == 0, "hidden_dim must be divisible by num_heads"
         self.feature_dim = feature_dim
         self.num_heads = heads
-
+        self.head_dim = self.feature_dim // self.num_heads
         self.qkv_proj = nn.Linear(self.feature_dim, 3 * self.feature_dim)
 
-        self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.feature_dim // self.num_heads)).item()
+        self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.head_dim)).item()
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         qkv: torch.Tensor = self.qkv_proj(x)
         q, k, v = qkv.split(self.feature_dim, -1)
-        # TODO add support for multiple heads
 
-        return WSBGraphTransformer.apply(q, k, v, graph, self.attn_scores_multiplier)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_heads, self.head_dim)
+        v = v.view(-1, self.num_heads, self.head_dim)
+
+        out = WSBGraphTransformer.apply(q, k, v, graph, self.attn_scores_multiplier)
+        out = out.view(-1, self.feature_dim)
+        return out
 
 
 @BackendRegistry.register_backend("triton_block_sparse")

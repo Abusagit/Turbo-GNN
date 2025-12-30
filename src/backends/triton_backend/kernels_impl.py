@@ -317,21 +317,34 @@ def wsb_flashattn_tc_forward_kernel(
     O_ptr,  # fp32 [N, D]
     L_ptr,  # fp32 [N]
     num_nodes,
+    num_heads,
     D: tl.constexpr,
+    # Q strides
     stride_qn,
+    stride_qh,
     stride_qd,
+    # K strides
     stride_kn,
+    stride_kh,
     stride_kd,
+    # V strides
     stride_vn,
+    stride_vh,
     stride_vd,
+    # O strides
     stride_on,
+    stride_oh,
     stride_od,
+    # L strides
+    stride_ln,
+    stride_lh,
     scale,
     ROW_WINDOW_SIZE: tl.constexpr,
     TCB_WIDTH: tl.constexpr,
     TILE_K: tl.constexpr,
 ):
     rw_id = tl.program_id(0)
+    head_id = tl.program_id(1)
 
     # rows in this row-window
     row_start = rw_id * ROW_WINDOW_SIZE
@@ -341,7 +354,8 @@ def wsb_flashattn_tc_forward_kernel(
     d_offs = tl.arange(0, D)
 
     # load Q block [16, D] (fp16)
-    q_ptrs = Q_ptr + rows[:, None] * stride_qn + d_offs[None, :] * stride_qd
+    q_ptrs = Q_ptr + rows[:, None] * stride_qn + head_id * stride_qh + d_offs[None, :] * stride_qd
+
     Q_block = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
     # online softmax state
@@ -378,12 +392,13 @@ def wsb_flashattn_tc_forward_kernel(
         cols_1 = tl.load(col_idx_ptr + safe_tcb_1 * TCB_WIDTH + local_col)
         cols = tl.where(in_second_half, cols_1, cols_0)  # [16]
 
-        # validity of each column (second half only if has_tcb_1)
+        # validity of each column (second half only if has_tcb_1) for this head
         col_valid = tl.where(in_second_half, has_tcb_1, has_tcb_0)  # [16]
 
         # K, V loads [16, D], unmasked (cols are always valid indices; padded cols are 0)
-        k_ptrs = K_ptr + cols[:, None] * stride_kn + d_offs[None, :] * stride_kd
-        v_ptrs = V_ptr + cols[:, None] * stride_vn + d_offs[None, :] * stride_vd
+        k_ptrs = K_ptr + cols[:, None] * stride_kn + head_id * stride_kh + d_offs[None, :] * stride_kd
+
+        v_ptrs = V_ptr + cols[:, None] * stride_vn + head_id * stride_vh + d_offs[None, :] * stride_vd
 
         K_block = tl.load(k_ptrs).to(tl.float16)
         V_block = tl.load(v_ptrs).to(tl.float16)
@@ -454,14 +469,15 @@ def wsb_flashattn_tc_forward_kernel(
     acc = acc / l_i[:, None]
     acc = tl.where(l_i[:, None] > 0, acc, 0.0)
 
-    # store O
-    out_ptrs = O_ptr + rows[:, None] * stride_on + d_offs[None, :] * stride_od
+    # store O [N, H, D]
+    out_ptrs = O_ptr + rows[:, None] * stride_on + head_id * stride_oh + d_offs[None, :] * stride_od
+
     tl.store(out_ptrs, acc, mask=row_mask[:, None])
 
     # store logsumexp
     logsumexp = m_i + tl.log(l_i)
     logsumexp = tl.where(l_i > 0, logsumexp, -float("inf"))
-    l_out_ptrs = L_ptr + rows
+    l_out_ptrs = L_ptr + rows * stride_ln + head_id * stride_lh
     tl.store(l_out_ptrs, logsumexp, mask=row_mask)
 
 
@@ -471,25 +487,30 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale):
 
     Args:
         wsb: WSBFormat object with tcb_row_offset, col_idx, bitmap
-        Q: [N, D] fp16 query matrix
-        K: [N, D] fp16 key matrix
-        V: [N, D] fp16 value matrix
+        Q: [N, H, D] fp16 query tensor
+        K: [N, H, D] fp16 key tensor
+        V: [N, H, D] fp16 value tensor
         scale: Attention scaling factor (default: 1/sqrt(D))
 
     Returns:
-        O: [N, D] fp32 output matrix
+        O: [N, D] fp32 output
+        L: [N, H] fp32 logsumexp for backward pass
     """
+    assert Q.ndim == 3, f"Q must be [N, H, D], got shape {Q.shape}"
+    assert K.ndim == 3, f"K must be [N, H, D], got shape {K.shape}"
+    assert V.ndim == 3, f"C must be [N, H, D], got shape {V.shape}"
+
     assert Q.is_cuda and K.is_cuda and V.is_cuda
     assert Q.shape == K.shape == V.shape
     assert Q.dtype == torch.float16, "Q must be fp16 for tensor cores"
 
-    N, D = Q.shape
+    N, H, D = Q.shape
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
 
-    output = torch.zeros((N, D), device=Q.device, dtype=torch.float32)
-    logsumexp = torch.full((N,), -float("inf"), device=Q.device, dtype=torch.float32)
+    output = torch.zeros((N, H, D), device=Q.device, dtype=torch.float32)
+    logsumexp = torch.full((N, H), -float("inf"), device=Q.device, dtype=torch.float32)
 
-    grid = (wsb.num_row_windows,)
+    grid = (wsb.num_row_windows, H)
 
     wsb_flashattn_tc_forward_kernel[grid](
         wsb.tcb_row_offset,
@@ -501,15 +522,27 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale):
         output,
         logsumexp,
         N,
+        H,
         D,
+        # Q strides
         Q.stride(0),
         Q.stride(1),
+        Q.stride(2),
+        # K strides
         K.stride(0),
         K.stride(1),
+        K.stride(2),
+        # V strides
         V.stride(0),
         V.stride(1),
+        V.stride(2),
+        # O strides
         output.stride(0),
         output.stride(1),
+        output.stride(2),
+        # L strides
+        logsumexp.stride(0),
+        logsumexp.stride(1),
         scale,
         ROW_WINDOW_SIZE=ROW_WINDOW_SIZE,
         TCB_WIDTH=TCB_WIDTH,
@@ -524,32 +557,52 @@ def wsb_flashattn_tc_backward_kernel(
     tcb_row_offset_ptr,
     col_idx_ptr,
     bitmap_ptr,
-    Q_ptr,  # fp16 [N, D]
-    K_ptr,  # fp16 [N, D]
-    V_ptr,  # fp16 [N, D]
-    O_ptr,  # fp32 [N, D]
-    L_ptr,  # fp32 [N]
-    dO_ptr,  # fp32 [N, D]
-    dQ_ptr,  # fp32 [N, D]
-    dK_ptr,  # fp32 [N, D]
-    dV_ptr,  # fp32 [N, D]
+    Q_ptr,  # fp16 [N, H, D]
+    K_ptr,  # fp16 [N, H, D]
+    V_ptr,  # fp16 [N, H, D]
+    O_ptr,  # fp32 [N, H, D]
+    L_ptr,  # fp32 [N, H]
+    dO_ptr,  # fp32 [N, H, D]
+    dQ_ptr,  # fp32 [N, H, D]
+    dK_ptr,  # fp32 [N, H, D]
+    dV_ptr,  # fp32 [N, H, D]
     num_nodes,
+    num_heads,
     D: tl.constexpr,
+    # Q strides
     stride_qn,
+    stride_qh,
     stride_qd,
+    # K strides
     stride_kn,
+    stride_kh,
     stride_kd,
+    # V strides
     stride_vn,
+    stride_vh,
     stride_vd,
+    # O strides
     stride_on,
+    stride_oh,
     stride_od,
+    # L strides
+    stride_ln,
+    stride_lh,
+    # dO strides
     stride_don,
+    stride_doh,
     stride_dod,
+    # dQ strides
     stride_dqn,
+    stride_dqh,
     stride_dqd,
+    # dK strides
     stride_dkn,
+    stride_dkh,
     stride_dkd,
+    # dV strides
     stride_dvn,
+    stride_dvh,
     stride_dvd,
     scale,
     ROW_WINDOW_SIZE: tl.constexpr,
@@ -557,6 +610,7 @@ def wsb_flashattn_tc_backward_kernel(
     TILE_K: tl.constexpr,
 ):
     rw_id = tl.program_id(0)
+    head_id = tl.program_id(1)
 
     row_start = rw_id * ROW_WINDOW_SIZE
     rows = row_start + tl.arange(0, ROW_WINDOW_SIZE)  # [16]
@@ -565,20 +619,24 @@ def wsb_flashattn_tc_backward_kernel(
     d_offs = tl.arange(0, D)
 
     # Q [16, D] fp16
-    q_ptrs = Q_ptr + rows[:, None] * stride_qn + d_offs[None, :] * stride_qd
+    q_ptrs = Q_ptr + rows[:, None] * stride_qn + head_id * stride_qh + d_offs[None, :] * stride_qd
+
     Q_block = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
     # O, dO [16, D] fp32
-    o_ptrs = O_ptr + rows[:, None] * stride_on + d_offs[None, :] * stride_od
-    do_ptrs = dO_ptr + rows[:, None] * stride_don + d_offs[None, :] * stride_dod
+
+    o_ptrs = O_ptr + rows[:, None] * stride_on + head_id * stride_oh + d_offs[None, :] * stride_od
+
+    do_ptrs = dO_ptr + rows[:, None] * stride_don + head_id * stride_doh + d_offs[None, :] * stride_dod
+
     O_block = tl.load(o_ptrs, mask=row_mask[:, None], other=0.0)
     dO_block = tl.load(do_ptrs, mask=row_mask[:, None], other=0.0)
 
     # L [16]
-    l_ptrs = L_ptr + rows
+    l_ptrs = L_ptr + rows * stride_ln + head_id * stride_lh
     L_vec = tl.load(l_ptrs, mask=row_mask, other=-float("inf"))
 
-    # D = sum_j dO_ij * O_ij [16]
+    # D_vec = sum_j dO_ij * O_ij [16]
     D_vec = tl.sum(dO_block * O_block, axis=1)
 
     # dQ accumulator [16, D]
@@ -614,8 +672,9 @@ def wsb_flashattn_tc_backward_kernel(
         col_valid = tl.where(in_second_half, has_tcb_1, has_tcb_0)  # [16]
 
         # K, V [16, D], unmasked
-        k_ptrs = K_ptr + cols[:, None] * stride_kn + d_offs[None, :] * stride_kd
-        v_ptrs = V_ptr + cols[:, None] * stride_vn + d_offs[None, :] * stride_vd
+        k_ptrs = K_ptr + cols[:, None] * stride_kn + head_id * stride_kh + d_offs[None, :] * stride_kd
+
+        v_ptrs = V_ptr + cols[:, None] * stride_vn + head_id * stride_vh + d_offs[None, :] * stride_vd
 
         K_block = tl.load(k_ptrs).to(tl.float16)
         V_block = tl.load(v_ptrs).to(tl.float16)
@@ -661,7 +720,8 @@ def wsb_flashattn_tc_backward_kernel(
         dV_block = tl.dot(tl.trans(P_block).to(tl.float16), dO_block.to(tl.float16)).to(tl.float32)
 
         # atomically add dV
-        dv_ptrs = dV_ptr + cols[:, None] * stride_dvn + d_offs[None, :] * stride_dvd
+        dv_ptrs = dV_ptr + cols[:, None] * stride_dvn + head_id * stride_dvh + d_offs[None, :] * stride_dvd
+
         atomic_mask_dv = col_valid[:, None]  # [16,1] broadcast with D
         tl.atomic_add(dv_ptrs, dV_block, mask=atomic_mask_dv)
 
@@ -679,22 +739,29 @@ def wsb_flashattn_tc_backward_kernel(
         dK_block = tl.dot(tl.trans(dS_block).to(tl.float16), Q_block).to(tl.float32)
 
         # atomically add dK
-        dk_ptrs = dK_ptr + cols[:, None] * stride_dkn + d_offs[None, :] * stride_dkd
+        dk_ptrs = dK_ptr + cols[:, None] * stride_dkn + head_id * stride_dkh + d_offs[None, :] * stride_dkd
+
         atomic_mask_dk = col_valid[:, None]
         tl.atomic_add(dk_ptrs, dK_block, mask=atomic_mask_dk)
 
     # write dQ (no atomics needed, each row window owns its rows)
-    dq_ptrs = dQ_ptr + rows[:, None] * stride_dqn + d_offs[None, :] * stride_dqd
+    dq_ptrs = dQ_ptr + rows[:, None] * stride_dqn + head_id * stride_dqh + d_offs[None, :] * stride_dqd
+
     tl.store(dq_ptrs, dQ_acc, mask=row_mask[:, None])
 
 
 def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
     """
-    Backward pass computing dQ, dK, dV.
+    Backward pass computing dQ, dK, dV for multi-head case.
+
+    All tensors Q, K, V, output, dO are [N, H, D].
+
+        L is [N, H].
+
 
     Args:
-        L: Logsumexp [N] from forward pass
-        dO: Gradient of output [N, D]
+        L: Logsumexp from forward pass
+        dO: Gradient of output
 
     Returns:
         dQ, dK, dV: Gradients
@@ -702,14 +769,19 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
     assert Q.is_cuda and K.is_cuda and V.is_cuda and output.is_cuda
     assert dO.is_cuda and L.is_cuda
 
-    N, D = Q.shape
+    assert Q.shape == K.shape == V.shape == output.shape == dO.shape
+    assert Q.ndim == 3, f"Q must be [N, H, D], got {Q.shape}"
+
+    N, H, D = Q.shape
+
+    assert L.shape == (N, H), f"L must be [N, H], got {L.shape}"
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
 
     dQ = torch.zeros_like(Q, dtype=torch.float32)
     dK = torch.zeros_like(K, dtype=torch.float32)
     dV = torch.zeros_like(V, dtype=torch.float32)
 
-    grid = (wsb.num_row_windows,)
+    grid = (wsb.num_row_windows, H)
 
     wsb_flashattn_tc_backward_kernel[grid](
         wsb.tcb_row_offset,
@@ -725,26 +797,46 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
         dK,
         dV,
         N,
+        H,
         D,
+        # Q strides
         Q.stride(0),
         Q.stride(1),
+        Q.stride(2),
+        # K strides
         K.stride(0),
         K.stride(1),
+        K.stride(2),
+        # V strides
         V.stride(0),
         V.stride(1),
+        V.stride(2),
+        # O strides
         output.stride(0),
         output.stride(1),
+        output.stride(2),
+        # L strides
+        L.stride(0),
+        L.stride(1),
+        # dO strides
         dO.stride(0),
         dO.stride(1),
+        dO.stride(2),
+        # dQ strides
         dQ.stride(0),
         dQ.stride(1),
+        dQ.stride(2),
+        # dK strides
         dK.stride(0),
         dK.stride(1),
+        dK.stride(2),
+        # dV strides
         dV.stride(0),
         dV.stride(1),
+        dV.stride(2),
         scale,
-        ROW_WINDOW_SIZE=16,
-        TCB_WIDTH=8,
+        ROW_WINDOW_SIZE=ROW_WINDOW_SIZE,
+        TCB_WIDTH=TCB_WIDTH,
         TILE_K=16,
     )
 
@@ -771,6 +863,9 @@ class WSBGraphTransformer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         Q, K, V, logsumexp, output = ctx.saved_tensors
+        head_dim = Q.shape[2]
+        num_heads = Q.shape[1]
+        grad_output = grad_output.view(-1, num_heads, head_dim)
 
         dQ, dK, dV = wsb_flashattn_tc_backward(ctx.wsb, Q, K, V, output, logsumexp, grad_output, scale=ctx.scale)
         return dQ, dK, dV, None, None
