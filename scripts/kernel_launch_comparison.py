@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import pandas as pd
 import torch
+import torch.multiprocessing as mp
 import yaml
 from dotenv import load_dotenv
 
@@ -32,11 +33,16 @@ Uses specified convolution with the combinations of hidden dims
 Logs results to Comet ML
 """
 
+mp.set_start_method("spawn", force=True)
+queue = mp.Queue()
 
 DEVICE = None
 COMET_WORKSPACE = "None"
 COMET_PROJECT_NAME = "None"
 COMET_EXP_NAME = ""
+
+
+BACKENDS_PRONE_TO_ERROR = {"f3s"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -210,6 +216,64 @@ def measure_kernel_performance(
     return overall_dict
 
 
+def _run_measurement_in_subprocess(X, graph, conv, queue):
+    """Run measurement in isolated process"""
+    try:
+        result = measure_kernel_performance(X, graph, conv)
+        queue.put(("success", result))
+    except Exception as e:
+        queue.put(("error", str(e)))
+
+
+def measure_kernel_performance_safe(X, graph, conv, timeout=60):
+    """Wrapper that runs measurement in subprocess to catch hard crashes"""
+    process = mp.Process(target=_run_measurement_in_subprocess, args=(X, graph, conv, queue))
+
+    process.start()
+    process.join(timeout=timeout)
+
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        return {
+            "forward_ms": None,
+            "forward_memory_mb": None,
+            "backward_ms": None,
+            "backward_memory_mb": None,
+            "error": "Timeout or hung",
+        }
+
+    if process.exitcode != 0:
+        return {
+            "forward_ms": None,
+            "forward_memory_mb": None,
+            "backward_ms": None,
+            "backward_memory_mb": None,
+            "error": f"Process crashed with exit code {process.exitcode}",
+        }
+
+    if not queue.empty():
+        status, result = queue.get()
+        if status == "success":
+            return result
+        else:
+            return {
+                "forward_ms": None,
+                "forward_memory_mb": None,
+                "backward_ms": None,
+                "backward_memory_mb": None,
+                "error": result,
+            }
+
+    return {
+        "forward_ms": None,
+        "forward_memory_mb": None,
+        "backward_ms": None,
+        "backward_memory_mb": None,
+        "error": "Unknown error",
+    }
+
+
 def generate_experiment_name(
     prefix: str,
     conv_type: str,
@@ -250,6 +314,8 @@ def main():
     args = parse_args()
 
     CONV_TYPE = args.conv_type
+
+    PARAMETERS_USED_IN_SWEEP: set[str] = set()  # collect parameters used for kernel comparison
 
     datasets_configs_to_load: list[dict[str, str]] = []
 
@@ -314,12 +380,14 @@ def main():
                 graph = graph.update_graph_repr_with_new_hyperparameters(
                     new_kernel_related_kwargs=kernel_specific_dataset_config,
                 )
+                PARAMETERS_USED_IN_SWEEP |= set(kernel_specific_dataset_config.keys())
 
                 num_nodes = graph.num_nodes
                 graph_repr = graph.graph_repr
                 for layer_parameters_dict_instance in convolution_parameters_grid:
                     feature_dim = layer_parameters_dict_instance["feature_dim"]
                     x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
+                    PARAMETERS_USED_IN_SWEEP |= set(layer_parameters_dict_instance.keys())
 
                     try:
                         conv = backend_module.create_conv(CONV_TYPE, **layer_parameters_dict_instance)
@@ -328,7 +396,10 @@ def main():
                         print(f"Couldnt create conv={CONV_TYPE} for {backend=}. Exception: {e}")
                         continue
 
-                    measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
+                    if backend in BACKENDS_PRONE_TO_ERROR:
+                        measurements_dict = measure_kernel_performance_safe(X=x, graph=graph_repr, conv=conv)
+                    else:
+                        measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
 
                     common_dict = {
                         "conv_type": CONV_TYPE,
@@ -369,9 +440,9 @@ def main():
             del graph
             torch.cuda.empty_cache()
 
-    df_for_dump = (
-        pd.DataFrame(results_for_table).sort_values(by=["dataset", "backend", "feature_dim"]).reset_index(drop=True)
-    )
+    values_to_groupby = ["dataset", "backend", "feature_dim"] + sorted(PARAMETERS_USED_IN_SWEEP)
+
+    df_for_dump = pd.DataFrame(results_for_table).sort_values(by=values_to_groupby).reset_index(drop=True)
 
     if args.out is not None:
         args.out.parent.mkdir(exist_ok=True, parents=True)
@@ -397,9 +468,10 @@ def main():
         col for col in df_without_constant_columns.columns if col not in ["feature_dim", "dataset", "backend"]
     ]
 
-    pivoted = df_without_constant_columns.pivot_table(
-        index=["dataset", "feature_dim"], columns="backend", values=value_cols
+    index = (
+        ["dataset", "feature_dim"] if "heads" not in PARAMETERS_USED_IN_SWEEP else ["dataset", "feature_dim", "heads"]
     )
+    pivoted = df_without_constant_columns.pivot_table(index=index, columns="backend", values=value_cols)
 
     pivoted.columns = [f"{backend}_{col}" for col, backend in pivoted.columns]
     pivoted = pivoted.reset_index()

@@ -99,20 +99,17 @@ class _CUDAGATv2Conv(BaseConvolution):
             **kwargs (Any): DGL GraphConv kwargs (norm, weight, ...).
         """
         super().__init__(num_heads=heads, bias=bias, **kwargs)
-
-        self.left_projection = nn.Linear(feature_dim, feature_dim * heads, bias=bias)
-        self.right_projection = nn.Linear(feature_dim, feature_dim * heads, bias=bias)
-
+        self.left_right_projection = nn.Linear(feature_dim, 2 * feature_dim * heads, bias=bias)
         self._outer_proj = torch.nn.Linear(feature_dim * heads, feature_dim, bias=bias)
 
         self.negative_slope = negative_slope
         self.heads = heads
+        self.grad_A_reduce_row_chunk_size = kwargs.get("grad_A_reduce_row_chunk_size", 512)
 
-        if heads > 1:
-            raise NotImplementedError("Heads > 1 is not implemented yet!!!!!!")
+        self.feature_dim = feature_dim
+        self.head_dim = feature_dim
 
-        # self.attn_weights = nn.Parameter(torch.FloatTensor(size=(heads, feature_dim)))
-        self.attn_weights = nn.Parameter(torch.FloatTensor(size=(1, feature_dim)))
+        self.attn_weights = nn.Parameter(torch.FloatTensor(size=(heads, feature_dim)))
 
         gain = nn.init.calculate_gain("relu")
         nn.init.xavier_normal_(self.attn_weights, gain=gain)
@@ -137,8 +134,9 @@ class _CUDAGATv2Conv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
 
-        x_left = self.left_projection(x)
-        x_right = self.right_projection(x)
+        x_left, x_right = self.left_right_projection(x).split(self.heads * self.head_dim, -1)
+        x_left = x_left.view(-1, self.heads, self.head_dim)
+        x_right = x_right.view(-1, self.heads, self.head_dim)
 
         indptr_forward = graph.forward_indptr
         indices_forward = graph.forward_indices
@@ -152,9 +150,11 @@ class _CUDAGATv2Conv(BaseConvolution):
             indices_backward,
             x_left,
             x_right,
-            self.attn_weights.data.flatten(),
+            self.attn_weights.data,
             self.negative_slope,
-        )
+            self.grad_A_reduce_row_chunk_size,
+        ).view(-1, self.heads * self.head_dim)
+
         out = self._outer_proj(out)
         return out
 

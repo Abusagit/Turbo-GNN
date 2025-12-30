@@ -1,6 +1,9 @@
 params_grid:
-  feature_dim: [32, 64, 128, 256]
-  heads: [1]
+  all:
+    feature_dim: [32, 64, 128, 256]
+    heads: [1, 2, 4, 8]
+  cuda:
+    grad_A_reduce_row_chunk_size: [16, 32, 64, 128, 256, 512, 1024, 2048]
 datasets:
   base_path: configs/datasets
   dirs:

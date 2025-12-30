@@ -49,6 +49,7 @@ class gatv2_function(torch.autograd.Function):
         x_right: torch.Tensor,
         attention_weights: torch.Tensor,
         negative_slope: float,
+        grad_A_reduce_row_chunk_size: int,
     ):
         output, logsumexp = gatv2_kernels.forward(
             x_left,
@@ -60,6 +61,9 @@ class gatv2_function(torch.autograd.Function):
         )
 
         ctx.negative_slope = negative_slope
+        ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
+        ctx.heads = x_left.shape[1]
+        ctx.head_dim = x_left.shape[2]
 
         ctx.save_for_backward(
             x_left,
@@ -87,7 +91,13 @@ class gatv2_function(torch.autograd.Function):
             logsumexp,
         ) = ctx.saved_tensors
 
+        num_heads = ctx.heads
+        head_dim = ctx.head_dim
+
+        grad_output = grad_output.view(-1, num_heads, head_dim)
+
         negative_slope = ctx.negative_slope
+        grad_A_reduce_row_chunk_size = ctx.grad_A_reduce_row_chunk_size
         grad_x_left, grad_x_right, grad_attention = gatv2_kernels.backward(
             grad_output,
             x_left,
@@ -99,9 +109,10 @@ class gatv2_function(torch.autograd.Function):
             attention_weights,
             logsumexp,
             negative_slope,
+            grad_A_reduce_row_chunk_size,
         )
 
-        return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None
+        return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None, None
 
 
 def gatv2_aggr(
@@ -113,6 +124,7 @@ def gatv2_aggr(
     x_right: torch.Tensor,
     attention_weights: torch.Tensor,
     negative_slope: float,
+    grad_A_reduce_row_chunk_size: int,
 ):
     return gatv2_function.apply(
         indptr_forward,
@@ -123,4 +135,5 @@ def gatv2_aggr(
         x_right,
         attention_weights,
         negative_slope,
+        grad_A_reduce_row_chunk_size,
     )

@@ -2,6 +2,11 @@ params_grid:
   all:
     feature_dim: [32, 64, 128, 256]
     heads: [1]
+kernel_related_kwargs:
+  cuda:
+    huge_degree_threshold_quantile: [0.95, 0.99, 0.999, -1]
+  triton_block_sparse:
+    huge_degree_threshold_quantile: [0.95, 0.99, 0.999, -1]
 datasets:
   base_path: configs/datasets
   dirs:
