@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Tuple
 
+import dgl
 import numpy as np
 import torch
 from torch_geometric.data import Data
@@ -42,6 +43,27 @@ EdgeList = Tuple[torch.Tensor, Optional[torch.Tensor]]  # (edge_index [2,E], edg
 CSR = Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor]
 ]  # (crow_indices [N+1], col_indices [E], values [E] or None)
+
+
+def reorder_graph(
+    edge_index: torch.Tensor,
+    edge_weights: torch.Tensor | None,
+    num_nodes: int,
+    node_permute_algo="metis",
+    partition_size=1024,
+):
+    graph = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
+    if edge_weights is not None:
+        graph.edata["w"] = edge_weights
+
+    graph_reordered = dgl.reorder_graph(
+        graph, node_permute_algo=node_permute_algo, permute_config={"k": partition_size}
+    )
+    src, dst = graph.edges()
+    new_edge_index = torch.vstack([src.long(), dst.long()])
+
+    new_edge_weight = graph.edata["w"] if edge_weights is not None else None
+    return new_edge_index, new_edge_weight
 
 
 def to_csr_from_edge_list(

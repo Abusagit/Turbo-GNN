@@ -355,10 +355,12 @@ def main():
         )
 
         kernel_param_grid_for_backend = kernel_specific_parameters_dict.get(
-            backend, {"huge_degree_threshold_quantile": [-1]}
+            backend, {"graph_reordering_partition_size": [-1]}
         )
 
-        kernel_specific_parameters_grid_for_datasets = get_parameters_grid_from_config(kernel_param_grid_for_backend)
+        kernel_specific_parameters_grid_for_datasets = get_parameters_grid_from_config(
+            kernel_specific_parameters_dict.get("all", {}) | kernel_param_grid_for_backend
+        )
 
         for dataset_config in datasets_configs_to_load:
             dataset_name = dataset_config["name"]
@@ -385,11 +387,10 @@ def main():
                 num_nodes = graph.num_nodes
                 graph_repr = graph.graph_repr
                 for layer_parameters_dict_instance in convolution_parameters_grid:
-                    feature_dim = layer_parameters_dict_instance["feature_dim"]
-                    x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
-                    PARAMETERS_USED_IN_SWEEP |= set(layer_parameters_dict_instance.keys())
-
                     try:
+                        feature_dim = layer_parameters_dict_instance["feature_dim"]
+                        x = torch.randn(num_nodes, feature_dim, device=DEVICE, requires_grad=True)
+                        PARAMETERS_USED_IN_SWEEP |= set(layer_parameters_dict_instance.keys())
                         conv = backend_module.create_conv(CONV_TYPE, **layer_parameters_dict_instance)
                         conv = conv.to(DEVICE)
                     except Exception as e:

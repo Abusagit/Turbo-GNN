@@ -21,6 +21,7 @@ from src.data.converters import (
     build_csr_as_is,
     get_cugraph_with_gcn_weights,
     normalize_adj,
+    reorder_graph,
     to_tcgnn_data,
 )
 
@@ -136,6 +137,9 @@ class GraphSample:
     add_self_loops: bool = True
     kernel_related_kwargs: dict[str, Any] = field(default_factory=lambda: {})
 
+    _original_edge_index: Optional[torch.Tensor] = None
+    _original_edge_weight: Optional[torch.Tensor] = None
+
     def update_graph_repr_with_new_hyperparameters(self, new_kernel_related_kwargs):
         delattr(self, "_graph_repr")
         torch.cuda.empty_cache()
@@ -143,8 +147,17 @@ class GraphSample:
 
         self.kernel_related_kwargs = new_kernel_related_kwargs
         self.add_self_loops = False  # we have already added self-loops when needed, now we don' have to do it
+        self.edge_index = self._original_edge_index
+        self.edge_weight = self._original_edge_weight
+
         self.__post_init__()
         return self
+
+    def _save_original_connectivity(self):
+        if self._original_edge_index is None:
+            self._original_edge_index = self.edge_index.cpu().clone()
+        if self._original_edge_weight is None and isinstance(self.edge_weight, torch.Tensor):
+            self._original_edge_weight = self.edge_weight.cpu().clone()
 
     def __post_init__(self):
         """
@@ -153,6 +166,19 @@ class GraphSample:
             1) Store graph representation in _graph_repr field --> it will be used in the convolutions
             2) Place everything on a default device -- defined in scripts
         """
+        self._save_original_connectivity()
+
+        graph_reordering_partition_size = self.kernel_related_kwargs.get("graph_reordering_partition_size", -1)
+
+        if graph_reordering_partition_size != -1:
+            # perform graph reordering
+            self.edge_index, self.edge_weight = reorder_graph(
+                edge_index=self.edge_index,
+                edge_weights=self.edge_weight,
+                num_nodes=self.num_nodes,
+                partition_size=graph_reordering_partition_size,
+            )
+
         graph: Any = None
         if self.backend == "pyg":  # pyg eats standard edge index & weight
             if self.add_self_loops:
