@@ -1,12 +1,10 @@
 params_grid:
   all:
-    feature_dim: [32, 64, 128, 256, 512, 1024, 2048, 4096]
-    heads: [1, 2, 4, 8]
+    feature_dim: [256, 512, 1024, 2048, 4096]
+    heads: [2, 4, 8]
 kernel_related_kwargs:
-  cuda:
-    huge_degree_threshold_quantile: [0.95, 0.99, 0.999, -1]
-  triton_block_sparse:
-    huge_degree_threshold_quantile: [0.95, 0.99, 0.999, -1]
+  all:
+    graph_reordering_partition_size: [-1, 128, 512, 1024, 4096, 2048, 8192, 10000, 15000, 5000, 4000]
 datasets:
   base_path: configs/datasets
   dirs:

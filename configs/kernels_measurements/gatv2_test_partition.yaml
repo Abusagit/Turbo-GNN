@@ -6,7 +6,6 @@ params_grid:
     grad_A_reduce_row_chunk_size: [16, 32, 64, 128, 256, 512, 1024, 2048]
 kernel_related_kwargs:
   cuda:
-    huge_degree_threshold_quantile: [0.99, 0.999, -1]
     graph_reordering_partition_size: [-1, 128, 512, 1024, 4096, 2048, 8192, 10000, 15000, 5000, 4000]
 datasets:
   base_path: configs/datasets

@@ -169,12 +169,14 @@ class _CudaGraphTransformerConv(BaseConvolution):
         **kwargs,
     ):
         super().__init__(bias=False, dropout=0.0)
-        if heads > 1:
-            raise NotImplementedError("Currently only single head attention is supported, work in progress")
 
         self.feature_dim = feature_dim
         self.num_heads = heads
         self.qkv_proj = nn.Linear(self.feature_dim, 3 * self.feature_dim)
+
+        self.head_dim = self.feature_dim // self.num_heads
+
+        self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.head_dim)).item()
 
     def forward(
         self,
@@ -195,12 +197,26 @@ class _CudaGraphTransformerConv(BaseConvolution):
         x = torch.nn.functional.layer_norm(x, (x.shape[-1],))
         qkv: torch.Tensor = self.qkv_proj(x)
         q, k, v = qkv.split(self.feature_dim, -1)
+
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_heads, self.head_dim)
+        v = v.view(-1, self.num_heads, self.head_dim)
+
         edge_ptr = graph.forward_indptr
         edge_idx = graph.forward_indices
-        mid_nodes = graph.light_nodes
-        huge_nodes = graph.heavy_nodes
+        edge_ptr_T = graph.backward_indptr
+        edge_idx_T = graph.backward_indices
 
-        out = graph_transformer_aggr(edge_ptr, edge_idx, mid_nodes, huge_nodes, q, k, v)
+        out = graph_transformer_aggr(
+            edge_ptr=edge_ptr,
+            edge_idx=edge_idx,
+            edge_ptr_T=edge_ptr_T,
+            edge_idx_T=edge_idx_T,
+            Q=q,
+            K=k,
+            V=v,
+            scale=self.attn_scores_multiplier,
+        ).view(-1, self.feature_dim)
         return out
 
 

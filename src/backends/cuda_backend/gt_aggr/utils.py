@@ -40,17 +40,18 @@ graph_transformer_kernels = load(
 
 class _FusedGraphAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, edge_ptr, edge_idx, mid_nodes, huge_nodes, Q, K, V):
+    def forward(ctx, edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale):
         """
         Forward pass wrapper.
         Returns: (output, logsumexp)
         """
-        out, logsumexp, attn_logits = graph_transformer_kernels.forward_buckets(
-            edge_ptr, edge_idx, mid_nodes, huge_nodes, Q, K, V
-        )
+        out, logsumexp = graph_transformer_kernels.gt_forward_csr_mh(edge_ptr, edge_idx, Q, K, V, scale)
 
         # Save for backward
-        ctx.save_for_backward(edge_ptr, edge_idx, mid_nodes, huge_nodes, Q, K, V, out, logsumexp, attn_logits)
+        ctx.scale = scale
+        ctx.num_heads = Q.shape[1]
+        ctx.head_dim = Q.shape[2]
+        ctx.save_for_backward(edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp)
         return out
 
     @staticmethod
@@ -59,14 +60,18 @@ class _FusedGraphAttention(torch.autograd.Function):
         Backward pass wrapper.
         Returns: (None, None, None, None, dQ, dK, dV)
         """
-        edge_ptr, edge_idx, mid_nodes, huge_nodes, Q, K, V, out, logsumexp, attn_logits = ctx.saved_tensors
+        edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp = ctx.saved_tensors
+        scale = ctx.scale
+        num_heads = ctx.num_heads
+        head_dim = ctx.head_dim
+        grad_output = grad_output.view(-1, num_heads, head_dim)
 
-        dQ, dK, dV = graph_transformer_kernels.backward_buckets(
-            edge_ptr, edge_idx, mid_nodes, huge_nodes, Q, K, V, out, grad_output, logsumexp, attn_logits
+        dQ, dK, dV = graph_transformer_kernels.gt_backward_csr_mh(
+            edge_ptr_T, edge_idx_T, Q, K, V, out, grad_output, logsumexp, scale
         )
 
-        return None, None, None, None, dQ, dK, dV
+        return None, None, None, None, dQ, dK, dV, None
 
 
-def graph_transformer_aggr(edge_ptr, edge_idx, mid_nodes, huge_nodes, Q, K, V):
-    return _FusedGraphAttention.apply(edge_ptr, edge_idx, mid_nodes, huge_nodes, Q, K, V)
+def graph_transformer_aggr(edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale):
+    return _FusedGraphAttention.apply(edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale)
