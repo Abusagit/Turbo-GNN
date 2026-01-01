@@ -16,7 +16,7 @@ from src.backends.registry import BackendRegistry
 def transpose_csr(row_pointers: torch.Tensor, column_indices: torch.Tensor):
     row_pointers_transposed = torch.zeros_like(row_pointers)
     reverse_degrees = column_indices.bincount()
-    row_pointers_transposed[1:] = reverse_degrees.cumsum()
+    row_pointers_transposed[1:] = reverse_degrees.cumsum(-1)
 
     column_indices_transposed = torch.zeros_like(column_indices)
 

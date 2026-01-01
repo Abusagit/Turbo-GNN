@@ -20,7 +20,7 @@ def wsb_spmm_kernel_tc(
     X_ptr,
     Y_ptr,
     N,
-    F,
+    F: tl.constexpr,
     stride_xn,
     stride_xf,
     stride_yn,
@@ -298,7 +298,7 @@ class WSBSpMM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        adj_mat_csr_backward = ctx.saved_tensors
+        (adj_mat_csr_backward,) = ctx.saved_tensors
         grad_input = wsb_spmm_backward_cusparse(adj_mat_csr_backward, grad_output)
         return grad_input, None
 

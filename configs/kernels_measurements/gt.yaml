@@ -1,10 +1,11 @@
 params_grid:
   all:
-    feature_dim: [256, 512, 1024, 2048, 4096]
+    # feature_dim: [256, 512, 1024, 2048, 4096]
+    feature_dim: [256, 512]
     heads: [2, 4, 8]
 kernel_related_kwargs:
   all:
-    graph_reordering_partition_size: [-1, 128, 512, 1024, 4096, 2048, 8192, 10000, 15000, 5000, 4000]
+    graph_reordering_partition_size: [-1, 128, 512, 1024, 2048, 4096, 8192]
 datasets:
   base_path: configs/datasets
   dirs:

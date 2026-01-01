@@ -1,6 +1,13 @@
 params_grid:
   all:
     feature_dim: [64, 128, 256, 512]
+kernel_related_kwargs:
+  # cuda:
+  #   huge_degree_threshold_quantile: [0.99, 0.999, -1]
+  #   warps_per_block: [1, 4, 16, 32]
+  #   edges_per_block_heavy_nodes: [32, 64, 128, 512]
+  all:
+    graph_reordering_partition_size: [-1, 128, 512, 1024, 2048, 4096, 8192]
 datasets:
   base_path: configs/datasets
   dirs:

@@ -530,7 +530,7 @@ class AdjacencyForwardBackwardCSR:
             adj_mat_csr_backward_device = self.adj_mat_csr_backward.to(device)
 
         self.adj_mat_csr_forward = adj_mat_csr_forward_device
-        self.adj_mat_csr_forward = adj_mat_csr_backward_device
+        self.adj_mat_csr_backward = adj_mat_csr_backward_device
         torch.cuda.empty_cache()
         self._device = device
         return self

@@ -159,7 +159,7 @@ def measure_kernel_performance(
         return conv(X, graph)
 
     try:
-        forward_function_measurements: MicrobenchResult = time_callable(forward_function, warmup=3, iters=10)
+        forward_function_measurements: MicrobenchResult = time_callable(forward_function, warmup=3, iters=5)
     except (Exception, torch.OutOfMemoryError) as e:
         print(f"Couldn't measure forward performance for convolution {conv}. Exception: {e}")
         forward_function_measurements = MicrobenchResult(
@@ -356,12 +356,11 @@ def main():
             conv_parameters_dict.get("all", {}) | conv_parameters_dict.get(backend, {})
         )
 
-        kernel_param_grid_for_backend = kernel_specific_parameters_dict.get(
-            backend, {"graph_reordering_partition_size": [-1]}
-        )
+        kernel_param_grid_for_backend = kernel_specific_parameters_dict.get(backend, {})
 
         kernel_specific_parameters_grid_for_datasets = get_parameters_grid_from_config(
-            kernel_specific_parameters_dict.get("all", {}) | kernel_param_grid_for_backend
+            kernel_specific_parameters_dict.get("all", {"graph_reordering_partition_size": [-1]})
+            | kernel_param_grid_for_backend
         )
 
         for dataset_config in datasets_configs_to_load:
@@ -397,6 +396,7 @@ def main():
                         conv = conv.to(DEVICE)
                     except Exception as e:
                         print(f"Couldnt create conv={CONV_TYPE} for {backend=}. Exception: {e}")
+                        torch.cuda.empty_cache()
                         continue
 
                     if backend in BACKENDS_PRONE_TO_ERROR:
@@ -433,7 +433,6 @@ def main():
                     results_for_table.append(overall_dict)
 
                     print(dumps(overall_dict, indent=4))
-                else:
                     del x
                     torch.cuda.empty_cache()
 
