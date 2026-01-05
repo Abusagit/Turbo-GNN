@@ -45,6 +45,7 @@ GraphBackendOption = Literal[
     "f3s",
     "cuda",
     "cuda_weighted_sparse_block_with_meta",
+    "csr_and_csr_T_for_cusparse",
 ]  # NOTE we can define cached formalizations via this option
 
 
@@ -59,6 +60,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cugraph": "cugraph",
     "torch_native_adj_mat": "adj_mat",
     "cusparse": "csr",
+    "cusparse_precomputed_bwd": "csr_and_csr_T_for_cusparse",
     "fusegnn": "coo",
     "tcgnn": "tcgnn",
     "triton_block_sparse": "weighted_sparse_block",
@@ -237,7 +239,6 @@ class GraphSample:
         elif self.backend == "csr":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
-            graph = self.edge_index_to_csr(edge_index=self.edge_index, edge_weight=self.edge_weight, transposed=True)
 
             row_ptr, cols, w, _ = build_csr_as_is(
                 self.edge_index, self.edge_weight, num_nodes=self.num_nodes, do_transpose=True
@@ -249,6 +250,23 @@ class GraphSample:
                 self._to_int32(self._to_default_device(cols)),
                 self._to_int32(self._to_default_device(w)),
             )
+        elif self.backend == "csr_and_csr_T_for_cusparse":
+            if self.add_self_loops:
+                self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
+            graph = []
+            for do_transpose in [True, False]:
+                row_ptr, cols, w, _ = build_csr_as_is(
+                    self.edge_index, self.edge_weight, num_nodes=self.num_nodes, do_transpose=do_transpose
+                )
+
+                graph.extend(
+                    [
+                        self._to_int32(self._to_default_device(row_ptr)),
+                        self._to_int32(self._to_default_device(cols)),
+                        self._to_int32(self._to_default_device(w)),
+                    ]
+                )
+
         elif self.backend == "cuda":
             if self.add_self_loops:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)

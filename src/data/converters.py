@@ -59,10 +59,10 @@ def reorder_graph(
     graph_reordered = dgl.reorder_graph(
         graph, node_permute_algo=node_permute_algo, permute_config={"k": partition_size}
     )
-    src, dst = graph.edges()
+    src, dst = graph_reordered.edges()
     new_edge_index = torch.vstack([src.long(), dst.long()])
 
-    new_edge_weight = graph.edata["w"] if edge_weights is not None else None
+    new_edge_weight = graph_reordered.edata["w"] if edge_weights is not None else None
     return new_edge_index, new_edge_weight
 
 

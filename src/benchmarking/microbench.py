@@ -52,7 +52,9 @@ def measure_memory(func):
     return result, peak_memory, peak_memory
 
 
-def time_callable(fn: Callable[[], Any], warmup: int = 10, iters: int = 50) -> MicrobenchResult:
+def time_callable(
+    fn: Callable[[], Any], warmup: int = 10, iters: int = 50, do_memory_profile: bool = True
+) -> MicrobenchResult:
     """Benchmark a zero-arg callable with warmup and averaged iterations.
 
     Args:
@@ -80,7 +82,11 @@ def time_callable(fn: Callable[[], Any], warmup: int = 10, iters: int = 50) -> M
         end.synchronize()
         total_ms = start.elapsed_time(end)
 
-        _, memory_allocated, peak_memory = measure_memory(func=fn)
+        if do_memory_profile:
+            _, memory_allocated, peak_memory = measure_memory(func=fn)
+        else:
+            memory_allocated = None
+
         return MicrobenchResult(
             iters=iters,
             ms_per_iter=total_ms / iters,

@@ -148,12 +148,11 @@ def wsb_spmm_backward_kernel_tc(
     G_ptr,
     dX_ptr,
     N,
-    F,
+    F: tl.constexpr,
     stride_gn,
     stride_gf,
     stride_dxn,
     stride_dxf,
-    BLOCK_F: tl.constexpr,
     ROW_WINDOW_SIZE: tl.constexpr,
     TCB_WIDTH: tl.constexpr,
     TCB_SIZE: tl.constexpr,
@@ -164,17 +163,15 @@ def wsb_spmm_backward_kernel_tc(
     """
 
     rw = tl.program_id(0)
-    f_block = tl.program_id(1)
 
     row_start = rw * ROW_WINDOW_SIZE
-    f_start = f_block * BLOCK_F
 
     row_offs = tl.arange(0, ROW_WINDOW_SIZE)
-    f_offs = tl.arange(0, BLOCK_F)
+    f_offs = tl.arange(0, F)
     k_offs = tl.arange(0, TILE_K)
 
     global_rows = row_start + row_offs
-    global_f = f_start + f_offs
+    global_f = f_offs
 
     row_mask = global_rows < N
     f_mask = global_f < F
@@ -248,8 +245,7 @@ def wsb_spmm_backward_tc(wsb, grad_output: torch.Tensor) -> torch.Tensor:
     weights = wsb.weights.half()
     G = grad_output.half()
 
-    BLOCK_F = 128 if F >= 128 else max(16, triton.next_power_of_2(F))
-    grid = (wsb.num_row_windows, triton.cdiv(F, BLOCK_F))
+    grid = (wsb.num_row_windows,)
 
     wsb_spmm_backward_kernel_tc[grid](
         wsb.tcb_row_offset,
@@ -263,7 +259,6 @@ def wsb_spmm_backward_tc(wsb, grad_output: torch.Tensor) -> torch.Tensor:
         G.stride(1),
         grad_input.stride(0),
         grad_input.stride(1),
-        BLOCK_F=BLOCK_F,
         ROW_WINDOW_SIZE=ROW_WINDOW_SIZE,
         TCB_WIDTH=TCB_WIDTH,
         TCB_SIZE=TCB_SIZE,

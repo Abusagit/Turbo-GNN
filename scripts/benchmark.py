@@ -47,12 +47,11 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Parsed args.
     """
     p = argparse.ArgumentParser(description="Microbenchmark graph conv layers.")
-    p.add_argument("--layer", type=str, required=True, choices=["gcn", "gat_v2", "sage", "gin", "mean_aggr"])
+    p.add_argument("--layer", type=str, required=True)
     p.add_argument("--backend", type=str, required=True, help="Backend name (pyg|dgl|...).")
     p.add_argument("--num-nodes", type=int, default=20000)
     p.add_argument("--avg-degree", type=int, default=10)
-    p.add_argument("--in-ch", type=int, default=128)
-    p.add_argument("--out-ch", type=int, default=128)
+    p.add_argument("--feature_dim", type=int, default=128)
     p.add_argument("--heads", type=int, default=1)
     p.add_argument("--mode", type=str, default="forward", choices=["forward", "train"])
     p.add_argument("--iters", type=int, default=100)
@@ -75,7 +74,7 @@ def main() -> int:
     torch.set_default_device(device)
     edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
 
-    x = torch.randn(args.num_nodes, args.in_ch, device=device)
+    x = torch.randn(args.num_nodes, args.feature_dim, device=device)
     graph = GraphSample(
         backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
         x=x,
@@ -83,12 +82,13 @@ def main() -> int:
         edge_index=edge_index,
         edge_weight=edge_weight,
     ).graph_repr
+
     # conv
     backend = BackendRegistry.get_backend(args.backend)
-    if args.layer != "gat_v2":
-        conv = backend.create_conv(args.layer, feature_dim=args.in_ch)
+    if args.layer not in {"gat_v2", "gt", "gat_v1"}:
+        conv = backend.create_conv(args.layer, feature_dim=args.feature_dim)
     else:
-        conv = backend.create_conv(args.layer, feature_dim=args.in_ch, heads=args.heads)
+        conv = backend.create_conv(args.layer, feature_dim=args.feature_dim, heads=args.heads)
 
     conv = conv.to(device)
 
@@ -126,9 +126,9 @@ def main() -> int:
     base_dict = {
         "backend": args.backend,
         "conv_type": args.layer,
-        "hidden_dim": args.in_ch,
+        "feature_dim": args.feature_dim,
         "heads": args.heads,
-        "dataset": args.dataset,
+        # "dataset": args.dataset,
         "iters": res.iters,
         "ms_per_iter": res.ms_per_iter,
         "device": res.device,
