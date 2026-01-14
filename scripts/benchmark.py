@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
+import yaml
 
 sys.path.append("./")
 
 from src.backends.registry import BackendRegistry
 from src.benchmarking.microbench import MicrobenchResult, get_gpu_info, time_callable
-from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, GraphSample
+from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
 
 doc = """
 Layer microbenchmark launcher.
@@ -48,7 +49,14 @@ def parse_args() -> argparse.Namespace:
     """
     p = argparse.ArgumentParser(description="Microbenchmark graph conv layers.")
     p.add_argument("--layer", type=str, required=True)
+    p.add_argument("--device", type=int, default=0)
     p.add_argument("--backend", type=str, required=True, help="Backend name (pyg|dgl|...).")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        help="Path to dataset YAML. If not presented, graph with `--num-nodes` and `--avg-degree` will be "
+        "generated for the benchmark",
+    )
     p.add_argument("--num-nodes", type=int, default=20000)
     p.add_argument("--avg-degree", type=int, default=10)
     p.add_argument("--feature_dim", type=int, default=128)
@@ -68,20 +76,35 @@ def main() -> int:
         int: Exit code.
     """
     args = parse_args()
-    device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda", args.device) if torch.cuda.is_available() else torch.device("cpu")
+    torch.set_default_device(device)
 
     # graph + features
-    torch.set_default_device(device)
-    edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
+    if args.dataset is None:
+        edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
+        x = torch.randn(args.num_nodes, args.feature_dim).to(device)
 
-    x = torch.randn(args.num_nodes, args.feature_dim, device=device)
-    graph = GraphSample(
-        backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
-        x=x,
-        y=torch.zeros(len(x)),
-        edge_index=edge_index,
-        edge_weight=edge_weight,
-    ).graph_repr
+        graph = GraphSample(
+            backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
+            x=x,
+            y=torch.zeros(len(x)),
+            edge_index=edge_index,
+            edge_weight=edge_weight,
+        )
+    else:
+        with open(args.dataset, encoding="utf-8") as f:
+            dataset_cfg_top_level = yaml.safe_load(f)
+            dataset_cfg = dataset_cfg_top_level["dataset"]
+            graph = load_single_graph(
+                DatasetConfig(
+                    source=dataset_cfg["source"],
+                    name=dataset_cfg["name"],
+                    root=dataset_cfg["root"],
+                    conv_backend=args.backend,
+                )
+            )
+        x = torch.randn(graph.num_nodes, args.feature_dim).to(device)
+    graph = graph.graph_repr
 
     # conv
     backend = BackendRegistry.get_backend(args.backend)
@@ -121,7 +144,7 @@ def main() -> int:
         opt.step()
 
     fn = _fn_forward if args.mode == "forward" else _fn_train
-    res: MicrobenchResult = time_callable(fn, warmup=args.warmup, iters=args.iters)
+    res: MicrobenchResult = time_callable(fn, warmup=args.warmup, iters=args.iters, do_memory_profile=False)
 
     base_dict = {
         "backend": args.backend,
