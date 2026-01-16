@@ -227,8 +227,20 @@ def _run_measurement_in_subprocess(X, graph, conv, queue):
         queue.put(("error", str(e)))
 
 
-def measure_kernel_performance_safe(X, graph, conv, timeout=60):
+def measure_kernel_performance_safe(X, graph, conv, timeout=60, use_subprocess=False):
     """Wrapper that runs measurement in subprocess to catch hard crashes"""
+    if not use_subprocess or X.is_cuda:
+        try:
+            return measure_kernel_performance(X, graph, conv)
+        except Exception as e:
+            return {
+                "forward_ms": None,
+                "forward_memory_mb": None,
+                "backward_ms": None,
+                "backward_memory_mb": None,
+                "error": str(e),
+            }
+
     process = mp.Process(target=_run_measurement_in_subprocess, args=(X, graph, conv, queue))
 
     process.start()
@@ -400,7 +412,9 @@ def main():
                         continue
 
                     if backend in BACKENDS_PRONE_TO_ERROR:
-                        measurements_dict = measure_kernel_performance_safe(X=x, graph=graph_repr, conv=conv)
+                        measurements_dict = measure_kernel_performance_safe(
+                            X=x, graph=graph_repr, conv=conv, use_subprocess=False
+                        )
                     else:
                         measurements_dict = measure_kernel_performance(X=x, graph=graph_repr, conv=conv)
 

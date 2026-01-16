@@ -25,25 +25,26 @@ if not build_path.is_dir():
 # Get PyTorch's ABI setting to match it
 torch_abi = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
 
-f3s_ops = load(
-    name="f3s_ops",
-    build_directory=str(build_path),
-    extra_cflags=["-O3", f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}"],
-    extra_cuda_cflags=[
-        "-O3",
-        "--use_fast_math",
-        "-arch=sm_80",
-        "--generate-line-info",
-        "-Xcompiler",
-        f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}",  # Use -Xcompiler for nvcc
-    ],
-    extra_include_paths=[
-        f"{cuda_path}/include",
-        str(path),  # Add directory containing config.h and ptx.h
-    ],
-    sources=[path / s for s in sources],
-    verbose=True,
-)
+f3s_ops = None
+# f3s_ops = load(
+#     name="f3s_ops",
+#     build_directory=str(build_path),
+#     extra_cflags=["-O3", f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}"],
+#     extra_cuda_cflags=[
+#         "-O3",
+#         "--use_fast_math",
+#         "-arch=sm_80",
+#         "--generate-line-info",
+#         "-Xcompiler",
+#         f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}",  # Use -Xcompiler for nvcc
+#     ],
+#     extra_include_paths=[
+#         f"{cuda_path}/include",
+#         str(path),  # Add directory containing config.h and ptx.h
+#     ],
+#     sources=[path / s for s in sources],
+#     verbose=True,
+# )
 
 
 def f3s_preprocess(edge_index, block_h=16, block_w=16):
@@ -64,7 +65,7 @@ def f3s_preprocess(edge_index, block_h=16, block_w=16):
     column_index = indices.to(torch.int32).cuda()
 
     row_window_offset, sorted_row_windows, tcblock_rowid, _, _, sparse_a_to_index, tcblock_bit_map, _ = (
-        f3s_ops.preprocess_gpu(
+        f3s_ops.preprocess_gpu(  # type: ignore
             column_index,
             row_pointers,
             num_nodes,
@@ -82,7 +83,7 @@ def f3s_preprocess(edge_index, block_h=16, block_w=16):
 def F3S_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, graph, block_h=16, block_w=16, n_warps_per_block=8):
     sorted_row_windows, row_window_offset, sparse_a_to_index, tcblock_bit_map, num_nodes = graph
 
-    x = f3s_ops.f3s_1tb1rw_scheduled_permuteV(
+    x = f3s_ops.f3s_1tb1rw_scheduled_permuteV(  # type: ignore
         row_window_offset,
         sorted_row_windows,
         sparse_a_to_index,

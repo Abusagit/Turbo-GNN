@@ -2,22 +2,25 @@
 #include <cmath>
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <ATen/AccumulateType.h>
 
 #define FULL_WARP_MASK 0xffffffff
 
 constexpr int kWarpSize = 32;
 constexpr int MAX_NUM_EDGES = 131072; // TODO we are limited by this constant
 
-
+template <typename scalar_t>
 __global__ void min_aggr_forward_light_kernel_1d(
     const int* __restrict__ nodes,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
-    const float* __restrict__ X,
-    float* __restrict__ out,
+    const scalar_t* __restrict__ X,
+    scalar_t* __restrict__ out,
     int* __restrict__ argmin,
     int d
 ) {
+    using acc_t = at::acc_type<scalar_t, true>;
+
     int i = blockIdx.x;
     int v = nodes[i];
 
@@ -27,19 +30,19 @@ __global__ void min_aggr_forward_light_kernel_1d(
     int tid = threadIdx.x;
 
     for (int f = tid; f < d; f += blockDim.x) {
-        float best_val = INFINITY;
+        acc_t best_val = (acc_t)INFINITY;
         int best_src = -1;
 
         for (int eid = row_start; eid < row_end; ++eid) {
             int src = edge_idx[eid];
-            float val = X[src * d + f];
+            acc_t val = (acc_t)X[src * d + f];
             if (val < best_val) {
                 best_val = val;
                 best_src = src;
             }
         }
 
-        out[v * d + f] = best_val;
+        out[v * d + f] = (scalar_t)best_val;
         argmin[v * d + f] = best_src;
     }
 }
@@ -89,12 +92,12 @@ __device__ __forceinline__ void unpack_val_idx(
 
 
 // 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
-template<int EDGES_PER_BLOCK>
+template<int EDGES_PER_BLOCK, typename scalar_t>
 __global__ void min_aggr_forward_heavy_kernel(
     const int* __restrict__ nodes,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
-    const float* __restrict__ X,
+    const scalar_t* __restrict__ X,
     unsigned long long* __restrict__ packed,
     int d
 ) {
@@ -123,7 +126,7 @@ __global__ void min_aggr_forward_heavy_kernel(
         #pragma unroll
         for (int eid = chunk_start; eid < chunk_end; ++eid) {
             int src = edge_idx[eid];
-            float val = X[src * d + f];
+            float val = (float)X[src * d + f];
             if (val < local_min) {
                 local_min = val;
                 local_arg = src;
@@ -139,10 +142,11 @@ __global__ void min_aggr_forward_heavy_kernel(
 }
 
 // unpack results back to separate arrays
+template <typename scalar_t>
 __global__ void unpack_results_kernel(
     const unsigned long long* __restrict__ packed,
     const int* __restrict__ nodes,
-    float* __restrict__ out,
+    scalar_t* __restrict__ out,
     int* __restrict__ argmin,
     int num_nodes,
     int d
@@ -158,7 +162,7 @@ __global__ void unpack_results_kernel(
         int idx;
         unpack_val_idx(packed[node_idx * d + f], val, idx);
 
-        out[v * d + f] = val;
+        out[v * d + f] = (scalar_t)val;
         argmin[v * d + f] = idx;
     }
 }
@@ -206,18 +210,28 @@ void min_aggr_forward_partitioned_cuda(
     TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
     TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
     TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
-    TORCH_CHECK(X.dtype() == torch::kFloat32, "X must be float32");
+    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16 || X.scalar_type() == at::kDouble, "X must be float32/float16/bfloat16/float64");
+    TORCH_CHECK(out.scalar_type() == X.scalar_type(), "out must have same dtype as X");
 
     if (light_nodes.numel() > 0) {
         const int num_light = light_nodes.numel();
-        min_aggr_forward_light_kernel_1d<<<num_light, THREADS_PER_BLOCK>>>(
-            light_nodes.data_ptr<int>(),
-            edge_ptr.data_ptr<int>(),
-            edge_idx.data_ptr<int>(),
-            X.data_ptr<float>(),
-            out.data_ptr<float>(),
-            argmin.data_ptr<int>(),
-            d
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            X.scalar_type(),
+            "min_aggr_forward_light",
+            ([&] {
+                min_aggr_forward_light_kernel_1d<scalar_t>
+                    <<<num_light, THREADS_PER_BLOCK>>>(
+                        light_nodes.data_ptr<int>(),
+                        edge_ptr.data_ptr<int>(),
+                        edge_idx.data_ptr<int>(),
+                        X.data_ptr<scalar_t>(),
+                        out.data_ptr<scalar_t>(),
+                        argmin.data_ptr<int>(),
+                        d
+                    );
+            })
         );
     }
 
@@ -226,118 +240,147 @@ void min_aggr_forward_partitioned_cuda(
     if (num_heavy > 0) {
         // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
         constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
-        auto packed = at::full(
-            {num_heavy, d},
-            static_cast<int64_t>(PACKED_INIT),
-            at::TensorOptions().dtype(torch::kInt64).device(X.device())
-        );
 
-        ;
-        if (edges_per_block_heavy_nodes == 32){
-            constexpr int EDGES_PER_BLOCK = 32;
-            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X.data_ptr<float>(),
-                (unsigned long long*)packed.data_ptr<int64_t>(),
-                d
-            );
-
-        } else if (edges_per_block_heavy_nodes == 64) {
-            constexpr int EDGES_PER_BLOCK = 64;
-            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X.data_ptr<float>(),
-                (unsigned long long*)packed.data_ptr<int64_t>(),
-                d
-            );
-
-        } else if (edges_per_block_heavy_nodes == 128) {
-            constexpr int EDGES_PER_BLOCK = 128;
-            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X.data_ptr<float>(),
-                (unsigned long long*)packed.data_ptr<int64_t>(),
-                d
-            );
-        } else if (edges_per_block_heavy_nodes == 256) {
-            constexpr int EDGES_PER_BLOCK = 256;
-            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X.data_ptr<float>(),
-                (unsigned long long*)packed.data_ptr<int64_t>(),
-                d
-            );
-        } else if (edges_per_block_heavy_nodes == 512) {
-            constexpr int EDGES_PER_BLOCK = 512;
-            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X.data_ptr<float>(),
-                (unsigned long long*)packed.data_ptr<int64_t>(),
-                d
-            );
-        } else if (edges_per_block_heavy_nodes == 1024) {
-            constexpr int EDGES_PER_BLOCK = 1024;
-            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X.data_ptr<float>(),
-                (unsigned long long*)packed.data_ptr<int64_t>(),
-                d
+        // TODO: think about what to do with the doubles
+        if (X.scalar_type() == at::kDouble) {
+            AT_DISPATCH_FLOATING_TYPES(
+                X.scalar_type(),
+                "min_aggr_forward_heavy_fallback_double",
+                ([&] {
+                    min_aggr_forward_light_kernel_1d<scalar_t>
+                        <<<num_heavy, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            out.data_ptr<scalar_t>(),
+                            argmin.data_ptr<int>(),
+                            d
+                        );
+                })
             );
         } else {
-            constexpr int EDGES_PER_BLOCK = 2048;
-            dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+            auto packed = at::full(
+                {num_heavy, d},
+                static_cast<int64_t>(PACKED_INIT),
+                at::TensorOptions().dtype(torch::kInt64).device(X.device())
+            );
 
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X.data_ptr<float>(),
-                (unsigned long long*)packed.data_ptr<int64_t>(),
-                d
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                at::ScalarType::Half,
+                at::ScalarType::BFloat16,
+                X.scalar_type(),
+                "min_aggr_forward_heavy",
+                ([&] {
+                    if (edges_per_block_heavy_nodes == 32){
+                        constexpr int EDGES_PER_BLOCK = 32;
+                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            (unsigned long long*)packed.data_ptr<int64_t>(),
+                            d
+                        );
+
+                    } else if (edges_per_block_heavy_nodes == 64) {
+                        constexpr int EDGES_PER_BLOCK = 64;
+                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            (unsigned long long*)packed.data_ptr<int64_t>(),
+                            d
+                        );
+
+                    } else if (edges_per_block_heavy_nodes == 128) {
+                        constexpr int EDGES_PER_BLOCK = 128;
+                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            (unsigned long long*)packed.data_ptr<int64_t>(),
+                            d
+                        );
+                    } else if (edges_per_block_heavy_nodes == 256) {
+                        constexpr int EDGES_PER_BLOCK = 256;
+                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            (unsigned long long*)packed.data_ptr<int64_t>(),
+                            d
+                        );
+                    } else if (edges_per_block_heavy_nodes == 512) {
+                        constexpr int EDGES_PER_BLOCK = 512;
+                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            (unsigned long long*)packed.data_ptr<int64_t>(),
+                            d
+                        );
+                    } else if (edges_per_block_heavy_nodes == 1024) {
+                        constexpr int EDGES_PER_BLOCK = 1024;
+                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            (unsigned long long*)packed.data_ptr<int64_t>(),
+                            d
+                        );
+                    } else {
+                        constexpr int EDGES_PER_BLOCK = 2048;
+                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            (unsigned long long*)packed.data_ptr<int64_t>(),
+                            d
+                        );
+                    }
+
+                    int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+                    unpack_results_kernel<scalar_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
+                        (unsigned long long*)packed.data_ptr<int64_t>(),
+                        heavy_nodes.data_ptr<int>(),
+                        out.data_ptr<scalar_t>(),
+                        argmin.data_ptr<int>(),
+                        num_heavy,
+                        d
+                    );
+                })
             );
         }
-
-        int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        unpack_results_kernel<<<unpack_blocks, THREADS_PER_BLOCK>>>(
-            (unsigned long long*)packed.data_ptr<int64_t>(),
-            heavy_nodes.data_ptr<int>(),
-            out.data_ptr<float>(),
-            argmin.data_ptr<int>(),
-            num_heavy,
-            d
-        );
     }
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
 }
 
-__global__ void min_aggr_backward(
-    const float* __restrict__ grad_out,
+template <typename scalar_t>
+__global__ void min_aggr_backward_accum_fp32(
+    const scalar_t* __restrict__ grad_out,
     const int*   __restrict__ argmin,
     float* __restrict__ grad_x,
     int num_nodes,
@@ -357,7 +400,34 @@ __global__ void min_aggr_backward(
             continue;
         }
 
-        float grad = grad_out[block_idx * d + f];
+        float grad = (float)grad_out[block_idx * d + f];
+        atomicAdd(&grad_x[src * d + f], grad);
+    }
+}
+
+template <typename scalar_t>
+__global__ void min_aggr_backward_typed(
+    const scalar_t* __restrict__ grad_out,
+    const int*   __restrict__ argmin,
+    scalar_t* __restrict__ grad_x,
+    int num_nodes,
+    int d
+) {
+    int block_idx = blockIdx.x;
+    if (block_idx >= num_nodes) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+
+    #pragma unroll
+    for (int f = tid; f < d; f += blockDim.x) {
+        int src = argmin[block_idx * d + f];
+        if (src < 0) {
+            continue;
+        }
+
+        scalar_t grad = grad_out[block_idx * d + f];
         atomicAdd(&grad_x[src * d + f], grad);
     }
 }
@@ -391,13 +461,48 @@ void min_aggr_backward_cuda(
     }
 
     const dim3 threads(THREADS_PER_BLOCK);
-    min_aggr_backward<<<blocks, threads>>>(
-        grad_out.data_ptr<float>(),
-        argmin.data_ptr<int>(),
-        grad_x.data_ptr<float>(),
-        num_nodes,
-        d
-    );
+    auto st = grad_out.scalar_type();
+
+    if (st == at::kFloat || st == at::kDouble) {
+        TORCH_CHECK(grad_x.scalar_type() == st, "grad_x must have same dtype as grad_out for float/double");
+
+        AT_DISPATCH_FLOATING_TYPES(
+            st,
+            "min_aggr_backward_float_double",
+            ([&] {
+                min_aggr_backward_typed<scalar_t><<<blocks, threads>>>(
+                    grad_out.data_ptr<scalar_t>(),
+                    argmin.data_ptr<int>(),
+                    grad_x.data_ptr<scalar_t>(),
+                    num_nodes,
+                    d
+                );
+            })
+        );
+
+    } else if (st == at::kHalf || st == at::kBFloat16) {
+        TORCH_CHECK(grad_x.scalar_type() == at::kFloat, "grad_x must be float32 when grad_out is half/bfloat16");
+
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            st,
+            "min_aggr_backward_half_bf16_accum_fp32",
+            ([&] {
+                min_aggr_backward_accum_fp32<scalar_t><<<blocks, threads>>>(
+                    grad_out.data_ptr<scalar_t>(),
+                    argmin.data_ptr<int>(),
+                    grad_x.data_ptr<float>(),
+                    num_nodes,
+                    d
+                );
+            })
+        );
+
+    } else {
+        TORCH_CHECK(false, "Unsupported grad_out dtype: ", grad_out.scalar_type());
+    }
+
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "backward kernel launch failed: ", cudaGetErrorString(err));

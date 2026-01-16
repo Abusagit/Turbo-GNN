@@ -1,4 +1,11 @@
+import os
+
+os.environ["CUDA_HOME"] = "/usr/local/cuda"
+os.environ["CUDA_PATH"] = "/usr/local/cuda"
+os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
+
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
 
 import dgl
@@ -26,9 +33,30 @@ except ImportError:
 
 from torch.utils.cpp_extension import load
 
+repo_root_path = Path(__file__).parent.parent.parent
+
+build_path = repo_root_path / "build/wsb"
+if not build_path.is_dir():
+    build_path.mkdir(parents=True)
+
+
 wsb_cuda = load(
-    name="wsb_cuda", sources=[__file__.replace("converters.py", "") + "wsb_format.cu"], extra_cuda_cflags=["-O3"]
+    name="wsb_cuda",
+    sources=[__file__.replace("converters.py", "") + "wsb_format.cu"],
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "--generate-line-info",
+    ],
+    extra_include_paths=[
+        # *glob.glob(str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True),
+        "/usr/local/cuda/include"
+    ],
+    verbose=True,
+    build_directory=str(build_path),
 )
+
 
 doc = """
 Graph format converters among edge list, CSR, and optional framework objects.
