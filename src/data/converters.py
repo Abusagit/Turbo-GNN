@@ -1,9 +1,13 @@
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
 
 import dgl
+import dgl.sparse as dglsp
 import numpy as np
 import torch
+from torch.utils.cpp_extension import load
 from torch_geometric.data import Data
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
@@ -24,11 +28,37 @@ except ImportError:
     except ImportError:
         pass
 
-from torch.utils.cpp_extension import load
+# Set up CUDA environment to avoid JIT compilation hangs
+if os.environ.get("CUDA_HOME") is None:
+    os.environ["CUDA_HOME"] = "/usr/local/cuda"
+    os.environ["CUDA_PATH"] = "/usr/local/cuda"
+    os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ.get('PATH', '')}"
 
-wsb_cuda = load(
-    name="wsb_cuda", sources=[__file__.replace("converters.py", "") + "wsb_format.cu"], extra_cuda_cflags=["-O3"]
-)
+# Set up build directory to avoid file locking issues
+path = Path(__file__).parent
+repo_root_path = Path(__file__).parent.parent.parent
+build_path = repo_root_path / "build/wsb_cuda"
+build_path.mkdir(parents=True, exist_ok=True)
+
+# Lazy loading to avoid deadlock on subsequent launches
+# PyTorch's cpp_extension.load() can hang when called at import time
+# on subsequent runs due to lock contention
+_wsb_cuda = None
+
+
+def _get_wsb_cuda():
+    """Lazy load wsb_cuda to avoid import-time deadlocks."""
+    global _wsb_cuda
+    if _wsb_cuda is None:
+        _wsb_cuda = load(
+            name="wsb_cuda",
+            sources=[str(path / "wsb_format.cu")],
+            build_directory=str(build_path),
+            extra_cuda_cflags=["-O3"],
+            verbose=True,
+        )
+    return _wsb_cuda
+
 
 doc = """
 Graph format converters among edge list, CSR, and optional framework objects.
@@ -211,6 +241,36 @@ def to_tcgnn_data(
         col_indices.cpu(), row_pointer.cpu(), num_nodes, BLK_H, BLK_W, block_partition, edge_to_column, edge_to_row
     )
     return row_pointer, col_indices, block_partition, edge_to_column, edge_to_row
+
+
+def g_to_SPmatrix(g):
+    indices = torch.stack(g.edges())
+    N = g.num_nodes()
+    A = dglsp.spmatrix(indices, shape=(N, N))
+    return A, 128
+
+
+def to_dfgnn_data(g: dgl.DGLGraph):
+    WARP_SIZE = 32
+
+    A, max_neigh = g_to_SPmatrix(g)
+
+    smem_consume = (max_neigh * 8 + WARP_SIZE - 1) // WARP_SIZE * WARP_SIZE  # noqa: F821
+    rows = A.row.int()
+    rows = torch.sort(rows).values
+
+    # the CSR format of adj matrix
+    row_ptr, col_ind, val_idx = A.csr()
+    row_ptr = row_ptr.int()
+    col_ind = col_ind.int()
+    val = A.val[val_idx]
+    A_csr = dglsp.from_csr(indptr=row_ptr, indices=col_ind, val=val)
+
+    # the CSC format of adj matrix
+    col_ptr, row_ind, val_idx = A_csr.csc()
+    col_ptr = col_ptr.int()
+    row_ind = row_ind.int()
+    return A, rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume
 
 
 def splot_by_rows(
@@ -810,7 +870,8 @@ class WSBFormat:
         num_row_windows = (N + ROW_WINDOW_SIZE - 1) // ROW_WINDOW_SIZE
         num_edges = adj._nnz()
 
-        tcb_row_offset, col_idx, bitmap, weights = wsb_cuda.build_wsb_format_cpu(adj, dtype)
+        wsb_ops = _get_wsb_cuda()
+        tcb_row_offset, col_idx, bitmap, weights = wsb_ops.build_wsb_format_cpu(adj, dtype)
 
         num_tcbs = tcb_row_offset[-1].item()
         return cls(
