@@ -387,6 +387,7 @@ class GraphSample:
         elif self.backend == "dfgnn":
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             graph = to_dfgnn_data(graph)
+            graph = [self._to_default_device(item) for item in graph]
 
         self._graph_repr = graph
         assert self._graph_repr is not None, f"The backend {self.backend} isn't supported"

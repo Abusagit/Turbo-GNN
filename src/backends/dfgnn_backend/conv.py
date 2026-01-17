@@ -110,7 +110,7 @@ class _DFGNN_GTConv(BaseConvolution):
             val_idx,
             smem_consume,
         ) = graph
-
+        x = torch.nn.functional.layer_norm(x, (x.shape[-1],))
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
@@ -119,7 +119,21 @@ class _DFGNN_GTConv(BaseConvolution):
         k = k.view(x.shape[0], self.num_heads, -1)
         v = v.view(x.shape[0], self.num_heads, -1)
 
-        return GTConvFunction.apply(rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume, q, k, v)
+        output = GTConvFunction.apply(
+            rows,
+            row_ptr,
+            col_ind,
+            val,
+            col_ptr,
+            row_ind,
+            val_idx,
+            smem_consume,
+            q,
+            k,
+            v,
+        ).view(x.shape[0], -1)
+
+        return output
 
 
 @BackendRegistry.register_backend("dfgnn")
@@ -135,5 +149,5 @@ class DFGNNBackend(BaseBackend):
         """
 
         if conv_type == "gt":
-            return _DFGNN_GTConv(kwargs["feature_dim"])
+            return _DFGNN_GTConv(kwargs["feature_dim"], num_heads=kwargs["heads"])
         raise ValueError(f"Unsupported conv_type for DFGNN backend: {conv_type}")
