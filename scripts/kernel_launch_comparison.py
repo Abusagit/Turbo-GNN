@@ -365,6 +365,7 @@ def main():
 
         for dataset_config in datasets_configs_to_load:
             dataset_name = dataset_config["name"]
+            print(f"TRYING DATASET: {dataset_name}")
 
             try:
                 graph = load_single_graph(
