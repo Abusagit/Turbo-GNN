@@ -119,7 +119,9 @@ class _DFGNN_GTConv(BaseConvolution):
         k = k.view(x.shape[0], self.num_heads, -1)
         v = v.view(x.shape[0], self.num_heads, -1)
 
-        return GTConvFunction.apply(rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume, q, k, v)
+        return GTConvFunction.apply(
+            rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume, q, k, v
+        ).reshape(x.shape[0], -1)
 
 
 @BackendRegistry.register_backend("dfgnn")

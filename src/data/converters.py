@@ -270,7 +270,16 @@ def to_dfgnn_data(g: dgl.DGLGraph):
     col_ptr, row_ind, val_idx = A_csr.csc()
     col_ptr = col_ptr.int()
     row_ind = row_ind.int()
-    return A, rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume
+
+    device = torch.get_default_device()
+    rows = rows.to(device)
+    row_ptr = row_ptr.to(device)
+    col_ind = col_ind.to(device)
+    val = val.to(device)
+    col_ptr = col_ptr.to(device)
+    row_ind = row_ind.to(device)
+    val_idx = val_idx.to(device)
+    return rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume
 
 
 def splot_by_rows(
