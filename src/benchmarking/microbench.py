@@ -65,32 +65,33 @@ def time_callable(
     Returns:
         MicrobenchResult: Average time per iteration in ms.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.get_default_device()
     for _ in range(warmup):
         fn()
         torch.cuda.synchronize()
 
     if torch.cuda.is_available():
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-            torch.cuda.synchronize()
+        with torch.cuda.device(device):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                fn()
+                torch.cuda.synchronize()
 
-        end.record()
-        end.synchronize()
-        total_ms = start.elapsed_time(end)
+            end.record()
+            end.synchronize()
+            total_ms = start.elapsed_time(end)
 
-        if do_memory_profile:
-            _, memory_allocated, peak_memory = measure_memory(func=fn)
-        else:
-            memory_allocated = None
+            if do_memory_profile:
+                _, memory_allocated, peak_memory = measure_memory(func=fn)
+            else:
+                memory_allocated = None
 
         return MicrobenchResult(
             iters=iters,
             ms_per_iter=total_ms / iters,
-            device=device,
+            device=str(device),
             memory_allocated=memory_allocated,
         )
 
@@ -99,7 +100,7 @@ def time_callable(
         for _ in range(iters):
             fn()
         ms = (time.perf_counter() - t0) * 1000.0
-        return MicrobenchResult(iters=iters, ms_per_iter=ms / iters, device=device)
+        return MicrobenchResult(iters=iters, ms_per_iter=ms / iters, device=str(device))
 
 
 def get_gpu_info(device=None) -> dict[str, Any]:
