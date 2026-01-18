@@ -2,7 +2,6 @@
 #include <cmath>
 #include <torch/extension.h>
 #include <torch/torch.h>
-#include <ATen/AccumulateType.h>
 
 #define FULL_WARP_MASK 0xffffffff
 
