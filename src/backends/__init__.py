@@ -2,6 +2,7 @@ from . import (
     cuda_backend,
     cugraph_backend,
     cusparse_backend,
+    dfgnn_backend,
     dgl_backend,
     # fused3s_backend,
     fusegnn_backend,
