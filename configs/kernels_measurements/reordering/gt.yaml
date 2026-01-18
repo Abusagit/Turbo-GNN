@@ -5,7 +5,7 @@ params_grid:
     heads: [2, 4, 8]
 kernel_related_kwargs:
   all:
-    graph_reordering_partition_size: [128, 512, 1024, 2048, 4096, 8192]
+    graph_reordering_partition_size: [128, 512, 1024, 2048, 4096, 8192, 16000, 65535]
 datasets:
   base_path: configs/datasets
   dirs:

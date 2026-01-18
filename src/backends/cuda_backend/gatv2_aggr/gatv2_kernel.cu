@@ -37,13 +37,6 @@ __device__ __forceinline__ float leaky_relu_der_elementwise(float x, float negat
     return (x > 0.0f) ? 1.0f : negative_slope;
 }
 
-__device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
-    return a.x * b.x
-         + a.y * b.y
-         + a.z * b.z
-         + a.w * b.w;
-}
-
 __device__ __forceinline__ float warp_reduce_sum(float x) {
     #pragma unroll
     for (int offset = kMaxThreadsInWarp / 2; offset > 0; offset >>= 1) {
@@ -60,6 +53,22 @@ __device__ __forceinline__ float warp_reduce_max(float x) {
     return x;
 }
 
+__device__ __forceinline__ int warp_bcast_i32(int v0) {
+    return __shfl_sync(FULL_WARP_MASK, v0, 0);
+}
+
+__device__ __forceinline__ float warp_bcast_f32(float v0) {
+    return __shfl_sync(FULL_WARP_MASK, v0, 0);
+}
+
+__device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
+    float acc = 0.f;
+    acc = fmaf(a.x, b.x, acc);
+    acc = fmaf(a.y, b.y, acc);
+    acc = fmaf(a.z, b.z, acc);
+    acc = fmaf(a.w, b.w, acc);
+    return acc;
+}
 
 struct OnlineSoftmaxState {
     float max_val;
@@ -131,7 +140,6 @@ __global__ void GATv2Kernel_CSR(
     const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
 
     float* h_out_base = d_h_out + ((node_i * H + head_h) * D );
-    float* logsumexp_base = d_logsumexp_out + (node_i * H + head_h);
 
     int num_float4 = D / 4;
     // ==========================================
@@ -202,7 +210,6 @@ __global__ void GATv2Kernel_CSR(
         // rescale previously accumulated values
         #pragma unroll
         for (int i = 0; i < float4_per_thread; ++i) {  // NOTE currently thys loop has at most 8 iterations
-                                                    // TODO support dimension > 1024, maybe use more blocks?
             h_acc[i].x *= rescale;
             h_acc[i].y *= rescale;
             h_acc[i].z *= rescale;
@@ -225,15 +232,172 @@ __global__ void GATv2Kernel_CSR(
 
     // write logsumexp value:
     if (lane_id == 0){
-        float L_i = softmax_state.max_val + __logf(softmax_state.sum_exp);
-        *logsumexp_base = L_i;
+        d_logsumexp_out[node_i * H + head_h] = softmax_state.max_val + __logf(softmax_state.sum_exp);
     }
 
+    float inv_sum = 1.0f / softmax_state.sum_exp;
+
     float4* h_out_f4 = reinterpret_cast<float4*>(h_out_base);
+    #pragma unroll
     for (int i = 0; i < float4_per_thread; ++i) {
         int idx4 = lane_id + i * kMaxThreadsInWarp;
         if (idx4 < num_float4) {
-            h_out_f4[idx4] = h_acc[i];
+            float4 v = h_acc[i];
+            v.x *= inv_sum;
+            v.y *= inv_sum;
+            v.z *= inv_sum;
+            v.w *= inv_sum;
+            h_out_f4[idx4] = v;
+        }
+    }
+}
+
+template<int D_CONST>
+__global__ void GATv2Kernel_CSR_D(
+    size_t N,
+    size_t H,
+    size_t D, // kept only so the call site stays identical
+    const float* __restrict__ d_l,
+    const float* __restrict__ d_r,
+    int64_t stride_l_n,
+    int64_t stride_l_h,
+    int64_t stride_r_n,
+    int64_t stride_r_h,
+    const int* __restrict__ d_row_ptr,
+    const int* __restrict__ d_col_idx,
+    const float* __restrict__ d_attn_vec,
+    float* __restrict__ d_h_out,
+    float* __restrict__ d_logsumexp_out,
+    float negative_slope
+) {
+    static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
+    static_assert(D_CONST <= 1024, "D_CONST must be <= 1024");
+
+    constexpr int num_float4 = D_CONST / 4;
+    constexpr int float4_per_thread = (num_float4 + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp; // 1..8
+
+    extern __shared__ float shared[];
+    float* l_shared = shared;
+
+    int node_i = blockIdx.x;
+    int head_h = blockIdx.y;
+    int lane_id = threadIdx.x % kMaxThreadsInWarp;
+
+    if (node_i >= (int)N || head_h >= (int)H) return;
+    if ((int)D != D_CONST) return; // safety
+
+    // warp-uniform row_ptr loads (lane0 + bcast)
+    int edge_start = 0, edge_end = 0;
+    if (lane_id == 0) {
+        edge_start = __ldg(&d_row_ptr[node_i]);
+        edge_end   = __ldg(&d_row_ptr[node_i + 1]);
+    }
+    edge_start = warp_bcast_i32(edge_start);
+    edge_end   = warp_bcast_i32(edge_end);
+
+    int num_neighbors = edge_end - edge_start;
+    if (num_neighbors == 0) return;
+
+    const float* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
+    const float* a_base = d_attn_vec + head_h * D_CONST;
+
+    const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
+
+    float* h_out_base      = d_h_out + ((node_i * H + head_h) * D_CONST);
+
+    {
+        const float4* l_src4 = reinterpret_cast<const float4*>(l_base);
+        float4* l_sh4        = reinterpret_cast<float4*>(l_shared);
+        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+            l_sh4[i] = l_src4[i];
+        }
+    }
+    __syncthreads();
+
+    const float4* l_f4 = reinterpret_cast<const float4*>(l_shared);
+    OnlineSoftmaxState softmax_state;
+
+    float4 h_acc[float4_per_thread];
+    #pragma unroll
+    for (int i = 0; i < float4_per_thread; ++i) {
+        h_acc[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+
+    for (int k = 0; k < num_neighbors; ++k) {
+        int neighbor_j = 0;
+        if (lane_id == 0) {
+            neighbor_j = __ldg(&d_col_idx[edge_start + k]);
+        }
+        neighbor_j = warp_bcast_i32(neighbor_j);
+
+        const float* r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+        const float4* r_f4 = reinterpret_cast<const float4*>(r_base);
+
+        float dot = 0.0f;
+        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+            float4 l_val = l_f4[i];
+            float4 r_val = r_f4[i];
+            float4 a_val = a_f4[i];
+
+            float4 sum;
+            sum.x = leaky_relu_elementwise(l_val.x + r_val.x, negative_slope);
+            sum.y = leaky_relu_elementwise(l_val.y + r_val.y, negative_slope);
+            sum.z = leaky_relu_elementwise(l_val.z + r_val.z, negative_slope);
+            sum.w = leaky_relu_elementwise(l_val.w + r_val.w, negative_slope);
+
+            // FMA chain (dot += sum * a)
+            dot = fmaf(sum.x, a_val.x, dot);
+            dot = fmaf(sum.y, a_val.y, dot);
+            dot = fmaf(sum.z, a_val.z, dot);
+            dot = fmaf(sum.w, a_val.w, dot);
+        }
+
+        dot = warp_reduce_sum(dot);
+
+        float rescale = softmax_state.update(dot);
+
+        // rescale previous accumulator
+        #pragma unroll
+        for (int i = 0; i < float4_per_thread; ++i) {
+            h_acc[i].x *= rescale;
+            h_acc[i].y *= rescale;
+            h_acc[i].z *= rescale;
+            h_acc[i].w *= rescale;
+        }
+
+        float contrib = __expf(dot - softmax_state.max_val);
+
+        #pragma unroll
+        for (int i = 0; i < float4_per_thread; ++i) {
+            int idx4 = lane_id + i * kMaxThreadsInWarp;
+            if (idx4 < num_float4) {
+                float4 r_val = r_f4[idx4];
+                h_acc[i].x = fmaf(contrib, r_val.x, h_acc[i].x);
+                h_acc[i].y = fmaf(contrib, r_val.y, h_acc[i].y);
+                h_acc[i].z = fmaf(contrib, r_val.z, h_acc[i].z);
+                h_acc[i].w = fmaf(contrib, r_val.w, h_acc[i].w);
+            }
+        }
+    }
+
+    // logsumexp
+    if (lane_id == 0) {
+        d_logsumexp_out[node_i * H + head_h] = softmax_state.max_val + __logf(softmax_state.sum_exp);
+    }
+
+    float inv_sum = 1.0f / softmax_state.sum_exp;
+
+    float4* h_out_f4 = reinterpret_cast<float4*>(h_out_base);
+    #pragma unroll
+    for (int i = 0; i < float4_per_thread; ++i) {
+        int idx4 = lane_id + i * kMaxThreadsInWarp;
+        if (idx4 < num_float4) {
+            float4 v = h_acc[i];
+            v.x *= inv_sum;
+            v.y *= inv_sum;
+            v.z *= inv_sum;
+            v.w *= inv_sum;
+            h_out_f4[idx4] = v;
         }
     }
 }
@@ -284,8 +448,20 @@ __global__ void GATv2Backward_AL(
         return;
     }
 
-    int edge_start = d_row_ptr[node_i];
-    int edge_end   = d_row_ptr[node_i + 1];
+    int edge_start = 0, edge_end = 0;
+    if (lane_id == 0) {
+        edge_start = __ldg(&d_row_ptr[node_i]);
+        edge_end   = __ldg(&d_row_ptr[node_i + 1]);
+    }
+    edge_start = warp_bcast_i32(edge_start);
+    edge_end   = warp_bcast_i32(edge_end);
+
+    float L_i = 0.f;
+    if (lane_id == 0) {
+        L_i = __ldg(&d_logsumexp[node_i * H + head_h]);
+    }
+    L_i = warp_bcast_f32(L_i);
+
     int num_neighbors = edge_end - edge_start;
 
     int num_float4 = D / 4;
@@ -307,9 +483,7 @@ __global__ void GATv2Backward_AL(
 
     const float* a_base = d_attn_vec + head_h * D;
     const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
-    float L_i = d_logsumexp[node_i * H + head_h];
 
-    // Initialize shared grad buffers
     for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
         grad_a_shared_f4[f_idx_f4] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         grad_li_shared_f4[f_idx_f4] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -332,7 +506,12 @@ __global__ void GATv2Backward_AL(
     float G_i_h = 0.0f;
 
     for (int neighbor_idx = 0; neighbor_idx < num_neighbors; ++neighbor_idx) {
-        int neighbor_j = d_col_idx[edge_start + neighbor_idx];
+        int neighbor_j = 0;
+        if (lane_id == 0) {
+            neighbor_j = __ldg(&d_col_idx[edge_start + neighbor_idx]);
+        }
+        neighbor_j = warp_bcast_i32(neighbor_j);
+
 
         const float* rj_base = d_r + neighbor_j * stride_r_n + head_h    * stride_r_h;
         const float4* rj_f4 = reinterpret_cast<const float4*>(rj_base);
@@ -362,12 +541,23 @@ __global__ void GATv2Backward_AL(
         float alpha_ij = recompute_alpha(e_ij, L_i);
         float p_ij = warp_reduce_sum(p_ij_cum);
 
-        G_i_h += alpha_ij * p_ij;
+        // G_i_h += alpha_ij * p_ij;
+        if (lane_id == 0) {
+            G_i_h = fmaf(alpha_ij, p_ij, G_i_h);
+        }
+
     }
+    G_i_h = warp_bcast_f32(G_i_h);
 
     // Second pass: compute gradients using G_{i, h}
     for (int neighbor_idx = 0; neighbor_idx < num_neighbors; ++neighbor_idx) {
-        int neighbor_j = d_col_idx[edge_start + neighbor_idx];
+        // int neighbor_j = d_col_idx[edge_start + neighbor_idx];
+        int neighbor_j = 0;
+        if (lane_id == 0) {
+            neighbor_j = __ldg(&d_col_idx[edge_start + neighbor_idx]);
+        }
+        neighbor_j = warp_bcast_i32(neighbor_j);
+
 
         const float* rj_base = d_r + neighbor_j * stride_r_n + head_h    * stride_r_h;
         const float4* rj_f4 = reinterpret_cast<const float4*>(rj_base);
@@ -394,10 +584,20 @@ __global__ void GATv2Backward_AL(
             p_ij_cum += dot_product_f4(grad_hi_val, rj_val);
         }
 
+        // float e_ij = warp_reduce_sum(e_ij_cum);
+        // float alpha_ij = recompute_alpha(e_ij, L_i);
+        // float p_ij = warp_reduce_sum(p_ij_cum);
+        // float grad_e_ij = alpha_ij * (p_ij - G_i_h);
         float e_ij = warp_reduce_sum(e_ij_cum);
-        float alpha_ij = recompute_alpha(e_ij, L_i);
         float p_ij = warp_reduce_sum(p_ij_cum);
-        float grad_e_ij = alpha_ij * (p_ij - G_i_h);
+
+        float alpha_ij = 0.f, grad_e_ij = 0.f;
+        if (lane_id == 0) {
+            alpha_ij  = recompute_alpha(e_ij, L_i);
+            grad_e_ij = alpha_ij * (p_ij - G_i_h);
+        }
+        alpha_ij  = warp_bcast_f32(alpha_ij);
+        grad_e_ij = warp_bcast_f32(grad_e_ij);
 
         // Accumulate gradients
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
@@ -428,18 +628,19 @@ __global__ void GATv2Backward_AL(
 
             // Accumulate grad_a
             float4 grad_a_shared_val = grad_a_shared_f4[f_idx_f4];
-            grad_a_shared_val.x += grad_e_ij * t_ij_val.x;
-            grad_a_shared_val.y += grad_e_ij * t_ij_val.y;
-            grad_a_shared_val.z += grad_e_ij * t_ij_val.z;
-            grad_a_shared_val.w += grad_e_ij * t_ij_val.w;
+            grad_a_shared_val.x = fmaf(grad_e_ij, t_ij_val.x, grad_a_shared_val.x);
+            grad_a_shared_val.y = fmaf(grad_e_ij, t_ij_val.y, grad_a_shared_val.y);
+            grad_a_shared_val.z = fmaf(grad_e_ij, t_ij_val.z, grad_a_shared_val.z);
+            grad_a_shared_val.w = fmaf(grad_e_ij, t_ij_val.w, grad_a_shared_val.w);
+
             grad_a_shared_f4[f_idx_f4] = grad_a_shared_val;
 
             // Accumulate grad_li
             float4 grad_li_shared_val = grad_li_shared_f4[f_idx_f4];
-            grad_li_shared_val.x += grad_e_ij * a_val.x * t_ij_der_val.x;
-            grad_li_shared_val.y += grad_e_ij * a_val.y * t_ij_der_val.y;
-            grad_li_shared_val.z += grad_e_ij * a_val.z * t_ij_der_val.z;
-            grad_li_shared_val.w += grad_e_ij * a_val.w * t_ij_der_val.w;
+            grad_li_shared_val.x = fmaf(grad_e_ij * t_ij_der_val.x, a_val.x, grad_li_shared_val.x);
+            grad_li_shared_val.y = fmaf(grad_e_ij * t_ij_der_val.y, a_val.y, grad_li_shared_val.y);
+            grad_li_shared_val.z = fmaf(grad_e_ij * t_ij_der_val.z, a_val.z, grad_li_shared_val.z);
+            grad_li_shared_val.w = fmaf(grad_e_ij * t_ij_der_val.w, a_val.w, grad_li_shared_val.w);
             grad_li_shared_f4[f_idx_f4] = grad_li_shared_val;
         }
     }
@@ -534,7 +735,11 @@ __global__ void GATv2Backward_R(
 
     // Process each incoming edge (i -> j)
     for (int incoming_idx = 0; incoming_idx < num_incoming; ++incoming_idx) {
-        int node_i = d_col_idx_T[edge_start + incoming_idx];
+        // int node_i = d_col_idx_T[edge_start + incoming_idx];
+        int node_i = 0;
+        if (lane_id == 0) node_i = __ldg(&d_col_idx_T[edge_start + incoming_idx]);
+        node_i = warp_bcast_i32(node_i);
+
 
         const float* li_base      = d_l + node_i * stride_l_n + head_h * stride_l_h;
         const float* grad_hi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
@@ -542,8 +747,16 @@ __global__ void GATv2Backward_R(
         const float4* li_f4       = reinterpret_cast<const float4*>(li_base);
         const float4* grad_hi_f4  = reinterpret_cast<const float4*>(grad_hi_base);
 
-        float L_i_h = d_logsumexp[node_i * H + head_h];
-        float G_i_h = d_G[node_i * H + head_h];
+        // float L_i_h = d_logsumexp[node_i * H + head_h];
+        // float G_i_h = d_G[node_i * H + head_h];
+        float L_i_h = 0.f, G_i_h = 0.f;
+        if (lane_id == 0) {
+            L_i_h = __ldg(&d_logsumexp[(int64_t)node_i * H + head_h]);
+            G_i_h = __ldg(&d_G[(int64_t)node_i * H + head_h]);
+        }
+        L_i_h = warp_bcast_f32(L_i_h);
+        G_i_h = warp_bcast_f32(G_i_h);
+
 
 
         float e_ij_cum = 0.0f;
@@ -595,29 +808,39 @@ __global__ void GATv2Backward_R(
                 leaky_relu_der_elementwise(edge_ij.w, negative_slope)
             );
 
-            // 1: attention path
-            float4 grad_attn = make_float4(
-                grad_e_ij * a_val.x * t_ij_der_val.x,
-                grad_e_ij * a_val.y * t_ij_der_val.y,
-                grad_e_ij * a_val.z * t_ij_der_val.z,
-                grad_e_ij * a_val.w * t_ij_der_val.w
-            );
+            // // 1: attention path
+            // float4 grad_attn = make_float4(
+            //     grad_e_ij * a_val.x * t_ij_der_val.x,
+            //     grad_e_ij * a_val.y * t_ij_der_val.y,
+            //     grad_e_ij * a_val.z * t_ij_der_val.z,
+            //     grad_e_ij * a_val.w * t_ij_der_val.w
+            // );
 
-            // 2: direct aggregation
-            float4 grad_direct = make_float4(
-                alpha_ij * grad_hi_val.x,
-                alpha_ij * grad_hi_val.y,
-                alpha_ij * grad_hi_val.z,
-                alpha_ij * grad_hi_val.w
-            );
+            // // 2: direct aggregation
+            // float4 grad_direct = make_float4(
+            //     alpha_ij * grad_hi_val.x,
+            //     alpha_ij * grad_hi_val.y,
+            //     alpha_ij * grad_hi_val.z,
+            //     alpha_ij * grad_hi_val.w
+            // );
 
             // Accumulate both paths
             float4 grad_rj_shared_val = grad_rj_shared_f4[f_idx_f4];
-            grad_rj_shared_val.x += grad_attn.x + grad_direct.x;
-            grad_rj_shared_val.y += grad_attn.y + grad_direct.y;
-            grad_rj_shared_val.z += grad_attn.z + grad_direct.z;
-            grad_rj_shared_val.w += grad_attn.w + grad_direct.w;
+
+            // direct path: alpha * grad_hi
+            grad_rj_shared_val.x = fmaf(alpha_ij, grad_hi_val.x, grad_rj_shared_val.x);
+            grad_rj_shared_val.y = fmaf(alpha_ij, grad_hi_val.y, grad_rj_shared_val.y);
+            grad_rj_shared_val.z = fmaf(alpha_ij, grad_hi_val.z, grad_rj_shared_val.z);
+            grad_rj_shared_val.w = fmaf(alpha_ij, grad_hi_val.w, grad_rj_shared_val.w);
+
+            // attention path: grad_e * a * t_der
+            grad_rj_shared_val.x = fmaf(grad_e_ij * t_ij_der_val.x, a_val.x, grad_rj_shared_val.x);
+            grad_rj_shared_val.y = fmaf(grad_e_ij * t_ij_der_val.y, a_val.y, grad_rj_shared_val.y);
+            grad_rj_shared_val.z = fmaf(grad_e_ij * t_ij_der_val.z, a_val.z, grad_rj_shared_val.z);
+            grad_rj_shared_val.w = fmaf(grad_e_ij * t_ij_der_val.w, a_val.w, grad_rj_shared_val.w);
+
             grad_rj_shared_f4[f_idx_f4] = grad_rj_shared_val;
+
         }
     }
 
@@ -874,19 +1097,15 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     // shared memory: z floats for l_i + max_neighbors floats for logits
     size_t shared_mem_size = D * sizeof(float);
 
-    GATv2Kernel_CSR<<<nBlocks, nThreads, shared_mem_size, stream>>>(
-        N, H, D,
-        d_l,
-        d_r,
-        stride_l_n, stride_l_h,
-        stride_r_n, stride_r_h,
-        d_row_ptr,
-        d_col_idx,
-        d_attn_vec,
-        d_h_out,
-        d_logsumexp,
-        negative_slope
-    );
+    switch ((int)D) {
+        case 32:  GATv2Kernel_CSR_D<32> <<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
+        case 64:  GATv2Kernel_CSR_D<64> <<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
+        case 128: GATv2Kernel_CSR_D<128><<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
+        case 256: GATv2Kernel_CSR_D<256><<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
+        default:
+            // fallback to your existing runtime-D kernel
+            GATv2Kernel_CSR<<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope);
+    }
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
