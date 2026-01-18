@@ -7,7 +7,6 @@
 #define FULL_WARP_MASK 0xffffffff
 
 constexpr int kWarpSize = 32;
-constexpr int MAX_NUM_EDGES = 131072; // TODO we are limited by this constant.
 
 template <typename scalar_t>
 __device__ __forceinline__ float to_float(scalar_t val);
@@ -218,6 +217,7 @@ void min_aggr_forward_partitioned_cuda(
     const at::Tensor& X,
     const at::Tensor& light_nodes,
     const at::Tensor& heavy_nodes,
+    int max_degree,
     at::Tensor& out,
     at::Tensor& argmin,
     int warps_per_block = 8,
@@ -320,7 +320,7 @@ void min_aggr_forward_partitioned_cuda(
                 ([&] {
                     if (edges_per_block_heavy_nodes == 32){
                         constexpr int EDGES_PER_BLOCK = 32;
-                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
                         min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
                             heavy_nodes.data_ptr<int>(),
@@ -333,7 +333,7 @@ void min_aggr_forward_partitioned_cuda(
 
                     } else if (edges_per_block_heavy_nodes == 64) {
                         constexpr int EDGES_PER_BLOCK = 64;
-                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
                         min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
                             heavy_nodes.data_ptr<int>(),
@@ -346,7 +346,7 @@ void min_aggr_forward_partitioned_cuda(
 
                     } else if (edges_per_block_heavy_nodes == 128) {
                         constexpr int EDGES_PER_BLOCK = 128;
-                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
                         min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
                             heavy_nodes.data_ptr<int>(),
@@ -358,7 +358,7 @@ void min_aggr_forward_partitioned_cuda(
                         );
                     } else if (edges_per_block_heavy_nodes == 256) {
                         constexpr int EDGES_PER_BLOCK = 256;
-                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
                         min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
                             heavy_nodes.data_ptr<int>(),
@@ -370,7 +370,7 @@ void min_aggr_forward_partitioned_cuda(
                         );
                     } else if (edges_per_block_heavy_nodes == 512) {
                         constexpr int EDGES_PER_BLOCK = 512;
-                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
                         min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
                             heavy_nodes.data_ptr<int>(),
@@ -382,7 +382,7 @@ void min_aggr_forward_partitioned_cuda(
                         );
                     } else if (edges_per_block_heavy_nodes == 1024) {
                         constexpr int EDGES_PER_BLOCK = 1024;
-                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
                         min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
                             heavy_nodes.data_ptr<int>(),
@@ -394,7 +394,7 @@ void min_aggr_forward_partitioned_cuda(
                         );
                     } else {
                         constexpr int EDGES_PER_BLOCK = 2048;
-                        dim3 grid(num_heavy, (MAX_NUM_EDGES + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
                         min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
                             heavy_nodes.data_ptr<int>(),

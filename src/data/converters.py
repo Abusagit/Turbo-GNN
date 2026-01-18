@@ -573,10 +573,14 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     light_nodes: torch.Tensor
     heavy_nodes: torch.Tensor
 
+    max_degree: int = -1
     _device: torch.device = torch.device("cpu")
 
     def __post__init__(self):
         self._device = self.forward_indptr.device
+        degrees = self.forward_indptr[1:] - self.forward_indptr[:-1]
+        self.max_degree = degrees.max().item()
+        assert self.max_degree != -1
 
     @property
     def device(self) -> torch.device:

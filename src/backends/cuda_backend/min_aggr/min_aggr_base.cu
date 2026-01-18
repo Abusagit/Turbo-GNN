@@ -21,6 +21,7 @@ void min_aggr_forward_partitioned_cuda(
     const at::Tensor& X,
     const at::Tensor& light_nodes,
     const at::Tensor& heavy_nodes,
+    int max_degree,
     at::Tensor& out,
     at::Tensor& argmin,
     int warps_per_block = 8,
@@ -60,6 +61,7 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     at::Tensor X,
     at::Tensor light_nodes,
     at::Tensor heavy_nodes,
+    int max_degree,
     int warps_per_block = 8,
     int edges_per_block_heavy_nodes = 128
 ) {
@@ -78,7 +80,7 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     auto out = torch::empty({num_nodes, d}, X.options());
     auto argmin = torch::empty({num_nodes, d}, edge_ptr.options());
 
-    min_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, out, argmin, warps_per_block, edges_per_block_heavy_nodes);
+    min_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, argmin, warps_per_block, edges_per_block_heavy_nodes);
     return {out, argmin};
 }
 
@@ -93,7 +95,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("min_aggr_forward_partitioned", &min_aggr_forward_partitioned_torch,
           "Min aggregation forward (partitioned)",
           py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("X"),
-          py::arg("light_nodes"), py::arg("heavy_nodes"),
+          py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("max_degree"),
           py::arg("warps_per_block") = 8, py::arg("edges_per_block_heavy_nodes") = 128
         );
 }

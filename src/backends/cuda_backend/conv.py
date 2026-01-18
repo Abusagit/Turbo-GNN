@@ -53,7 +53,16 @@ class _CudaMinAggrConv(nn.Module):
         light = graph.light_nodes
         heavy = graph.heavy_nodes
 
-        return min_aggr(edge_ptr, edge_idx, x, light, heavy, self.warps_per_block, self.edges_per_block_heavy_nodes)
+        return min_aggr(
+            edge_ptr,
+            edge_idx,
+            x,
+            light,
+            heavy,
+            graph.max_degree,
+            self.warps_per_block,
+            self.edges_per_block_heavy_nodes,
+        )
 
 
 class _CudaSimpleAggrConv(BaseConvolution):

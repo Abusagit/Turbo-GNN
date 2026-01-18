@@ -38,7 +38,7 @@ def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128):
 
 
 def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128):
-    out = min_aggr(indptr, indices, x, light, heavy, warps, epb)
+    out = min_aggr(indptr, indices, x, light, heavy, 131070, warps, epb)
     out = zero_inf(out)
 
     grad_out = torch.ones_like(out)
@@ -132,8 +132,8 @@ def test_real_dataset_matches_fp32_reference(dtype):
     x = torch.randn(N, F, device=device, dtype=dtype, requires_grad=True)
     x_ref = x.detach().float().requires_grad_(True)
 
-    out = min_aggr(indptr, indices, x, light, heavy, 8, 128)
-    out_ref = min_aggr(indptr, indices, x_ref, light, heavy, 8, 128)
+    out = min_aggr(indptr, indices, x, light, heavy, 131070, 8, 128)
+    out_ref = min_aggr(indptr, indices, x_ref, light, heavy, 131070, 8, 128)
 
     out = zero_inf(out).float()
     out_ref = zero_inf(out_ref).float()

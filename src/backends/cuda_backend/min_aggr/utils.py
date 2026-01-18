@@ -42,7 +42,7 @@ def min_aggr_forward(edge_ptr: torch.Tensor, edge_idx: torch.Tensor, X: torch.Te
 
 def min_aggr_forward_partitioned(edge_ptr, edge_idx, X, light, heavy, warps_per_block, edges_per_block_heavy_nodes):
     return min_aggr_cuda.min_aggr_forward_partitioned(
-        edge_ptr, edge_idx, X, light, heavy, warps_per_block, edges_per_block_heavy_nodes
+        edge_ptr, edge_idx, X, light, heavy, 131070, warps_per_block, edges_per_block_heavy_nodes
     )
 
 
@@ -56,11 +56,12 @@ class MinAggrFunction(torch.autograd.Function):
         X: torch.Tensor,
         light,
         heavy,
+        max_degree,
         warps_per_block,
         edges_per_block_heavy_nodes,
     ):
-        out, argmin = min_aggr_forward_partitioned(
-            edge_ptr, edge_idx, X, light, heavy, warps_per_block, edges_per_block_heavy_nodes
+        out, argmin = min_aggr_cuda.min_aggr_forward_partitioned(
+            edge_ptr, edge_idx, X, light, heavy, max_degree, warps_per_block, edges_per_block_heavy_nodes
         )
         ctx.save_for_backward(argmin)
         ctx.num_src_nodes = X.size(0)
@@ -73,7 +74,7 @@ class MinAggrFunction(torch.autograd.Function):
         (argmin,) = ctx.saved_tensors
         num_src_nodes = ctx.num_src_nodes
         grad_x = min_aggr_cuda.min_aggr_backward(grad_out, argmin, num_src_nodes, ctx.warps_per_block)
-        return None, None, grad_x, None, None, None, None
+        return None, None, grad_x, None, None, None, None, None
 
 
 def min_aggr(
@@ -82,7 +83,10 @@ def min_aggr(
     X: torch.Tensor,
     light,
     heavy,
+    max_degree: int,
     warps_per_block: int,
     edges_per_block_heavy_nodes: int,
 ):
-    return MinAggrFunction.apply(edge_ptr, edge_idx, X, light, heavy, warps_per_block, edges_per_block_heavy_nodes)
+    return MinAggrFunction.apply(
+        edge_ptr, edge_idx, X, light, heavy, max_degree, warps_per_block, edges_per_block_heavy_nodes
+    )
