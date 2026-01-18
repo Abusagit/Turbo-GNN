@@ -48,6 +48,7 @@ def min_aggr_forward_partitioned(edge_ptr, edge_idx, X, light, heavy, warps_per_
 
 class MinAggrFunction(torch.autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
         edge_ptr: torch.Tensor,
@@ -67,6 +68,7 @@ class MinAggrFunction(torch.autograd.Function):
         return out
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out: torch.Tensor):
         (argmin,) = ctx.saved_tensors
         num_src_nodes = ctx.num_src_nodes

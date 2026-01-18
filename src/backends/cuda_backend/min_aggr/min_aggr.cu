@@ -2,6 +2,7 @@
 #include <cmath>
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <cuda_fp16.h>
 
 #define FULL_WARP_MASK 0xffffffff
 
@@ -424,30 +425,18 @@ void min_aggr_forward_partitioned_cuda(
 }
 
 template <typename scalar_t>
-__global__ void min_aggr_backward_accum_fp32(
-    const scalar_t* __restrict__ grad_out,
-    const int*   __restrict__ argmin,
-    float* __restrict__ grad_x,
-    int num_nodes,
-    int d
-) {
-    int block_idx = blockIdx.x;
-    if (block_idx >= num_nodes) {
-        return;
-    }
+__device__ __forceinline__ void atomic_add_wrapper(scalar_t* address, scalar_t val) {
+    atomicAdd(address, val);
+}
 
-    int tid = threadIdx.x;
+template <>
+__device__ __forceinline__ void atomic_add_wrapper<at::Half>(at::Half* address, at::Half val) {
+    atomicAdd(reinterpret_cast<__half*>(address), *reinterpret_cast<__half*>(&val));
+}
 
-    #pragma unroll
-    for (int f = tid; f < d; f += blockDim.x) {
-        int src = argmin[block_idx * d + f];
-        if (src < 0) {
-            continue;
-        }
-
-        float grad = (float)grad_out[block_idx * d + f];
-        atomicAdd(&grad_x[src * d + f], grad);
-    }
+template <>
+__device__ __forceinline__ void atomic_add_wrapper<at::BFloat16>(at::BFloat16* address, at::BFloat16 val) {
+    atomicAdd(reinterpret_cast<__nv_bfloat16*>(address), *reinterpret_cast<__nv_bfloat16*>(&val));
 }
 
 template <typename scalar_t>
@@ -473,7 +462,7 @@ __global__ void min_aggr_backward_typed(
         }
 
         scalar_t grad = grad_out[block_idx * d + f];
-        atomicAdd(&grad_x[src * d + f], grad);
+        atomic_add_wrapper(&grad_x[src * d + f], grad);
     }
 }
 
@@ -508,45 +497,21 @@ void min_aggr_backward_cuda(
     const dim3 threads(THREADS_PER_BLOCK);
     auto st = grad_out.scalar_type();
 
-    if (st == at::kFloat || st == at::kDouble) {
-        TORCH_CHECK(grad_x.scalar_type() == st, "grad_x must have same dtype as grad_out for float/double");
-
-        AT_DISPATCH_FLOATING_TYPES(
-            st,
-            "min_aggr_backward_float_double",
-            ([&] {
-                min_aggr_backward_typed<scalar_t><<<blocks, threads>>>(
-                    grad_out.data_ptr<scalar_t>(),
-                    argmin.data_ptr<int>(),
-                    grad_x.data_ptr<scalar_t>(),
-                    num_nodes,
-                    d
-                );
-            })
-        );
-
-    } else if (st == at::kHalf || st == at::kBFloat16) {
-        TORCH_CHECK(grad_x.scalar_type() == at::kFloat, "grad_x must be float32 when grad_out is half/bfloat16");
-
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half,
-            at::ScalarType::BFloat16,
-            st,
-            "min_aggr_backward_half_bf16_accum_fp32",
-            ([&] {
-                min_aggr_backward_accum_fp32<scalar_t><<<blocks, threads>>>(
-                    grad_out.data_ptr<scalar_t>(),
-                    argmin.data_ptr<int>(),
-                    grad_x.data_ptr<float>(),
-                    num_nodes,
-                    d
-                );
-            })
-        );
-
-    } else {
-        TORCH_CHECK(false, "Unsupported grad_out dtype: ", grad_out.scalar_type());
-    }
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        st,
+        "min_aggr_backward_float_double",
+        ([&] {
+            min_aggr_backward_typed<scalar_t><<<blocks, threads>>>(
+                grad_out.data_ptr<scalar_t>(),
+                argmin.data_ptr<int>(),
+                grad_x.data_ptr<scalar_t>(),
+                num_nodes,
+                d
+            );
+        })
+    );
 
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();

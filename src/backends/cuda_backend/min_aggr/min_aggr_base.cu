@@ -48,13 +48,7 @@ at::Tensor min_aggr_backward_torch(
     const int64_t num_nodes = grad_out.size(0);
     const int64_t d = grad_out.size(1);
 
-    at::TensorOptions gx_opts = grad_out.options();
-
-    if (grad_out.scalar_type() == at::kHalf || grad_out.scalar_type() == at::kBFloat16) {
-        gx_opts = gx_opts.dtype(at::kFloat);
-    }
-
-    auto grad_x = torch::zeros({num_src_nodes, d}, gx_opts);
+    auto grad_x = torch::zeros({num_src_nodes, d}, grad_out.options());
 
     min_aggr_backward_cuda(grad_out, argmin, grad_x, warps_per_block);
     return grad_x;
