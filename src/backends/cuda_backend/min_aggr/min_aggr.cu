@@ -286,7 +286,9 @@ void min_aggr_forward_partitioned_cuda(
 
         // TODO: think about what to do with the doubles
         if (X.scalar_type() == at::kDouble) {
-            AT_DISPATCH_FLOATING_TYPES(
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                at::ScalarType::Half,
+                at::ScalarType::BFloat16,
                 X.scalar_type(),
                 "min_aggr_forward_heavy_fallback_double",
                 ([&] {
