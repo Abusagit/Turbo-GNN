@@ -7,7 +7,53 @@
 #define FULL_WARP_MASK 0xffffffff
 
 constexpr int kWarpSize = 32;
-constexpr int MAX_NUM_EDGES = 131072; // TODO we are limited by this constant
+constexpr int MAX_NUM_EDGES = 131072; // TODO we are limited by this constant.
+
+template <typename scalar_t>
+__device__ __forceinline__ float to_float(scalar_t val);
+
+template <>
+__device__ __forceinline__ float to_float<float>(float val) {
+    return val;
+}
+
+template <>
+__device__ __forceinline__ float to_float<double>(double val) {
+    return __double2float_rn(val);
+}
+
+template <>
+__device__ __forceinline__ float to_float<at::Half>(at::Half val) {
+    return __half2float(__half(val));
+}
+
+template <>
+__device__ __forceinline__ float to_float<at::BFloat16>(at::BFloat16 val) {
+    return __bfloat162float(__nv_bfloat16(val));
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t from_float(float v);
+
+template <>
+__device__ __forceinline__ float from_float<float>(float v) {
+    return v;
+}
+
+template <>
+__device__ __forceinline__ double from_float<double>(float v) {
+    return static_cast<double>(v);
+}
+
+template <>
+__device__ __forceinline__ at::Half from_float<at::Half>(float v) {
+    return __float2half(v);
+}
+
+template <>
+__device__ __forceinline__ at::BFloat16 from_float<at::BFloat16>(float v) {
+    return __float2bfloat16(v);
+}
 
 template <typename scalar_t>
 __global__ void min_aggr_forward_light_kernel_1d(
@@ -19,8 +65,6 @@ __global__ void min_aggr_forward_light_kernel_1d(
     int* __restrict__ argmin,
     int d
 ) {
-    using acc_t = at::acc_type<scalar_t, true>;
-
     int i = blockIdx.x;
     int v = nodes[i];
 
@@ -30,19 +74,19 @@ __global__ void min_aggr_forward_light_kernel_1d(
     int tid = threadIdx.x;
 
     for (int f = tid; f < d; f += blockDim.x) {
-        acc_t best_val = (acc_t)INFINITY;
+        scalar_t best_val = from_float<scalar_t>(INFINITY);
         int best_src = -1;
 
         for (int eid = row_start; eid < row_end; ++eid) {
             int src = edge_idx[eid];
-            acc_t val = (acc_t)X[src * d + f];
+            scalar_t val = X[src * d + f];
             if (val < best_val) {
                 best_val = val;
                 best_src = src;
             }
         }
 
-        out[v * d + f] = (scalar_t)best_val;
+        out[v * d + f] = best_val;
         argmin[v * d + f] = best_src;
     }
 }
@@ -126,7 +170,7 @@ __global__ void min_aggr_forward_heavy_kernel(
         #pragma unroll
         for (int eid = chunk_start; eid < chunk_end; ++eid) {
             int src = edge_idx[eid];
-            float val = (float)X[src * d + f];
+            float val = to_float(X[src * d + f]);
             if (val < local_min) {
                 local_min = val;
                 local_arg = src;
@@ -162,7 +206,7 @@ __global__ void unpack_results_kernel(
         int idx;
         unpack_val_idx(packed[node_idx * d + f], val, idx);
 
-        out[v * d + f] = (scalar_t)val;
+        out[v * d + f] = from_float<scalar_t>(val);
         argmin[v * d + f] = idx;
     }
 }
