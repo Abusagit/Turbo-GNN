@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
-from .bindings import dfgnn_ops
+from .bindings import dfgnn_hyper_ops
 
 
 class GTConvFunction(torch.autograd.Function):
@@ -25,7 +25,7 @@ class GTConvFunction(torch.autograd.Function):
         K,
         V,
     ):
-        out_feat, attn_edge = dfgnn_ops.gt_hyper_forward(
+        out_feat, attn_edge = dfgnn_hyper_ops.gt_hyper_forward(
             row_ptr,
             col_ind,
             rows,
@@ -58,7 +58,7 @@ class GTConvFunction(torch.autograd.Function):
             attn_edge,
         ) = ctx.saved_tensors
         grad_out = grad_out.contiguous()
-        grad_Q, grad_K, grad_V = dfgnn_ops.gt_backward(
+        grad_Q, grad_K, grad_V = dfgnn_hyper_ops.gt_backward(
             row_ptr,
             col_ind,
             rows,
@@ -136,18 +136,18 @@ class _DFGNN_GTConv(BaseConvolution):
         return output
 
 
-@BackendRegistry.register_backend("dfgnn")
-class DFGNNBackend(BaseBackend):
+@BackendRegistry.register_backend("dfgnn_hyper")
+class DFGNNHyperBackend(BaseBackend):
     def create_conv(self, conv_type: str, **kwargs: Any) -> BaseConvolution:
-        """Factory for DFGNN convolution layers.
+        """Factory for DFG Hyper convolution layers.
 
         Args:
             conv_type (str): "gt"
             **kwargs (Any): ignored.
         Returns:
-            BaseConvolution: An instance of the requested DFGNN conv.
+            BaseConvolution: An instance of the requested DFG Hyper conv.
         """
 
         if conv_type == "gt":
             return _DFGNN_GTConv(kwargs["feature_dim"], num_heads=kwargs["heads"])
-        raise ValueError(f"Unsupported conv_type for DFGNN backend: {conv_type}")
+        raise ValueError(f"Unsupported conv_type for DFG Hyper backend: {conv_type}")

@@ -251,11 +251,8 @@ def g_to_SPmatrix(g):
 
 
 def to_dfgnn_data(g: dgl.DGLGraph):
-    WARP_SIZE = 32
-
     A, max_neigh = g_to_SPmatrix(g)
 
-    smem_consume = (max_neigh * 8 + WARP_SIZE - 1) // WARP_SIZE * WARP_SIZE  # noqa: F821
     rows = A.row.int()
     rows = torch.sort(rows).values
 
@@ -270,7 +267,7 @@ def to_dfgnn_data(g: dgl.DGLGraph):
     col_ptr, row_ind, val_idx = A_csr.csc()
     col_ptr = col_ptr.int()
     row_ind = row_ind.int()
-    return rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume
+    return rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, max_neigh
 
 
 def splot_by_rows(

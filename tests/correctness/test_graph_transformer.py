@@ -13,6 +13,7 @@ from fixtures import (
 )
 
 from src.backends.registry import BackendRegistry
+from src.data.converters import to_dfgnn_data
 
 
 class TestGraphTransformer:
@@ -103,3 +104,32 @@ class TestGraphTransformer:
         assert torch.allclose(
             conv.qkv_proj.bias.grad, dgl_grads_qkv_bias, atol=1e-6
         ), "Gradient mismatch for qkv_proj.bias"
+
+    def test_correctness_dfgnn(self):
+        torch.set_default_device("cuda")
+        backend = BackendRegistry.get_backend("dfgnn_tiling")
+
+        hidden_dim = 16
+        num_heads = 4
+
+        # initialize conv
+        conv = backend.create_conv("gt", feature_dim=hidden_dim, heads=num_heads)
+
+        # create test graph
+        num_nodes = 6
+        node_features = torch.randn(num_nodes, hidden_dim)
+        edges = [(1, 0), (2, 0), (3, 0), (1, 4), (2, 5), (1, 5)]
+        edges = torch.tensor(edges)
+        num_edges = len(edges)
+
+        graph = DGLGraph()
+        graph.add_nodes(num_nodes)
+
+        for src, dst in edges:
+            graph.add_edges(src, dst)
+
+        graph = to_dfgnn_data(graph)
+        out_dfgnn = conv(node_features, graph)
+
+        assert isinstance(out_dfgnn, torch.Tensor), f"Output is not a tensor, got {type(out_dfgnn)}"
+        assert len(out_dfgnn.shape) == 2, "expected output shape (num_nodes, hidden_dim), got {out_dfgnn.shape}"

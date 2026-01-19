@@ -18,17 +18,17 @@ cuda_path = os.environ["CUDA_PATH"]
 sources = [
     "csrc/fused_gtconv/fused_gtconv.cpp",
     "csrc/fused_gtconv/fused_gtconv_backward.cu",
-    "csrc/fused_gtconv/fused_gtconv_hyper.cu",
+    "csrc/fused_gtconv/fused_gtconv_tiling.cu",
     "csrc/util/indicator.cc",
     "csrc/util/indicator.cu",
 ]
 
 extra_include_path = ["csrc/util/"]
 
-dfgnn_ops = load(
+dfgnn_tiling_ops = load(
     # NOTE: C++ sources use `PYBIND11_MODULE(fused_gtconv, m)` (and `ind`).
     # `load(name=...)` must match the exported `PyInit_<name>` symbol.
-    name="fused_gtconv",
+    name="fused_gtconv_tiling",
     build_directory=str(build_path),
     # Don't override `_GLIBCXX_USE_CXX11_ABI`; PyTorch already provides the correct one.
     extra_cflags=["-O3"],

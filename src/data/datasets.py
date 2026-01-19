@@ -67,7 +67,8 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "triton_block_sparse": "weighted_sparse_block",
     "cuda": "csr_and_csr_transposed",
     "f3s": "f3s",
-    "dfgnn": "dfgnn",
+    "dfgnn_hyper": "dfgnn",
+    "dfgnn_tiling": "dfgnn",
 }
 
 

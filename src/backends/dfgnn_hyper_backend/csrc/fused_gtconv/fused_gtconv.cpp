@@ -114,7 +114,7 @@ gt_backward(torch::Tensor row_ptr, torch::Tensor col_ind, torch::Tensor rows,
                           val_idx, smem_consume, Q, K, V, attn_edge, grad);
 }
 
-PYBIND11_MODULE(fused_gtconv, m) {
+PYBIND11_MODULE(fused_gtconv_hyper, m) {
   m.doc() = "fuse sparse ops in graph transformer into one kernel.";
   m.def("gt_hyper_forward", &gt_hyper_forward,
         "fused graph transformer forward op in hyper format, one kernel");
