@@ -638,7 +638,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     max_degree: int = -1
     _device: torch.device = torch.device("cpu")
 
-    def __post__init__(self):
+    def __post_init__(self):
         self._device = self.forward_indptr.device
         degrees = self.forward_indptr[1:] - self.forward_indptr[:-1]
         self.max_degree = degrees.max().item()
