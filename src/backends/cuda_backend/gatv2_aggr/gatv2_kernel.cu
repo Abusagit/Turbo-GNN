@@ -24,6 +24,115 @@
 #define FULL_WARP_MASK 0xffffffff
 
 constexpr int kMaxThreadsInWarp = 32;
+constexpr size_t kPackAlignment = 16;
+
+union HalfPack {
+    uint64_t u64_[2];
+    __half h_[8];
+};
+static_assert(sizeof(HalfPack) == kPackAlignment);
+
+__device__ __forceinline__ HalfPack LoadPack(const HalfPack* ptr) {
+    HalfPack res;
+    asm("ld.relaxed.sys.global.v2.b64 {%0, %1}, [%2];" : "=l"(res.u64_[0]), "=l"(res.u64_[1]) : "l"(ptr));
+    return res;
+}
+
+__device__ __forceinline__ void StorePack(HalfPack* ptr, HalfPack val) {
+    asm("st.relaxed.sys.global.v2.b64 [%0], {%1, %2};" :: "l"(ptr), "l"(val.u64_[0]), "l"(val.u64_[1]) : "memory");
+}
+
+__device__ __forceinline__ void LoadHalf8ToFloat(const at::Half* ptr, float out[8]) {
+    HalfPack p = LoadPack(reinterpret_cast<const HalfPack*>(ptr));
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = __half2float(p.h_[i]);
+    }
+}
+
+__device__ __forceinline__ void StoreFloat8ToHalf(at::Half* ptr, const float in[8]) {
+    HalfPack p;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        p.h_[i] = __float2half_rn(in[i]);
+    }
+    StorePack(reinterpret_cast<HalfPack*>(ptr), p);
+}
+
+union BFloat16Pack {
+    uint64_t u64_[2];
+    __nv_bfloat16 bf16_[8];
+};
+static_assert(sizeof(BFloat16Pack) == kPackAlignment);
+
+__device__ __forceinline__ BFloat16Pack LoadPack(const BFloat16Pack* ptr) {
+    BFloat16Pack res;
+    asm("ld.relaxed.sys.global.v2.b64 {%0, %1}, [%2];" : "=l"(res.u64_[0]), "=l"(res.u64_[1]) : "l"(ptr));
+    return res;
+}
+
+__device__ __forceinline__ void StorePack(BFloat16Pack* ptr, BFloat16Pack val) {
+    asm("st.relaxed.sys.global.v2.b64 [%0], {%1, %2};" :: "l"(ptr), "l"(val.u64_[0]), "l"(val.u64_[1]) : "memory");
+}
+
+__device__ __forceinline__ void LoadBF168ToFloat(const at::BFloat16* ptr, float out[8]) {
+    BFloat16Pack p = LoadPack(reinterpret_cast<const BFloat16Pack*>(ptr));
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = __bfloat162float(p.bf16_[i]);
+    }
+}
+
+__device__ __forceinline__ void StoreFloat8ToBF16(at::BFloat16* ptr, const float in[8]) {
+    BFloat16Pack p;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        p.bf16_[i] = __float2bfloat16_rn(in[i]);
+    }
+    StorePack(reinterpret_cast<BFloat16Pack*>(ptr), p);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float to_float(scalar_t x);
+
+template <>
+__device__ __forceinline__ float to_float<at::Half>(at::Half x) {
+    return __half2float((__half)x);
+}
+
+template <>
+__device__ __forceinline__ float to_float<at::BFloat16>(at::BFloat16 x) {
+    return __bfloat162float((__nv_bfloat16)x);
+}
+
+template <typename scalar_t>
+struct Mp16IO;
+
+template <>
+struct Mp16IO<at::Half> {
+    __device__ __forceinline__ static void load8(const at::Half* p, float out[8]) {
+        LoadHalf8ToFloat(p, out);
+    }
+    __device__ __forceinline__ static void store8(at::Half* p, const float in[8]) {
+        StoreFloat8ToHalf(p, in);
+    }
+    __device__ __forceinline__ static at::Half cast1(float x) {
+        return (at::Half)__float2half_rn(x);
+    }
+};
+
+template <>
+struct Mp16IO<at::BFloat16> {
+    __device__ __forceinline__ static void load8(const at::BFloat16* p, float out[8]) {
+        LoadBF168ToFloat(p, out);
+    }
+    __device__ __forceinline__ static void store8(at::BFloat16* p, const float in[8]) {
+        StoreFloat8ToBF16(p, in);
+    }
+    __device__ __forceinline__ static at::BFloat16 cast1(float x) {
+        return (at::BFloat16)__float2bfloat16_rn(x);
+    }
+};
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
@@ -273,7 +382,7 @@ __global__ void GATv2Kernel_CSR_D(
     static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
     static_assert(D_CONST <= 1024, "D_CONST must be <= 1024");
 
-    constexpr int num_float4 = D_CONST / 4;
+    constexpr int num_float4 = D_CONST / 4; // num_elements -- сколько грузим за одну инструкцию (D_CONST / (128 / sizeof(sclara_t)))
     constexpr int float4_per_thread = (num_float4 + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp; // 1..8
 
     extern __shared__ float shared[];
@@ -305,11 +414,12 @@ __global__ void GATv2Kernel_CSR_D(
 
     float* h_out_base      = d_h_out + ((node_i * H + head_h) * D_CONST);
 
+    // https://a.yandex-team.ru/arcadia/ml/torch/yccl/csrc/kernel_helpers.h
     {
         const float4* l_src4 = reinterpret_cast<const float4*>(l_base);
         float4* l_sh4        = reinterpret_cast<float4*>(l_shared);
         for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
-            l_sh4[i] = l_src4[i];
+            l_sh4[2 * i] = l_src4[i];
         }
     }
     __syncthreads();
@@ -335,9 +445,9 @@ __global__ void GATv2Kernel_CSR_D(
 
         float dot = 0.0f;
         for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
-            float4 l_val = l_f4[i];
-            float4 r_val = r_f4[i];
-            float4 a_val = a_f4[i];
+            float4 l_val = l_f4[i]; // reinterpret to 8 fp/bf16
+            float4 r_val = r_f4[i]; // reinterpret to 8 fp/bf16
+            float4 a_val = a_f4[i]; // reinterpret to 8 fp/bf16
 
             float4 sum;
             sum.x = leaky_relu_elementwise(l_val.x + r_val.x, negative_slope);
@@ -402,6 +512,438 @@ __global__ void GATv2Kernel_CSR_D(
     }
 }
 
+// template<int D_CONST, typename scalar_t>
+// __global__ void GATv2Kernel_CSR_D_MP16(
+//     size_t N,
+//     size_t H,
+//     size_t D, // kept only so the call site stays identical
+//     const scalar_t* __restrict__ d_l,
+//     const scalar_t* __restrict__ d_r,
+//     int64_t stride_l_n,
+//     int64_t stride_l_h,
+//     int64_t stride_r_n,
+//     int64_t stride_r_h,
+//     const int* __restrict__ d_row_ptr,
+//     const int* __restrict__ d_col_idx,
+//     const scalar_t* __restrict__ d_attn_vec,
+//     scalar_t* __restrict__ d_h_out,
+//     float* __restrict__ d_logsumexp_out,
+//     float negative_slope
+// ) {
+//     static_assert(D_CONST % 8 == 0,  "D_CONST must be divisible by 8 for pack8");
+//     static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
+//     static_assert(D_CONST <= 1024, "D_CONST must be <= 1024");
+
+//     // constexpr int num_float4 = D_CONST / 4; // num_elements -- сколько грузим за одну инструкцию (D_CONST / (128 / sizeof(sclara_t)))
+//     // constexpr int float4_per_thread = (num_float4 + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp; // 1..8
+//     constexpr int num_packs = D_CONST / 8;
+//     constexpr int packs_per_thread = (num_packs + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+
+//     extern __shared__ float shared[];
+//     float* l_shared = shared;
+
+//     int node_i = blockIdx.x;
+//     int head_h = blockIdx.y;
+//     int lane_id = threadIdx.x % kMaxThreadsInWarp;
+
+//     if (node_i >= (int)N || head_h >= (int)H) return;
+//     if ((int)D != D_CONST) return; // safety
+
+//     // warp-uniform row_ptr loads (lane0 + bcast)
+//     int edge_start = 0, edge_end = 0;
+//     if (lane_id == 0) {
+//         edge_start = __ldg(&d_row_ptr[node_i]);
+//         edge_end   = __ldg(&d_row_ptr[node_i + 1]);
+//     }
+//     edge_start = warp_bcast_i32(edge_start);
+//     edge_end   = warp_bcast_i32(edge_end);
+
+//     int num_neighbors = edge_end - edge_start;
+//     if (num_neighbors == 0) return;
+
+//     const scalar_t* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
+//     const scalar_t* a_base = d_attn_vec + head_h * D_CONST;
+
+//     // const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
+
+//     scalar_t* h_out_base      = d_h_out + ((node_i * H + head_h) * D_CONST);
+
+//     // https://a.yandex-team.ru/arcadia/ml/torch/yccl/csrc/kernel_helpers.h
+//     {
+//         // const float4* l_src4 = reinterpret_cast<const float4*>(l_base);
+//         // float4* l_sh4        = reinterpret_cast<float4*>(l_shared);
+//         for (int i = lane_id; i < D_CONST; i += kMaxThreadsInWarp) {
+//             l_shared[i] = to_float<scalar_t>(l_base[i]);
+//         }
+//     }
+//     __syncthreads();
+
+//     // const float4* l_f4 = reinterpret_cast<const float4*>(l_shared);
+//     OnlineSoftmaxState softmax_state;
+
+//     float4 h_acc[float4_per_thread];
+//     #pragma unroll
+//     for (int i = 0; i < float4_per_thread; ++i) {
+//         h_acc[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+//     }
+
+//     for (int k = 0; k < num_neighbors; ++k) {
+//         int neighbor_j = 0;
+//         if (lane_id == 0) {
+//             neighbor_j = __ldg(&d_col_idx[edge_start + k]);
+//         }
+//         neighbor_j = warp_bcast_i32(neighbor_j);
+
+//         const scalar_t* r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+//         // const float4* r_f4 = reinterpret_cast<const float4*>(r_base);
+
+//         float dot = 0.0f;
+//         for (int i = lane_id; i <  num_packs; i += kMaxThreadsInWarp) {
+//             // float4 l_val = l_f4[i]; // reinterpret to 8 fp/bf16
+//             // float4 r_val = r_f4[i]; // reinterpret to 8 fp/bf16
+//             // float4 a_val = a_f4[i]; // reinterpret to 8 fp/bf16
+
+//             // float sum = 0.f;
+//             // float4 sum;
+//             // sum.x = leaky_relu_elementwise(l_val.x + r_val.x, negative_slope);
+//             // sum.y = leaky_relu_elementwise(l_val.y + r_val.y, negative_slope);
+//             // sum.z = leaky_relu_elementwise(l_val.z + r_val.z, negative_slope);
+//             // sum.w = leaky_relu_elementwise(l_val.w + r_val.w, negative_slope);
+
+//             // // FMA chain (dot += sum * a)
+//             // dot = fmaf(sum.x, a_val.x, dot);
+//             // dot = fmaf(sum.y, a_val.y, dot);
+//             // dot = fmaf(sum.z, a_val.z, dot);
+//             // dot = fmaf(sum.w, a_val.w, dot);
+
+//             float l_val[8];
+//             float r_val[8];
+//             float a_val[8];
+//             Mp16IO<scalar_t>::load8(r_base + i * 8, r_val);
+//             Mp16IO<scalar_t>::load8(a_base + i * 8, a_val);
+
+//             int d0 = i * 8;
+//             #pragma unroll
+//             for (int t = 0; t < 8; ++t) {
+//                 l_val[t] = l_shared[d0 + t];
+//             }
+
+//             float sum[8];
+//             #pragma unroll
+//             for (int t = 0; t < 8; ++t) {
+//                 sum[t] = leaky_relu_elementwise(l_val[t] + r_val[t], negative_slope);
+//             }
+
+//             #pragma unroll
+//             for (int t = 0; t < 8; ++t) {
+//                 dot = fmaf(sum[t], a_val[t], dot);
+//             }
+//         }
+
+//         dot = warp_reduce_sum(dot);
+
+//         float rescale = softmax_state.update(dot);
+
+//         // rescale previous accumulator
+//         #pragma unroll
+//         for (int i = 0; i < float4_per_thread; ++i) {
+//             h_acc[i].x *= rescale;
+//             h_acc[i].y *= rescale;
+//             h_acc[i].z *= rescale;
+//             h_acc[i].w *= rescale;
+//         }
+
+//         float contrib = __expf(dot - softmax_state.max_val);
+
+//         #pragma unroll
+//         for (int i = 0; i < float4_per_thread; ++i) {
+//             int idx4 = lane_id + i * kMaxThreadsInWarp;
+//             if (idx4 < num_float4) {
+//                 int d0 = idx4 * 4;
+//                 // float4 r_val = r_f4[idx4];
+//                 float r_val0 = to_float<scalar_t>(r_base[d0 + 0]);
+//                 float r_val1 = to_float<scalar_t>(r_base[d0 + 1]);
+//                 float r_val2 = to_float<scalar_t>(r_base[d0 + 2]);
+//                 float r_val3 = to_float<scalar_t>(r_base[d0 + 3]);
+
+//                 h_acc[i].x = fmaf(contrib, r_val0, h_acc[i].x);
+//                 h_acc[i].y = fmaf(contrib, r_val1, h_acc[i].y);
+//                 h_acc[i].z = fmaf(contrib, r_val2, h_acc[i].z);
+//                 h_acc[i].w = fmaf(contrib, r_val3, h_acc[i].w);
+//             }
+//         }
+//     }
+
+//     // logsumexp
+//     if (lane_id == 0) {
+//         d_logsumexp_out[node_i * H + head_h] = softmax_state.max_val + __logf(softmax_state.sum_exp);
+//     }
+
+//     float inv_sum = 1.0f / softmax_state.sum_exp;
+
+//     #pragma unroll
+//     for (int i = 0; i < float4_per_thread; ++i) {
+//         int idx4 = lane_id + i * kMaxThreadsInWarp;
+//         if (idx4 < num_float4) {
+//             float4 v = h_acc[i];
+//             v.x *= inv_sum;
+//             v.y *= inv_sum;
+//             v.z *= inv_sum;
+//             v.w *= inv_sum;
+
+//             int d0 = idx4 * 4;
+//             if constexpr (std::is_same_v<scalar_t, at::Half>) {
+//                 h_out_base[d0 + 0] = (at::Half)__float2half_rn(v.x);
+//                 h_out_base[d0 + 1] = (at::Half)__float2half_rn(v.y);
+//                 h_out_base[d0 + 2] = (at::Half)__float2half_rn(v.z);
+//                 h_out_base[d0 + 3] = (at::Half)__float2half_rn(v.w);
+//             } else {
+//                 h_out_base[d0 + 0] = (at::BFloat16)__float2bfloat16_rn(v.x);
+//                 h_out_base[d0 + 1] = (at::BFloat16)__float2bfloat16_rn(v.y);
+//                 h_out_base[d0 + 2] = (at::BFloat16)__float2bfloat16_rn(v.z);
+//                 h_out_base[d0 + 3] = (at::BFloat16)__float2bfloat16_rn(v.w);
+//             }
+//         }
+//     }
+// }
+
+template<int D_CONST, typename scalar_t>
+__global__ void GATv2Kernel_CSR_D_MP16_2(
+    size_t N,
+    size_t H,
+    size_t D, // kept only so the call site stays identical
+    const scalar_t* __restrict__ d_l,
+    const scalar_t* __restrict__ d_r,
+    int64_t stride_l_n,
+    int64_t stride_l_h,
+    int64_t stride_r_n,
+    int64_t stride_r_h,
+    const int* __restrict__ d_row_ptr,
+    const int* __restrict__ d_col_idx,
+    const scalar_t* __restrict__ d_attn_vec,
+    scalar_t* __restrict__ d_h_out,
+    float* __restrict__ d_logsumexp_out,
+    float negative_slope
+) {
+    static_assert(D_CONST % 8 == 0,  "D_CONST must be divisible by 8 for pack8");
+    static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
+    static_assert(D_CONST <= 1024, "D_CONST must be <= 1024");
+
+    // constexpr int num_float4 = D_CONST / 4; // num_elements -- сколько грузим за одну инструкцию (D_CONST / (128 / sizeof(sclara_t)))
+    // constexpr int float4_per_thread = (num_float4 + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp; // 1..8
+    constexpr int num_packs = D_CONST / 8;
+    constexpr int packs_per_thread = (num_packs + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+
+    extern __shared__ float shared[];
+    float* l_shared = shared;
+
+    int node_i = blockIdx.x;
+    int head_h = blockIdx.y;
+    int lane_id = threadIdx.x % kMaxThreadsInWarp;
+
+    if (node_i >= (int)N || head_h >= (int)H) return;
+    if ((int)D != D_CONST) return; // safety
+
+    // warp-uniform row_ptr loads (lane0 + bcast)
+    int edge_start = 0, edge_end = 0;
+    if (lane_id == 0) {
+        edge_start = __ldg(&d_row_ptr[node_i]);
+        edge_end   = __ldg(&d_row_ptr[node_i + 1]);
+    }
+    edge_start = warp_bcast_i32(edge_start);
+    edge_end   = warp_bcast_i32(edge_end);
+
+    int num_neighbors = edge_end - edge_start;
+    if (num_neighbors == 0) return;
+
+    const scalar_t* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
+    const scalar_t* a_base = d_attn_vec + head_h * D_CONST;
+
+    // const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
+
+    scalar_t* h_out_base      = d_h_out + ((node_i * H + head_h) * D_CONST);
+
+    // https://a.yandex-team.ru/arcadia/ml/torch/yccl/csrc/kernel_helpers.h
+    {
+        // const float4* l_src4 = reinterpret_cast<const float4*>(l_base);
+        // float4* l_sh4        = reinterpret_cast<float4*>(l_shared);
+        for (int i = lane_id; i < D_CONST; i += kMaxThreadsInWarp) {
+            l_shared[i] = to_float<scalar_t>(l_base[i]);
+        }
+    }
+    __syncthreads();
+
+    // const float4* l_f4 = reinterpret_cast<const float4*>(l_shared);
+    OnlineSoftmaxState softmax_state;
+
+    // float4 h_acc[float4_per_thread];
+    // #pragma unroll
+    // for (int i = 0; i < float4_per_thread; ++i) {
+    //     h_acc[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    // }
+    float h_acc[packs_per_thread][8];
+    #pragma unroll
+    for (int i = 0; i < packs_per_thread; ++i) {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            h_acc[i][t] = 0.f;
+        }
+    }
+
+    for (int k = 0; k < num_neighbors; ++k) {
+        int neighbor_j = 0;
+        if (lane_id == 0) {
+            neighbor_j = __ldg(&d_col_idx[edge_start + k]);
+        }
+        neighbor_j = warp_bcast_i32(neighbor_j);
+
+        const scalar_t* r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+        // const float4* r_f4 = reinterpret_cast<const float4*>(r_base);
+
+        float dot = 0.0f;
+        for (int i = 0; i <  packs_per_thread; ++i) {
+            // float4 l_val = l_f4[i]; // reinterpret to 8 fp/bf16
+            // float4 r_val = r_f4[i]; // reinterpret to 8 fp/bf16
+            // float4 a_val = a_f4[i]; // reinterpret to 8 fp/bf16
+
+            // float sum = 0.f;
+            // float4 sum;
+            // sum.x = leaky_relu_elementwise(l_val.x + r_val.x, negative_slope);
+            // sum.y = leaky_relu_elementwise(l_val.y + r_val.y, negative_slope);
+            // sum.z = leaky_relu_elementwise(l_val.z + r_val.z, negative_slope);
+            // sum.w = leaky_relu_elementwise(l_val.w + r_val.w, negative_slope);
+
+            // // FMA chain (dot += sum * a)
+            // dot = fmaf(sum.x, a_val.x, dot);
+            // dot = fmaf(sum.y, a_val.y, dot);
+            // dot = fmaf(sum.z, a_val.z, dot);
+            // dot = fmaf(sum.w, a_val.w, dot);
+            int p = lane_id + i * kMaxThreadsInWarp;
+            if (p < num_packs) {
+
+                float l_val[8];
+                float r_val[8];
+                float a_val[8];
+                Mp16IO<scalar_t>::load8(r_base + p * 8, r_val);
+                Mp16IO<scalar_t>::load8(a_base + p * 8, a_val);
+
+                int d0 = p * 8;
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    l_val[t] = l_shared[d0 + t];
+                }
+
+                float sum[8];
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    sum[t] = leaky_relu_elementwise(l_val[t] + r_val[t], negative_slope);
+                }
+
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    dot = fmaf(sum[t], a_val[t], dot);
+                }
+            }
+        }
+
+        dot = warp_reduce_sum(dot);
+
+        float rescale = softmax_state.update(dot);
+
+        // rescale previous accumulator
+        // #pragma unroll
+        // for (int i = 0; i < float4_per_thread; ++i) {
+        //     h_acc[i].x *= rescale;
+        //     h_acc[i].y *= rescale;
+        //     h_acc[i].z *= rescale;
+        //     h_acc[i].w *= rescale;
+        // }
+        #pragma unroll
+        for (int i = 0; i < packs_per_thread; ++i) {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                h_acc[i][t] *= rescale;
+            }
+        }
+
+        float contrib = __expf(dot - softmax_state.max_val);
+
+        // #pragma unroll
+        // for (int i = 0; i < float4_per_thread; ++i) {
+        //     int idx4 = lane_id + i * kMaxThreadsInWarp;
+        //     if (idx4 < num_float4) {
+        //         int d0 = idx4 * 4;
+        //         // float4 r_val = r_f4[idx4];
+        //         float r_val0 = to_float<scalar_t>(r_base[d0 + 0]);
+        //         float r_val1 = to_float<scalar_t>(r_base[d0 + 1]);
+        //         float r_val2 = to_float<scalar_t>(r_base[d0 + 2]);
+        //         float r_val3 = to_float<scalar_t>(r_base[d0 + 3]);
+
+        //         h_acc[i].x = fmaf(contrib, r_val0, h_acc[i].x);
+        //         h_acc[i].y = fmaf(contrib, r_val1, h_acc[i].y);
+        //         h_acc[i].z = fmaf(contrib, r_val2, h_acc[i].z);
+        //         h_acc[i].w = fmaf(contrib, r_val3, h_acc[i].w);
+        //     }
+        // }
+        #pragma unroll
+        for (int i = 0; i < packs_per_thread; ++i) {
+            int p = lane_id + i * kMaxThreadsInWarp;
+            if (p < num_packs) {
+                float rv[8];
+                Mp16IO<scalar_t>::load8(r_base + p * 8, rv);
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    h_acc[i][t] = fmaf(contrib, rv[t], h_acc[i][t]);
+                }
+            }
+        }
+    }
+
+    // logsumexp
+    if (lane_id == 0) {
+        d_logsumexp_out[node_i * H + head_h] = softmax_state.max_val + __logf(softmax_state.sum_exp);
+    }
+
+    float inv_sum = 1.0f / softmax_state.sum_exp;
+
+    // #pragma unroll
+    // for (int i = 0; i < float4_per_thread; ++i) {
+    //     int idx4 = lane_id + i * kMaxThreadsInWarp;
+    //     if (idx4 < num_float4) {
+    //         float4 v = h_acc[i];
+    //         v.x *= inv_sum;
+    //         v.y *= inv_sum;
+    //         v.z *= inv_sum;
+    //         v.w *= inv_sum;
+
+    //         int d0 = idx4 * 4;
+    //         if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    //             h_out_base[d0 + 0] = (at::Half)__float2half_rn(v.x);
+    //             h_out_base[d0 + 1] = (at::Half)__float2half_rn(v.y);
+    //             h_out_base[d0 + 2] = (at::Half)__float2half_rn(v.z);
+    //             h_out_base[d0 + 3] = (at::Half)__float2half_rn(v.w);
+    //         } else {
+    //             h_out_base[d0 + 0] = (at::BFloat16)__float2bfloat16_rn(v.x);
+    //             h_out_base[d0 + 1] = (at::BFloat16)__float2bfloat16_rn(v.y);
+    //             h_out_base[d0 + 2] = (at::BFloat16)__float2bfloat16_rn(v.z);
+    //             h_out_base[d0 + 3] = (at::BFloat16)__float2bfloat16_rn(v.w);
+    //         }
+    //     }
+    // }
+    #pragma unroll
+    for (int i = 0; i < packs_per_thread; ++i) {
+        int p = lane_id + i * kMaxThreadsInWarp;
+        if (p < num_packs) {
+            float out8[8];
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                out8[t] = h_acc[i][t] * inv_sum;
+            }
+
+            Mp16IO<scalar_t>::store8(h_out_base + p * 8, out8);
+        }
+    }
+}
 
 // FlashAttention2-like logsumexp trick
 __device__ __forceinline__ float recompute_alpha(
@@ -1074,10 +1616,16 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
 
     TORCH_CHECK(stride_l_d == 1 && stride_r_d == 1, "Feature dim (D) must be contiguous (stride_d == 1)");
 
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
+    // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
 
-    torch::Tensor h_out     = torch::empty({N, H, D}, options);
-    torch::Tensor logsumexp = torch::full({N, H}, -INFINITY, options);
+    // torch::Tensor h_out     = torch::empty({N, H, D}, options);
+    // torch::Tensor logsumexp = torch::full({N, H}, -INFINITY, options);
+
+    auto out_options = torch::TensorOptions().dtype(l.scalar_type()).device(l.device());
+    torch::Tensor h_out = torch::empty({N, H, D}, out_options);
+
+    auto lse_options = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
+    torch::Tensor logsumexp = torch::full({N, H}, -INFINITY, lse_options);
 
     const float* d_l = l.data_ptr<float>();
     const float* d_r = r.data_ptr<float>();
