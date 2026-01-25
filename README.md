@@ -159,10 +159,12 @@ python setup.py develop
 ```bash
 python scripts/train.py \
     --dataset configs/datasets/pyg_cora.yaml \
-    --model configs/models/gcn_dgl.yaml \
+    --model configs/models/node_classifier_128_hidden_1_head.yaml \
     --config configs/training/base.yaml \
     --config configs/comet/disabled.yaml \
-    --out runs/gcn_cora
+    --out runs/gcn_cora \
+    --conv_type gcn \
+    --backend dgl
 ```
 
 For experiments use `configs/comet/exp_run.yaml` (probably with another `project_name`) to enable comet logging.

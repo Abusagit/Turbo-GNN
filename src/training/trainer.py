@@ -38,8 +38,6 @@ class TrainingConfig:
 
     Attributes:
         epochs: Number of training epochs
-        learning_rate: Initial learning rate
-        weight_decay: Weight decay for regularization
         batch_size: Batch size for training
         accumulation_steps: Gradient accumulation steps
         use_amp: Whether to use automatic mixed precision

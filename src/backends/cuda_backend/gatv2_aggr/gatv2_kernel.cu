@@ -115,6 +115,7 @@ __global__ void GATv2Kernel_CSR(
     // [0, z): l_i cached
     extern __shared__ float shared[];
     float* l_shared = shared;
+    float* a_shared = l_shared + D;
 
     int node_i = blockIdx.x;
     int head_h = blockIdx.y;
@@ -137,7 +138,6 @@ __global__ void GATv2Kernel_CSR(
 
     const float* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const float* a_base = d_attn_vec + head_h * D;
-    const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
 
     float* h_out_base = d_h_out + ((node_i * H + head_h) * D );
 
@@ -148,11 +148,15 @@ __global__ void GATv2Kernel_CSR(
 
     {
         const float4* l_src4 = reinterpret_cast<const float4*>(l_base);
+        const float4* a_src4 = reinterpret_cast<const float4*>(a_base);
+
         float4* l_shared4    = reinterpret_cast<float4*>(l_shared);
+        float4* a_shared4    = reinterpret_cast<float4*>(a_shared);
 
         for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
             // because stride_l_d == 1, contiguous access is valid
             l_shared4[i] = l_src4[i];
+            a_shared4[i] = a_src4[i];
         }
     }
     __syncthreads();
@@ -164,6 +168,7 @@ __global__ void GATv2Kernel_CSR(
     // ==========================================
 
     const float4* l_f4 = reinterpret_cast<const float4*>(l_shared);
+    const float4* a_f4 = reinterpret_cast<const float4*>(a_shared);
     OnlineSoftmaxState softmax_state;
 
     // ==========================================
@@ -278,6 +283,7 @@ __global__ void GATv2Kernel_CSR_D(
 
     extern __shared__ float shared[];
     float* l_shared = shared;
+    float* a_shared = l_shared + D_CONST;
 
     int node_i = blockIdx.x;
     int head_h = blockIdx.y;
@@ -301,20 +307,22 @@ __global__ void GATv2Kernel_CSR_D(
     const float* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const float* a_base = d_attn_vec + head_h * D_CONST;
 
-    const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
-
     float* h_out_base      = d_h_out + ((node_i * H + head_h) * D_CONST);
 
     {
         const float4* l_src4 = reinterpret_cast<const float4*>(l_base);
+        const float4* a_src4 = reinterpret_cast<const float4*>(a_base);
         float4* l_sh4        = reinterpret_cast<float4*>(l_shared);
+        float4* a_sh4        = reinterpret_cast<float4*>(a_shared);
         for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
             l_sh4[i] = l_src4[i];
+            a_sh4[i] = a_src4[i];
         }
     }
     __syncthreads();
 
     const float4* l_f4 = reinterpret_cast<const float4*>(l_shared);
+    const float4* a_f4 = reinterpret_cast<const float4*>(a_shared);
     OnlineSoftmaxState softmax_state;
 
     float4 h_acc[float4_per_thread];
@@ -468,21 +476,21 @@ __global__ void GATv2Backward_AL(
 
     extern __shared__ float shared[];
     float* li_shared          = shared;
-    float* grad_hi_shared     = li_shared + D;
+    float* a_shared           = li_shared + D;
+    float* grad_hi_shared     = a_shared + D;
     float* grad_a_shared      = grad_hi_shared + D;
     float* grad_li_shared     = grad_a_shared + D;
 
     float4* li_shared_f4      = reinterpret_cast<float4*>(li_shared);
+    float4* a_shared_f4       = reinterpret_cast<float4*>(a_shared);
     float4* grad_hi_shared_f4 = reinterpret_cast<float4*>(grad_hi_shared);
     float4* grad_a_shared_f4  = reinterpret_cast<float4*>(grad_a_shared);
     float4* grad_li_shared_f4 = reinterpret_cast<float4*>(grad_li_shared);
 
 
     const float* li_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
-    const float* grad_hi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
-
     const float* a_base = d_attn_vec + head_h * D;
-    const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
+    const float* grad_hi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
 
     for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
         grad_a_shared_f4[f_idx_f4] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -492,11 +500,13 @@ __global__ void GATv2Backward_AL(
     if (num_neighbors > 0) {
         // Copy l_{i, h} and grad_h_{i, h} to shared memory
         const float4* li_f4      = reinterpret_cast<const float4*>(li_base);
+        const float4* a_f4       = reinterpret_cast<const float4*>(a_base);
         const float4* grad_hi_f4 = reinterpret_cast<const float4*>(grad_hi_base);
 
         // feature dim contiguous, so float4 loads are valid
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
             li_shared_f4[f_idx_f4]      = li_f4[f_idx_f4];
+            a_shared_f4[f_idx_f4]       = a_f4[f_idx_f4];
             grad_hi_shared_f4[f_idx_f4] = grad_hi_f4[f_idx_f4];
         }
     }
@@ -522,7 +532,7 @@ __global__ void GATv2Backward_AL(
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
             float4 li_val      = li_shared_f4[f_idx_f4];
             float4 rj_val      = rj_f4[f_idx_f4];
-            float4 a_val       = a_f4[f_idx_f4];
+            float4 a_val       = a_shared_f4[f_idx_f4];
             float4 grad_hi_val = grad_hi_shared_f4[f_idx_f4];
 
             float4 t_ij_val = make_float4(
@@ -569,7 +579,7 @@ __global__ void GATv2Backward_AL(
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
             float4 li_val      = li_shared_f4[f_idx_f4];
             float4 rj_val      = rj_f4[f_idx_f4];
-            float4 a_val       = a_f4[f_idx_f4];
+            float4 a_val       = a_shared_f4[f_idx_f4];
             float4 grad_hi_val = grad_hi_shared_f4[f_idx_f4];
 
             float4 t_ij_val = make_float4(
@@ -603,7 +613,7 @@ __global__ void GATv2Backward_AL(
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
             float4 li_val = li_shared_f4[f_idx_f4];
             float4 rj_val = rj_f4[f_idx_f4];
-            float4 a_val  = a_f4[f_idx_f4];
+            float4 a_val  = a_shared_f4[f_idx_f4];
 
             float4 edge_ij = make_float4(
                 li_val.x + rj_val.x,
@@ -708,15 +718,16 @@ __global__ void GATv2Backward_R(
 
     extern __shared__ float shared[];
     float* rj_shared      = shared;
-    float* grad_rj_shared = rj_shared + D;
+    float* a_shared       = rj_shared + D;
+    float* grad_rj_shared = a_shared + D;
 
     float4* rj_shared_f4      = reinterpret_cast<float4*>(rj_shared);
+    float4* a_shared_f4       = reinterpret_cast<float4*>(a_shared);
     float4* grad_rj_shared_f4 = reinterpret_cast<float4*>(grad_rj_shared);
 
 
     const float* rj_base = d_r + node_j * stride_r_n + head_h * stride_r_h;
     const float* a_base = d_attn_vec + head_h * D;
-    const float4* a_f4  = reinterpret_cast<const float4*>(a_base);
 
     // init output values
     for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
@@ -726,9 +737,11 @@ __global__ void GATv2Backward_R(
     if (num_incoming > 0) {
         // copy r_j to shared memory
         const float4* rj_f4 = reinterpret_cast<const float4*>(rj_base);
+        const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
 
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
             rj_shared_f4[f_idx_f4] = rj_f4[f_idx_f4];
+            a_shared_f4[f_idx_f4] = a_f4[f_idx_f4];
         }
     }
     __syncthreads();
@@ -767,7 +780,7 @@ __global__ void GATv2Backward_R(
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
             float4 li_val      = li_f4[f_idx_f4];
             float4 rj_val      = rj_shared_f4[f_idx_f4];
-            float4 a_val       = a_f4[f_idx_f4];
+            float4 a_val       = a_shared_f4[f_idx_f4];
             float4 grad_hi_val = grad_hi_f4[f_idx_f4];
 
             float4 t_ij_val = make_float4(
@@ -791,7 +804,7 @@ __global__ void GATv2Backward_R(
         for (int f_idx_f4 = lane_id; f_idx_f4 < num_float4; f_idx_f4 += kMaxThreadsInWarp) {
             float4 li_val      = li_f4[f_idx_f4];
             float4 rj_val      = rj_shared_f4[f_idx_f4];
-            float4 a_val       = a_f4[f_idx_f4];
+            float4 a_val       = a_shared_f4[f_idx_f4];
             float4 grad_hi_val = grad_hi_f4[f_idx_f4];
 
             float4 edge_ij = make_float4(

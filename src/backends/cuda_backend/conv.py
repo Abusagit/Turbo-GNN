@@ -241,7 +241,7 @@ class CUDABackend(BaseBackend):
         """Factory for CUDA convolution layers.
 
         Args:
-            conv_type (str): 'gat_v2' or 'min_aggr' currently.
+            conv_type (str): 'gat_v2', 'gt', 'min_aggr' currently.
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments for CUDA layers.
 
@@ -265,4 +265,4 @@ class CUDABackend(BaseBackend):
                 heads = kwargs.pop("heads")
                 return _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
 
-        raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
+        raise KeyError(f"Unsupported conv_type for CUDA backend: {conv_type}")
