@@ -210,6 +210,104 @@ __global__ void unpack_results_kernel(
     }
 }
 
+template<int EDGES_PER_TILE, typename scalar_t>
+__global__ void min_aggr_forward_heavy_kernel_2d(
+    const int* __restrict__ nodes,
+    const int* __restrict__ edge_ptr,
+    const int* __restrict__ edge_idx,
+    const scalar_t* __restrict__ X,
+    scalar_t* __restrict__ out,
+    int* __restrict__ argmin,
+    int d
+) {
+    int i = blockIdx.x;
+    int v = nodes[i];
+
+    int row_start = edge_ptr[v];
+    int row_end   = edge_ptr[v + 1];
+    const int degree = row_end - row_start;
+
+    int fid = threadIdx.x; // feature dimension
+    int tid = threadIdx.y; // tile index
+
+    const int F_BLOCK = blockDim.x;
+    const int TILES_Y = blockDim.y;
+
+    extern __shared__ unsigned char shared_mem[];
+    float* shmem_val = reinterpret_cast<float*>(shared_mem);
+    int* shmem_idx = reinterpret_cast<int*>(shmem_val + (TILES_Y * F_BLOCK));
+
+    const int cnt_tiles = (degree + EDGES_PER_TILE - 1) / EDGES_PER_TILE;
+    for (int f = fid; f < d; f += F_BLOCK) {
+        float best_val = INFINITY;
+        int best_src = -1;
+
+        // Процессим тайлы в батче
+        for (int tile_base = 0; tile_base < cnt_tiles; tile_base += TILES_Y) {
+            const int tile_idx = tile_base + tid;
+
+            float local_min = INFINITY;
+            int local_arg = -1;
+
+            if (tile_idx < cnt_tiles) {
+                const int start = row_start + tile_idx * EDGES_PER_TILE;
+                const int end = min(start + EDGES_PER_TILE, row_end);
+
+                for (int eid = start; eid < end; ++eid) {
+                    const int src = edge_idx[eid];
+                    const float val = to_float(X[src * d + f]);
+                    if (val < local_min) {
+                        local_min = val;
+                        local_arg = src;
+                    }
+                }
+            }
+
+            const int s = tid * F_BLOCK + fid;
+            shmem_val[s] = local_min;
+            shmem_idx[s] = local_arg;
+
+            __syncthreads();
+
+            for (int offset = TILES_Y / 2; offset > 0; offset /= 2) {
+                if (tid < offset) {
+                    const int a = tid * F_BLOCK + fid;
+                    const int b = (tid + offset) * F_BLOCK + fid;
+
+                    const float val_a = shmem_val[a];
+                    const int idx_a = shmem_idx[a];
+                    const float val_b = shmem_val[b];
+                    const int idx_b = shmem_idx[b];
+
+                    if (val_b < val_a || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
+                        shmem_val[a] = val_b;
+                        shmem_idx[a] = idx_b;
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                const float group_min = shmem_val[fid];
+                const int group_arg = shmem_idx[fid];
+
+                if (group_min < best_val || (group_min == best_val && group_arg >= 0 && (best_src < 0 || group_arg < best_src))) {
+                    best_val = group_min;
+                    best_src = group_arg;
+                }
+            }
+
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            out[v * d + f] = from_float<scalar_t>(best_val);
+            argmin[v * d + f] = best_src;
+        }
+
+        __syncthreads();
+    }
+}
 
 void min_aggr_forward_partitioned_cuda(
     const at::Tensor& edge_ptr,
@@ -221,7 +319,10 @@ void min_aggr_forward_partitioned_cuda(
     at::Tensor& out,
     at::Tensor& argmin,
     int warps_per_block = 8,
-    int edges_per_block_heavy_nodes = 128
+    int edges_per_block_heavy_nodes = 128,
+    bool use_2d_kernel = false,
+    int features_per_block = 32,
+    int tiles_y = 8
 ) {
     int THREADS_PER_BLOCK;
 
@@ -285,7 +386,6 @@ void min_aggr_forward_partitioned_cuda(
         // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
         constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
 
-        // TODO: think about what to do with the doubles
         if (X.scalar_type() == at::kDouble) {
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 at::ScalarType::Half,
@@ -303,6 +403,92 @@ void min_aggr_forward_partitioned_cuda(
                             argmin.data_ptr<int>(),
                             d
                         );
+                })
+            );
+        } else if (use_2d_kernel) {
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                at::ScalarType::Half,
+                at::ScalarType::BFloat16,
+                X.scalar_type(),
+                "min_aggr_forward_heavy_2d",
+                ([&] {
+                    const int shmem_size = (tiles_y * features_per_block) * (sizeof(float) + sizeof(int));
+
+                    dim3 block(features_per_block, tiles_y);
+                    dim3 grid(num_heavy);
+                    if (edges_per_block_heavy_nodes == 32) {
+                        constexpr int EDGES_PER_TILE = 32;
+                        min_aggr_forward_heavy_kernel_2d<EDGES_PER_TILE, scalar_t>
+                            <<<grid, block, shmem_size>>>(
+                                heavy_nodes.data_ptr<int>(),
+                                edge_ptr.data_ptr<int>(),
+                                edge_idx.data_ptr<int>(),
+                                X.data_ptr<scalar_t>(),
+                                out.data_ptr<scalar_t>(),
+                                argmin.data_ptr<int>(),
+                                d
+                            );
+                    } else if (edges_per_block_heavy_nodes == 64) {
+                        constexpr int EDGES_PER_TILE = 64;
+                        min_aggr_forward_heavy_kernel_2d<EDGES_PER_TILE, scalar_t>
+                            <<<grid, block, shmem_size>>>(
+                                heavy_nodes.data_ptr<int>(),
+                                edge_ptr.data_ptr<int>(),
+                                edge_idx.data_ptr<int>(),
+                                X.data_ptr<scalar_t>(),
+                                out.data_ptr<scalar_t>(),
+                                argmin.data_ptr<int>(),
+                                d
+                            );
+                    } else if (edges_per_block_heavy_nodes == 128) {
+                        constexpr int EDGES_PER_TILE = 128;
+                        min_aggr_forward_heavy_kernel_2d<EDGES_PER_TILE, scalar_t>
+                            <<<grid, block, shmem_size>>>(
+                                heavy_nodes.data_ptr<int>(),
+                                edge_ptr.data_ptr<int>(),
+                                edge_idx.data_ptr<int>(),
+                                X.data_ptr<scalar_t>(),
+                                out.data_ptr<scalar_t>(),
+                                argmin.data_ptr<int>(),
+                                d
+                            );
+                    } else if (edges_per_block_heavy_nodes == 256) {
+                        constexpr int EDGES_PER_TILE = 256;
+                        min_aggr_forward_heavy_kernel_2d<EDGES_PER_TILE, scalar_t>
+                            <<<grid, block, shmem_size>>>(
+                                heavy_nodes.data_ptr<int>(),
+                                edge_ptr.data_ptr<int>(),
+                                edge_idx.data_ptr<int>(),
+                                X.data_ptr<scalar_t>(),
+                                out.data_ptr<scalar_t>(),
+                                argmin.data_ptr<int>(),
+                                d
+                            );
+                    } else if (edges_per_block_heavy_nodes == 512) {
+                        constexpr int EDGES_PER_TILE = 512;
+                        min_aggr_forward_heavy_kernel_2d<EDGES_PER_TILE, scalar_t>
+                            <<<grid, block, shmem_size>>>(
+                                heavy_nodes.data_ptr<int>(),
+                                edge_ptr.data_ptr<int>(),
+                                edge_idx.data_ptr<int>(),
+                                X.data_ptr<scalar_t>(),
+                                out.data_ptr<scalar_t>(),
+                                argmin.data_ptr<int>(),
+                                d
+                            );
+                    } else {
+                        constexpr int EDGES_PER_TILE = 1024;
+                        min_aggr_forward_heavy_kernel_2d<EDGES_PER_TILE, scalar_t>
+                            <<<grid, block, shmem_size>>>(
+                                heavy_nodes.data_ptr<int>(),
+                                edge_ptr.data_ptr<int>(),
+                                edge_idx.data_ptr<int>(),
+                                X.data_ptr<scalar_t>(),
+                                out.data_ptr<scalar_t>(),
+                                argmin.data_ptr<int>(),
+                                d
+                            );
+                    }
                 })
             );
         } else {
