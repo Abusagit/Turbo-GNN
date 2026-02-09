@@ -163,7 +163,7 @@ def measure_kernel_performance(
     except (Exception, torch.OutOfMemoryError) as e:
         print(f"Couldn't measure forward performance for convolution {conv}. Exception: {e}")
         forward_function_measurements = MicrobenchResult(
-            iters=10,
+            iters=5,
             ms_per_iter=float("nan"),
             device="cuda",
             memory_allocated=None,
@@ -198,7 +198,7 @@ def measure_kernel_performance(
         def backward_function():
             Y.backward(grad_output, retain_graph=True)
 
-        backward_function_measurements: MicrobenchResult = time_callable(backward_function, warmup=3, iters=10)
+        backward_function_measurements: MicrobenchResult = time_callable(backward_function, warmup=3, iters=5)
     except (Exception, torch.OutOfMemoryError) as e:
         print(f"Couldn't measure backward performance for convolution {conv}. Exception: {e}")
         backward_function_measurements = MicrobenchResult(

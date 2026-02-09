@@ -252,6 +252,107 @@ __global__ void GATv2Kernel_CSR(
     }
 }
 
+
+// =============================================================================
+// scalar (non-float4) templated forward for D in {32,64}
+// =============================================================================
+template<int D_CONST>
+__global__ void GATv2Kernel_CSR_Scalar_D(
+    size_t N,
+    size_t H,
+    size_t D,
+    const float* __restrict__ d_l,          // [N, H, D]
+    const float* __restrict__ d_r,          // [N, H, D]
+    int64_t stride_l_n,
+    int64_t stride_l_h,
+    int64_t stride_r_n,
+    int64_t stride_r_h,
+    const int* __restrict__ d_row_ptr,
+    const int* __restrict__ d_col_idx,
+    const float* __restrict__ d_attn_vec,   // [H, D]
+    float* __restrict__ d_h_out,            // [N, H, D]
+    float* __restrict__ d_logsumexp_out,    // [N, H]
+    float negative_slope
+) {
+
+    int node_i = blockIdx.x;
+    int head_h = blockIdx.y;
+    int lane   = threadIdx.x % kMaxThreadsInWarp;
+
+    if (node_i >= N || head_h >= H) return;
+
+    int edge_start = d_row_ptr[node_i];
+    int edge_end = d_row_ptr[node_i + 1];
+    int num_neighbors = edge_end - edge_start;
+    if (num_neighbors == 0) return;
+
+    const float* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
+    const float* a_base = d_attn_vec + head_h * D_CONST;
+    float* h_out_base   = d_h_out + ((node_i * H + head_h) * D_CONST);
+
+    // shared: cache l_i only
+    extern __shared__ float sh[];
+    float* l_sh = sh; // [D_CONST]
+
+    for (int f = lane; f < D_CONST; f += kMaxThreadsInWarp) {
+        l_sh[f] = __ldg(&l_base[f]);
+    }
+    __syncthreads();
+
+    constexpr int kPerLane = (D_CONST + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp; // 1,2,4,8 for 32/64/128/256
+    float h_acc[kPerLane];
+    #pragma unroll
+    for (int t = 0; t < kPerLane; ++t) h_acc[t] = 0.f;
+
+    OnlineSoftmaxState softmax_state;
+
+    for (int k = 0; k < num_neighbors; ++k) {
+        int neighbor_j = __ldg(&d_col_idx[edge_start + k]);
+
+        const float* r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+
+        // dot lane partial
+        float dot_lane = 0.f;
+        #pragma unroll
+        for (int t = 0; t < kPerLane; ++t) {
+            int f = lane + kMaxThreadsInWarp * t;
+            if (f < D_CONST) {
+                float s = leaky_relu_elementwise(l_sh[f] + __ldg(&r_base[f]), negative_slope);
+                float a = __ldg(&a_base[f]);
+                dot_lane = fmaf(s, a, dot_lane);
+            }
+        }
+        float dot = warp_reduce_sum(dot_lane);
+
+        float rescale = softmax_state.update(dot);
+        #pragma unroll
+        for (int t = 0; t < kPerLane; ++t) h_acc[t] *= rescale;
+
+        float contrib = __expf(dot - softmax_state.max_val);
+        #pragma unroll
+        for (int t = 0; t < kPerLane; ++t) {
+            int f = lane + kMaxThreadsInWarp * t;
+            if (f < D_CONST) {
+                h_acc[t] = fmaf(contrib, __ldg(&r_base[f]), h_acc[t]);
+            }
+        }
+    }
+
+    if (lane == 0) {
+        d_logsumexp_out[(int64_t)node_i * (int64_t)H + head_h] =
+            softmax_state.max_val + __logf(softmax_state.sum_exp);
+    }
+
+    float inv_sum = 1.f / softmax_state.sum_exp;
+    #pragma unroll
+    for (int t = 0; t < kPerLane; ++t) {
+        int f = lane + kMaxThreadsInWarp * t;
+        if (f < D_CONST) h_out_base[f] = h_acc[t] * inv_sum;
+    }
+}
+
+
+
 template<int D_CONST>
 __global__ void GATv2Kernel_CSR_D(
     size_t N,
@@ -286,14 +387,8 @@ __global__ void GATv2Kernel_CSR_D(
     if (node_i >= (int)N || head_h >= (int)H) return;
     if ((int)D != D_CONST) return; // safety
 
-    // warp-uniform row_ptr loads (lane0 + bcast)
-    int edge_start = 0, edge_end = 0;
-    if (lane_id == 0) {
-        edge_start = __ldg(&d_row_ptr[node_i]);
-        edge_end   = __ldg(&d_row_ptr[node_i + 1]);
-    }
-    edge_start = warp_bcast_i32(edge_start);
-    edge_end   = warp_bcast_i32(edge_end);
+    int edge_start = d_row_ptr[node_i];
+    int edge_end   = d_row_ptr[node_i + 1];
 
     int num_neighbors = edge_end - edge_start;
     if (num_neighbors == 0) return;
@@ -853,6 +948,262 @@ __global__ void GATv2Backward_R(
     }
 }
 
+// =============================================================================
+// Scalar (non-float4) templated backward for D in {32,64}
+// =============================================================================
+template<int D_CONST>
+__global__ void GATv2Backward_AL_Scalar_D(
+    size_t N, size_t H, size_t D,
+    const float* __restrict__ grad_h,
+    int64_t stride_gh_n,
+    int64_t stride_gh_h,
+    const float* __restrict__ d_l,
+    int64_t stride_l_n,
+    int64_t stride_l_h,
+    const float* __restrict__ d_r,
+    int64_t stride_r_n,
+    int64_t stride_r_h,
+    const int* __restrict__ d_row_ptr,
+    const int* __restrict__ d_col_idx,
+    const float* __restrict__ d_attn_vec,   // [H, D]
+    const float* __restrict__ d_logsumexp,  // [N, H]
+    float negative_slope,
+    float* __restrict__ grad_a,  // [N, H, D]
+    float* __restrict__ grad_l,  // [N, H, D]
+    float* __restrict__ d_G      // [N, H]
+) {
+    int node_i = blockIdx.x;
+    int head_h = blockIdx.y;
+    int lane   = threadIdx.x % kMaxThreadsInWarp;
+
+    if (node_i >= N || head_h >= H) return;
+
+    int edge_start = d_row_ptr[node_i];
+    int edge_end   = d_row_ptr[node_i + 1];
+    int num_neighbors = edge_end - edge_start;
+
+    if (num_neighbors == 0) return;
+
+    float L_i = d_logsumexp[node_i * H + head_h];
+
+    const float* li_base      = d_l    + node_i * stride_l_n  + head_h * stride_l_h;
+    const float* ghi_base     = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
+    const float* a_base       = d_attn_vec + head_h * D_CONST;
+
+    // shared: li, grad_hi, grad_a_acc, grad_li_acc
+    extern __shared__ float sh[];
+    float* li_sh     = sh;                  // [D_CONST]
+    float* ghi_sh    = li_sh + D_CONST;     // [D_CONST]
+    float* grada_sh  = ghi_sh + D_CONST;    // [D_CONST]
+    float* gradli_sh = grada_sh + D_CONST;  // [D_CONST]
+
+    for (int f = lane; f < D_CONST; f += kMaxThreadsInWarp) {
+        li_sh[f]     = __ldg(&li_base[f]);
+        ghi_sh[f]    = __ldg(&ghi_base[f]);
+        grada_sh[f]  = 0.f;
+        gradli_sh[f] = 0.f;
+    }
+    __syncthreads();
+
+    constexpr int kPerLane = (D_CONST + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+
+    // Pass 1: G_i_h = sum_j alpha_ij * <grad_hi, rj>
+    float G_i_h = 0.f;
+    for (int k = 0; k < num_neighbors; ++k) {
+
+        int neighbor_j = d_col_idx[edge_start + k];
+
+        const float* rj_base = d_r + (int64_t)neighbor_j * stride_r_n + (int64_t)head_h * stride_r_h;
+
+        float e_lane = 0.f;
+        float p_lane = 0.f;
+        #pragma unroll
+        for (int t = 0; t < kPerLane; ++t) {
+            int f = lane + 32 * t;
+            if (f < D_CONST) {
+                float rj = __ldg(&rj_base[f]);
+                float tval = leaky_relu_elementwise(li_sh[f] + rj, negative_slope);
+                float a = __ldg(&a_base[f]); // NO reg cache
+                e_lane = fmaf(tval, a, e_lane);
+                p_lane = fmaf(ghi_sh[f], rj, p_lane);
+            }
+        }
+        float e_ij = warp_reduce_sum(e_lane);
+        float p_ij = warp_reduce_sum(p_lane);
+
+        if (lane == 0) {
+            float alpha = recompute_alpha(e_ij, L_i);
+            G_i_h = fmaf(alpha, p_ij, G_i_h);
+        }
+        G_i_h = warp_bcast_f32(G_i_h);
+    }
+
+    // Pass 2: accumulate grad_a and grad_l
+    for (int k = 0; k < num_neighbors; ++k) {
+        int neighbor_j = __ldg(&d_col_idx[edge_start + k]);
+
+        const float* rj_base = d_r + (int64_t)neighbor_j * stride_r_n + (int64_t)head_h * stride_r_h;
+
+        float e_lane = 0.f;
+        float p_lane = 0.f;
+        #pragma unroll
+        for (int t = 0; t < kPerLane; ++t) {
+            int f = lane + 32 * t;
+            if (f < D_CONST) {
+                float rj = __ldg(&rj_base[f]);
+                float tval = leaky_relu_elementwise(li_sh[f] + rj, negative_slope);
+                float a = __ldg(&a_base[f]); // NO reg cache
+                e_lane = fmaf(tval, a, e_lane);
+                p_lane = fmaf(ghi_sh[f], rj, p_lane);
+            }
+        }
+        float e_ij = warp_reduce_sum(e_lane);
+        float p_ij = warp_reduce_sum(p_lane);
+
+        float alpha = 0.f, grad_e = 0.f;
+        if (lane == 0) {
+            alpha  = recompute_alpha(e_ij, L_i);
+            grad_e = alpha * (p_ij - G_i_h);
+        }
+        alpha  = warp_bcast_f32(alpha);
+        grad_e = warp_bcast_f32(grad_e);
+
+        for (int f = lane; f < D_CONST; f += 32) {
+            float rj   = __ldg(&rj_base[f]);
+            float edge = li_sh[f] + rj;
+            float tder = leaky_relu_der_elementwise(edge, negative_slope);
+
+            // Keep EXACT original algebra from your float4 AL kernel:
+            // grad_a uses t_ij_val = t_der * edge
+            float t_ij_val = tder * edge;
+            grada_sh[f] = fmaf(grad_e, t_ij_val, grada_sh[f]);
+
+            // grad_li uses grad_e * t_der * a[f]
+            float a = __ldg(&a_base[f]); // NO reg cache
+            gradli_sh[f] = fmaf(grad_e * tder, a, gradli_sh[f]);
+        }
+    }
+
+    __syncthreads();
+    if (lane == 0) d_G[node_i * H + head_h] = G_i_h;
+
+    float* grad_l_base = grad_l + ((node_i * H + head_h) * D_CONST);
+    float* grad_a_base = grad_a + ((node_i * H + head_h) * D_CONST);
+    for (int f = lane; f < D_CONST; f += kMaxThreadsInWarp) {
+        grad_l_base[f] = gradli_sh[f];
+        grad_a_base[f] = grada_sh[f];
+    }
+}
+
+template<int D_CONST>
+__global__ void GATv2Backward_R_Scalar_D(
+    size_t N, size_t H, size_t D,
+    const float* __restrict__ grad_h,
+    int64_t stride_gh_n,
+    int64_t stride_gh_h,
+    const float* __restrict__ d_l,
+    int64_t stride_l_n,
+    int64_t stride_l_h,
+    const float* __restrict__ d_r,
+    int64_t stride_r_n,
+    int64_t stride_r_h,
+    const int* __restrict__ d_row_ptr_T,
+    const int* __restrict__ d_col_idx_T,
+    const float* __restrict__ d_attn_vec,
+    const float* __restrict__ d_logsumexp,
+    const float* __restrict__ d_G,
+    float negative_slope,
+    float* __restrict__ grad_r
+) {
+    int node_j = blockIdx.x;
+    int head_h = blockIdx.y;
+    int lane   = threadIdx.x % kMaxThreadsInWarp;
+
+    if (node_j >= N || head_h >= H) return;
+
+
+    int edge_start = __ldg(&d_row_ptr_T[node_j]);
+    int edge_end   = __ldg(&d_row_ptr_T[node_j + 1]);
+    int num_incoming = edge_end - edge_start;
+    if (num_incoming == 0) return;
+
+    const float* rj_base = d_r + node_j * stride_r_n + head_h * stride_r_h;
+    const float* a_base  = d_attn_vec + head_h * D_CONST;
+
+    extern __shared__ float sh[];
+    float* rj_sh     = sh;              // [D_CONST]
+    float* grad_r_sh = rj_sh + D_CONST; // [D_CONST]
+
+    for (int f = lane; f < D_CONST; f += 32) {
+        rj_sh[f]     = __ldg(&rj_base[f]);
+        grad_r_sh[f] = 0.f;
+    }
+    __syncthreads();
+
+    constexpr int kPerLane = (D_CONST + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+
+    for (int idx = 0; idx < num_incoming; ++idx) {
+        int node_i = 0;
+        if (lane == 0) node_i = __ldg(&d_col_idx_T[edge_start + idx]);
+        node_i = warp_bcast_i32(node_i);
+
+        const float* li_base      = d_l + node_i * stride_l_n + head_h * stride_l_h;
+        const float* ghi_base     = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
+
+        float L_i_h = 0.f, G_i_h = 0.f;
+        if (lane == 0) {
+            L_i_h = __ldg(&d_logsumexp[node_i * H + head_h]);
+            G_i_h = __ldg(&d_G[node_i * H + head_h]);
+        }
+        L_i_h = warp_bcast_f32(L_i_h);
+        G_i_h = warp_bcast_f32(G_i_h);
+
+        float e_lane = 0.f;
+        float p_lane = 0.f;
+        #pragma unroll
+        for (int t = 0; t < kPerLane; ++t) {
+            int f = lane + kMaxThreadsInWarp * t;
+            if (f < D_CONST) {
+                float li  = __ldg(&li_base[f]);
+                float rj  = rj_sh[f];
+                float ghi = __ldg(&ghi_base[f]);
+                float tval = leaky_relu_elementwise(li + rj, negative_slope);
+                float a = __ldg(&a_base[f]); // NO reg cache
+                e_lane = fmaf(tval, a, e_lane);
+                p_lane = fmaf(ghi, rj, p_lane);
+            }
+        }
+        float e_ij = warp_reduce_sum(e_lane);
+        float p_ij = warp_reduce_sum(p_lane);
+
+        float alpha = recompute_alpha(e_ij, L_i_h);
+        float grad_e = alpha * (p_ij - G_i_h);
+
+        for (int f = lane; f < D_CONST; f += 32) {
+            float li  = __ldg(&li_base[f]);
+            float rj  = rj_sh[f];
+            float ghi = __ldg(&ghi_base[f]);
+
+            float edge = li + rj;
+            float tder = leaky_relu_der_elementwise(edge, negative_slope);
+            float a = __ldg(&a_base[f]); // NO reg cache
+
+            float acc = grad_r_sh[f];
+            // direct path: alpha * grad_hi
+            acc = fmaf(alpha, ghi, acc);
+            // attention path: grad_e * t_der * a
+            acc = fmaf(grad_e * tder, a, acc);
+            grad_r_sh[f] = acc;
+        }
+    }
+
+    __syncthreads();
+    float* grad_r_base = grad_r + (((int64_t)node_j * (int64_t)H + head_h) * (int64_t)D_CONST);
+    for (int f = lane; f < D_CONST; f += kMaxThreadsInWarp) {
+        grad_r_base[f] = grad_r_sh[f];
+    }
+}
+
 
 template<int grad_A_reduce_row_chunk_size>
 __global__ void ReduceGradAKernel(
@@ -963,45 +1314,69 @@ void GATv2Backward_CSR(
     // G has shape [N, H]
     float* d_G;
     CUDA_CHECK(cudaMalloc(&d_G, N * H * sizeof(float)));
-
     // 1: AL kernel - computes grad_a, grad_l, G
-    size_t shared_AL = 4 * D * sizeof(float); // li, grad_hi, grad_a, grad_li
-    GATv2Backward_AL<<<nBlocks, nThreads, shared_AL, stream>>>(
-        N, H, D,
-        grad_h,
-        stride_gh_n, stride_gh_h,
-        d_l,
-        stride_l_n, stride_l_h,
-        d_r,
-        stride_r_n, stride_r_h,
-        d_row_ptr,
-        d_col_idx,
-        d_attn_vec,
-        d_logsumexp,
-        negative_slope,
-        grad_a,
-        grad_l,
-        d_G
-    );
+    if (D == 32) {
+        size_t sh = 4 * 32 * sizeof(float);
+        GATv2Backward_AL_Scalar_D<32><<<nBlocks, nThreads, sh, stream>>>(
+            N,H,D, grad_h, stride_gh_n,stride_gh_h, d_l, stride_l_n,stride_l_h, d_r, stride_r_n,stride_r_h,
+            d_row_ptr,d_col_idx, d_attn_vec, d_logsumexp, negative_slope, grad_a, grad_l, d_G);
+    } else if (D == 64) {
+        size_t sh = 4 * 64 * sizeof(float);
+        GATv2Backward_AL_Scalar_D<64><<<nBlocks, nThreads, sh, stream>>>(
+            N,H,D, grad_h, stride_gh_n,stride_gh_h, d_l, stride_l_n,stride_l_h, d_r, stride_r_n,stride_r_h,
+            d_row_ptr,d_col_idx, d_attn_vec, d_logsumexp, negative_slope, grad_a, grad_l, d_G);
+    } else {
+        // fallback to existing float4 kernel for any other D
+        size_t shared_AL = 4 * D * sizeof(float); // li, grad_hi, grad_a, grad_li
+        GATv2Backward_AL<<<nBlocks, nThreads, shared_AL, stream>>>(
+            N, H, D,
+            grad_h,
+            stride_gh_n, stride_gh_h,
+            d_l,
+            stride_l_n, stride_l_h,
+            d_r,
+            stride_r_n, stride_r_h,
+            d_row_ptr,
+            d_col_idx,
+            d_attn_vec,
+            d_logsumexp,
+            negative_slope,
+            grad_a,
+            grad_l,
+            d_G
+        );
+    }
 
     // 2: R kernel - computes grad_r
-    size_t shared_R = 2 * D * sizeof(float); // r_j, grad_r_j
-    GATv2Backward_R<<<nBlocks, nThreads, shared_R, stream>>>(
-        N, H, D,
-        grad_h,
-        stride_gh_n, stride_gh_h,
-        d_l,
-        stride_l_n, stride_l_h,
-        d_r,
-        stride_r_n, stride_r_h,
-        d_row_ptr_T,
-        d_col_idx_T,
-        d_attn_vec,
-        d_logsumexp,
-        d_G,
-        negative_slope,
-        grad_r
-    );
+    if (D == 32) {
+        size_t sh = 2 * 32 * sizeof(float);
+        GATv2Backward_R_Scalar_D<32><<<nBlocks, nThreads, sh, stream>>>(
+            N,H,D, grad_h, stride_gh_n,stride_gh_h, d_l, stride_l_n,stride_l_h, d_r, stride_r_n,stride_r_h,
+            d_row_ptr_T,d_col_idx_T, d_attn_vec, d_logsumexp, d_G, negative_slope, grad_r);
+    } else if (D == 64) {
+        size_t sh = 2 * 64 * sizeof(float);
+        GATv2Backward_R_Scalar_D<64><<<nBlocks, nThreads, sh, stream>>>(
+            N,H,D, grad_h, stride_gh_n,stride_gh_h, d_l, stride_l_n,stride_l_h, d_r, stride_r_n,stride_r_h,
+            d_row_ptr_T,d_col_idx_T, d_attn_vec, d_logsumexp, d_G, negative_slope, grad_r);
+    } else {
+        size_t shared_R = 2 * D * sizeof(float); // r_j, grad_r_j
+        GATv2Backward_R<<<nBlocks, nThreads, shared_R, stream>>>(
+            N, H, D,
+            grad_h,
+            stride_gh_n, stride_gh_h,
+            d_l,
+            stride_l_n, stride_l_h,
+            d_r,
+            stride_r_n, stride_r_h,
+            d_row_ptr_T,
+            d_col_idx_T,
+            d_attn_vec,
+            d_logsumexp,
+            d_G,
+            negative_slope,
+            grad_r
+        );
+    }
 
     // Here we need to sum-reduce grad_a [N, H, D] over N into [H, D]
 
@@ -1098,8 +1473,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     size_t shared_mem_size = D * sizeof(float);
 
     switch ((int)D) {
-        case 32:  GATv2Kernel_CSR_D<32> <<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
-        case 64:  GATv2Kernel_CSR_D<64> <<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
+        case 32:  GATv2Kernel_CSR_Scalar_D<32><<<nBlocks, nThreads, 32*sizeof(float),  stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
+        case 64:  GATv2Kernel_CSR_Scalar_D<64><<<nBlocks, nThreads, 32*sizeof(float),  stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
         case 128: GATv2Kernel_CSR_D<128><<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
         case 256: GATv2Kernel_CSR_D<256><<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope); break;
         default:

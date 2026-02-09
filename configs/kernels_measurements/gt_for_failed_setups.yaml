@@ -1,0 +1,28 @@
+params_grid:
+  all:
+    feature_dim: [512]
+    heads: [2, 4, 8]
+kernel_related_kwargs:
+  all:
+    graph_reordering_partition_size: [-1]
+datasets:
+  base_path: configs/datasets
+  dirs:
+    graphland_remaining:
+      all: false
+      choices:
+        - web_fraud
+        - web_topics
+        - web_traffic
+
+# ('gt', 'web-fraud', 2, 512)
+# ('gt', 'web-fraud', 4, 512)
+# ('gt', 'web-fraud', 8, 512)
+
+# ('gt', 'web-topics', 2, 512)
+# ('gt', 'web-topics', 4, 512)
+# ('gt', 'web-topics', 8, 512)
+
+# ('gt', 'web-traffic', 2, 512)
+# ('gt', 'web-traffic', 4, 512)
+# ('gt', 'web-traffic', 8, 512)

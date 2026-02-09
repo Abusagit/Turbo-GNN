@@ -4,20 +4,18 @@ params_grid:
     feature_dim: [256, 512]
     heads: [2, 4, 8]
 kernel_related_kwargs:
-  cuda:
-    huge_degree_threshold_quantile: [0.99, 0.999, -1]
   all:
     graph_reordering_partition_size: [-1]
 datasets:
   base_path: configs/datasets
   dirs:
-    graphland_remaining:
-      all: true
+    # secondary:
+    #   all: false
+    #   choices:
+    #     - cora
+    #     - citeseer
+    #     - pubmed
     main:
-      all: true
-    secondary:
       all: false
       choices:
-        - cora
-        - citeseer
-        - pubmed
+        - city_roads_m

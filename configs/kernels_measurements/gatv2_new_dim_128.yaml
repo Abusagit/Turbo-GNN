@@ -1,7 +1,12 @@
 params_grid:
   all:
-    feature_dim: [64, 128, 256, 512]
-    heads: [1, 2, 4, 8]
+    feature_dim: [128]
+    heads: [2, 4, 8]
+  cuda:
+    grad_A_reduce_row_chunk_size: [16, 32, 64, 128, 256, 512, 1024, 2048]
+kernel_related_kwargs:
+  all:
+    graph_reordering_partition_size: [-1]
 datasets:
   base_path: configs/datasets
   dirs:

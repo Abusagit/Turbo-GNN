@@ -1,5 +1,6 @@
 from . import (
     cuda_backend,
+    cuda_test_backend,
     cugraph_backend,
     cusparse_backend,
     dfgnn_backend,

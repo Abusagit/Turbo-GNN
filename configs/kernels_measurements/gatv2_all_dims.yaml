@@ -1,0 +1,29 @@
+params_grid:
+  all:
+    # feature_dim: [32, 64, 128, 256, 512]
+    feature_dim: [128]
+    heads: [4]
+  cuda:
+    # grad_A_reduce_row_chunk_size: [16, 32, 64, 128, 256, 512, 1024, 2048]
+    grad_A_reduce_row_chunk_size: [128]
+kernel_related_kwargs:
+  all:
+    graph_reordering_partition_size: [-1]
+datasets:
+  base_path: configs/datasets
+  dirs:
+    graphland_remaining:
+      all: false
+    main:
+      all: false
+      choices:
+        - artnet_views
+        - city_roads_m
+        - ogbn_arxiv
+        - ogbn_products
+    secondary:
+      all: false
+      choices:
+        - cora
+        - citeseer
+        - pubmed

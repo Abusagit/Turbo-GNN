@@ -28,3 +28,7 @@ cutlass
 thirdparty/*
 
 out/*
+
+*.tex
+
+*.pdf

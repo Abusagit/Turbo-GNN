@@ -1,12 +1,10 @@
 params_grid:
   all:
-    feature_dim: [64, 128, 256, 512]
+    feature_dim: [32, 64]
+    heads: [2, 4, 8]
   cuda:
-    warps_per_block: [1, 4, 16, 32]
-    edges_per_block_heavy_nodes: [32, 64, 128, 512]
+    grad_A_reduce_row_chunk_size: [16, 32, 64, 128, 256, 512, 1024, 2048]
 kernel_related_kwargs:
-  cuda:
-    huge_degree_threshold_quantile: [0.99, 0.999, -1]
   all:
     graph_reordering_partition_size: [-1]
 datasets:

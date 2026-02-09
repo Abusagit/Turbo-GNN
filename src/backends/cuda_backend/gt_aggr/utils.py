@@ -69,7 +69,6 @@ class _FusedGraphAttention(torch.autograd.Function):
         dQ, dK, dV = graph_transformer_kernels.gt_backward_csr_mh(
             edge_ptr_T, edge_idx_T, Q, K, V, out, grad_output, logsumexp, scale
         )
-
         return None, None, None, None, dQ, dK, dV, None
 
 

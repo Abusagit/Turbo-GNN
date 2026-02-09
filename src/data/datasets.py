@@ -68,6 +68,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cuda": "csr_and_csr_transposed",
     "f3s": "f3s",
     "dfgnn": "dfgnn",
+    "cuda_test": "csr_and_csr_transposed",
 }
 
 

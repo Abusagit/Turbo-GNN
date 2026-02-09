@@ -1,0 +1,42 @@
+params_grid:
+  all:
+    feature_dim: [256]
+    heads: [4, 8]
+    average_heads: [true]
+  cuda:
+    grad_A_reduce_row_chunk_size: [16] #[16, 32, 64, 128, 256, 512, 1024, 2048]
+kernel_related_kwargs:
+  all:
+    graph_reordering_partition_size: [-1]
+datasets:
+  base_path: configs/datasets
+  dirs:
+    # graphland_remaining:
+    #   all: true
+    main:
+      all: false
+      choices:
+        - ogbn_products
+    # secondary:
+    #   all: false
+    #   choices:
+    #     - cora
+    #     - citeseer
+    #     - pubmed
+
+
+
+
+# ('gat_v2', 'pokec-regions', 8, 256)
+# ('gat_v2', 'ogbn-products', 8, 256)
+# ('gat_v2', 'web-topics',    8, 256)
+
+# ('gat_v2', 'ogbn-products', 4, 256)
+# ('gat_v2', 'web-fraud',     4, 256)
+# ('gat_v2', 'web-topics',    4, 256)
+# ('gat_v2', 'web-traffic',   4, 256)
+
+# ('gat_v2', 'ogbn-products', 8, 128)
+# ('gat_v2', 'web-fraud',     8, 128)
+# ('gat_v2', 'web-topics',    8, 128)
+# ('gat_v2', 'web-traffic',   8, 128)

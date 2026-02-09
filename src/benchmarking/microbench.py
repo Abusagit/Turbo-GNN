@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+import triton
 
 doc = """
 Microbenchmark helper for timing only the layer kernel (forward/backward).
@@ -66,31 +67,20 @@ def time_callable(
         MicrobenchResult: Average time per iteration in ms.
     """
     device = torch.get_default_device()
-    for _ in range(warmup):
-        fn()
-        torch.cuda.synchronize()
 
     if torch.cuda.is_available():
-        with torch.cuda.device(device):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(iters):
-                fn()
-                torch.cuda.synchronize()
-
-            end.record()
-            end.synchronize()
-            total_ms = start.elapsed_time(end)
-
-            if do_memory_profile:
-                _, memory_allocated, peak_memory = measure_memory(func=fn)
-            else:
-                memory_allocated = None
+        ms_per_iter = triton.testing.do_bench(fn, warmup=warmup, rep=iters)
+        if do_memory_profile:
+            _, memory_allocated, peak_memory = measure_memory(func=fn)
+            del _
+            torch.cuda.empty_cache()
+        else:
+            memory_allocated = None
+        torch.cuda.synchronize()
 
         return MicrobenchResult(
             iters=iters,
-            ms_per_iter=total_ms / iters,
+            ms_per_iter=ms_per_iter,
             device=str(device),
             memory_allocated=memory_allocated,
         )

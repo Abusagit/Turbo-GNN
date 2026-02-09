@@ -56,7 +56,7 @@ __device__ __forceinline__ at::BFloat16 from_float<at::BFloat16>(float v) {
 
 template <typename scalar_t>
 __global__ void min_aggr_forward_light_kernel_1d(
-    const int* __restrict__ nodes,
+    const int* __restrict__ light_nodes_indices,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
     const scalar_t* __restrict__ X,
@@ -65,7 +65,7 @@ __global__ void min_aggr_forward_light_kernel_1d(
     int d
 ) {
     int i = blockIdx.x;
-    int v = nodes[i];
+    int v = light_nodes_indices[i];
 
     int row_start = edge_ptr[v];
     int row_end   = edge_ptr[v + 1];
@@ -137,7 +137,7 @@ __device__ __forceinline__ void unpack_val_idx(
 // 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
 template<int EDGES_PER_BLOCK, typename scalar_t>
 __global__ void min_aggr_forward_heavy_kernel(
-    const int* __restrict__ nodes,
+    const int* __restrict__ heavy_nodes_indices,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
     const scalar_t* __restrict__ X,
@@ -146,7 +146,7 @@ __global__ void min_aggr_forward_heavy_kernel(
 ) {
     int node_idx = blockIdx.x;
     int chunk_idx = blockIdx.y;
-    int v = nodes[node_idx];
+    int v = heavy_nodes_indices[node_idx];
 
     int row_start = edge_ptr[v];
     int row_end = edge_ptr[v + 1];
