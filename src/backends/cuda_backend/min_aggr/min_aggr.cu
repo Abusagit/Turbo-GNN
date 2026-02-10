@@ -3,10 +3,52 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <cuda_fp16.h>
+#include <variant>
 
 #define FULL_WARP_MASK 0xffffffff
 
 constexpr int kWarpSize = 32;
+
+// Dispatch TODO move to the separate file in the final version
+
+template <int... Values>
+std::variant<std::integral_constant<int, Values>...> MakeIntVariant(int value) {
+    std::variant<std::integral_constant<int, Values>...> result;
+    bool found = false;
+    ([&] {
+        if (value == Values) {
+            result.template emplace<std::integral_constant<int, Values>>();
+            found = true;
+        }
+    }(), ...);
+    if (!found) {
+        throw std::runtime_error("Wrong edges_per_block value: " + std::to_string(value));
+    }
+    return result;
+}
+
+template <typename T>
+struct TTypeInfo {
+    using TType = T;
+};
+
+template <typename... T>
+inline std::variant<TTypeInfo<T>...> MakeTypeVariant(at::ScalarType type) {
+    std::variant<TTypeInfo<T>...> result;
+    bool found = false;
+    ([&] {
+        if (c10::CppTypeToScalarType<T>::value == type) {
+            result.template emplace<TTypeInfo<T>>();
+            found = true;
+        }
+    }(), ...);
+    if (!found) {
+        throw std::runtime_error("Unsupported scalar type");
+    }
+    return result;
+}
+
+// Type conversion TODO move to the separate file in the final version
 
 template <typename scalar_t>
 __device__ __forceinline__ float to_float(scalar_t val);
@@ -213,219 +255,6 @@ __global__ void unpack_results_kernel(
 }
 
 
-void min_aggr_forward_partitioned_cuda(
-    const at::Tensor& edge_ptr,
-    const at::Tensor& edge_idx,
-    const at::Tensor& X,
-    const at::Tensor& light_nodes,
-    const at::Tensor& heavy_nodes,
-    int max_degree,
-    at::Tensor& out,
-    at::Tensor& argmin,
-    int warps_per_block = 8,
-    int edges_per_block_heavy_nodes = 128
-) {
-    int THREADS_PER_BLOCK;
-
-    if (warps_per_block == 1){
-        THREADS_PER_BLOCK = 1 * kWarpSize;
-    } else if (warps_per_block == 2) {
-        THREADS_PER_BLOCK = 2 * kWarpSize;
-    } else if (warps_per_block == 4) {
-        THREADS_PER_BLOCK = 4 * kWarpSize;
-    } else if (warps_per_block == 8) {
-        THREADS_PER_BLOCK = 8 * kWarpSize;
-    } else if (warps_per_block == 16) {
-        THREADS_PER_BLOCK = 16 * kWarpSize;
-    } else if (warps_per_block == 32) {
-        THREADS_PER_BLOCK = 32 * kWarpSize;
-    } else {
-        THREADS_PER_BLOCK = 2048;
-    }
-
-    const int d = X.size(1);
-    const int num_out_nodes = out.size(0);
-
-    TORCH_CHECK(edge_ptr.is_cuda(), "edge_ptr must be CUDA");
-    TORCH_CHECK(edge_idx.is_cuda(), "edge_idx must be CUDA");
-    TORCH_CHECK(X.is_cuda(), "X must be CUDA");
-    TORCH_CHECK(light_nodes.is_cuda(), "light_nodes must be CUDA");
-    TORCH_CHECK(heavy_nodes.is_cuda(), "heavy_nodes must be CUDA");
-
-    TORCH_CHECK(edge_ptr.dtype() == torch::kInt32, "edge_ptr must be int32");
-    TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
-    TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
-    TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
-    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16 || X.scalar_type() == at::kDouble, "X must be float32/float16/bfloat16/float64");
-    TORCH_CHECK(out.scalar_type() == X.scalar_type(), "out must have same dtype as X");
-
-    if (light_nodes.numel() > 0) {
-        const int num_light = light_nodes.numel();
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half,
-            at::ScalarType::BFloat16,
-            X.scalar_type(),
-            "min_aggr_forward_light",
-            ([&] {
-                min_aggr_forward_light_kernel_1d<scalar_t>
-                    <<<num_light, THREADS_PER_BLOCK>>>(
-                        light_nodes.data_ptr<int>(),
-                        edge_ptr.data_ptr<int>(),
-                        edge_idx.data_ptr<int>(),
-                        X.data_ptr<scalar_t>(),
-                        out.data_ptr<scalar_t>(),
-                        argmin.data_ptr<int>(),
-                        d
-                    );
-            })
-        );
-    }
-
-    const int num_heavy = heavy_nodes.numel();
-
-    if (num_heavy > 0) {
-        // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
-        constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
-
-        // TODO: think about what to do with the doubles
-        if (X.scalar_type() == at::kDouble) {
-            AT_DISPATCH_FLOATING_TYPES_AND2(
-                at::ScalarType::Half,
-                at::ScalarType::BFloat16,
-                X.scalar_type(),
-                "min_aggr_forward_heavy_fallback_double",
-                ([&] {
-                    min_aggr_forward_light_kernel_1d<scalar_t>
-                        <<<num_heavy, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            out.data_ptr<scalar_t>(),
-                            argmin.data_ptr<int>(),
-                            d
-                        );
-                })
-            );
-        } else {
-            auto packed = at::full(
-                {num_heavy, d},
-                static_cast<int64_t>(PACKED_INIT),
-                at::TensorOptions().dtype(torch::kInt64).device(X.device())
-            );
-
-            AT_DISPATCH_FLOATING_TYPES_AND2(
-                at::ScalarType::Half,
-                at::ScalarType::BFloat16,
-                X.scalar_type(),
-                "min_aggr_forward_heavy",
-                ([&] {
-                    if (edges_per_block_heavy_nodes == 32){
-                        constexpr int EDGES_PER_BLOCK = 32;
-                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            (unsigned long long*)packed.data_ptr<int64_t>(),
-                            d
-                        );
-
-                    } else if (edges_per_block_heavy_nodes == 64) {
-                        constexpr int EDGES_PER_BLOCK = 64;
-                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            (unsigned long long*)packed.data_ptr<int64_t>(),
-                            d
-                        );
-
-                    } else if (edges_per_block_heavy_nodes == 128) {
-                        constexpr int EDGES_PER_BLOCK = 128;
-                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            (unsigned long long*)packed.data_ptr<int64_t>(),
-                            d
-                        );
-                    } else if (edges_per_block_heavy_nodes == 256) {
-                        constexpr int EDGES_PER_BLOCK = 256;
-                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            (unsigned long long*)packed.data_ptr<int64_t>(),
-                            d
-                        );
-                    } else if (edges_per_block_heavy_nodes == 512) {
-                        constexpr int EDGES_PER_BLOCK = 512;
-                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            (unsigned long long*)packed.data_ptr<int64_t>(),
-                            d
-                        );
-                    } else if (edges_per_block_heavy_nodes == 1024) {
-                        constexpr int EDGES_PER_BLOCK = 1024;
-                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            (unsigned long long*)packed.data_ptr<int64_t>(),
-                            d
-                        );
-                    } else {
-                        constexpr int EDGES_PER_BLOCK = 2048;
-                        dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                        min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            (unsigned long long*)packed.data_ptr<int64_t>(),
-                            d
-                        );
-                    }
-
-                    int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-                    unpack_results_kernel<scalar_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
-                        (unsigned long long*)packed.data_ptr<int64_t>(),
-                        heavy_nodes.data_ptr<int>(),
-                        out.data_ptr<scalar_t>(),
-                        argmin.data_ptr<int>(),
-                        num_heavy,
-                        d
-                    );
-                })
-            );
-        }
-    }
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
-}
-
 template <typename scalar_t>
 __device__ __forceinline__ void atomic_add_wrapper(scalar_t* address, scalar_t val) {
     atomicAdd(address, val);
@@ -468,54 +297,167 @@ __global__ void min_aggr_backward_typed(
     }
 }
 
+void min_aggr_forward_partitioned_cuda(
+    const at::Tensor& edge_ptr,
+    const at::Tensor& edge_idx,
+    const at::Tensor& X,
+    const at::Tensor& light_nodes,
+    const at::Tensor& heavy_nodes,
+    int max_degree,
+    at::Tensor& out,
+    at::Tensor& argmin,
+    int warps_per_block = 8,
+    int edges_per_block_heavy_nodes = 128
+) {
+
+    const int d = X.size(1);
+    const int num_out_nodes = out.size(0);
+
+    TORCH_CHECK(edge_ptr.is_cuda(), "edge_ptr must be CUDA");
+    TORCH_CHECK(edge_idx.is_cuda(), "edge_idx must be CUDA");
+    TORCH_CHECK(X.is_cuda(), "X must be CUDA");
+    TORCH_CHECK(light_nodes.is_cuda(), "light_nodes must be CUDA");
+    TORCH_CHECK(heavy_nodes.is_cuda(), "heavy_nodes must be CUDA");
+
+    TORCH_CHECK(edge_ptr.dtype() == torch::kInt32, "edge_ptr must be int32");
+    TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
+    TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
+    TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
+    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16 || X.scalar_type() == at::kDouble, "X must be float32/float16/bfloat16/float64");
+    TORCH_CHECK(out.scalar_type() == X.scalar_type(), "out must have same dtype as X");
+
+    const int num_light = light_nodes.numel();
+    if (num_light > 0) {
+        std::visit([&](auto typeInfo, auto warps_const) {
+            using scalar_t = typename decltype(typeInfo)::TType;
+            constexpr int WARPS_PER_BLOCK = warps_const.value;
+            constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+            min_aggr_forward_light_kernel_1d<scalar_t><<<num_light, THREADS_PER_BLOCK>>>(
+                light_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X.data_ptr<scalar_t>(),
+                out.data_ptr<scalar_t>(),
+                argmin.data_ptr<int>(),
+                d
+            );
+        },
+        MakeTypeVariant<float, double, at::Half, at::BFloat16>(X.scalar_type()),
+        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)  // 64*32=2048
+        );
+    }
+
+    const int num_heavy = heavy_nodes.numel();
+
+    if (num_heavy > 0) {
+        // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
+        constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
+
+        // TODO: think about what to do with the doubles
+        if (X.scalar_type() == at::kDouble) {
+            std::visit([&](auto typeInfo, auto warps_const) {
+                using scalar_t = typename decltype(typeInfo)::TType;
+                constexpr int WARPS_PER_BLOCK = warps_const.value;
+                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+                min_aggr_forward_light_kernel_1d<scalar_t><<<num_heavy, THREADS_PER_BLOCK>>>(
+                    heavy_nodes.data_ptr<int>(),
+                    edge_ptr.data_ptr<int>(),
+                    edge_idx.data_ptr<int>(),
+                    X.data_ptr<scalar_t>(),
+                    out.data_ptr<scalar_t>(),
+                    argmin.data_ptr<int>(),
+                    d
+                );
+            },
+            MakeTypeVariant<double>(X.scalar_type()),
+            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            );
+        } else {
+            auto packed = at::full(
+                {num_heavy, d},
+                static_cast<int64_t>(PACKED_INIT),
+                at::TensorOptions().dtype(torch::kInt64).device(X.device())
+            );
+
+            std::visit([&](auto typeInfo, auto edges_const, auto warps_const) {
+                using scalar_t = typename decltype(typeInfo)::TType;
+                constexpr int EDGES_PER_BLOCK = edges_const.value;
+                constexpr int WARPS_PER_BLOCK = warps_const.value;
+                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+                dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                    heavy_nodes.data_ptr<int>(),
+                    edge_ptr.data_ptr<int>(),
+                    edge_idx.data_ptr<int>(),
+                    X.data_ptr<scalar_t>(),
+                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                    d
+                );
+            },
+            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
+            MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
+            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            );
+
+            std::visit([&](auto typeInfo, auto warps_const) {
+                using scalar_t = typename decltype(typeInfo)::TType;
+                constexpr int WARPS_PER_BLOCK = warps_const.value;
+                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+                int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+                unpack_results_kernel<scalar_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
+                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                    heavy_nodes.data_ptr<int>(),
+                    out.data_ptr<scalar_t>(),
+                    argmin.data_ptr<int>(),
+                    num_heavy,
+                    d
+                );
+            },
+            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
+            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            );
+        }
+    }
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
+}
+
 void min_aggr_backward_cuda(
     const at::Tensor& grad_out,
     const at::Tensor& argmin,
     at::Tensor& grad_x,
     int warps_per_block = 8
 ) {
-    int THREADS_PER_BLOCK;
     const int num_nodes = grad_out.size(0);
     const int d = grad_out.size(1);
 
     const dim3 blocks(num_nodes);
 
-    if (warps_per_block == 1){
-        THREADS_PER_BLOCK = 1 * kWarpSize;
-    } else if (warps_per_block == 2) {
-        THREADS_PER_BLOCK = 2 * kWarpSize;
-    } else if (warps_per_block == 4) {
-        THREADS_PER_BLOCK = 4 * kWarpSize;
-    } else if (warps_per_block == 8) {
-        THREADS_PER_BLOCK = 8 * kWarpSize;
-    } else if (warps_per_block == 16) {
-        THREADS_PER_BLOCK = 16 * kWarpSize;
-    } else if (warps_per_block == 32) {
-        THREADS_PER_BLOCK = 32 * kWarpSize;
-    } else {
-        THREADS_PER_BLOCK = 2048;
-    }
+    std::visit([&](auto typeInfo, auto warps_const) {
+        using scalar_t = typename decltype(typeInfo)::TType;
+        constexpr int WARPS_PER_BLOCK = warps_const.value;
+        constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-    const dim3 threads(THREADS_PER_BLOCK);
-    auto st = grad_out.scalar_type();
+        const dim3 threads(THREADS_PER_BLOCK);
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half,
-        at::ScalarType::BFloat16,
-        st,
-        "min_aggr_backward_float_double",
-        ([&] {
-            min_aggr_backward_typed<scalar_t><<<blocks, threads>>>(
-                grad_out.data_ptr<scalar_t>(),
-                argmin.data_ptr<int>(),
-                grad_x.data_ptr<scalar_t>(),
-                num_nodes,
-                d
-            );
-        })
+        min_aggr_backward_typed<scalar_t><<<blocks, threads>>>(
+            grad_out.data_ptr<scalar_t>(),
+            argmin.data_ptr<int>(),
+            grad_x.data_ptr<scalar_t>(),
+            num_nodes,
+            d
+        );
+    },
+    MakeTypeVariant<float, double, at::Half, at::BFloat16>(grad_out.scalar_type()),
+    MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
     );
 
-    cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "backward kernel launch failed: ", cudaGetErrorString(err));
 }
