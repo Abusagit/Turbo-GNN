@@ -48,6 +48,8 @@ def wsb_spmm_kernel_tc(
 
     # skip empty row windows
     if num_tcbs == 0:
+        y_ptrs = Y_ptr + global_rows[:, None] * stride_yn + global_f[None, :] * stride_yf
+        tl.store(y_ptrs, 0.0, mask=row_mask[:, None])
         return
 
     # fp32 accumulator
@@ -240,7 +242,7 @@ def wsb_spmm_backward_tc(wsb, grad_output: torch.Tensor) -> torch.Tensor:
 
     N, F = grad_output.shape
 
-    grad_input = torch.empty_like(grad_output)
+    grad_input = torch.zeros_like(grad_output)
 
     weights = wsb.weights.half()
     G = grad_output.half()
@@ -773,8 +775,9 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
 
     dQ = torch.empty_like(Q, dtype=torch.float32)
-    dK = torch.empty_like(K, dtype=torch.float32)
-    dV = torch.empty_like(V, dtype=torch.float32)
+    # dK/dV are updated with atomics -> must be zero-initialized
+    dK = torch.zeros_like(K, dtype=torch.float32)
+    dV = torch.zeros_like(V, dtype=torch.float32)
 
     grid = (wsb.num_row_windows, H)
 

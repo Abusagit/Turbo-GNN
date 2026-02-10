@@ -249,12 +249,12 @@ __global__ void GraphAttentionForward_CSR_MH_v2(
     // Handle isolated nodes
     if (num_neighbors == 0) {
         if (warp_id == 0) {
-            float* out_base = O + (int64_t)node_i * stride_o_n + (int64_t)head_h * stride_o_h;
+            float* out_base = O + node_i * stride_o_n + head_h * stride_o_h;
             for (int d = lane_id; d < D; d += kWarpSize) {
                 out_base[d] = 0.0f;
             }
             if (lane_id == 0) {
-                logsumexp[(int64_t)node_i * H + head_h] = -INFINITY;
+                logsumexp[node_i * H + head_h] = -INFINITY;
             }
         }
         return;
@@ -286,8 +286,8 @@ __global__ void GraphAttentionForward_CSR_MH_v2(
     for (int e = warp_id; e < num_neighbors; e += kWarpsPerBlock) {
         const int j = __ldg(&col_idx[edge_start + e]);
 
-        const float* q_base = Q + (int64_t)j * stride_q_n + (int64_t)head_h * stride_q_h;
-        const float* v_base = V + (int64_t)j * stride_v_n + (int64_t)head_h * stride_v_h;
+        const float* q_base = Q + j * stride_q_n + head_h * stride_q_h;
+        const float* v_base = V + j * stride_v_n + head_h * stride_v_h;
 
         // Dot(K_i, Q_j) with warp-striped, coalesced scalar LDG loads
         float s_partial = 0.0f;
@@ -464,12 +464,22 @@ __global__ void graph_attn_backward_csrT_kernel_D(
     int edge_end      = row_ptr_T[node_j + 1];
     int num_incoming  = edge_end - edge_start;
 
+    constexpr int NF4 = D_CONST / 4;
+
     // nothing to do if this node has no incoming edges
     if (num_incoming == 0) {
-        return;
+       const size_t base_jh = (node_j * H + head_h) * D_CONST;
+       float4* dQ4 = reinterpret_cast<float4*>(dQ + base_jh);
+       float4* dV4 = reinterpret_cast<float4*>(dV + base_jh);
+
+       #pragma unroll
+       for (int idx4 = lane; idx4 < NF4; idx4 += kWarpSize) {
+           dQ4[idx4] = make_float4(0.f, 0.f, 0.f, 0.f);
+           dV4[idx4] = make_float4(0.f, 0.f, 0.f, 0.f);
+       }
+       return;
     }
 
-    constexpr int NF4 = D_CONST / 4;
 
     extern __shared__ float shared[];
     float* qj_shared      = shared;                 // D
@@ -765,9 +775,9 @@ graph_attention_backward_csr_mh_cuda(
     // ---------------------------
     // Allocate outputs
     // ---------------------------
-    torch::Tensor dQ = torch::zeros_like(Q);
+    torch::Tensor dQ = torch::empty_like(Q);
     torch::Tensor dK = torch::zeros_like(K);
-    torch::Tensor dV = torch::zeros_like(V);
+    torch::Tensor dV = torch::empty_like(V);
 
     // Delta[i,h] = <O[i,h,:], dO[i,h,:]>
     torch::Tensor Delta = torch::empty({N, H}, options);
