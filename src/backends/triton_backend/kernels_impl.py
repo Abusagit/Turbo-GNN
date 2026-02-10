@@ -48,6 +48,8 @@ def wsb_spmm_kernel_tc(
 
     # skip empty row windows
     if num_tcbs == 0:
+        y_ptrs = Y_ptr + global_rows[:, None] * stride_yn + global_f[None, :] * stride_yf
+        tl.store(y_ptrs, 0.0, mask=row_mask[:, None])
         return
 
     # fp32 accumulator
@@ -111,7 +113,7 @@ def wsb_spmm_tc_forward(wsb, X: torch.Tensor) -> torch.Tensor:
 
     N, F = X.shape
 
-    Y = torch.zeros_like(X)  # NOTE for now it's fp32
+    Y = torch.empty_like(X)  # NOTE for now it's fp32
 
     # use fp16 here
     weights = wsb.weights.half()
@@ -502,7 +504,7 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale):
     N, H, D = Q.shape
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
 
-    output = torch.zeros((N, H, D), device=Q.device, dtype=torch.float32)
+    output = torch.empty((N, H, D), device=Q.device, dtype=torch.float32)
     logsumexp = torch.full((N, H), -float("inf"), device=Q.device, dtype=torch.float32)
 
     grid = (wsb.num_row_windows, H)
@@ -772,7 +774,8 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
     assert L.shape == (N, H), f"L must be [N, H], got {L.shape}"
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
 
-    dQ = torch.zeros_like(Q, dtype=torch.float32)
+    dQ = torch.empty_like(Q, dtype=torch.float32)
+    # dK/dV are updated with atomics -> must be zero-initialized
     dK = torch.zeros_like(K, dtype=torch.float32)
     dV = torch.zeros_like(V, dtype=torch.float32)
 

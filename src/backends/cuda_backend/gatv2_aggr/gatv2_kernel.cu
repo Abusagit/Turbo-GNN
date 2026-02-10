@@ -130,8 +130,20 @@ __global__ void GATv2Kernel_CSR(
     int edge_end   = d_row_ptr[node_i + 1];
     int num_neighbors = edge_end - edge_start;
 
+    float* h_out_base = d_h_out + ((node_i * H + head_h) * D);
+
     // skip isolated nodes (no neighbors)
     if (num_neighbors == 0) {
+        float4* h_out_f4 = reinterpret_cast<float4*>(h_out_base);
+        int num_float4 = D / 4;
+
+        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+            h_out_f4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        if (lane_id == 0) {
+            d_logsumexp_out[node_i * H + head_h] = -INFINITY;
+        }
         return;
     }
 
@@ -139,7 +151,6 @@ __global__ void GATv2Kernel_CSR(
     const float* a_base = d_attn_vec + head_h * D;
     const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
 
-    float* h_out_base = d_h_out + ((node_i * H + head_h) * D );
 
     int num_float4 = D / 4;
     // ==========================================
@@ -385,20 +396,32 @@ __global__ void GATv2Kernel_CSR_D(
     int lane_id = threadIdx.x % kMaxThreadsInWarp;
 
     if (node_i >= (int)N || head_h >= (int)H) return;
-    if ((int)D != D_CONST) return; // safety
 
     int edge_start = d_row_ptr[node_i];
     int edge_end   = d_row_ptr[node_i + 1];
 
     int num_neighbors = edge_end - edge_start;
-    if (num_neighbors == 0) return;
+
+    float* h_out_base = d_h_out + ((node_i * H + head_h) * D_CONST);
+    // skip isolated nodes (no neighbors)
+    if (num_neighbors == 0) {
+        float4* h_out_f4 = reinterpret_cast<float4*>(h_out_base);
+        int num_float4 = D_CONST / 4;
+
+        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+            h_out_f4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        if (lane_id == 0) {
+            d_logsumexp_out[node_i * H + head_h] = -INFINITY;
+        }
+        return;
+    }
 
     const float* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const float* a_base = d_attn_vec + head_h * D_CONST;
 
     const float4* a_f4 = reinterpret_cast<const float4*>(a_base);
-
-    float* h_out_base      = d_h_out + ((node_i * H + head_h) * D_CONST);
 
     {
         const float4* l_src4 = reinterpret_cast<const float4*>(l_base);
@@ -1452,7 +1475,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
 
     torch::Tensor h_out     = torch::empty({N, H, D}, options);
-    torch::Tensor logsumexp = torch::full({N, H}, -INFINITY, options);
+    torch::Tensor logsumexp = torch::empty({N, H}, options);
 
     const float* d_l = l.data_ptr<float>();
     const float* d_r = r.data_ptr<float>();
@@ -1570,9 +1593,9 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
 
-    torch::Tensor grad_l = torch::zeros({N, H, D}, options);
-    torch::Tensor grad_r = torch::zeros({N, H, D}, options);
-    torch::Tensor grad_a = torch::zeros({N, H, D}, options);      // only internal
+    torch::Tensor grad_l = torch::empty({N, H, D}, options);
+    torch::Tensor grad_r = torch::empty({N, H, D}, options);
+    torch::Tensor grad_a = torch::empty({N, H, D}, options);      // only internal
     torch::Tensor grad_a_reduced = torch::zeros({H, D}, options); // returned
 
     const float* d_grad_h    = grad_h.data_ptr<float>();

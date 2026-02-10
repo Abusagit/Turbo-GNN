@@ -72,6 +72,8 @@ __global__ void min_aggr_forward_light_kernel_1d(
 
     int tid = threadIdx.x;
 
+    int node_stride = v * d;
+
     for (int f = tid; f < d; f += blockDim.x) {
         scalar_t best_val = from_float<scalar_t>(INFINITY);
         int best_src = -1;
@@ -85,8 +87,8 @@ __global__ void min_aggr_forward_light_kernel_1d(
             }
         }
 
-        out[v * d + f] = best_val;
-        argmin[v * d + f] = best_src;
+        out[node_stride + f] = (best_src != -1) ? best_val : from_float<scalar_t>(0.0f);
+        argmin[node_stride + f] = best_src;
     }
 }
 
@@ -205,7 +207,7 @@ __global__ void unpack_results_kernel(
         int idx;
         unpack_val_idx(packed[node_idx * d + f], val, idx);
 
-        out[v * d + f] = from_float<scalar_t>(val);
+        out[v * d + f] =  from_float<scalar_t>((idx > -1) ? val : 0.0f);
         argmin[v * d + f] = idx;
     }
 }
