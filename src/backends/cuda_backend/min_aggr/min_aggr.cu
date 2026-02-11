@@ -9,7 +9,77 @@
 
 constexpr int kWarpSize = 32;
 
-// Dispatch TODO move to the separate file in the final version
+// ============================================================================
+// CUDA comparison operators -- pytorch disables them
+// ============================================================================
+#ifdef __CUDA_NO_HALF_OPERATORS__
+__device__ __forceinline__ bool operator<(const __half& a, const __half& b) {
+    return __hlt(a, b);
+}
+
+__device__ __forceinline__ bool operator>(const __half& a, const __half& b) {
+    return __hgt(a, b);
+}
+
+__device__ __forceinline__ bool operator<=(const __half& a, const __half& b) {
+    return __hle(a, b);
+}
+
+__device__ __forceinline__ bool operator>=(const __half& a, const __half& b) {
+    return __hge(a, b);
+}
+
+__device__ __forceinline__ bool operator==(const __half& a, const __half& b) {
+    return __heq(a, b);
+}
+
+__device__ __forceinline__ bool operator!=(const __half& a, const __half& b) {
+    return __hne(a, b);
+}
+#endif
+
+
+// Dispatch and datatype Traits TODO move to the separate file in the final version
+
+template <typename T>
+struct TTypeTraits;
+
+// Spec for float
+template <>
+struct TTypeTraits<float> {
+    using TorchType = float;
+    using CudaType = float;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::Float;
+};
+
+// Spec for double
+template <>
+struct TTypeTraits<double> {
+    using TorchType = double;
+    using CudaType = double;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::Double;
+};
+
+// Spec for at::Half
+template <>
+struct TTypeTraits<at::Half> {
+    using TorchType = at::Half;
+    using CudaType = __half;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::Half;
+};
+
+// Spec for at::BFloat16
+template <>
+struct TTypeTraits<at::BFloat16> {
+    using TorchType = at::BFloat16;
+    using CudaType = __nv_bfloat16;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::BFloat16;
+};
+
+// Helper for obtaining CUDA type from PyTorch  type
+template <typename TorchT>
+using ToCudaType = typename TTypeTraits<TorchT>::CudaType;
+
 
 template <int... Values>
 std::variant<std::integral_constant<int, Values>...> MakeIntVariant(int value) {
@@ -22,14 +92,17 @@ std::variant<std::integral_constant<int, Values>...> MakeIntVariant(int value) {
         }
     }(), ...);
     if (!found) {
-        throw std::runtime_error("Wrong edges_per_block value: " + std::to_string(value));
+        throw std::runtime_error("Wrong int value: " + std::to_string(value));
     }
     return result;
 }
 
 template <typename T>
 struct TTypeInfo {
-    using TType = T;
+    using Traits = TTypeTraits<T>;
+    using TorchType = typename Traits::TorchType;
+    using CudaType = typename Traits::CudaType;
+    static constexpr c10::ScalarType ScalarType = Traits::ScalarType;
 };
 
 template <typename... T>
@@ -37,7 +110,7 @@ inline std::variant<TTypeInfo<T>...> MakeTypeVariant(at::ScalarType type) {
     std::variant<TTypeInfo<T>...> result;
     bool found = false;
     ([&] {
-        if (c10::CppTypeToScalarType<T>::value == type) {
+        if (TTypeInfo<T>::ScalarType == type) {
             result.template emplace<TTypeInfo<T>>();
             found = true;
         }
@@ -48,61 +121,37 @@ inline std::variant<TTypeInfo<T>...> MakeTypeVariant(at::ScalarType type) {
     return result;
 }
 
-// Type conversion TODO move to the separate file in the final version
-
-template <typename scalar_t>
-__device__ __forceinline__ float to_float(scalar_t val);
+template <typename cuda_t>
+__device__ __forceinline__ cuda_t make_cuda_value(float val);
 
 template <>
-__device__ __forceinline__ float to_float<float>(float val) {
+__device__ __forceinline__ float make_cuda_value<float>(float val) {
     return val;
 }
 
 template <>
-__device__ __forceinline__ float to_float<double>(double val) {
-    return __double2float_rn(val);
+__device__ __forceinline__ double make_cuda_value<double>(float val) {
+    return static_cast<double>(val);
 }
 
 template <>
-__device__ __forceinline__ float to_float<at::Half>(at::Half val) {
-    return __half2float(__half(val));
+__device__ __forceinline__ __half make_cuda_value<__half>(float val) {
+    return __float2half(val);
 }
 
 template <>
-__device__ __forceinline__ float to_float<at::BFloat16>(at::BFloat16 val) {
-    return __bfloat162float(__nv_bfloat16(val));
+__device__ __forceinline__ __nv_bfloat16 make_cuda_value<__nv_bfloat16>(float val) {
+    return __float2bfloat16(val);
 }
 
-template <typename scalar_t>
-__device__ __forceinline__ scalar_t from_float(float v);
 
-template <>
-__device__ __forceinline__ float from_float<float>(float v) {
-    return v;
-}
-
-template <>
-__device__ __forceinline__ double from_float<double>(float v) {
-    return static_cast<double>(v);
-}
-
-template <>
-__device__ __forceinline__ at::Half from_float<at::Half>(float v) {
-    return __float2half(v);
-}
-
-template <>
-__device__ __forceinline__ at::BFloat16 from_float<at::BFloat16>(float v) {
-    return __float2bfloat16(v);
-}
-
-template <typename scalar_t>
+template <typename cuda_t>
 __global__ void min_aggr_forward_light_kernel_1d(
     const int* __restrict__ light_nodes_indices,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
-    const scalar_t* __restrict__ X,
-    scalar_t* __restrict__ out,
+    const cuda_t* __restrict__ X,
+    cuda_t* __restrict__ out,
     int* __restrict__ argmin,
     int d
 ) {
@@ -116,22 +165,47 @@ __global__ void min_aggr_forward_light_kernel_1d(
 
     int node_stride = v * d;
 
+    cuda_t infinity = make_cuda_value<cuda_t>(INFINITY);
     for (int f = tid; f < d; f += blockDim.x) {
-        scalar_t best_val = from_float<scalar_t>(INFINITY);
+        cuda_t best_val = infinity;
         int best_src = -1;
 
         for (int eid = row_start; eid < row_end; ++eid) {
             int src = edge_idx[eid];
-            scalar_t val = X[src * d + f];
+            cuda_t val = X[src * d + f];
             if (val < best_val) {
                 best_val = val;
                 best_src = src;
             }
         }
 
-        out[node_stride + f] = (best_src != -1) ? best_val : from_float<scalar_t>(0.0f);
+        out[node_stride + f] = (best_src != -1) ? best_val : make_cuda_value<cuda_t>(0.0f);
         argmin[node_stride + f] = best_src;
     }
+}
+
+// CUDA type --> float
+template <typename cuda_t>
+__device__ __forceinline__ float cuda_to_float(cuda_t val);
+
+template <>
+__device__ __forceinline__ float cuda_to_float<float>(float val) {
+    return val;
+}
+
+template <>
+__device__ __forceinline__ float cuda_to_float<double>(double val) {
+    return static_cast<float>(val);
+}
+
+template <>
+__device__ __forceinline__ float cuda_to_float<__half>(__half val) {
+    return __half2float(val);
+}
+
+template <>
+__device__ __forceinline__ float cuda_to_float<__nv_bfloat16>(__nv_bfloat16 val) {
+    return __bfloat162float(val);
 }
 
 __device__ __forceinline__ unsigned int float_to_ordered_uint(float x) {
@@ -179,12 +253,12 @@ __device__ __forceinline__ void unpack_val_idx(
 
 
 // 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
-template<int EDGES_PER_BLOCK, typename scalar_t>
+template<int EDGES_PER_BLOCK, typename cuda_t>
 __global__ void min_aggr_forward_heavy_kernel(
     const int* __restrict__ heavy_nodes_indices,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
-    const scalar_t* __restrict__ X,
+    const cuda_t* __restrict__ X,
     unsigned long long* __restrict__ packed,
     int d
 ) {
@@ -204,16 +278,17 @@ __global__ void min_aggr_forward_heavy_kernel(
     }
 
     int tid = threadIdx.x;
+    cuda_t infinity = make_cuda_value<cuda_t>(INFINITY);
 
     for (int f = tid; f < d; f += blockDim.x) {
-        float local_min = INFINITY;
+        cuda_t local_min = infinity;
         int local_arg = -1;
 
         // find local minimum in this chunk
         #pragma unroll
         for (int eid = chunk_start; eid < chunk_end; ++eid) {
             int src = edge_idx[eid];
-            float val = to_float(X[src * d + f]);
+            cuda_t val = X[src * d + f];
             if (val < local_min) {
                 local_min = val;
                 local_arg = src;
@@ -222,18 +297,18 @@ __global__ void min_aggr_forward_heavy_kernel(
 
         if (local_arg >= 0) {
             unsigned long long* addr = &packed[node_idx * d + f];
-            unsigned long long new_val = pack_val_idx(local_min, local_arg);
+            unsigned long long new_val = pack_val_idx(cuda_to_float(local_min), local_arg);
             atomicMin(addr, new_val);
         }
     }
 }
 
 // unpack results back to separate arrays
-template <typename scalar_t>
+template <typename cuda_t>
 __global__ void unpack_results_kernel(
     const unsigned long long* __restrict__ packed,
     const int* __restrict__ nodes,
-    scalar_t* __restrict__ out,
+    cuda_t* __restrict__ out,
     int* __restrict__ argmin,
     int num_nodes,
     int d
@@ -249,32 +324,39 @@ __global__ void unpack_results_kernel(
         int idx;
         unpack_val_idx(packed[node_idx * d + f], val, idx);
 
-        out[v * d + f] =  from_float<scalar_t>((idx > -1) ? val : 0.0f);
+        out[v * d + f] = (idx > -1) ? make_cuda_value<cuda_t>(val) : make_cuda_value<cuda_t>(0.0f);
         argmin[v * d + f] = idx;
     }
 }
 
+template <typename cuda_t>
+__device__ __forceinline__ void cuda_atomic_add(cuda_t* address, cuda_t val);
 
-template <typename scalar_t>
-__device__ __forceinline__ void atomic_add_wrapper(scalar_t* address, scalar_t val) {
+template <>
+__device__ __forceinline__ void cuda_atomic_add<float>(float* address, float val) {
     atomicAdd(address, val);
 }
 
 template <>
-__device__ __forceinline__ void atomic_add_wrapper<at::Half>(at::Half* address, at::Half val) {
-    atomicAdd(reinterpret_cast<__half*>(address), *reinterpret_cast<__half*>(&val));
+__device__ __forceinline__ void cuda_atomic_add<double>(double* address, double val) {
+    atomicAdd(address, val);
 }
 
 template <>
-__device__ __forceinline__ void atomic_add_wrapper<at::BFloat16>(at::BFloat16* address, at::BFloat16 val) {
-    atomicAdd(reinterpret_cast<__nv_bfloat16*>(address), *reinterpret_cast<__nv_bfloat16*>(&val));
+__device__ __forceinline__ void cuda_atomic_add<__half>(__half* address, __half val) {
+    atomicAdd(address, val);
 }
 
-template <typename scalar_t>
+template <>
+__device__ __forceinline__ void cuda_atomic_add<__nv_bfloat16>(__nv_bfloat16* address, __nv_bfloat16 val) {
+    atomicAdd(address, val);
+}
+
+template <typename cuda_t>
 __global__ void min_aggr_backward_typed(
-    const scalar_t* __restrict__ grad_out,
+    const cuda_t* __restrict__ grad_out,
     const int*   __restrict__ argmin,
-    scalar_t* __restrict__ grad_x,
+    cuda_t* __restrict__ grad_x,
     int num_nodes,
     int d
 ) {
@@ -292,8 +374,8 @@ __global__ void min_aggr_backward_typed(
             continue;
         }
 
-        scalar_t grad = grad_out[block_idx * d + f];
-        atomic_add_wrapper(&grad_x[src * d + f], grad);
+        cuda_t grad = grad_out[block_idx * d + f];
+        cuda_atomic_add(&grad_x[src * d + f], grad);
     }
 }
 
@@ -329,16 +411,21 @@ void min_aggr_forward_partitioned_cuda(
     const int num_light = light_nodes.numel();
     if (num_light > 0) {
         std::visit([&](auto typeInfo, auto warps_const) {
-            using scalar_t = typename decltype(typeInfo)::TType;
+            using torch_t = typename decltype(typeInfo)::TorchType;
+            using cuda_t = typename decltype(typeInfo)::CudaType;
+
             constexpr int WARPS_PER_BLOCK = warps_const.value;
             constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-            min_aggr_forward_light_kernel_1d<scalar_t><<<num_light, THREADS_PER_BLOCK>>>(
+            auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
+            auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
+
+            min_aggr_forward_light_kernel_1d<cuda_t><<<num_light, THREADS_PER_BLOCK>>>(
                 light_nodes.data_ptr<int>(),
                 edge_ptr.data_ptr<int>(),
                 edge_idx.data_ptr<int>(),
-                X.data_ptr<scalar_t>(),
-                out.data_ptr<scalar_t>(),
+                X_ptr,
+                out_ptr,
                 argmin.data_ptr<int>(),
                 d
             );
@@ -354,19 +441,23 @@ void min_aggr_forward_partitioned_cuda(
         // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
         constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
 
-        // TODO: think about what to do with the doubles
         if (X.scalar_type() == at::kDouble) {
             std::visit([&](auto typeInfo, auto warps_const) {
-                using scalar_t = typename decltype(typeInfo)::TType;
+                using torch_t = typename decltype(typeInfo)::TorchType;
+                using cuda_t = typename decltype(typeInfo)::CudaType;
+
                 constexpr int WARPS_PER_BLOCK = warps_const.value;
                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-                min_aggr_forward_light_kernel_1d<scalar_t><<<num_heavy, THREADS_PER_BLOCK>>>(
+                auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
+                auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
+
+                min_aggr_forward_light_kernel_1d<cuda_t><<<num_heavy, THREADS_PER_BLOCK>>>(
                     heavy_nodes.data_ptr<int>(),
                     edge_ptr.data_ptr<int>(),
                     edge_idx.data_ptr<int>(),
-                    X.data_ptr<scalar_t>(),
-                    out.data_ptr<scalar_t>(),
+                    X_ptr,
+                    out_ptr,
                     argmin.data_ptr<int>(),
                     d
                 );
@@ -382,18 +473,21 @@ void min_aggr_forward_partitioned_cuda(
             );
 
             std::visit([&](auto typeInfo, auto edges_const, auto warps_const) {
-                using scalar_t = typename decltype(typeInfo)::TType;
+                using torch_t = typename decltype(typeInfo)::TorchType;
+                using cuda_t = typename decltype(typeInfo)::CudaType;
                 constexpr int EDGES_PER_BLOCK = edges_const.value;
                 constexpr int WARPS_PER_BLOCK = warps_const.value;
                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
+                auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
+
                 dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
-                min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, scalar_t><<<grid, THREADS_PER_BLOCK>>>(
+                min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, cuda_t><<<grid, THREADS_PER_BLOCK>>>(
                     heavy_nodes.data_ptr<int>(),
                     edge_ptr.data_ptr<int>(),
                     edge_idx.data_ptr<int>(),
-                    X.data_ptr<scalar_t>(),
+                    X_ptr,
                     reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
                     d
                 );
@@ -404,15 +498,18 @@ void min_aggr_forward_partitioned_cuda(
             );
 
             std::visit([&](auto typeInfo, auto warps_const) {
-                using scalar_t = typename decltype(typeInfo)::TType;
+                using torch_t = typename decltype(typeInfo)::TorchType;
+                using cuda_t = typename decltype(typeInfo)::CudaType;
                 constexpr int WARPS_PER_BLOCK = warps_const.value;
                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
+                auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
+
                 int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-                unpack_results_kernel<scalar_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
+                unpack_results_kernel<cuda_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
                     reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
                     heavy_nodes.data_ptr<int>(),
-                    out.data_ptr<scalar_t>(),
+                    out_ptr,
                     argmin.data_ptr<int>(),
                     num_heavy,
                     d
@@ -436,20 +533,23 @@ void min_aggr_backward_cuda(
 ) {
     const int num_nodes = grad_out.size(0);
     const int d = grad_out.size(1);
-
     const dim3 blocks(num_nodes);
 
     std::visit([&](auto typeInfo, auto warps_const) {
-        using scalar_t = typename decltype(typeInfo)::TType;
+        using torch_t = typename decltype(typeInfo)::TorchType;
+        using cuda_t = typename decltype(typeInfo)::CudaType;
         constexpr int WARPS_PER_BLOCK = warps_const.value;
         constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
+        auto* grad_out_ptr = reinterpret_cast<const cuda_t*>(grad_out.data_ptr<torch_t>());
+        auto* grad_x_ptr = reinterpret_cast<cuda_t*>(grad_x.data_ptr<torch_t>());
+
         const dim3 threads(THREADS_PER_BLOCK);
 
-        min_aggr_backward_typed<scalar_t><<<blocks, threads>>>(
-            grad_out.data_ptr<scalar_t>(),
+        min_aggr_backward_typed<cuda_t><<<blocks, threads>>>(
+            grad_out_ptr,
             argmin.data_ptr<int>(),
-            grad_x.data_ptr<scalar_t>(),
+            grad_x_ptr,
             num_nodes,
             d
         );
@@ -458,6 +558,7 @@ void min_aggr_backward_cuda(
     MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
     );
 
+    cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "backward kernel launch failed: ", cudaGetErrorString(err));
 }

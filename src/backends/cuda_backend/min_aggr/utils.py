@@ -60,6 +60,9 @@ class MinAggrFunction(torch.autograd.Function):
         warps_per_block,
         edges_per_block_heavy_nodes,
     ):
+        if torch.is_autocast_enabled():
+            X = X.to(torch.get_autocast_gpu_dtype())
+
         out, argmin = min_aggr_cuda.min_aggr_forward_partitioned(
             edge_ptr, edge_idx, X, light, heavy, max_degree, warps_per_block, edges_per_block_heavy_nodes
         )
