@@ -83,9 +83,9 @@ class MinAggrFunction(torch.autograd.Function):
         num_features_per_thread = FOUR_BYTES_CONSTANT // X.dtype.itemsize  # 1, 2, 4, ...
 
         num_threads_needed = ceil(X.shape[-1] / num_features_per_thread)
-        warps_per_block_needed = ceil(num_threads_needed / WARP_SIZE)
 
         if num_threads_needed < num_of_threads_invoked:
+            warps_per_block_needed = ceil(num_threads_needed / WARP_SIZE)
             warnings.warn(
                 f"Number of threads involved for MinAggr is {num_of_threads_invoked} "
                 f"({warps_per_block} warps per thread block requested). "

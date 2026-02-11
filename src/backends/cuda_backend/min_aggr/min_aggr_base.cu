@@ -1,9 +1,4 @@
-#include <cuda_runtime.h>
-#include <cmath>
-#include <torch/extension.h>
-#include <torch/torch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
+#include "../common.cuh"
 
 namespace py = pybind11;
 

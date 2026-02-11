@@ -1,17 +1,4 @@
-#include <cstddef>
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-#include <cfloat>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-
-#ifndef FULL_WARP_MASK
-#define FULL_WARP_MASK 0xffffffff
-#endif
-
-#ifndef kWarpSize
-constexpr int kWarpSize = 32;
-#endif
+#include "../common.cuh"
 
 #define DISPATCH_D(DVAL) do { \
     constexpr int D_CONST = (DVAL); \
@@ -31,14 +18,6 @@ constexpr int kWarpSize = 32;
 } while(0)
 
 constexpr int kWarpsPerBlock = 4;
-
-__device__ __forceinline__ float warp_reduce_sum(float x) {
-    #pragma unroll
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(FULL_WARP_MASK, x, offset);
-    }
-    return x;
-}
 
 template<int D_CONST>
 __global__ void GraphAttentionForward_CSR_MH_v2_D(

@@ -1,29 +1,4 @@
-#include <cstddef>
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-#include <iostream>
-#include <vector>
-#include <iomanip>
-#include <cmath>
-#include <algorithm>
-#include <random>
-#include <cfloat>
-
-
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t error = call; \
-        if (error != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(error)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
-
-
-#define FULL_WARP_MASK 0xffffffff
-
-constexpr int kMaxThreadsInWarp = 32;
+#include "../common.cuh"
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
@@ -36,61 +11,6 @@ __device__ __forceinline__ float leaky_relu_elementwise(float x, float negative_
 __device__ __forceinline__ float leaky_relu_der_elementwise(float x, float negative_slope) {
     return (x > 0.0f) ? 1.0f : negative_slope;
 }
-
-__device__ __forceinline__ float warp_reduce_sum(float x) {
-    #pragma unroll
-    for (int offset = kMaxThreadsInWarp / 2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(FULL_WARP_MASK, x, offset);
-    }
-    return x;
-}
-
-__device__ __forceinline__ float warp_reduce_max(float x) {
-    #pragma unroll
-    for (int offset = kMaxThreadsInWarp / 2; offset > 0; offset >>= 1) {
-        x = fmaxf(x, __shfl_xor_sync(FULL_WARP_MASK, x, offset));
-    }
-    return x;
-}
-
-__device__ __forceinline__ int warp_bcast_i32(int v0) {
-    return __shfl_sync(FULL_WARP_MASK, v0, 0);
-}
-
-__device__ __forceinline__ float warp_bcast_f32(float v0) {
-    return __shfl_sync(FULL_WARP_MASK, v0, 0);
-}
-
-__device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
-    float acc = 0.f;
-    acc = fmaf(a.x, b.x, acc);
-    acc = fmaf(a.y, b.y, acc);
-    acc = fmaf(a.z, b.z, acc);
-    acc = fmaf(a.w, b.w, acc);
-    return acc;
-}
-
-struct OnlineSoftmaxState {
-    float max_val;
-    float sum_exp;
-
-    __device__ __forceinline__ OnlineSoftmaxState() : max_val(-FLT_MAX), sum_exp(0.0f) {}
-
-    __device__ __forceinline__ float update(float logit) {
-        float old_max = max_val;
-        max_val = fmaxf(max_val, logit);
-
-        // correction factor for previous sum when max changes
-        float correction = __expf(old_max - max_val);
-        sum_exp = sum_exp * correction + __expf(logit - max_val);
-        return correction;
-    }
-
-    __device__ __forceinline__ float get_alpha(float logit) const {
-        return __expf(logit - max_val) / sum_exp;
-    }
-};
-
 
 __global__ void GATv2Kernel_CSR(
     size_t N,
