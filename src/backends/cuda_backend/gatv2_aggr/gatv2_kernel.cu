@@ -1425,8 +1425,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
             GATv2Kernel_CSR<<<nBlocks, nThreads, shared_mem_size, stream>>>(N,H,D, d_l,d_r, stride_l_n,stride_l_h, stride_r_n,stride_r_h, d_row_ptr,d_col_idx, d_attn_vec, d_h_out, d_logsumexp, negative_slope);
     }
 
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+    CUDA_KERNEL_CHECK();
 
     return {h_out, logsumexp};
 }
@@ -1689,8 +1688,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
             );
     }
 
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+    CUDA_KERNEL_CHECK();
 
     return {grad_l, grad_r, grad_a_reduced};
 }

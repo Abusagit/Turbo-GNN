@@ -663,8 +663,7 @@ graph_attention_forward_csr_mh_cuda(
         }
     }
 
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "`graph_attention_forward_csr_mh_cuda` kernel failed: ", cudaGetErrorString(err));
+    CUDA_KERNEL_CHECK();
 
     return std::make_tuple(O, lse);
 }
@@ -857,8 +856,7 @@ graph_attention_backward_csr_mh_cuda(
             TORCH_CHECK(false, "Unsupported D: ", D, " (supported: 32, 64, 128, 256)");
     }
 
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "`graph_attention_backward_csr_mh_cuda` backward kernels failed: ", cudaGetErrorString(err));
+    CUDA_KERNEL_CHECK();
     return std::make_tuple(dQ, dK, dV);
 }
 

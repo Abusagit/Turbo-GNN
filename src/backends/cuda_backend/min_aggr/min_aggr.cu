@@ -394,9 +394,7 @@ void min_aggr_forward_partitioned_cuda(
             );
         }
     }
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "min_aggr_forward_partitioned_cuda failed: ", cudaGetErrorString(err));
+    CUDA_KERNEL_CHECK();
 }
 
 void min_aggr_backward_cuda(
@@ -432,7 +430,5 @@ void min_aggr_backward_cuda(
     MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
     );
 
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "backward kernel launch failed: ", cudaGetErrorString(err));
+    CUDA_KERNEL_CHECK();
 }
