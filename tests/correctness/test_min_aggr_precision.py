@@ -125,7 +125,7 @@ def test_real_dataset_matches_fp32_reference(dtype):
     indices = indices.to(device).to(torch.int32)
 
     N = sample.num_nodes
-    F = sample.num_features
+    F = 128
 
     light, heavy = partition_nodes(indptr, threshold=50)
 

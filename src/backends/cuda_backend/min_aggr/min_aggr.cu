@@ -145,6 +145,32 @@ __device__ __forceinline__ __nv_bfloat16 make_cuda_value<__nv_bfloat16>(float va
 }
 
 
+// Vec2 instructions
+
+template <typename cuda_t>
+struct Vec2 {
+    cuda_t x, y;
+};
+
+template <typename cuda_t>
+__device__ __forceinline__ Vec2<cuda_t> load_vec2(const cuda_t* ptr) {
+    static_assert(sizeof(cuda_t) == 2, "Vec2 only for 16-bit types");
+    uint32_t data = *reinterpret_cast<const uint32_t*>(ptr);
+    Vec2<cuda_t> result;
+    result.x = reinterpret_cast<const cuda_t*>(&data)[0];
+    result.y = reinterpret_cast<const cuda_t*>(&data)[1];
+    return result;
+}
+
+template <typename cuda_t>
+__device__ __forceinline__ void store_vec2(cuda_t* ptr, Vec2<cuda_t> val) {
+    static_assert(sizeof(cuda_t) == 2, "Vec2 only for 16-bit types");
+    uint32_t data;
+    reinterpret_cast<cuda_t*>(&data)[0] = val.x;
+    reinterpret_cast<cuda_t*>(&data)[1] = val.y;
+    *reinterpret_cast<uint32_t*>(ptr) = data;
+}
+
 template <typename cuda_t>
 __global__ void min_aggr_forward_light_kernel_1d(
     const int* __restrict__ light_nodes_indices,
@@ -166,21 +192,73 @@ __global__ void min_aggr_forward_light_kernel_1d(
     int node_stride = v * d;
 
     cuda_t infinity = make_cuda_value<cuda_t>(INFINITY);
-    for (int f = tid; f < d; f += blockDim.x) {
-        cuda_t best_val = infinity;
-        int best_src = -1;
 
-        for (int eid = row_start; eid < row_end; ++eid) {
-            int src = edge_idx[eid];
-            cuda_t val = X[src * d + f];
-            if (val < best_val) {
-                best_val = val;
-                best_src = src;
+    if constexpr (sizeof(cuda_t) == 2) {
+        // Vec2 for half/bfloat16
+        const int d_vec = d / 2;
+
+        for (int f_vec = tid; f_vec < d_vec; f_vec += blockDim.x) {
+            const int f_base = f_vec * 2;
+
+            Vec2<cuda_t> best_val;
+            best_val.x = infinity;
+            best_val.y = infinity;
+
+            int best_src_x = -1;
+            int best_src_y = -1;
+
+            for (int eid = row_start; eid < row_end; ++eid) {
+                int src = edge_idx[eid];
+                Vec2<cuda_t> val = load_vec2(&X[src * d + f_base]);
+
+                if (val.x < best_val.x) { best_val.x = val.x; best_src_x = src; }
+                if (val.y < best_val.y) { best_val.y = val.y; best_src_y = src; }
             }
+
+            Vec2<cuda_t> out_val;
+            out_val.x = (best_src_x != -1) ? best_val.x : make_cuda_value<cuda_t>(0.0f);
+            out_val.y = (best_src_y != -1) ? best_val.y : make_cuda_value<cuda_t>(0.0f);
+
+            store_vec2(&out[node_stride + f_base], out_val);
+
+            argmin[node_stride + f_base + 0] = best_src_x;
+            argmin[node_stride + f_base + 1] = best_src_y;
         }
 
-        out[node_stride + f] = (best_src != -1) ? best_val : make_cuda_value<cuda_t>(0.0f);
-        argmin[node_stride + f] = best_src;
+        if (d % 2 != 0 && tid == 0) {
+            int f = d - 1;
+            cuda_t best_val = make_cuda_value<cuda_t>(INFINITY);
+            int best_src = -1;
+
+            for (int eid = row_start; eid < row_end; ++eid) {
+                int src = edge_idx[eid];
+                cuda_t val = X[src * d + f];
+                if (val < best_val) {
+                    best_val = val;
+                    best_src = src;
+                }
+            }
+
+            out[node_stride + f] = (best_src != -1) ? best_val : make_cuda_value<cuda_t>(0.0f);
+            argmin[node_stride + f] = best_src;
+        }
+    } else {
+        for (int f = tid; f < d; f += blockDim.x) {
+            cuda_t best_val = infinity;
+            int best_src = -1;
+
+            for (int eid = row_start; eid < row_end; ++eid) {
+                int src = edge_idx[eid];
+                cuda_t val = X[src * d + f];
+                if (val < best_val) {
+                    best_val = val;
+                    best_src = src;
+                }
+            }
+
+            out[node_stride + f] = (best_src != -1) ? best_val : make_cuda_value<cuda_t>(0.0f);
+            argmin[node_stride + f] = best_src;
+        }
     }
 }
 
@@ -330,29 +408,6 @@ __global__ void unpack_results_kernel(
 }
 
 template <typename cuda_t>
-__device__ __forceinline__ void cuda_atomic_add(cuda_t* address, cuda_t val);
-
-template <>
-__device__ __forceinline__ void cuda_atomic_add<float>(float* address, float val) {
-    atomicAdd(address, val);
-}
-
-template <>
-__device__ __forceinline__ void cuda_atomic_add<double>(double* address, double val) {
-    atomicAdd(address, val);
-}
-
-template <>
-__device__ __forceinline__ void cuda_atomic_add<__half>(__half* address, __half val) {
-    atomicAdd(address, val);
-}
-
-template <>
-__device__ __forceinline__ void cuda_atomic_add<__nv_bfloat16>(__nv_bfloat16* address, __nv_bfloat16 val) {
-    atomicAdd(address, val);
-}
-
-template <typename cuda_t>
 __global__ void min_aggr_backward_typed(
     const cuda_t* __restrict__ grad_out,
     const int*   __restrict__ argmin,
@@ -366,16 +421,30 @@ __global__ void min_aggr_backward_typed(
     }
 
     int tid = threadIdx.x;
+    const int base_offset = block_idx * d;
 
-    #pragma unroll
-    for (int f = tid; f < d; f += blockDim.x) {
-        int src = argmin[block_idx * d + f];
-        if (src < 0) {
-            continue;
+    if constexpr (sizeof(cuda_t) == 2) {
+        for (int f_vec = tid; f_vec < d / 2; f_vec += blockDim.x) {
+            const int f_base = f_vec * 2;
+
+            Vec2<cuda_t> grad = load_vec2(&grad_out[base_offset + f_base]);
+            uint2 src_pair = *reinterpret_cast<const uint2*>(&argmin[base_offset + f_base]);
+
+            int src_x = reinterpret_cast<const int*>(&src_pair)[0];
+            int src_y = reinterpret_cast<const int*>(&src_pair)[1];
+
+            if (src_x >= 0) atomicAdd(&grad_x[src_x * d + f_base], grad.x);
+            if (src_y >= 0) atomicAdd(&grad_x[src_y * d + f_base + 1], grad.y);
         }
-
-        cuda_t grad = grad_out[block_idx * d + f];
-        cuda_atomic_add(&grad_x[src * d + f], grad);
+    } else {
+        #pragma unroll
+        for (int f = tid; f < d; f += blockDim.x) {
+            int src = argmin[base_offset + f];
+            if (src >= 0) {
+                cuda_t grad = grad_out[base_offset + f];
+                atomicAdd(&grad_x[src * d + f], grad);
+            }
+        }
     }
 }
 

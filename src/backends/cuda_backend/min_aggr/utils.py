@@ -5,6 +5,8 @@ os.environ["CUDA_PATH"] = "/usr/local/cuda"
 os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
 
 import glob
+import warnings
+from math import ceil
 from pathlib import Path
 
 import torch
@@ -17,6 +19,9 @@ repo_root_path = Path(__file__).parent.parent.parent.parent.parent
 build_path = repo_root_path / "build/min_aggr"
 if not build_path.is_dir():
     build_path.mkdir(parents=True)
+
+WARP_SIZE = 32
+FOUR_BYTES_CONSTANT = 4
 
 min_aggr_cuda = load(
     name="min_aggr_cuda",
@@ -46,6 +51,17 @@ def min_aggr_forward_partitioned(edge_ptr, edge_idx, X, light, heavy, warps_per_
     )
 
 
+def next_power_of_two(x):
+    x -= 1
+    x |= x >> 1
+    x |= x >> 2
+    x |= x >> 4
+    x |= x >> 8
+    x |= x >> 16
+    x += 1
+    return x
+
+
 class MinAggrFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
@@ -62,6 +78,24 @@ class MinAggrFunction(torch.autograd.Function):
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
+
+        num_of_threads_invoked = WARP_SIZE * warps_per_block
+        num_features_per_thread = FOUR_BYTES_CONSTANT // X.dtype.itemsize  # 1, 2, 4, ...
+
+        num_threads_needed = ceil(X.shape[-1] / num_features_per_thread)
+        warps_per_block_needed = ceil(num_threads_needed / WARP_SIZE)
+
+        if num_threads_needed < num_of_threads_invoked:
+            warnings.warn(
+                f"Number of threads involved for MinAggr is {num_of_threads_invoked} "
+                f"({warps_per_block} warps per thread block requested). "
+                f"However, number of threads needed is {num_threads_needed} "
+                f"({warps_per_block_needed} warps). Setting this value instead."
+            )
+
+            warps_per_block = warps_per_block_needed
+            if warps_per_block not in {1, 2, 4, 8, 16, 32, 64}:
+                warps_per_block = next_power_of_two(warps_per_block)
 
         out, argmin = min_aggr_cuda.min_aggr_forward_partitioned(
             edge_ptr, edge_idx, X, light, heavy, max_degree, warps_per_block, edges_per_block_heavy_nodes
