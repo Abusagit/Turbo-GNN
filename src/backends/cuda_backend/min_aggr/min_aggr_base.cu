@@ -81,11 +81,10 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     TORCH_CHECK(X.dim() == 2, "X must be 2D");
 
     if (use_2d_kernel) {
-        TORCH_CHECK(features_per_block > 0 && features_per_block <= 1024,  "features_per_block must be in range [1, 1024]");
         TORCH_CHECK(tiles_y > 0 && tiles_y <= 32, "tiles_y must be in range [1, 32]");
-        TORCH_CHECK((tiles_y & (tiles_y - 1)) == 0, "tiles_y must be a power of 2 (e.g., 1, 2, 4, 8, 16, 32)");
-        int total_threads = features_per_block * tiles_y;
-        TORCH_CHECK(total_threads <= 1024,  "features_per_block * tiles_y must be <= 1024, got " +  std::to_string(total_threads));
+        TORCH_CHECK((tiles_y & (tiles_y - 1)) == 0, "tiles_y must be power of 2");
+        TORCH_CHECK(features_per_block > 0 && features_per_block <= 1024, "features_per_block must be in range [1, 1024]");
+        TORCH_CHECK(features_per_block * tiles_y <= 1024, "features_per_block * tiles_y must be <= 1024");
     }
 
     const auto num_nodes = X.size(0);
