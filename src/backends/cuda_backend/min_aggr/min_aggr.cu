@@ -239,17 +239,15 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
 
     int num_tiles = blockDim.y;
 
-    int q = 0;
-    int rem = 0;
-    if (num_tiles > 0) {
-        q = degree / num_tiles;
-        rem = degree % num_tiles;
+    int tile_size_ceil = 0;
+    if (TILES_Y > 0) {
+        tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;
     }
-
-    int tile_len = q + (tid < rem ? 1 : 0);
-    int tile_offset = tid * q + (tid < rem ? tid : rem);
-    int start = row_start + tile_offset;
-    int end = start + tile_len;
+    int start = row_start + tid * tile_size_ceil;
+    int end = start + tile_size_ceil;
+    if (start > row_end) {
+        start = row_end;
+    }
     if (end > row_end) {
         end = row_end;
     }
