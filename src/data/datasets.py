@@ -456,6 +456,11 @@ class GraphSample:
         return self.x.shape[1]  # type: ignore
 
     @property
+    def num_edges(self) -> int:
+        """Number of edges E."""
+        return self.edge_index.shape[1]  # type: ignore
+
+    @property
     def num_classes(self) -> int:
         """Number of classes if labels are class indices or one-hot."""
         if self.y.ndim == 1 and self.y.numel() > 0:

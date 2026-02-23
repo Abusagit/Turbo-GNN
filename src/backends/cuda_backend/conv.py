@@ -5,7 +5,7 @@ from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import AutotuneConfig, BaseBackend, BaseConvolution, TunableParam
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import gatv2_aggr
 from .gt_aggr.utils import graph_transformer_aggr
@@ -88,6 +88,22 @@ class _CudaSimpleAggrConv(BaseConvolution):
     ) -> torch.Tensor:
         return self.conv(x, graph, edge_weight=edge_weight, **kwargs)
 
+    def get_tunable_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
+            TunableParam("edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
+        ]
+
+    def get_tunable_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99, 0.999], default=-1),
+        ]
+
+    def configure(self, **kwargs: Any) -> None:
+        for k in ("warps_per_block", "edges_per_block_heavy_nodes"):
+            if k in kwargs:
+                setattr(self.conv, k, kwargs[k])
+
 
 class _CUDAGATv2Conv(BaseConvolution):
     """CUDA-backed GATv2Conv wrapper."""
@@ -167,6 +183,16 @@ class _CUDAGATv2Conv(BaseConvolution):
         out = self._outer_proj(out)
         return out
 
+    def get_tunable_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("grad_A_reduce_row_chunk_size", [16, 32, 64, 128, 256, 512, 1024, 2048], default=512),
+        ]
+
+    def get_tunable_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
 
 class _CudaGraphTransformerConv(BaseConvolution):
     """CUDA-based Fused graph transformer"""
@@ -228,6 +254,11 @@ class _CudaGraphTransformerConv(BaseConvolution):
         ).view(-1, self.feature_dim)
         return out
 
+    def get_tunable_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
 
 @BackendRegistry.register_backend("cuda")
 class CUDABackend(BaseBackend):
@@ -248,21 +279,29 @@ class CUDABackend(BaseBackend):
         Returns:
             BaseConvolution: An instance of the requested CUDA conv.
         """
+        autotune = kwargs.pop("autotune", False)
+        autotune_config = kwargs.pop("autotune_config", None)
+
         feature_dim = kwargs.pop("feature_dim")
 
         ct = conv_type.lower()
         match ct:
             case "gat_v2":
                 heads = kwargs.pop("heads")
-                return _CUDAGATv2Conv(feature_dim=feature_dim, heads=heads, **kwargs)
+                conv = _CUDAGATv2Conv(feature_dim=feature_dim, heads=heads, **kwargs)
             case "min_aggr":
-                return _CudaSimpleAggrConv(
+                conv = _CudaSimpleAggrConv(
                     aggr_type="min",
                     bias=False,
                     **kwargs,
                 )
             case "gt":
                 heads = kwargs.pop("heads")
-                return _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
+                conv = _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
+            case _:
+                raise KeyError(f"Unsupported conv_type for CUDA backend: {conv_type}")
 
-        raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
+        if autotune:
+            conv.enable_autotune(config=autotune_config)
+
+        return conv
