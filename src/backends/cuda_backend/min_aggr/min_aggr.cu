@@ -239,18 +239,9 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
 
     int num_tiles = blockDim.y;
 
-    int tile_size_ceil = 0;
-    if (TILES_Y > 0) {
-        tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;
-    }
+    int tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;;
     int start = row_start + tid * tile_size_ceil;
-    int end = start + tile_size_ceil;
-    if (start > row_end) {
-        start = row_end;
-    }
-    if (end > row_end) {
-        end = row_end;
-    }
+    int end = std::min(start + tile_size_ceil, row_end);
 
     for (int f = fid; f < d; f += F_BLOCK) {
         float local_min = INFINITY;
