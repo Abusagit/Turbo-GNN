@@ -59,7 +59,7 @@ class TunableParam:
     """A single tunable parameter for autotuning grid search.
 
     Attributes:
-        name: Must match kwarg name accepted by configure().
+        name: Prefixed param name (e.g. 'forward_warps_per_block').
         values: Candidate values for grid search.
         default: Default value when not tuning.
     """
@@ -196,25 +196,34 @@ class BaseConvolution(nn.Module):
         """
         pass
 
-    def get_tunable_kernel_params(self) -> list[TunableParam]:
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         """Return kernel parameter search space for autotuning.
 
         Override in subclasses to declare tunable kernel parameters.
         """
         return []
 
-    def get_tunable_graph_params(self) -> list[TunableParam]:
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
         """Return graph parameter search space for autotuning.
 
         Override in subclasses to declare tunable graph-level parameters.
         """
         return []
 
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
+        """Backward-pass kernel parameter search space."""
+        return []
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        """Backward-pass graph parameter search space."""
+        return []
+
     def configure(self, **kwargs: Any) -> None:
         """Apply tunable parameter values.
 
-        Sets kernel params via setattr. Subclasses can override to delegate
-        to inner convolutions or apply custom logic.
+        Sets attributes using the full prefixed names from TunableParam.
+        Subclasses can override to delegate to inner convolutions or
+        apply custom logic.
         """
         for k, v in kwargs.items():
             setattr(self, k, v)

@@ -37,8 +37,8 @@ class _CudaMinAggrConv(nn.Module):
         warps_per_block = kwargs.get("warps_per_block", 8)
         edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
 
-        self.warps_per_block = warps_per_block
-        self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
+        self.forward_warps_per_block = warps_per_block
+        self.forward_edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
 
     def forward(
         self,
@@ -60,8 +60,8 @@ class _CudaMinAggrConv(nn.Module):
             light,
             heavy,
             graph.max_degree,
-            self.warps_per_block,
-            self.edges_per_block_heavy_nodes,
+            self.forward_warps_per_block,
+            self.forward_edges_per_block_heavy_nodes,
         )
 
 
@@ -88,21 +88,16 @@ class _CudaSimpleAggrConv(BaseConvolution):
     ) -> torch.Tensor:
         return self.conv(x, graph, edge_weight=edge_weight, **kwargs)
 
-    def get_tunable_kernel_params(self) -> list[TunableParam]:
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
-            TunableParam("edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
+            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
+            TunableParam("forward_edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
         ]
 
-    def get_tunable_graph_params(self) -> list[TunableParam]:
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
         return [
-            TunableParam("huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99, 0.999], default=-1),
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99, 0.999], default=-1),
         ]
-
-    def configure(self, **kwargs: Any) -> None:
-        for k in ("warps_per_block", "edges_per_block_heavy_nodes"):
-            if k in kwargs:
-                setattr(self.conv, k, kwargs[k])
 
 
 class _CUDAGATv2Conv(BaseConvolution):
@@ -129,7 +124,7 @@ class _CUDAGATv2Conv(BaseConvolution):
 
         self.negative_slope = negative_slope
         self.heads = heads
-        self.grad_A_reduce_row_chunk_size = kwargs.get("grad_A_reduce_row_chunk_size", 512)
+        self.backward_grad_A_reduce_row_chunk_size = kwargs.get("grad_A_reduce_row_chunk_size", 512)
 
         self.feature_dim = feature_dim
         self.head_dim = feature_dim
@@ -177,20 +172,28 @@ class _CUDAGATv2Conv(BaseConvolution):
             x_right,
             self.attn_weights.data,
             self.negative_slope,
-            self.grad_A_reduce_row_chunk_size,
+            self.backward_grad_A_reduce_row_chunk_size,
         ).view(-1, self.heads * self.head_dim)
 
         out = self._outer_proj(out)
         return out
 
-    def get_tunable_kernel_params(self) -> list[TunableParam]:
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return []
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
         return [
-            TunableParam("grad_A_reduce_row_chunk_size", [16, 32, 64, 128, 256, 512, 1024, 2048], default=512),
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
         ]
 
-    def get_tunable_graph_params(self) -> list[TunableParam]:
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+            TunableParam("backward_grad_A_reduce_row_chunk_size", [16, 32, 64, 128, 256, 512, 1024, 2048], default=512),
+        ]
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("backward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
         ]
 
 
@@ -254,9 +257,14 @@ class _CudaGraphTransformerConv(BaseConvolution):
         ).view(-1, self.feature_dim)
         return out
 
-    def get_tunable_graph_params(self) -> list[TunableParam]:
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
         return [
-            TunableParam("huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("backward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
         ]
 
 

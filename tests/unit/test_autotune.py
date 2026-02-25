@@ -46,8 +46,8 @@ class DummyConv(BaseConvolution):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.warps_per_block = 8
-        self.tile_size = 32
+        self.forward_warps_per_block = 8
+        self.forward_tile_size = 32
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         return x
@@ -58,26 +58,22 @@ class TunableDummyConv(BaseConvolution):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.warps_per_block = 8
-        self.tile_size = 32
+        self.forward_warps_per_block = 8
+        self.forward_tile_size = 32
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         return x
 
-    def get_tunable_kernel_params(self) -> list[TunableParam]:
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("warps_per_block", [4, 8, 16], default=8),
-            TunableParam("tile_size", [16, 32], default=32),
+            TunableParam("forward_warps_per_block", [4, 8, 16], default=8),
+            TunableParam("forward_tile_size", [16, 32], default=32),
         ]
 
-    def get_tunable_graph_params(self) -> list[TunableParam]:
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
         return [
-            TunableParam("huge_degree_threshold_quantile", [-1, 0.99], default=-1),
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.99], default=-1),
         ]
-
-    def configure(self, **kwargs: Any) -> None:
-        for k, v in kwargs.items():
-            setattr(self, k, v)
 
 
 class KernelOnlyConv(BaseConvolution):
@@ -85,13 +81,13 @@ class KernelOnlyConv(BaseConvolution):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.block_size = 128
+        self.forward_block_size = 128
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         return x
 
-    def get_tunable_kernel_params(self) -> list[TunableParam]:
-        return [TunableParam("block_size", [64, 128, 256], default=128)]
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam("forward_block_size", [64, 128, 256], default=128)]
 
 
 class GraphOnlyConv(BaseConvolution):
@@ -103,8 +99,46 @@ class GraphOnlyConv(BaseConvolution):
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         return x
 
-    def get_tunable_graph_params(self) -> list[TunableParam]:
-        return [TunableParam("huge_degree_threshold_quantile", [-1, 0.9], default=-1)]
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9], default=-1)]
+
+
+class BackwardOnlyConv(BaseConvolution):
+    """Convolution with only backward kernel tunable params."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.backward_grad_chunk = 512
+
+    def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        return x
+
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam("backward_grad_chunk", [128, 256, 512], default=512)]
+
+
+class MixedFwdBwdConv(BaseConvolution):
+    """Convolution with both forward and backward kernel + graph params."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.forward_warps_per_block = 8
+        self.backward_grad_chunk = 512
+
+    def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        return x
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam("forward_warps_per_block", [4, 8], default=8)]
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.99], default=-1)]
+
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam("backward_grad_chunk", [128, 256, 512], default=512)]
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        return [TunableParam("backward_huge_degree_threshold_quantile", [-1, 0.9], default=-1)]
 
 
 # ---------------------------------------------------------------------------
@@ -364,41 +398,41 @@ class TestBuildCombinations:
 class TestApplyBestConfig:
     def test_kernel_only(self, graph_sample):
         conv = TunableDummyConv()
-        _apply_best_config(conv, graph_sample, {"warps_per_block": 16, "tile_size": 64}, [])
-        assert conv.warps_per_block == 16
-        assert conv.tile_size == 64
+        _apply_best_config(conv, graph_sample, {"forward_warps_per_block": 16, "forward_tile_size": 64}, [])
+        assert conv.forward_warps_per_block == 16
+        assert conv.forward_tile_size == 64
         graph_sample.update_graph_repr_with_new_hyperparameters.assert_not_called()
 
     def test_graph_only(self, graph_sample):
         conv = TunableDummyConv()
-        gp = [TunableParam("huge_degree_threshold_quantile", [-1, 0.99], default=-1)]
+        gp = [TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.99], default=-1)]
         graph_sample.kernel_related_kwargs = {"existing": 42}
 
-        _apply_best_config(conv, graph_sample, {"huge_degree_threshold_quantile": 0.99}, gp)
+        _apply_best_config(conv, graph_sample, {"forward_huge_degree_threshold_quantile": 0.99}, gp)
 
         graph_sample.update_graph_repr_with_new_hyperparameters.assert_called_once_with(
-            {"existing": 42, "huge_degree_threshold_quantile": 0.99},
+            {"existing": 42, "forward_huge_degree_threshold_quantile": 0.99},
         )
 
     def test_mixed(self, graph_sample):
         conv = TunableDummyConv()
-        gp = [TunableParam("huge_degree_threshold_quantile", [-1, 0.99], default=-1)]
+        gp = [TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.99], default=-1)]
         graph_sample.kernel_related_kwargs = {}
 
         _apply_best_config(
             conv,
             graph_sample,
-            {"warps_per_block": 4, "huge_degree_threshold_quantile": 0.99},
+            {"forward_warps_per_block": 4, "forward_huge_degree_threshold_quantile": 0.99},
             gp,
         )
-        assert conv.warps_per_block == 4
+        assert conv.forward_warps_per_block == 4
         graph_sample.update_graph_repr_with_new_hyperparameters.assert_called_once()
 
     def test_empty_config_is_noop(self, graph_sample):
         conv = TunableDummyConv()
-        orig = conv.warps_per_block
+        orig = conv.forward_warps_per_block
         _apply_best_config(conv, graph_sample, {}, [])
-        assert conv.warps_per_block == orig
+        assert conv.forward_warps_per_block == orig
         graph_sample.update_graph_repr_with_new_hyperparameters.assert_not_called()
 
 
@@ -410,14 +444,16 @@ class TestApplyBestConfig:
 class TestBaseConvolutionAutotune:
     def test_default_tunable_params_empty(self):
         conv = DummyConv()
-        assert conv.get_tunable_kernel_params() == []
-        assert conv.get_tunable_graph_params() == []
+        assert conv.get_tunable_forward_kernel_params() == []
+        assert conv.get_tunable_forward_graph_params() == []
+        assert conv.get_tunable_backward_kernel_params() == []
+        assert conv.get_tunable_backward_graph_params() == []
 
     def test_configure_sets_attrs(self):
         conv = DummyConv()
-        conv.configure(warps_per_block=16, tile_size=64)
-        assert conv.warps_per_block == 16
-        assert conv.tile_size == 64
+        conv.configure(forward_warps_per_block=16, forward_tile_size=64)
+        assert conv.forward_warps_per_block == 16
+        assert conv.forward_tile_size == 64
 
     def test_configure_creates_new_attrs(self):
         conv = DummyConv()
@@ -586,8 +622,8 @@ class TestRunAutotune:
         result = run_autotune(conv, x_tensor, graph_sample, AutotuneConfig())
 
         assert ctr["n"] == 3
-        assert result == {"block_size": 128}  # 2.0 ms is min
-        assert conv.block_size == 128
+        assert result == {"forward_block_size": 128}  # 2.0 ms is min
+        assert conv.forward_block_size == 128
 
     @patch("src.backends.autotune._microbench")
     def test_graph_only_grid_search(self, mock_mb, graph_sample, x_tensor):
@@ -597,7 +633,7 @@ class TestRunAutotune:
         result = run_autotune(conv, x_tensor, graph_sample, AutotuneConfig())
 
         assert ctr["n"] == 2
-        assert result == {"huge_degree_threshold_quantile": -1}
+        assert result == {"forward_huge_degree_threshold_quantile": -1}
 
     @patch("src.backends.autotune._microbench")
     def test_mixed_grid_search(self, mock_mb, graph_sample, x_tensor):
@@ -612,9 +648,9 @@ class TestRunAutotune:
         assert ctr["n"] == 12
         # Trial 4: graph={hdtq:-1}, kernel={wpb:16, ts:16}
         assert result == {
-            "huge_degree_threshold_quantile": -1,
-            "warps_per_block": 16,
-            "tile_size": 16,
+            "forward_huge_degree_threshold_quantile": -1,
+            "forward_warps_per_block": 16,
+            "forward_tile_size": 16,
         }
 
     @patch("src.backends.autotune._microbench")
@@ -623,7 +659,7 @@ class TestRunAutotune:
 
         conv = KernelOnlyConv()
         run_autotune(conv, x_tensor, graph_sample, AutotuneConfig())
-        assert conv.block_size == 128
+        assert conv.forward_block_size == 128
 
     @patch("src.backends.autotune._microbench")
     def test_graph_param_triggers_rebuild(self, mock_mb, graph_sample, x_tensor):
@@ -657,14 +693,14 @@ class TestRunAutotune:
             graph_sample,
             AutotuneConfig(),
         )
-        assert result == {"block_size": 64}  # first is fastest
+        assert result == {"forward_block_size": 64}  # first is fastest
 
     @patch("src.backends.autotune._microbench")
     def test_equal_times_picks_first(self, mock_mb, graph_sample, x_tensor):
         mock_mb.time_callable, _ = _make_time_callable_mock([5.0])
 
         result = run_autotune(KernelOnlyConv(), x_tensor, graph_sample, AutotuneConfig())
-        assert result == {"block_size": 64}
+        assert result == {"forward_block_size": 64}
 
     @patch("src.backends.autotune._microbench")
     def test_backward_tuning_creates_callables(self, mock_mb, graph_sample, x_tensor):
@@ -727,6 +763,75 @@ class TestRunAutotune:
         run_autotune(KernelOnlyConv(), x_tensor, graph_sample, cfg)
         assert ctr["n"] == n1 * 2
 
+    # --- backward-specific tests ---
+
+    @patch("src.backends.autotune._microbench")
+    def test_backward_separate_grid_search(self, mock_mb, graph_sample, x_tensor):
+        """Forward and backward run independent grid searches."""
+        fns = []
+
+        def fake(fn, **kw):
+            fns.append(fn)
+            return FakeMicrobenchResult(iters=50, ms_per_iter=5.0)
+
+        mock_mb.time_callable = fake
+
+        # MixedFwdBwdConv:
+        #   fwd: 2 kernel (warps_per_block) x 2 graph (hdtq) = 4 trials
+        #   bwd: 3 kernel (grad_chunk) x 2 graph (bwd_hdtq) = 6 trials
+        conv = MixedFwdBwdConv()
+        run_autotune(conv, x_tensor, graph_sample, AutotuneConfig(tune_backward=True))
+
+        assert len(fns) == 4 + 6  # 4 forward + 6 backward
+
+    @patch("src.backends.autotune._microbench")
+    def test_backward_params_merged_with_forward(self, mock_mb, graph_sample, x_tensor):
+        """Combined result dict has both forward and backward params."""
+        # fwd trials: 2 kernel x 2 graph = 4, bwd trials: 3 kernel x 2 graph = 6
+        fwd_ms = [10.0, 10.0, 1.0, 10.0]  # best at trial 2 (wpb=8, hdtq=-1 -> wait, let me think)
+        bwd_ms = [10.0, 10.0, 10.0, 2.0, 10.0, 10.0]  # best at trial 3
+        mock_mb.time_callable, ctr = _make_time_callable_mock(fwd_ms + bwd_ms)
+
+        conv = MixedFwdBwdConv()
+        result = run_autotune(conv, x_tensor, graph_sample, AutotuneConfig(tune_backward=True))
+
+        # result must contain keys from both fwd and bwd
+        assert "forward_warps_per_block" in result
+        assert "forward_huge_degree_threshold_quantile" in result
+        assert "backward_grad_chunk" in result
+        assert "backward_huge_degree_threshold_quantile" in result
+        assert ctr["n"] == 10
+
+    @patch("src.backends.autotune._microbench")
+    def test_no_backward_params_skips_backward_search(self, mock_mb, graph_sample, x_tensor):
+        """tune_backward=True but no bwd params → only forward search runs."""
+        fns = []
+
+        def fake(fn, **kw):
+            fns.append(fn)
+            return FakeMicrobenchResult(iters=50, ms_per_iter=5.0)
+
+        mock_mb.time_callable = fake
+
+        # KernelOnlyConv has no backward params
+        conv = KernelOnlyConv()
+        run_autotune(conv, x_tensor, graph_sample, AutotuneConfig(tune_backward=True))
+
+        # Only forward search: 3 kernel combos
+        assert len(fns) == 3
+
+    @patch("src.backends.autotune._microbench")
+    def test_backward_only_conv(self, mock_mb, graph_sample, x_tensor):
+        """Conv with only backward params, tune_backward=True."""
+        mock_mb.time_callable, ctr = _make_time_callable_mock([10.0, 2.0, 8.0])
+
+        conv = BackwardOnlyConv()
+        result = run_autotune(conv, x_tensor, graph_sample, AutotuneConfig(tune_backward=True))
+
+        assert ctr["n"] == 3  # 3 backward kernel combos
+        assert result == {"backward_grad_chunk": 256}  # 2.0 ms is min (index 1 → value 256)
+        assert conv.backward_grad_chunk == 256
+
 
 # ===================================================================
 # Tests — end-to-end flows
@@ -745,7 +850,7 @@ class TestEndToEnd:
         conv(x_tensor, graph_sample.graph_repr)
         assert conv._is_tuned
         assert ctr["n"] == 3
-        assert conv.block_size == 128
+        assert conv.forward_block_size == 128
 
     @patch("src.backends.autotune._microbench")
     def test_explicit_autotune_prevents_hook_retrigger(self, mock_mb, graph_sample, x_tensor):
@@ -773,4 +878,4 @@ class TestEndToEnd:
 
         assert ctr["n"] == 0
         assert r1 == r2
-        assert conv2.block_size == conv1.block_size
+        assert conv2.forward_block_size == conv1.forward_block_size

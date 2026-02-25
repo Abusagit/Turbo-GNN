@@ -118,61 +118,38 @@ def _apply_best_config(
         conv.configure(**kernel_cfg)
 
 
-def run_autotune(
+def _grid_search(
     conv: BaseConvolution,
     x: torch.Tensor,
     graph_sample: GraphSample,
     config: AutotuneConfig,
-) -> dict:
-    """Core autotuning search.
-
-    Grid search grouped by graph params (outer) then kernel params (inner)
-    to minimize expensive graph rebuilds.
+    kernel_params: list[TunableParam],
+    graph_params: list[TunableParam],
+    make_bench_fn,
+) -> tuple[dict[str, Any], float]:
+    """Run grid search: outer loop over graph combos, inner over kernel combos.
 
     Args:
         conv: The convolution module to tune.
         x: Input features for benchmarking.
         graph_sample: GraphSample instance for graph param tuning.
         config: Autotuning configuration.
+        kernel_params: Kernel parameters to search over.
+        graph_params: Graph parameters to search over.
+        make_bench_fn: Callable(conv, x, graph_repr) -> zero-arg callable for timing.
 
     Returns:
-        Dict of best parameter name -> value mappings.
+        (best_config_dict, best_ms)
     """
     time_callable = _microbench.time_callable
-
-    kernel_params = conv.get_tunable_kernel_params()
-    graph_params = conv.get_tunable_graph_params()
-    all_params = kernel_params + graph_params
-
-    if not all_params:
-        logger.info("No tunable parameters declared. Skipping autotuning.")
-        return {}
-
-    conv_class_name = type(conv).__name__
-    feature_dim = x.shape[1] if x.ndim > 1 else 1
-
-    # check cache
-    if config.cache_dir is not None and config.use_cache:
-        cache_key = AutotuneCache.compute_cache_key(
-            conv_class=conv_class_name,
-            feature_dim=feature_dim,
-            num_nodes=graph_sample.num_nodes,
-            num_edges=graph_sample.num_edges,
-            device=str(x.device),
-            param_space=all_params,
-        )
-        cached = AutotuneCache.load(config.cache_dir, conv_class_name, cache_key)
-        if cached is not None:
-            logger.info("Autotuning cache hit for %s. Applying cached config: %s", conv_class_name, cached)
-            _apply_best_config(conv, graph_sample, cached, graph_params)
-            return cached
 
     graph_combos = _build_combinations(graph_params)
     kernel_combos = _build_combinations(kernel_params)
 
     total_trials = len(graph_combos) * len(kernel_combos)
+    conv_class_name = type(conv).__name__
     logger.info(
-        "Autotuning %s: %d graph combos x %d kernel combos = %d total trials",
+        "Grid search %s: %d graph combos x %d kernel combos = %d total trials",
         conv_class_name,
         len(graph_combos),
         len(kernel_combos),
@@ -198,19 +175,9 @@ def run_autotune(
             if kernel_cfg:
                 conv.configure(**kernel_cfg)
 
-            # build benchmark callable that calls forward directly (bypasses hooks)
-            if config.tune_backward:
+            bench_fn = make_bench_fn(conv, x, graph_repr)
 
-                def _bench_fn(c=conv, xi=x, g=graph_repr):
-                    grad_output = torch.randn_like(x)
-                    out = c.forward(xi, g)
-                    out.backward(grad_output, retain_graph=True)
-            else:
-
-                def _bench_fn(c=conv, xi=x, g=graph_repr):
-                    c.forward(xi, g)
-
-            result = time_callable(_bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
+            result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
             ms = result.ms_per_iter
 
             combined_cfg = {**graph_cfg, **kernel_cfg}
@@ -220,10 +187,120 @@ def run_autotune(
                 best_ms = ms
                 best_config = combined_cfg
 
-    logger.info("Autotuning %s complete. Best config: %s (%.3f ms)", conv_class_name, best_config, best_ms)
+    return best_config, best_ms
+
+
+def run_autotune(
+    conv: BaseConvolution,
+    x: torch.Tensor,
+    graph_sample: GraphSample,
+    config: AutotuneConfig,
+) -> dict:
+    """Core autotuning search with separate forward/backward parameter spaces.
+
+    Runs independent grid searches for forward and backward passes, then
+    merges results. Forward uses get_tunable_forward_kernel_params() and
+    get_tunable_forward_graph_params(); backward uses get_tunable_backward_kernel_params()
+    and get_tunable_backward_graph_params().
+
+    Args:
+        conv: The convolution module to tune.
+        x: Input features for benchmarking.
+        graph_sample: GraphSample instance for graph param tuning.
+        config: Autotuning configuration.
+
+    Returns:
+        Dict of best parameter name -> value mappings.
+    """
+    fwd_kernel_params = conv.get_tunable_forward_kernel_params()
+    fwd_graph_params = conv.get_tunable_forward_graph_params()
+    bwd_kernel_params = conv.get_tunable_backward_kernel_params() if config.tune_backward else []
+    bwd_graph_params = conv.get_tunable_backward_graph_params() if config.tune_backward else []
+
+    all_params = fwd_kernel_params + fwd_graph_params + bwd_kernel_params + bwd_graph_params
+
+    if not all_params:
+        logger.info("No tunable parameters declared. Skipping autotuning.")
+        return {}
+
+    conv_class_name = type(conv).__name__
+    feature_dim = x.shape[1] if x.ndim > 1 else 1
+
+    # check cache (key includes all four param lists)
+    if config.cache_dir is not None and config.use_cache:
+        cache_key = AutotuneCache.compute_cache_key(
+            conv_class=conv_class_name,
+            feature_dim=feature_dim,
+            num_nodes=graph_sample.num_nodes,
+            num_edges=graph_sample.num_edges,
+            device=str(x.device),
+            param_space=all_params,
+        )
+        cached = AutotuneCache.load(config.cache_dir, conv_class_name, cache_key)
+        if cached is not None:
+            all_graph_params = fwd_graph_params + bwd_graph_params
+            logger.info("Autotuning cache hit for %s. Applying cached config: %s", conv_class_name, cached)
+            _apply_best_config(conv, graph_sample, cached, all_graph_params)
+            return cached
+
+    best_fwd: dict[str, Any] = {}
+    best_bwd: dict[str, Any] = {}
+
+    # --- fwd grid search ---
+    fwd_params = fwd_kernel_params + fwd_graph_params
+    if fwd_params:
+
+        def _make_fwd_bench(c, xi, g):
+            def _bench():
+                c.forward(xi, g)
+
+            return _bench
+
+        logger.info("Autotuning %s forward pass:", conv_class_name)
+        best_fwd, fwd_ms = _grid_search(
+            conv,
+            x,
+            graph_sample,
+            config,
+            fwd_kernel_params,
+            fwd_graph_params,
+            _make_fwd_bench,
+        )
+        logger.info("Forward best: %s (%.3f ms)", best_fwd, fwd_ms)
+
+    # --- bwd grid search ---
+    bwd_params = bwd_kernel_params + bwd_graph_params
+    if config.tune_backward and bwd_params:
+
+        def _make_bwd_bench(c, xi, g):
+            grad_output = torch.randn_like(xi)
+            out = c.forward(xi, g)
+
+            def _bench():
+                out.backward(grad_output, retain_graph=True)
+
+            return _bench
+
+        logger.info("Autotuning %s backward pass:", conv_class_name)
+        best_bwd, bwd_ms = _grid_search(
+            conv,
+            x,
+            graph_sample,
+            config,
+            bwd_kernel_params,
+            bwd_graph_params,
+            _make_bwd_bench,
+        )
+        logger.info("Backward best: %s (%.3f ms)", best_bwd, bwd_ms)
+
+    # merge (no overlap by design)
+    best_config = {**best_fwd, **best_bwd}
+    all_graph_params = fwd_graph_params + bwd_graph_params
+
+    logger.info("Autotuning %s complete. Best config: %s", conv_class_name, best_config)
 
     # apply best config
-    _apply_best_config(conv, graph_sample, best_config, graph_params)
+    _apply_best_config(conv, graph_sample, best_config, all_graph_params)
 
     # save to cache
     if config.cache_dir is not None:
