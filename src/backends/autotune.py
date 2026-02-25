@@ -11,6 +11,7 @@ import hashlib
 import itertools
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -23,68 +24,84 @@ from src.data.datasets import GraphSample
 logger = logging.getLogger(__name__)
 
 
+def _get_gpu_name(device) -> str:
+    """Return the GPU device name, or ``"cpu"`` when CUDA is unavailable."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(device).name  # type: ignore
+    return "cpu"
+
+
 class AutotuneCache:
-    """JSON-backed cache for autotuning results."""
+    """Per-trial JSON cache for individual autotuning timing results.
+
+    Each trial (a single parameter configuration) is stored as its own
+    JSON file under ``{cache_dir}/{ConvClassName}/{trial_key}.json``.
+    """
 
     @staticmethod
-    def compute_cache_key(
+    def compute_trial_key(
         conv_class: str,
         feature_dim: int,
         num_nodes: int,
         num_edges: int,
-        device: str,
-        param_space: list[TunableParam],
+        gpu_name: str,
+        trial_config: dict[str, Any],
     ) -> str:
-        """Compute a SHA256-based cache key from the tuning context."""
+        """Compute a SHA256 cache key for a single trial configuration."""
         key_data = {
             "conv_class": conv_class,
             "feature_dim": feature_dim,
             "num_nodes": num_nodes,
             "num_edges": num_edges,
-            "device": device,
-            "param_space": [{"name": p.name, "values": p.values} for p in param_space],
+            "gpu_name": gpu_name,
+            "config": trial_config,
         }
         raw = json.dumps(key_data, sort_keys=True)
         return hashlib.sha256(raw.encode()).hexdigest()
 
     @staticmethod
-    def _cache_path(cache_dir: str, conv_class_name: str, key: str) -> Path:
-        return Path(cache_dir) / f"{conv_class_name}_{key}_autotune_cache.json"
+    def _trial_path(cache_dir: str, conv_class_name: str, trial_key: str) -> Path:
+        return Path(cache_dir) / conv_class_name / f"{trial_key}.json"
 
     @staticmethod
-    def load(cache_dir: str, conv_class_name: str, key: str) -> dict | None:
-        """Load cached result for the given key, or None if not found."""
-        path = AutotuneCache._cache_path(cache_dir, conv_class_name, key)
+    def load_trial(cache_dir: str, conv_class_name: str, trial_key: str) -> float | None:
+        """Load a cached trial's ``ms_per_iter``, or ``None`` if not found."""
+        path = AutotuneCache._trial_path(cache_dir, conv_class_name, trial_key)
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text())  # type: ignore
-        except (json.JSONDecodeError, OSError):
+            data = json.loads(path.read_text())
+            return float(data["ms_per_iter"])
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
             return None
 
     @staticmethod
-    def save(cache_dir: str, conv_class_name: str, key: str, result: dict) -> None:
-        """Save a result to the cache file."""
-        path = AutotuneCache._cache_path(cache_dir, conv_class_name, key)
+    def save_trial(cache_dir: str, conv_class_name: str, trial_key: str, ms_per_iter: float) -> None:
+        """Persist a single trial timing result."""
+        path = AutotuneCache._trial_path(cache_dir, conv_class_name, trial_key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(result, indent=2))
+        path.write_text(json.dumps({"ms_per_iter": ms_per_iter}))
 
     @staticmethod
     def clear_cache(cache_dir: str, conv_class_name: str | None = None) -> int:
-        """Delete cache files. Returns count of files deleted."""
+        """Delete cached trial files. Returns count of files deleted."""
         cache_path = Path(cache_dir)
         if not cache_path.exists():
             return 0
 
         if conv_class_name is not None:
-            pattern = f"{conv_class_name}_*_autotune_cache.json"
-        else:
-            pattern = "*_autotune_cache.json"
+            subdir = cache_path / conv_class_name
+            if not subdir.is_dir():
+                return 0
+            count = sum(1 for _ in subdir.glob("*.json"))
+            shutil.rmtree(subdir)
+            return count
 
         count = 0
-        for path in cache_path.glob(pattern):
-            path.unlink()
-            count += 1
+        for subdir in cache_path.iterdir():
+            if subdir.is_dir():
+                count += sum(1 for _ in subdir.glob("*.json"))
+                shutil.rmtree(subdir)
         return count
 
 
@@ -126,8 +143,16 @@ def _grid_search(
     kernel_params: list[TunableParam],
     graph_params: list[TunableParam],
     make_bench_fn,
+    *,
+    conv_class_name: str,
+    feature_dim: int,
+    gpu_name: str,
 ) -> tuple[dict[str, Any], float]:
     """Run grid search: outer loop over graph combos, inner over kernel combos.
+
+    Individual trial results are cached per-trial when ``config.cache_dir``
+    is set, so previously-timed configurations are reused even if the
+    parameter space changes.
 
     Args:
         conv: The convolution module to tune.
@@ -137,6 +162,9 @@ def _grid_search(
         kernel_params: Kernel parameters to search over.
         graph_params: Graph parameters to search over.
         make_bench_fn: Callable(conv, x, graph_repr) -> zero-arg callable for timing.
+        conv_class_name: Class name of *conv* (for cache keys).
+        feature_dim: Input feature dimensionality (for cache keys).
+        gpu_name: GPU device name string (for cache keys).
 
     Returns:
         (best_config_dict, best_ms)
@@ -147,7 +175,6 @@ def _grid_search(
     kernel_combos = _build_combinations(kernel_params)
 
     total_trials = len(graph_combos) * len(kernel_combos)
-    conv_class_name = type(conv).__name__
     logger.info(
         "Grid search %s: %d graph combos x %d kernel combos = %d total trials",
         conv_class_name,
@@ -155,6 +182,9 @@ def _grid_search(
         len(kernel_combos),
         total_trials,
     )
+
+    use_cache = config.cache_dir is not None and config.use_cache
+    save_cache = config.cache_dir is not None
 
     best_ms = float("inf")
     best_config: dict[str, Any] = {}
@@ -171,17 +201,46 @@ def _grid_search(
 
         for kernel_cfg in kernel_combos:
             trial += 1
+            combined_cfg = {**graph_cfg, **kernel_cfg}
+
             # apply kernel params
             if kernel_cfg:
                 conv.configure(**kernel_cfg)
 
-            bench_fn = make_bench_fn(conv, x, graph_repr)
+            # per-trial cache lookup
+            trial_key = None
+            ms = None
+            if use_cache:
+                trial_key = AutotuneCache.compute_trial_key(
+                    conv_class_name,
+                    feature_dim,
+                    graph_sample.num_nodes,
+                    graph_sample.num_edges,
+                    gpu_name,
+                    combined_cfg,
+                )
+                ms = AutotuneCache.load_trial(config.cache_dir, conv_class_name, trial_key)  # type: ignore
+                if ms is not None:
+                    logger.debug("Trial %d/%d: %s -> %.3f ms (cached)", trial, total_trials, combined_cfg, ms)
 
-            result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
-            ms = result.ms_per_iter
+            if ms is None:
+                bench_fn = make_bench_fn(conv, x, graph_repr)
+                result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
+                ms = result.ms_per_iter
+                logger.debug("Trial %d/%d: %s -> %.3f ms", trial, total_trials, combined_cfg, ms)
 
-            combined_cfg = {**graph_cfg, **kernel_cfg}
-            logger.debug("Trial %d/%d: %s -> %.3f ms", trial, total_trials, combined_cfg, ms)
+                # save this trial
+                if save_cache:
+                    if trial_key is None:
+                        trial_key = AutotuneCache.compute_trial_key(
+                            conv_class_name,
+                            feature_dim,
+                            graph_sample.num_nodes,
+                            graph_sample.num_edges,
+                            gpu_name,
+                            combined_cfg,
+                        )
+                    AutotuneCache.save_trial(config.cache_dir, conv_class_name, trial_key, ms)  # type: ignore
 
             if ms < best_ms:
                 best_ms = ms
@@ -225,23 +284,7 @@ def run_autotune(
 
     conv_class_name = type(conv).__name__
     feature_dim = x.shape[1] if x.ndim > 1 else 1
-
-    # check cache (key includes all four param lists)
-    if config.cache_dir is not None and config.use_cache:
-        cache_key = AutotuneCache.compute_cache_key(
-            conv_class=conv_class_name,
-            feature_dim=feature_dim,
-            num_nodes=graph_sample.num_nodes,
-            num_edges=graph_sample.num_edges,
-            device=str(x.device),
-            param_space=all_params,
-        )
-        cached = AutotuneCache.load(config.cache_dir, conv_class_name, cache_key)
-        if cached is not None:
-            all_graph_params = fwd_graph_params + bwd_graph_params
-            logger.info("Autotuning cache hit for %s. Applying cached config: %s", conv_class_name, cached)
-            _apply_best_config(conv, graph_sample, cached, all_graph_params)
-            return cached
+    gpu_name = _get_gpu_name(x.device)
 
     best_fwd: dict[str, Any] = {}
     best_bwd: dict[str, Any] = {}
@@ -265,6 +308,9 @@ def run_autotune(
             fwd_kernel_params,
             fwd_graph_params,
             _make_fwd_bench,
+            conv_class_name=conv_class_name,
+            feature_dim=feature_dim,
+            gpu_name=gpu_name,
         )
         logger.info("Forward best: %s (%.3f ms)", best_fwd, fwd_ms)
 
@@ -290,6 +336,9 @@ def run_autotune(
             bwd_kernel_params,
             bwd_graph_params,
             _make_bwd_bench,
+            conv_class_name=conv_class_name,
+            feature_dim=feature_dim,
+            gpu_name=gpu_name,
         )
         logger.info("Backward best: %s (%.3f ms)", best_bwd, bwd_ms)
 
@@ -301,18 +350,5 @@ def run_autotune(
 
     # apply best config
     _apply_best_config(conv, graph_sample, best_config, all_graph_params)
-
-    # save to cache
-    if config.cache_dir is not None:
-        cache_key = AutotuneCache.compute_cache_key(
-            conv_class=conv_class_name,
-            feature_dim=feature_dim,
-            num_nodes=graph_sample.num_nodes,
-            num_edges=graph_sample.num_edges,
-            device=str(x.device),
-            param_space=all_params,
-        )
-        AutotuneCache.save(config.cache_dir, conv_class_name, cache_key, best_config)
-        logger.info("Saved autotuning result to cache at %s", config.cache_dir)
 
     return best_config

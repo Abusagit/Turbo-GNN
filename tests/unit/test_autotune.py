@@ -2,7 +2,7 @@
 
 Tests cover:
 - TunableParam / AutotuneConfig dataclasses
-- AutotuneCache (compute_cache_key, load, save, clear_cache)
+- AutotuneCache (compute_trial_key, load_trial, save_trial, clear_cache)
 - _build_combinations helper
 - _apply_best_config helper
 - run_autotune (grid search, cache hit/miss, backward tuning)
@@ -261,12 +261,12 @@ class TestAutotuneConfig:
 
 
 class TestAutotuneCache:
-    # --- compute_cache_key ---
+    # --- compute_trial_key ---
 
-    def test_cache_key_deterministic(self):
-        params = [TunableParam("a", [1, 2], default=1)]
-        k1 = AutotuneCache.compute_cache_key("MyConv", 16, 100, 500, "cpu", params)
-        k2 = AutotuneCache.compute_cache_key("MyConv", 16, 100, 500, "cpu", params)
+    def test_trial_key_deterministic(self):
+        cfg = {"forward_block_size": 128}
+        k1 = AutotuneCache.compute_trial_key("MyConv", 16, 100, 500, "cpu", cfg)
+        k2 = AutotuneCache.compute_trial_key("MyConv", 16, 100, 500, "cpu", cfg)
         assert k1 == k2
         assert len(k1) == 64  # SHA-256 hex digest
 
@@ -277,82 +277,89 @@ class TestAutotuneCache:
             ("feature_dim", ("C", 16, 100, 500, "cpu"), ("C", 32, 100, 500, "cpu")),
             ("num_nodes", ("C", 16, 100, 500, "cpu"), ("C", 16, 200, 500, "cpu")),
             ("num_edges", ("C", 16, 100, 500, "cpu"), ("C", 16, 100, 600, "cpu")),
-            ("device", ("C", 16, 100, 500, "cpu"), ("C", 16, 100, 500, "cuda:0")),
+            ("gpu_name", ("C", 16, 100, 500, "cpu"), ("C", 16, 100, 500, "NVIDIA H100")),
         ],
     )
-    def test_cache_key_differs_on_field(self, field, args_a, args_b):
-        p = [TunableParam("a", [1], default=1)]
-        assert AutotuneCache.compute_cache_key(*args_a, p) != AutotuneCache.compute_cache_key(*args_b, p)
+    def test_trial_key_differs_on_field(self, field, args_a, args_b):
+        cfg = {"a": 1}
+        assert AutotuneCache.compute_trial_key(*args_a, cfg) != AutotuneCache.compute_trial_key(*args_b, cfg)
 
-    def test_cache_key_differs_on_param_space(self):
-        p1 = [TunableParam("a", [1, 2], default=1)]
-        p2 = [TunableParam("a", [1, 2, 3], default=1)]
-        k1 = AutotuneCache.compute_cache_key("C", 16, 100, 500, "cpu", p1)
-        k2 = AutotuneCache.compute_cache_key("C", 16, 100, 500, "cpu", p2)
+    def test_trial_key_differs_on_config(self):
+        k1 = AutotuneCache.compute_trial_key("C", 16, 100, 500, "cpu", {"a": 1})
+        k2 = AutotuneCache.compute_trial_key("C", 16, 100, 500, "cpu", {"a": 2})
         assert k1 != k2
 
-    # --- load / save ---
+    def test_trial_key_sorted_keys_consistent(self):
+        """Key order in trial_config should not matter (json sort_keys=True)."""
+        k1 = AutotuneCache.compute_trial_key("C", 16, 100, 500, "cpu", {"b": 2, "a": 1})
+        k2 = AutotuneCache.compute_trial_key("C", 16, 100, 500, "cpu", {"a": 1, "b": 2})
+        assert k1 == k2
 
-    def test_load_nonexistent_returns_none(self, tmp_cache_dir):
-        assert AutotuneCache.load(tmp_cache_dir, "X", "missing") is None
+    # --- load_trial / save_trial ---
 
-    def test_save_and_load(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "MyConv", "k1", {"warps": 4})
-        assert AutotuneCache.load(tmp_cache_dir, "MyConv", "k1") == {"warps": 4}
+    def test_load_trial_nonexistent_returns_none(self, tmp_cache_dir):
+        assert AutotuneCache.load_trial(tmp_cache_dir, "X", "missing") is None
 
-    def test_save_multiple_keys(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "C", "k1", {"a": 1})
-        AutotuneCache.save(tmp_cache_dir, "C", "k2", {"b": 2})
-        assert AutotuneCache.load(tmp_cache_dir, "C", "k1") == {"a": 1}
-        assert AutotuneCache.load(tmp_cache_dir, "C", "k2") == {"b": 2}
+    def test_save_and_load_trial(self, tmp_cache_dir):
+        AutotuneCache.save_trial(tmp_cache_dir, "MyConv", "k1", 5.0)
+        assert AutotuneCache.load_trial(tmp_cache_dir, "MyConv", "k1") == 5.0
 
-    def test_save_overwrites_key(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "C", "k1", {"a": 1})
-        AutotuneCache.save(tmp_cache_dir, "C", "k1", {"a": 99})
-        assert AutotuneCache.load(tmp_cache_dir, "C", "k1") == {"a": 99}
+    def test_save_multiple_trials(self, tmp_cache_dir):
+        AutotuneCache.save_trial(tmp_cache_dir, "C", "k1", 3.0)
+        AutotuneCache.save_trial(tmp_cache_dir, "C", "k2", 7.0)
+        assert AutotuneCache.load_trial(tmp_cache_dir, "C", "k1") == 3.0
+        assert AutotuneCache.load_trial(tmp_cache_dir, "C", "k2") == 7.0
+
+    def test_save_trial_overwrites(self, tmp_cache_dir):
+        AutotuneCache.save_trial(tmp_cache_dir, "C", "k1", 3.0)
+        AutotuneCache.save_trial(tmp_cache_dir, "C", "k1", 99.0)
+        assert AutotuneCache.load_trial(tmp_cache_dir, "C", "k1") == 99.0
 
     def test_save_creates_nested_directory(self, tmp_path):
         deep = str(tmp_path / "a" / "b" / "c")
-        AutotuneCache.save(deep, "C", "k", {"x": 1})
-        assert AutotuneCache.load(deep, "C", "k") == {"x": 1}
+        AutotuneCache.save_trial(deep, "C", "k", 1.0)
+        assert AutotuneCache.load_trial(deep, "C", "k") == 1.0
 
-    def test_separate_files_per_conv_class(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "A", "k", {"a": 1})
-        AutotuneCache.save(tmp_cache_dir, "B", "k", {"b": 2})
-        assert AutotuneCache.load(tmp_cache_dir, "A", "k") == {"a": 1}
-        assert AutotuneCache.load(tmp_cache_dir, "B", "k") == {"b": 2}
+    def test_separate_subdirs_per_conv_class(self, tmp_cache_dir):
+        AutotuneCache.save_trial(tmp_cache_dir, "A", "k", 1.0)
+        AutotuneCache.save_trial(tmp_cache_dir, "B", "k", 2.0)
+        assert AutotuneCache.load_trial(tmp_cache_dir, "A", "k") == 1.0
+        assert AutotuneCache.load_trial(tmp_cache_dir, "B", "k") == 2.0
+        # Verify subdirectory structure
+        assert (Path(tmp_cache_dir) / "A" / "k.json").exists()
+        assert (Path(tmp_cache_dir) / "B" / "k.json").exists()
 
     def test_load_corrupted_json_returns_none(self, tmp_cache_dir):
-        p = Path(tmp_cache_dir)
+        p = Path(tmp_cache_dir) / "C"
         p.mkdir(parents=True, exist_ok=True)
-        (p / "C_k_autotune_cache.json").write_text("{bad json")
-        assert AutotuneCache.load(tmp_cache_dir, "C", "k") is None
+        (p / "k.json").write_text("{bad json")
+        assert AutotuneCache.load_trial(tmp_cache_dir, "C", "k") is None
 
     def test_saved_file_is_valid_json(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "C", "k1", {"a": 1})
-        path = Path(tmp_cache_dir) / "C_k1_autotune_cache.json"
+        AutotuneCache.save_trial(tmp_cache_dir, "C", "k1", 5.0)
+        path = Path(tmp_cache_dir) / "C" / "k1.json"
         data = json.loads(path.read_text())
-        assert data == {"a": 1}
+        assert data == {"ms_per_iter": 5.0}
 
     # --- clear_cache ---
 
     def test_clear_specific_class(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "A", "k", {"a": 1})
-        AutotuneCache.save(tmp_cache_dir, "B", "k", {"b": 2})
+        AutotuneCache.save_trial(tmp_cache_dir, "A", "k", 1.0)
+        AutotuneCache.save_trial(tmp_cache_dir, "B", "k", 2.0)
         assert AutotuneCache.clear_cache(tmp_cache_dir, "A") == 1
-        assert AutotuneCache.load(tmp_cache_dir, "A", "k") is None
-        assert AutotuneCache.load(tmp_cache_dir, "B", "k") == {"b": 2}
+        assert AutotuneCache.load_trial(tmp_cache_dir, "A", "k") is None
+        assert AutotuneCache.load_trial(tmp_cache_dir, "B", "k") == 2.0
 
     def test_clear_all(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "A", "k", {"a": 1})
-        AutotuneCache.save(tmp_cache_dir, "B", "k", {"b": 2})
+        AutotuneCache.save_trial(tmp_cache_dir, "A", "k", 1.0)
+        AutotuneCache.save_trial(tmp_cache_dir, "B", "k", 2.0)
         assert AutotuneCache.clear_cache(tmp_cache_dir) == 2
 
     def test_clear_nonexistent_dir(self):
         assert AutotuneCache.clear_cache("/nonexistent/path") == 0
 
     def test_clear_nonexistent_class(self, tmp_cache_dir):
-        AutotuneCache.save(tmp_cache_dir, "A", "k", {"a": 1})
+        AutotuneCache.save_trial(tmp_cache_dir, "A", "k", 1.0)
         assert AutotuneCache.clear_cache(tmp_cache_dir, "X") == 0
 
 
@@ -724,9 +731,10 @@ class TestRunAutotune:
 
         run_autotune(KernelOnlyConv(), x_tensor, graph_sample, AutotuneConfig(cache_dir=tmp_cache_dir))
 
-        files = list(Path(tmp_cache_dir).glob("*_autotune_cache.json"))
-        assert len(files) == 1
-        assert "KernelOnlyConv" in files[0].name
+        trial_dir = Path(tmp_cache_dir) / "KernelOnlyConv"
+        assert trial_dir.is_dir()
+        files = list(trial_dir.glob("*.json"))
+        assert len(files) == 3  # one per trial
 
     @patch("src.backends.autotune._microbench")
     def test_cache_hit_skips_search(self, mock_mb, graph_sample, x_tensor, tmp_cache_dir):
