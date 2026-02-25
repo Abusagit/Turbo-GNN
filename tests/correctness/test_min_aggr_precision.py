@@ -31,14 +31,28 @@ def partition_nodes(indptr: torch.Tensor, threshold=100):
     return light, heavy
 
 
-def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128):
-    out, argmin = min_aggr_forward_partitioned(indptr, indices, x, light, heavy, warps, epb)
+def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False, fpb=32, tiles=8):
+    out, argmin = min_aggr_forward_partitioned(
+        indptr, indices, x, light, heavy, warps, epb, use_2d_kernel=use_2d, features_per_block=fpb, tiles_y=tiles
+    )
     out = zero_inf(out)
     return out, argmin
 
 
-def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128):
-    out = min_aggr(indptr, indices, x, light, heavy, 131070, warps, epb)
+def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False, fpb=32, tiles=8):
+    out = min_aggr(
+        indptr,
+        indices,
+        x,
+        light,
+        heavy,
+        131070,
+        warps,
+        epb,
+        use_2d_kernel=use_2d,
+        features_per_block=fpb,
+        tiles_y=tiles,
+    )
     out = zero_inf(out)
 
     grad_out = torch.ones_like(out)
@@ -48,9 +62,13 @@ def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64])
 @pytest.mark.parametrize("num_features", [16, 64, 128])
-def test_forward_matches_fp32_reference(dtype, num_features):
+@pytest.mark.parametrize("use_2d_kernel", [False, True])
+def test_forward_matches_fp32_reference(dtype, num_features, use_2d_kernel):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+
+    if use_2d_kernel and dtype == torch.float64:
+        pytest.skip("2D kernel does not support float64")
 
     device = torch.device("cuda")
     torch.manual_seed(42)
@@ -63,8 +81,8 @@ def test_forward_matches_fp32_reference(dtype, num_features):
     x = torch.randn(N, num_features, device=device, dtype=dtype)
     x_ref = x.float()
 
-    out, _ = run_forward(indptr, indices, x, light, heavy)
-    out_ref, _ = run_forward(indptr, indices, x_ref, light, heavy)
+    out, _ = run_forward(indptr, indices, x, light, heavy, use_2d=use_2d_kernel)
+    out_ref, _ = run_forward(indptr, indices, x_ref, light, heavy, use_2d=use_2d_kernel)
 
     a = out.float()
     b = out_ref.float()
@@ -76,12 +94,16 @@ def test_forward_matches_fp32_reference(dtype, num_features):
     else:
         atol, rtol = 1e-2, 1e-2
 
-    torch.testing.assert_close(a, b, atol=atol, rtol=rtol, msg=f"Forward mismatch vs fp32 ref for dtype {dtype}")
+    kernel_type = "2D" if use_2d_kernel else "atomic"
+    torch.testing.assert_close(
+        a, b, atol=atol, rtol=rtol, msg=f"Forward mismatch vs fp32 ref for dtype {dtype}, kernel={kernel_type}"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_features", [16, 64, 128])
-def test_backward_matches_fp32_reference(dtype, num_features):
+@pytest.mark.parametrize("use_2d_kernel", [False, True])
+def test_backward_matches_fp32_reference(dtype, num_features, use_2d_kernel):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -96,8 +118,8 @@ def test_backward_matches_fp32_reference(dtype, num_features):
     x = torch.randn(N, num_features, device=device, dtype=dtype, requires_grad=True)
     x_ref = x.detach().float().requires_grad_(True)
 
-    grad_x = run_backward(indptr, indices, x, light, heavy)
-    grad_x_ref = run_backward(indptr, indices, x_ref, light, heavy)
+    grad_x = run_backward(indptr, indices, x, light, heavy, use_2d=use_2d_kernel)
+    grad_x_ref = run_backward(indptr, indices, x_ref, light, heavy, use_2d=use_2d_kernel)
 
     a = grad_x.float()
     b = grad_x_ref.float()
@@ -107,11 +129,15 @@ def test_backward_matches_fp32_reference(dtype, num_features):
     else:
         atol, rtol = 1e-2, 1e-2
 
-    torch.testing.assert_close(a, b, atol=atol, rtol=rtol, msg=f"Backward mismatch vs fp32 ref for dtype {dtype}")
+    kernel_type = "2D" if use_2d_kernel else "atomic"
+    torch.testing.assert_close(
+        a, b, atol=atol, rtol=rtol, msg=f"Backward mismatch vs fp32 ref for dtype {dtype}, kernel={kernel_type}"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_real_dataset_matches_fp32_reference(dtype):
+@pytest.mark.parametrize("use_2d_kernel", [False, True])
+def test_real_dataset_matches_fp32_reference(dtype, use_2d_kernel):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -132,8 +158,22 @@ def test_real_dataset_matches_fp32_reference(dtype):
     x = torch.randn(N, F, device=device, dtype=dtype, requires_grad=True)
     x_ref = x.detach().float().requires_grad_(True)
 
-    out = min_aggr(indptr, indices, x, light, heavy, 131070, 8, 128)
-    out_ref = min_aggr(indptr, indices, x_ref, light, heavy, 131070, 8, 128)
+    out = min_aggr(
+        indptr, indices, x, light, heavy, 131070, 8, 128, use_2d_kernel=use_2d_kernel, features_per_block=32, tiles_y=8
+    )
+    out_ref = min_aggr(
+        indptr,
+        indices,
+        x_ref,
+        light,
+        heavy,
+        131070,
+        8,
+        128,
+        use_2d_kernel=use_2d_kernel,
+        features_per_block=32,
+        tiles_y=8,
+    )
 
     out = zero_inf(out).float()
     out_ref = zero_inf(out_ref).float()
@@ -145,8 +185,13 @@ def test_real_dataset_matches_fp32_reference(dtype):
         atol_fwd, rtol_fwd = 1e-2, 1e-2
         atol_bwd, rtol_bwd = 5e-2, 5e-2
 
+    kernel_type = "2D" if use_2d_kernel else "atomic"
     torch.testing.assert_close(
-        out, out_ref, atol=atol_fwd, rtol=rtol_fwd, msg=f"Forward mismatch on Cora vs fp32 ref for {dtype}"
+        out,
+        out_ref,
+        atol=atol_fwd,
+        rtol=rtol_fwd,
+        msg=f"Forward mismatch on Cora vs fp32 ref for {dtype}, kernel={kernel_type}",
     )
 
     grad_out = torch.ones_like(out_ref, device=device, dtype=torch.float32)
@@ -157,13 +202,18 @@ def test_real_dataset_matches_fp32_reference(dtype):
     gx_ref = x_ref.grad.detach().float()
 
     torch.testing.assert_close(
-        gx, gx_ref, atol=atol_bwd, rtol=rtol_bwd, msg=f"Backward mismatch on Cora vs fp32 ref for {dtype}"
+        gx,
+        gx_ref,
+        atol=atol_bwd,
+        rtol=rtol_bwd,
+        msg=f"Backward mismatch on Cora vs fp32 ref for {dtype}, kernel={kernel_type}",
     )
 
 
 @pytest.mark.parametrize("warps", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_forward_block_sizes_vs_fp32_reference(warps, dtype):
+@pytest.mark.parametrize("use_2d_kernel", [False, True])
+def test_forward_block_sizes_vs_fp32_reference(warps, dtype, use_2d_kernel):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -180,8 +230,8 @@ def test_forward_block_sizes_vs_fp32_reference(warps, dtype):
     x = torch.randn(N, F, device=device, dtype=dtype)
     x_ref = x.float()
 
-    out, _ = run_forward(indptr, indices, x, light, heavy, warps=warps, epb=128)
-    out_ref, _ = run_forward(indptr, indices, x_ref, light, heavy, warps=warps, epb=128)
+    out, _ = run_forward(indptr, indices, x, light, heavy, warps=warps, epb=128, use_2d=use_2d_kernel)
+    out_ref, _ = run_forward(indptr, indices, x_ref, light, heavy, warps=warps, epb=128, use_2d=use_2d_kernel)
 
     a = out.float()
     b = out_ref.float()
@@ -189,12 +239,11 @@ def test_forward_block_sizes_vs_fp32_reference(warps, dtype):
     atol = 1e-5 if dtype == torch.float32 else 1e-2
     rtol = 1e-4 if dtype == torch.float32 else 1e-2
 
+    kernel_type = "2D" if use_2d_kernel else "atomic"
     torch.testing.assert_close(
-        a, b, atol=atol, rtol=rtol, msg=f"Forward mismatch vs fp32 ref for warps={warps}, dtype={dtype}"
+        a,
+        b,
+        atol=atol,
+        rtol=rtol,
+        msg=f"Forward mismatch vs fp32 ref for warps={warps}, dtype={dtype}, kernel={kernel_type}",
     )
-
-
-if __name__ == "__main__":
-    import pytest
-
-    pytest.main([__file__, "-v", "-s"])

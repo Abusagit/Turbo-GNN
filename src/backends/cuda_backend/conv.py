@@ -36,9 +36,17 @@ class _CudaMinAggrConv(nn.Module):
         super().__init__()
         warps_per_block = kwargs.get("warps_per_block", 8)
         edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
+        use_2d_kernel = kwargs.get("use_2d_kernel", False)
+        features_per_block = kwargs.get("features_per_block", 32)
+        tiles_y = kwargs.get("tiles_y", 8)
 
         self.forward_warps_per_block = warps_per_block
         self.forward_edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
+        self.warps_per_block = warps_per_block
+        self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
+        self.use_2d_kernel = use_2d_kernel
+        self.features_per_block = features_per_block
+        self.tiles_y = tiles_y
 
     def forward(
         self,
@@ -62,6 +70,11 @@ class _CudaMinAggrConv(nn.Module):
             graph.max_degree,
             self.forward_warps_per_block,
             self.forward_edges_per_block_heavy_nodes,
+            self.warps_per_block,
+            self.edges_per_block_heavy_nodes,
+            self.use_2d_kernel,
+            self.features_per_block,
+            self.tiles_y,
         )
 
 

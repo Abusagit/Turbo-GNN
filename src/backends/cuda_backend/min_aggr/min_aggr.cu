@@ -212,6 +212,84 @@ __global__ void unpack_results_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void min_aggr_forward_heavy_kernel_2d(
+    const int* __restrict__ nodes,
+    const int* __restrict__ edge_ptr,
+    const int* __restrict__ edge_idx,
+    const scalar_t* __restrict__ X,
+    scalar_t* __restrict__ out,
+    int* __restrict__ argmin,
+    int d
+) {
+    int i = blockIdx.x;
+    int v = nodes[i];
+
+    int row_start = edge_ptr[v];
+    int row_end   = edge_ptr[v + 1];
+    const int degree = row_end - row_start;
+
+    int fid = threadIdx.x; // feature dimension
+    int tid = threadIdx.y; // tile index
+
+    const int F_BLOCK = blockDim.x;
+    const int TILES_Y = blockDim.y;
+
+    extern __shared__ unsigned char shared_mem[];
+    float* shmem_val = reinterpret_cast<float*>(shared_mem);
+    int* shmem_idx = reinterpret_cast<int*>(shmem_val + (TILES_Y * F_BLOCK));
+
+    int num_tiles = blockDim.y;
+
+    int tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;;
+    int start = row_start + tid * tile_size_ceil;
+    int end = std::min(start + tile_size_ceil, row_end);
+
+    for (int f = fid; f < d; f += F_BLOCK) {
+        float local_min = INFINITY;
+        int local_arg = -1;
+
+        for (int eid = start; eid < end; ++eid) {
+            int src = edge_idx[eid];
+            float val = to_float(X[src * d + f]);
+            if (val < local_min || (val == local_min && src < local_arg)) {
+                local_min = val;
+                local_arg = src;
+            }
+        }
+
+        const int s = tid * F_BLOCK + fid;
+        shmem_val[s] = local_min;
+        shmem_idx[s] = local_arg;
+
+        __syncthreads();
+
+        for (int offset = num_tiles / 2; offset > 0; offset /= 2) {
+            if (tid < offset) {
+                const int a = tid * F_BLOCK + fid;
+                const int b = (tid + offset) * F_BLOCK + fid;
+
+                const float val_a = shmem_val[a];
+                const int idx_a = shmem_idx[a];
+                const float val_b = shmem_val[b];
+                const int idx_b = shmem_idx[b];
+
+                if (val_b < val_a || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
+                    shmem_val[a] = val_b;
+                    shmem_idx[a] = idx_b;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            out[v * d + f] = from_float<scalar_t>(shmem_val[0 * F_BLOCK + fid]);
+            argmin[v * d + f] = shmem_idx[0 * F_BLOCK + fid];
+        }
+
+        __syncthreads();
+    }
+}
 
 void min_aggr_forward_partitioned_cuda(
     const at::Tensor& edge_ptr,
@@ -223,7 +301,10 @@ void min_aggr_forward_partitioned_cuda(
     at::Tensor& out,
     at::Tensor& argmin,
     int warps_per_block = 8,
-    int edges_per_block_heavy_nodes = 128
+    int edges_per_block_heavy_nodes = 128,
+    bool use_2d_kernel = false,
+    int features_per_block = 32,
+    int tiles_y = 8
 ) {
     int THREADS_PER_BLOCK;
 
@@ -287,7 +368,6 @@ void min_aggr_forward_partitioned_cuda(
         // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
         constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
 
-        // TODO: think about what to do with the doubles
         if (X.scalar_type() == at::kDouble) {
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 at::ScalarType::Half,
@@ -297,6 +377,30 @@ void min_aggr_forward_partitioned_cuda(
                 ([&] {
                     min_aggr_forward_light_kernel_1d<scalar_t>
                         <<<num_heavy, THREADS_PER_BLOCK>>>(
+                            heavy_nodes.data_ptr<int>(),
+                            edge_ptr.data_ptr<int>(),
+                            edge_idx.data_ptr<int>(),
+                            X.data_ptr<scalar_t>(),
+                            out.data_ptr<scalar_t>(),
+                            argmin.data_ptr<int>(),
+                            d
+                        );
+                })
+            );
+        } else if (use_2d_kernel) {
+            dim3 grid(num_heavy);
+            dim3 block(features_per_block, tiles_y);
+
+            size_t shmem_size = (size_t)tiles_y * (size_t)features_per_block * (sizeof(float) + sizeof(int));
+
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                at::ScalarType::Half,
+                at::ScalarType::BFloat16,
+                X.scalar_type(),
+                "min_aggr_forward_heavy_2d",
+                ([&] {
+                    min_aggr_forward_heavy_kernel_2d<scalar_t>
+                        <<<grid, block, shmem_size>>>(
                             heavy_nodes.data_ptr<int>(),
                             edge_ptr.data_ptr<int>(),
                             edge_idx.data_ptr<int>(),
