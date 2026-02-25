@@ -112,6 +112,32 @@ def ensure_cpu_device(func):
     return wrapper
 
 
+# ----------------------------- Helper functions ----------------------------- #
+
+
+def _bucket_nodes_by_degree(
+    degree_counts: torch.Tensor,
+    quantile: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Partition nodes into light/heavy buckets based on degree quantile.
+
+    Args:
+        degree_counts: Per-node degree counts.
+        quantile: Quantile threshold (-1 disables, putting all nodes in light).
+
+    Returns:
+        (light_node_indices, heavy_node_indices)
+    """
+    if quantile != -1:
+        thresh = torch.quantile(degree_counts.float(), quantile).item()
+    else:
+        thresh = degree_counts.max().item() + 1
+
+    light = (degree_counts < thresh).nonzero(as_tuple=False).view(-1)
+    heavy = (degree_counts >= thresh).nonzero(as_tuple=False).view(-1)
+    return light, heavy
+
+
 # ------------------------- Canonical sample container ------------------------- #
 
 
@@ -281,22 +307,14 @@ class GraphSample:
                 do_transpose=True,
             )
 
-            deg = counts
             quantile = self.kernel_related_kwargs.get("huge_degree_threshold_quantile", -1)
-
-            if quantile != -1:
-                huge_degree_threshold_quantile = torch.quantile(deg.float(), quantile).item()
-            else:
-                huge_degree_threshold_quantile = max(counts) + 1
-
-            light = (deg < huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
-            heavy = (deg >= huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1).to(torch.int32)
+            light, heavy = _bucket_nodes_by_degree(counts, quantile)
 
             graph = (
                 self._to_int32(self._to_default_device(row_ptr)),
                 self._to_int32(self._to_default_device(cols)),
-                self._to_int32(self._to_default_device(light)),
-                self._to_int32(self._to_default_device(heavy)),
+                self._to_int32(self._to_default_device(light.to(torch.int32))),
+                self._to_int32(self._to_default_device(heavy.to(torch.int32))),
             )
 
         elif self.backend == "csc":
@@ -347,16 +365,14 @@ class GraphSample:
                 do_transpose=False,
             )
 
-            deg = counts_fwd
-            quantile = self.kernel_related_kwargs.get("huge_degree_threshold_quantile", -1)
+            kwargs = self.kernel_related_kwargs
+            fallback_q = kwargs.get("huge_degree_threshold_quantile", -1)
 
-            if quantile != -1:
-                huge_degree_threshold_quantile = torch.quantile(deg.float(), quantile).item()
-            else:
-                huge_degree_threshold_quantile = max(counts_fwd) + 1
+            fwd_quantile = kwargs.get("forward_huge_degree_threshold_quantile", fallback_q)
+            fwd_light, fwd_heavy = _bucket_nodes_by_degree(counts_fwd, fwd_quantile)
 
-            light = (deg < huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1)
-            heavy = (deg >= huge_degree_threshold_quantile).nonzero(as_tuple=False).view(-1)
+            bwd_quantile = kwargs.get("backward_huge_degree_threshold_quantile", fallback_q)
+            bwd_light, bwd_heavy = _bucket_nodes_by_degree(counts_bwd, bwd_quantile)
 
             graph = self._to_default_device(
                 AdjacencyForwardBackwardWithNodeBuckets(
@@ -364,8 +380,10 @@ class GraphSample:
                     forward_indices=self._to_int32(cols_fwd),
                     backward_indptr=self._to_int32(row_ptr_bwd),
                     backward_indices=self._to_int32(cols_bwd),
-                    light_nodes=self._to_int32(light),
-                    heavy_nodes=self._to_int32(heavy),
+                    forward_light_nodes=self._to_int32(fwd_light),
+                    forward_heavy_nodes=self._to_int32(fwd_heavy),
+                    backward_light_nodes=self._to_int32(bwd_light),
+                    backward_heavy_nodes=self._to_int32(bwd_heavy),
                 )
             )
 
@@ -454,6 +472,11 @@ class GraphSample:
     def num_features(self) -> int:
         """Feature dimensionality F."""
         return self.x.shape[1]  # type: ignore
+
+    @property
+    def num_edges(self) -> int:
+        """Number of edges E."""
+        return self.edge_index.shape[1]  # type: ignore
 
     @property
     def num_classes(self) -> int:
