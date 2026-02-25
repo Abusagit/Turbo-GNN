@@ -33,10 +33,9 @@ at::Tensor min_aggr_backward_torch(
     TORCH_CHECK(argmin.is_cuda(), "argmin must be CUDA");
     TORCH_CHECK(
         grad_out.scalar_type() == at::kFloat ||
-        grad_out.scalar_type() == at::kDouble ||
         grad_out.scalar_type() == at::kHalf ||
         grad_out.scalar_type() == at::kBFloat16,
-        "grad_out must be float32/float64/float16/bfloat16"
+        "grad_out must be float32/float16/bfloat16"
     );
 
     TORCH_CHECK(grad_out.dim() == 2, "grad_out must be 2D");
@@ -66,7 +65,7 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
     TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
     TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
-    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16 || X.scalar_type() == at::kDouble, "X must be float32/float16/bfloat16/float64");
+    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16, "X must be float32/float16/bfloat16");
     TORCH_CHECK(X.dim() == 2, "X must be 2D");
 
     const auto num_nodes = X.size(0);

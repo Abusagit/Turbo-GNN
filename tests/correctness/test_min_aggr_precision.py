@@ -46,7 +46,7 @@ def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128):
     return x.grad.detach()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_features", [16, 64, 128])
 def test_forward_matches_fp32_reference(dtype, num_features):
     if not torch.cuda.is_available():

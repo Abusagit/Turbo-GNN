@@ -10,6 +10,7 @@ from ..registry import BackendRegistry
 from .gatv2_aggr.utils import gatv2_aggr
 from .gt_aggr.utils import graph_transformer_aggr
 from .min_aggr.utils import min_aggr
+from .spmm_aggr.utils import spmm_aggr
 
 doc = """
 CUDA backend: wraps cuda-written kernels .
@@ -229,6 +230,40 @@ class _CudaGraphTransformerConv(BaseConvolution):
         return out
 
 
+class _CudaSpMMConv(BaseConvolution):
+    """cuSPARSE SpMM convolution using AdjacencyForwardBackwardWithNodeBuckets.
+
+    Supports float32, float16, bfloat16 features via mixed-precision cuSPARSE.
+    """
+
+    def __init__(
+        self,
+        norm_type: str = "none",
+        cu_sparse_algorithm_id: int = -1,
+        block_dim: int = 256,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(bias=False, dropout=0.0)
+        self.norm_type = norm_type
+        self.cu_sparse_algorithm_id = cu_sparse_algorithm_id
+        self.block_dim = block_dim
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return spmm_aggr(
+            x,
+            graph.forward_indptr,
+            graph.forward_indices,
+            self.norm_type,
+            self.cu_sparse_algorithm_id,
+            self.block_dim,
+        )
+
+
 @BackendRegistry.register_backend("cuda")
 class CUDABackend(BaseBackend):
     """Backend that instantiates CUDA-based convolutions."""
@@ -241,7 +276,7 @@ class CUDABackend(BaseBackend):
         """Factory for CUDA convolution layers.
 
         Args:
-            conv_type (str): 'gat_v2' or 'min_aggr' currently.
+            conv_type (str): 'gat_v2', 'min_aggr', 'gt', 'sum_aggr', 'mean_aggr', 'gcn'.
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments for CUDA layers.
 
@@ -264,5 +299,23 @@ class CUDABackend(BaseBackend):
             case "gt":
                 heads = kwargs.pop("heads")
                 return _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
+            case "sum_aggr":
+                return _CudaSpMMConv(
+                    norm_type="none",
+                    cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
+                    block_dim=kwargs.get("block_dim", 256),
+                )
+            case "mean_aggr":
+                return _CudaSpMMConv(
+                    norm_type="right",
+                    cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
+                    block_dim=kwargs.get("block_dim", 256),
+                )
+            case "gcn":
+                return _CudaSpMMConv(
+                    norm_type="both",
+                    cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
+                    block_dim=kwargs.get("block_dim", 256),
+                )
 
-        raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
+        raise KeyError(f"Unsupported conv_type for CUDA backend: {conv_type}")

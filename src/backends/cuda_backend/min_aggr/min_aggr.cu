@@ -10,6 +10,10 @@ __global__ void min_aggr_forward_light_kernel_1d(
     int* __restrict__ argmin,
     int d
 ) {
+    constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    using Tile = TileOps<VW, cuda_t>;
+    constexpr int EPV = Tile::ELEM_PER_VEC;
+
     int i = blockIdx.x;
     int v = light_nodes_indices[i];
 
@@ -20,72 +24,52 @@ __global__ void min_aggr_forward_light_kernel_1d(
 
     int node_stride = v * d;
 
-    cuda_t infinity = make_cuda_value<cuda_t>(INFINITY);
+    cuda_t inf_val = make_cuda_value<cuda_t>(INFINITY);
+    cuda_t zero_val = make_cuda_value<cuda_t>(0.0f);
 
-    if constexpr (sizeof(cuda_t) == 2) {
-        // Vec2 for half/bfloat16
-        const int d_vec = d / 2;
+    const int d_vec = d / EPV;
 
-        for (int f_vec = tid; f_vec < d_vec; f_vec += blockDim.x) {
-            const int f_base = f_vec * 2;
+    for (int fv = tid; fv < d_vec; fv += blockDim.x) {
+        const int base_f = fv * EPV;
 
-            Vec2<cuda_t> best_val;
-            best_val.x = infinity;
-            best_val.y = infinity;
-
-            int best_src_x = -1;
-            int best_src_y = -1;
-
-            for (int eid = row_start; eid < row_end; ++eid) {
-                int src = edge_idx[eid];
-                Vec2<cuda_t> val = load_vec2(&X[src * d + f_base]);
-
-                if (val.x < best_val.x) { best_val.x = val.x; best_src_x = src; }
-                if (val.y < best_val.y) { best_val.y = val.y; best_src_y = src; }
-            }
-
-            Vec2<cuda_t> out_val;
-            out_val.x = (best_src_x != -1) ? best_val.x : make_cuda_value<cuda_t>(0.0f);
-            out_val.y = (best_src_y != -1) ? best_val.y : make_cuda_value<cuda_t>(0.0f);
-
-            store_vec2(&out[node_stride + f_base], out_val);
-
-            argmin[node_stride + f_base + 0] = best_src_x;
-            argmin[node_stride + f_base + 1] = best_src_y;
+        cuda_t best_vals[EPV];
+        int best_srcs[EPV];
+        #pragma unroll
+        for (int e = 0; e < EPV; ++e) {
+            best_vals[e] = inf_val;
+            best_srcs[e] = -1;
         }
 
-        if (d % 2 != 0 && tid == 0) {
-            int f = d - 1;
-            cuda_t best_val = make_cuda_value<cuda_t>(INFINITY);
-            int best_src = -1;
+        for (int eid = row_start; eid < row_end; ++eid) {
+            int src = edge_idx[eid];
+            auto val = Tile::load(&X[src * d], fv);
+            #pragma unroll
+            for (int e = 0; e < EPV; ++e) {
+                cuda_t v_e = Tile::extract(val, e);
+                if (v_e < best_vals[e]) { best_vals[e] = v_e; best_srcs[e] = src; }
+            }
+        }
 
+        cuda_t result[EPV];
+        #pragma unroll
+        for (int e = 0; e < EPV; ++e) {
+            result[e] = (best_srcs[e] != -1) ? best_vals[e] : zero_val;
+            argmin[node_stride + base_f + e] = best_srcs[e];
+        }
+        Tile::store_vec(&out[node_stride], fv, Tile::build(result));
+    }
+
+    // Scalar tail for d % EPV != 0 (compiles away for EPV=1)
+    if (d % EPV != 0 && tid == 0) {
+        for (int f = d_vec * EPV; f < d; ++f) {
+            cuda_t best_val = inf_val;
+            int best_src = -1;
             for (int eid = row_start; eid < row_end; ++eid) {
                 int src = edge_idx[eid];
                 cuda_t val = X[src * d + f];
-                if (val < best_val) {
-                    best_val = val;
-                    best_src = src;
-                }
+                if (val < best_val) { best_val = val; best_src = src; }
             }
-
-            out[node_stride + f] = (best_src != -1) ? best_val : make_cuda_value<cuda_t>(0.0f);
-            argmin[node_stride + f] = best_src;
-        }
-    } else {
-        for (int f = tid; f < d; f += blockDim.x) {
-            cuda_t best_val = infinity;
-            int best_src = -1;
-
-            for (int eid = row_start; eid < row_end; ++eid) {
-                int src = edge_idx[eid];
-                cuda_t val = X[src * d + f];
-                if (val < best_val) {
-                    best_val = val;
-                    best_src = src;
-                }
-            }
-
-            out[node_stride + f] = (best_src != -1) ? best_val : make_cuda_value<cuda_t>(0.0f);
+            out[node_stride + f] = (best_src != -1) ? best_val : zero_val;
             argmin[node_stride + f] = best_src;
         }
     }
@@ -145,6 +129,10 @@ __global__ void min_aggr_forward_heavy_kernel(
     unsigned long long* __restrict__ packed,
     int d
 ) {
+    constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    using Tile = TileOps<VW, cuda_t>;
+    constexpr int EPV = Tile::ELEM_PER_VEC;
+
     int node_idx = blockIdx.x;
     int chunk_idx = blockIdx.y;
     int v = heavy_nodes_indices[node_idx];
@@ -161,27 +149,58 @@ __global__ void min_aggr_forward_heavy_kernel(
     }
 
     int tid = threadIdx.x;
-    cuda_t infinity = make_cuda_value<cuda_t>(INFINITY);
+    cuda_t inf_val = make_cuda_value<cuda_t>(INFINITY);
 
-    for (int f = tid; f < d; f += blockDim.x) {
-        cuda_t local_min = infinity;
-        int local_arg = -1;
+    const int d_vec = d / EPV;
 
-        // find local minimum in this chunk
+    for (int fv = tid; fv < d_vec; fv += blockDim.x) {
+        const int base_f = fv * EPV;
+
+        cuda_t best_vals[EPV];
+        int best_srcs[EPV];
+        #pragma unroll
+        for (int e = 0; e < EPV; ++e) {
+            best_vals[e] = inf_val;
+            best_srcs[e] = -1;
+        }
+
         #pragma unroll
         for (int eid = chunk_start; eid < chunk_end; ++eid) {
             int src = edge_idx[eid];
-            cuda_t val = X[src * d + f];
-            if (val < local_min) {
-                local_min = val;
-                local_arg = src;
+            auto val = Tile::load(&X[src * d], fv);
+            #pragma unroll
+            for (int e = 0; e < EPV; ++e) {
+                cuda_t v_e = Tile::extract(val, e);
+                if (v_e < best_vals[e]) { best_vals[e] = v_e; best_srcs[e] = src; }
             }
         }
 
-        if (local_arg >= 0) {
-            unsigned long long* addr = &packed[node_idx * d + f];
-            unsigned long long new_val = pack_val_idx(cuda_to_float(local_min), local_arg);
-            atomicMin(addr, new_val);
+        #pragma unroll
+        for (int e = 0; e < EPV; ++e) {
+            if (best_srcs[e] >= 0) {
+                unsigned long long new_val = pack_val_idx(cuda_to_float(best_vals[e]), best_srcs[e]);
+                atomicMin(&packed[node_idx * d + base_f + e], new_val);
+            }
+        }
+    }
+
+    // scalar tail for d % EPV != 0
+    if (d % EPV != 0 && tid == 0) {
+        for (int f = d_vec * EPV; f < d; ++f) {
+            cuda_t local_min = inf_val;
+            int local_arg = -1;
+
+            #pragma unroll
+            for (int eid = chunk_start; eid < chunk_end; ++eid) {
+                int src = edge_idx[eid];
+                cuda_t val = X[src * d + f];
+                if (val < local_min) { local_min = val; local_arg = src; }
+            }
+
+            if (local_arg >= 0) {
+                unsigned long long new_val = pack_val_idx(cuda_to_float(local_min), local_arg);
+                atomicMin(&packed[node_idx * d + f], new_val);
+            }
         }
     }
 }
@@ -220,6 +239,10 @@ __global__ void min_aggr_backward_typed(
     int num_nodes,
     int d
 ) {
+    constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    using Tile = TileOps<VW, cuda_t>;
+    constexpr int EPV = Tile::ELEM_PER_VEC;
+
     int block_idx = blockIdx.x;
     if (block_idx >= num_nodes) {
         return;
@@ -227,27 +250,26 @@ __global__ void min_aggr_backward_typed(
 
     int tid = threadIdx.x;
     const int base_offset = block_idx * d;
+    const int d_vec = d / EPV;
 
-    if constexpr (sizeof(cuda_t) == 2) {
-        for (int f_vec = tid; f_vec < d / 2; f_vec += blockDim.x) {
-            const int f_base = f_vec * 2;
-
-            Vec2<cuda_t> grad = load_vec2(&grad_out[base_offset + f_base]);
-            uint2 src_pair = *reinterpret_cast<const uint2*>(&argmin[base_offset + f_base]);
-
-            int src_x = reinterpret_cast<const int*>(&src_pair)[0];
-            int src_y = reinterpret_cast<const int*>(&src_pair)[1];
-
-            if (src_x >= 0) atomicAdd(&grad_x[src_x * d + f_base], grad.x);
-            if (src_y >= 0) atomicAdd(&grad_x[src_y * d + f_base + 1], grad.y);
-        }
-    } else {
+    for (int fv = tid; fv < d_vec; fv += blockDim.x) {
+        const int base_f = fv * EPV;
+        auto grad_v = Tile::load(&grad_out[base_offset], fv);
         #pragma unroll
-        for (int f = tid; f < d; f += blockDim.x) {
+        for (int e = 0; e < EPV; ++e) {
+            int src = argmin[base_offset + base_f + e];
+            if (src >= 0) {
+                atomicAdd(&grad_x[src * d + base_f + e], Tile::extract(grad_v, e));
+            }
+        }
+    }
+
+    // scalar tail for d % EPV != 0
+    if (d % EPV != 0 && tid == 0) {
+        for (int f = d_vec * EPV; f < d; ++f) {
             int src = argmin[base_offset + f];
             if (src >= 0) {
-                cuda_t grad = grad_out[base_offset + f];
-                atomicAdd(&grad_x[src * d + f], grad);
+                atomicAdd(&grad_x[src * d + f], grad_out[base_offset + f]);
             }
         }
     }
@@ -279,7 +301,7 @@ void min_aggr_forward_partitioned_cuda(
     TORCH_CHECK(edge_idx.dtype() == torch::kInt32, "edge_idx must be int32");
     TORCH_CHECK(light_nodes.dtype() == torch::kInt32, "light_nodes must be int32");
     TORCH_CHECK(heavy_nodes.dtype() == torch::kInt32, "heavy_nodes must be int32");
-    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16 || X.scalar_type() == at::kDouble, "X must be float32/float16/bfloat16/float64");
+    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16, "X must be float32/float16/bfloat16");
     TORCH_CHECK(out.scalar_type() == X.scalar_type(), "out must have same dtype as X");
 
     const int num_light = light_nodes.numel();
@@ -304,7 +326,7 @@ void min_aggr_forward_partitioned_cuda(
                 d
             );
         },
-        MakeTypeVariant<float, double, at::Half, at::BFloat16>(X.scalar_type()),
+        MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
         MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)  // 64*32=2048
         );
     }
@@ -312,87 +334,60 @@ void min_aggr_forward_partitioned_cuda(
     const int num_heavy = heavy_nodes.numel();
 
     if (num_heavy > 0) {
-        // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
         constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
 
-        if (X.scalar_type() == at::kDouble) {
-            std::visit([&](auto typeInfo, auto warps_const) {
-                using torch_t = typename decltype(typeInfo)::TorchType;
-                using cuda_t = typename decltype(typeInfo)::CudaType;
+        auto packed = at::full(
+            {num_heavy, d},
+            static_cast<int64_t>(PACKED_INIT),
+            at::TensorOptions().dtype(torch::kInt64).device(X.device())
+        );
 
-                constexpr int WARPS_PER_BLOCK = warps_const.value;
-                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+        std::visit([&](auto typeInfo, auto edges_const, auto warps_const) {
+            using torch_t = typename decltype(typeInfo)::TorchType;
+            using cuda_t = typename decltype(typeInfo)::CudaType;
+            constexpr int EDGES_PER_BLOCK = edges_const.value;
+            constexpr int WARPS_PER_BLOCK = warps_const.value;
+            constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-                auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
-                auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
+            auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
 
-                min_aggr_forward_light_kernel_1d<cuda_t><<<num_heavy, THREADS_PER_BLOCK>>>(
-                    heavy_nodes.data_ptr<int>(),
-                    edge_ptr.data_ptr<int>(),
-                    edge_idx.data_ptr<int>(),
-                    X_ptr,
-                    out_ptr,
-                    argmin.data_ptr<int>(),
-                    d
-                );
-            },
-            MakeTypeVariant<double>(X.scalar_type()),
-            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, cuda_t><<<grid, THREADS_PER_BLOCK>>>(
+                heavy_nodes.data_ptr<int>(),
+                edge_ptr.data_ptr<int>(),
+                edge_idx.data_ptr<int>(),
+                X_ptr,
+                reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                d
             );
-        } else {
-            auto packed = at::full(
-                {num_heavy, d},
-                static_cast<int64_t>(PACKED_INIT),
-                at::TensorOptions().dtype(torch::kInt64).device(X.device())
+        },
+        MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
+        MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
+        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+        );
+
+        std::visit([&](auto typeInfo, auto warps_const) {
+            using torch_t = typename decltype(typeInfo)::TorchType;
+            using cuda_t = typename decltype(typeInfo)::CudaType;
+            constexpr int WARPS_PER_BLOCK = warps_const.value;
+            constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+            auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
+
+            int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+            unpack_results_kernel<cuda_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
+                reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                heavy_nodes.data_ptr<int>(),
+                out_ptr,
+                argmin.data_ptr<int>(),
+                num_heavy,
+                d
             );
-
-            std::visit([&](auto typeInfo, auto edges_const, auto warps_const) {
-                using torch_t = typename decltype(typeInfo)::TorchType;
-                using cuda_t = typename decltype(typeInfo)::CudaType;
-                constexpr int EDGES_PER_BLOCK = edges_const.value;
-                constexpr int WARPS_PER_BLOCK = warps_const.value;
-                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
-
-                auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
-
-                dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
-                min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, cuda_t><<<grid, THREADS_PER_BLOCK>>>(
-                    heavy_nodes.data_ptr<int>(),
-                    edge_ptr.data_ptr<int>(),
-                    edge_idx.data_ptr<int>(),
-                    X_ptr,
-                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
-                    d
-                );
-            },
-            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
-            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
-            );
-
-            std::visit([&](auto typeInfo, auto warps_const) {
-                using torch_t = typename decltype(typeInfo)::TorchType;
-                using cuda_t = typename decltype(typeInfo)::CudaType;
-                constexpr int WARPS_PER_BLOCK = warps_const.value;
-                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
-
-                auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
-
-                int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-                unpack_results_kernel<cuda_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
-                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
-                    heavy_nodes.data_ptr<int>(),
-                    out_ptr,
-                    argmin.data_ptr<int>(),
-                    num_heavy,
-                    d
-                );
-            },
-            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
-            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
-            );
-        }
+        },
+        MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
+        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+        );
     }
     CUDA_KERNEL_CHECK();
 }
@@ -426,7 +421,7 @@ void min_aggr_backward_cuda(
             d
         );
     },
-    MakeTypeVariant<float, double, at::Half, at::BFloat16>(grad_out.scalar_type()),
+    MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
     MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
     );
 
