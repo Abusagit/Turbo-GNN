@@ -7,11 +7,32 @@ import triton.language as tl
 from src.data.converters import WSBFormat
 from src.utils.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
 
+# --- Triton autotune config spaces ------------------------------------------
+_LOOP_CONFIGS = [(1, False), (2, True), (3, True)]  # (LOOP_NUM_STAGES, WARP_SPECIALIZE)
+
+SPMM_AUTOTUNE_CONFIGS = [
+    triton.Config({"LOOP_NUM_STAGES": ls, "WARP_SPECIALIZE": ws}, num_warps=w, num_stages=s)
+    for w in [1, 2, 4, 8]
+    for s in [1, 2, 3]
+    for ls, ws in _LOOP_CONFIGS
+]
+
+FLASHATTN_AUTOTUNE_CONFIGS = [
+    triton.Config({"LOOP_NUM_STAGES": ls, "WARP_SPECIALIZE": ws}, num_warps=w, num_stages=s)
+    for w in [2, 4, 8]
+    for s in [2, 3]
+    for ls, ws in _LOOP_CONFIGS
+]
+
 #####################################################
 ################# GraphConv Kernels #################
 #####################################################
 
 
+@triton.autotune(
+    configs=SPMM_AUTOTUNE_CONFIGS,
+    key=["N", "F"],
+)
 @triton.jit
 def wsb_spmm_kernel_tc(
     tcb_row_offset_ptr,
@@ -29,6 +50,8 @@ def wsb_spmm_kernel_tc(
     TCB_WIDTH: tl.constexpr,
     TCB_SIZE: tl.constexpr,
     TILE_K: tl.constexpr,
+    LOOP_NUM_STAGES: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
 ):
     row_window_idx = tl.program_id(0)
 
@@ -57,7 +80,7 @@ def wsb_spmm_kernel_tc(
 
     num_pairs = (num_tcbs + 1) // 2  # we need to construct 16x16 tiles for WMMA from two 16x8 tiles
 
-    for pair_idx in range(num_pairs):
+    for pair_idx in tl.range(num_pairs, num_stages=LOOP_NUM_STAGES, warp_specialize=WARP_SPECIALIZE):
         tcb_idx_0 = tcb_start + pair_idx * 2
         tcb_idx_1 = tcb_idx_0 + 1
 
@@ -142,6 +165,10 @@ def wsb_spmm_tc_forward(wsb, X: torch.Tensor) -> torch.Tensor:
     return Y
 
 
+@triton.autotune(
+    configs=SPMM_AUTOTUNE_CONFIGS,
+    key=["N", "F"],
+)
 @triton.jit
 def wsb_spmm_backward_kernel_tc(
     tcb_row_offset_ptr,
@@ -159,6 +186,8 @@ def wsb_spmm_backward_kernel_tc(
     TCB_WIDTH: tl.constexpr,
     TCB_SIZE: tl.constexpr,
     TILE_K: tl.constexpr,
+    LOOP_NUM_STAGES: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
 ):
     """
     Backward kernel with tensor cores. # NOTE very slow
@@ -194,7 +223,7 @@ def wsb_spmm_backward_kernel_tc(
 
     num_pairs = (num_tcbs + 1) // 2
 
-    for pair_idx in range(num_pairs):
+    for pair_idx in tl.range(num_pairs, num_stages=LOOP_NUM_STAGES, warp_specialize=WARP_SPECIALIZE):
         tcb_idx_0 = tcb_start + pair_idx * 2
         tcb_idx_1 = tcb_idx_0 + 1
 
@@ -303,6 +332,10 @@ class WSBSpMM(torch.autograd.Function):
 #####################################################
 ################# Graph Transformer Kernels #########
 #####################################################
+@triton.autotune(
+    configs=FLASHATTN_AUTOTUNE_CONFIGS,
+    key=["num_nodes", "D"],
+)
 @triton.jit
 def wsb_flashattn_tc_forward_kernel(
     tcb_row_offset_ptr,  # int32 [num_row_windows + 1]
@@ -339,6 +372,8 @@ def wsb_flashattn_tc_forward_kernel(
     ROW_WINDOW_SIZE: tl.constexpr,
     TCB_WIDTH: tl.constexpr,
     TILE_K: tl.constexpr,
+    LOOP_NUM_STAGES: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
 ):
     rw_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -369,7 +404,7 @@ def wsb_flashattn_tc_forward_kernel(
     row_offs = tl.arange(0, ROW_WINDOW_SIZE)  # [16]
     k_offs = tl.arange(0, TILE_K)  # [16]  (2 * TCB_WIDTH)
 
-    for pair_idx in tl.range(n_pairs, num_stages=2, warp_specialize=True):
+    for pair_idx in tl.range(n_pairs, num_stages=LOOP_NUM_STAGES, warp_specialize=WARP_SPECIALIZE):
         # two TCBs in this pair
         tcb_idx_0 = tcb_start + pair_idx * 2
         tcb_idx_1 = tcb_idx_0 + 1
@@ -549,6 +584,10 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale):
     return output, logsumexp
 
 
+@triton.autotune(
+    configs=FLASHATTN_AUTOTUNE_CONFIGS,
+    key=["num_nodes", "D"],
+)
 @triton.jit
 def wsb_flashattn_tc_backward_kernel(
     tcb_row_offset_ptr,
@@ -605,6 +644,8 @@ def wsb_flashattn_tc_backward_kernel(
     ROW_WINDOW_SIZE: tl.constexpr,
     TCB_WIDTH: tl.constexpr,
     TILE_K: tl.constexpr,
+    LOOP_NUM_STAGES: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
 ):
     rw_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -649,7 +690,7 @@ def wsb_flashattn_tc_backward_kernel(
     row_offs = tl.arange(0, ROW_WINDOW_SIZE)  # [16]
     k_offs = tl.arange(0, TILE_K)  # [16]
 
-    for pair_idx in tl.range(n_pairs, num_stages=2, warp_specialize=True):
+    for pair_idx in tl.range(n_pairs, num_stages=LOOP_NUM_STAGES, warp_specialize=WARP_SPECIALIZE):
         tcb_idx_0 = tcb_start + pair_idx * 2
         tcb_idx_1 = tcb_idx_0 + 1
 
