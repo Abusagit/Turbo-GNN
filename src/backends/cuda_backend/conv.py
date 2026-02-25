@@ -44,9 +44,9 @@ class _CudaMinAggrConv(nn.Module):
         self.forward_edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
         self.warps_per_block = warps_per_block
         self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
-        self.use_2d_kernel = use_2d_kernel
-        self.features_per_block = features_per_block
-        self.tiles_y = tiles_y
+        self.forward_use_2d_kernel = use_2d_kernel
+        self.forward_features_per_block = features_per_block
+        self.forward_tiles_y = tiles_y
 
     def forward(
         self,
@@ -70,11 +70,9 @@ class _CudaMinAggrConv(nn.Module):
             graph.max_degree,
             self.forward_warps_per_block,
             self.forward_edges_per_block_heavy_nodes,
-            self.warps_per_block,
-            self.edges_per_block_heavy_nodes,
-            self.use_2d_kernel,
-            self.features_per_block,
-            self.tiles_y,
+            self.forward_use_2d_kernel,
+            self.forward_features_per_block,
+            self.forward_tiles_y,
         )
 
 
@@ -105,6 +103,9 @@ class _CudaSimpleAggrConv(BaseConvolution):
         return [
             TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
             TunableParam("forward_edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
+            TunableParam("forward_use_2d_kernel", [True, False], default=False),
+            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
+            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:

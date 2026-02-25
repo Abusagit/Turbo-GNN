@@ -368,26 +368,7 @@ void min_aggr_forward_partitioned_cuda(
         // unsigned long long packing_init_val = pack_val_idx(INFINITY, -1);
         constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
 
-        if (X.scalar_type() == at::kDouble) {
-            AT_DISPATCH_FLOATING_TYPES_AND2(
-                at::ScalarType::Half,
-                at::ScalarType::BFloat16,
-                X.scalar_type(),
-                "min_aggr_forward_heavy_fallback_double",
-                ([&] {
-                    min_aggr_forward_light_kernel_1d<scalar_t>
-                        <<<num_heavy, THREADS_PER_BLOCK>>>(
-                            heavy_nodes.data_ptr<int>(),
-                            edge_ptr.data_ptr<int>(),
-                            edge_idx.data_ptr<int>(),
-                            X.data_ptr<scalar_t>(),
-                            out.data_ptr<scalar_t>(),
-                            argmin.data_ptr<int>(),
-                            d
-                        );
-                })
-            );
-        } else if (use_2d_kernel) {
+        if (use_2d_kernel) {
             dim3 grid(num_heavy);
             dim3 block(features_per_block, tiles_y);
 
