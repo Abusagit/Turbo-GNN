@@ -439,10 +439,9 @@ struct TileOps<1, float> {
     using vec_t = float;
     using ns_t  = float;
     static constexpr int ELEM_PER_VEC = 1;
-    static constexpr vec_t zero = 0.0f;
 
     static __device__ __forceinline__ vec_t load(const float* ptr, int vec_idx) {
-        return __ldg(&ptr[vec_idx]);
+        return ptr[vec_idx];
     }
     static __device__ __forceinline__ ns_t make_ns(float ns) { return ns; }
 
@@ -479,7 +478,7 @@ struct TileOps<1, float> {
         out[vec_idx] = acc[0];
     }
     static __device__ __forceinline__ void write_zero(float* out, int vec_idx) {
-        out[vec_idx] = zero;
+        out[vec_idx] = 0.0f;
     }
 
     // --- generic element access ---
@@ -505,7 +504,6 @@ struct TileOps<4, float> {
     using vec_t = float4;
     using ns_t  = float;
     static constexpr int ELEM_PER_VEC = 4;
-    static constexpr vec_t zero = {0.f, 0.f, 0.f, 0.f};
 
     static __device__ __forceinline__ vec_t load(const float* ptr, int vec_idx) {
         return reinterpret_cast<const float4*>(ptr)[vec_idx];
@@ -555,7 +553,7 @@ struct TileOps<4, float> {
         reinterpret_cast<float4*>(out)[vec_idx] = make_float4(acc[0], acc[1], acc[2], acc[3]);
     }
     static __device__ __forceinline__ void write_zero(float* out, int vec_idx) {
-        reinterpret_cast<float4*>(out)[vec_idx] = zero;
+        reinterpret_cast<float4*>(out)[vec_idx] = make_float4(0.f, 0.f, 0.f, 0.f);
     }
 
     // --- generic element access ---
@@ -658,7 +656,7 @@ struct TileOps<2, cuda_t> {
         *reinterpret_cast<float2*>(&out[vec_idx * 2]) = make_float2(acc[0], acc[1]);
     }
     static __device__ __forceinline__ void write_zero(cuda_t* out, int vec_idx) {
-        *reinterpret_cast<vec2_t*>(&out[vec_idx * 2]) = get_zero();
+        *reinterpret_cast<vec2_t*>(&out[vec_idx * 2]) = Ops::from_float(0.0f);
     }
 
     // --- generic element access ---
@@ -790,7 +788,10 @@ struct TileOps<8, cuda_t> {
         reinterpret_cast<float4*>(&out[vec_idx * 8])[1] = make_float4(acc[4], acc[5], acc[6], acc[7]);
     }
     static __device__ __forceinline__ void write_zero(cuda_t* out, int vec_idx) {
-        *reinterpret_cast<float4*>(&out[vec_idx * 8]) = zero_bits;
+        Vec8<cuda_t> zero_v;
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) zero_v.v[p] = Ops::get_zero();
+        store_vec8(&out[vec_idx * 8], zero_v);
     }
 
     // --- generic element access ---

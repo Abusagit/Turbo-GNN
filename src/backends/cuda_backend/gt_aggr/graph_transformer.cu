@@ -241,9 +241,10 @@ __global__ void compute_D_mh_kernel_D(
 }
 
 
-// Q, K, V, dO are [N, H, D] with contiguous D, D % 4 == 0
+// Q, K, V, dO are [N, H, D] with contiguous D (stride(2)==1), D % 4 == 0
+// Q, K, V may be non-contiguous in N,H dims (e.g. from split/view).
 // logsumexp and Delta are [N, H].
-// dQ, dK, dV are cuda_t output; internal accumulation in float32
+// dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
 template<int D_CONST, typename cuda_t>
 __global__ void graph_attn_backward_csrT_kernel_D(
     int64_t N,
@@ -253,13 +254,16 @@ __global__ void graph_attn_backward_csrT_kernel_D(
     const cuda_t* __restrict__ Q,        // [N, H, D]
     const cuda_t* __restrict__ K,        // [N, H, D]
     const cuda_t* __restrict__ V,        // [N, H, D]
+    int64_t stride_q_n, int64_t stride_q_h,
+    int64_t stride_k_n, int64_t stride_k_h,
+    int64_t stride_v_n, int64_t stride_v_h,
     const cuda_t* __restrict__ dO,       // [N, H, D]
     const float* __restrict__ logsumexp, // [N, H]
     const float* __restrict__ Delta,     // [N, H]
     float scale,
-    cuda_t* __restrict__ dQ,             // [N, H, D]
-    cuda_t* __restrict__ dK,             // [N, H, D]
-    cuda_t* __restrict__ dV              // [N, H, D]
+    cuda_t* __restrict__ dQ,             // [N, H, D] (contiguous)
+    cuda_t* __restrict__ dK,             // [N, H, D] (contiguous)
+    cuda_t* __restrict__ dV              // [N, H, D] (contiguous)
 ) {
     static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
 
@@ -280,13 +284,14 @@ __global__ void graph_attn_backward_csrT_kernel_D(
     int edge_end      = row_ptr_T[node_j + 1];
     int num_incoming  = edge_end - edge_start;
 
-    const size_t base_jh = (node_j * H + head_h) * D_CONST;
+    // Contiguous offset for output dQ, dV (freshly allocated, always contiguous)
+    const size_t out_jh = (node_j * H + head_h) * D_CONST;
 
     // nothing to do if this node has no incoming edges
     if (num_incoming == 0) {
         for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
-            Tile::write_zero(dQ + base_jh, fv);
-            Tile::write_zero(dV + base_jh, fv);
+            Tile::write_zero(dQ + out_jh, fv);
+            Tile::write_zero(dV + out_jh, fv);
         }
         return;
     }
@@ -302,12 +307,12 @@ __global__ void graph_attn_backward_csrT_kernel_D(
     float*  gq_shared = reinterpret_cast<float*>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
     float*  gv_shared = gq_shared + D_CONST;
 
-    // Load qj, vj via 128-bit transactions
+    // Load qj, vj via 128-bit transactions (stride-aware)
     {
         constexpr int ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);
         constexpr int NUM_LOADS = D_CONST / ELEMS_PER_F4;
-        const float4* qj_src = reinterpret_cast<const float4*>(Q + base_jh);
-        const float4* vj_src = reinterpret_cast<const float4*>(V + base_jh);
+        const float4* qj_src = reinterpret_cast<const float4*>(Q + node_j * stride_q_n + head_h * stride_q_h);
+        const float4* vj_src = reinterpret_cast<const float4*>(V + node_j * stride_v_n + head_h * stride_v_h);
         float4* qj_sh_f4 = reinterpret_cast<float4*>(qj_shared);
         float4* vj_sh_f4 = reinterpret_cast<float4*>(vj_shared);
         for (int i = lane; i < NUM_LOADS; i += kWarpSize) {
@@ -337,10 +342,10 @@ __global__ void graph_attn_backward_csrT_kernel_D(
 
         if ((unsigned)node_i >= (unsigned)N) continue;
 
-        const size_t base_ih = ((size_t)node_i * (size_t)H + (size_t)head_h) * (size_t)D_CONST;
-
-        const cuda_t* ki_base  = K  + base_ih;
-        const cuda_t* dOi_base = dO + base_ih;
+        const cuda_t* ki_base  = K  + (size_t)node_i * stride_k_n + (size_t)head_h * stride_k_h;
+        // dO is contiguous (checked by TORCH_CHECK)
+        const size_t out_ih = ((size_t)node_i * (size_t)H + (size_t)head_h) * (size_t)D_CONST;
+        const cuda_t* dOi_base = dO + out_ih;
 
         // 1) dot(k_i, q_j) and dP_ij = <dO_i, v_j>
         float dot_kq = 0.0f;
@@ -374,8 +379,8 @@ __global__ void graph_attn_backward_csrT_kernel_D(
         const float dS        = alpha * (dP_ij - Delta_i);
         const float dS_scaled = dS * scale;
 
-        // 2) accumulate dV_j, dQ_j in float32 shared; atomicAdd dK_i (typed)
-        cuda_t* dK_i_base = dK + base_ih;
+        // 2) accumulate dV_j, dQ_j in float32 shared; atomicAdd dK_i (typed, contiguous)
+        cuda_t* dK_i_base = dK + out_ih;
 
         for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
             int base_f = fv * EPV;
@@ -389,9 +394,9 @@ __global__ void graph_attn_backward_csrT_kernel_D(
         }
     }
 
-    // 3) write dQ_j and dV_j: convert float32 accumulators to cuda_t
-    cuda_t* dQ_base = dQ + base_jh;
-    cuda_t* dV_base = dV + base_jh;
+    // 3) write dQ_j and dV_j: convert float32 accumulators to cuda_t (contiguous output)
+    cuda_t* dQ_base = dQ + out_jh;
+    cuda_t* dV_base = dV + out_jh;
 
     for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
         int base_f = fv * EPV;
@@ -627,6 +632,9 @@ graph_attention_backward_csr_mh_cuda(
             N, H,
             row_ptr_T.data_ptr<int>(), col_idx_T.data_ptr<int>(),
             Q_ptr, K_ptr, V_ptr,
+            q_strides[0], q_strides[1],
+            k_strides[0], k_strides[1],
+            v_strides[0], v_strides[1],
             dO_ptr,
             logsumexp.data_ptr<float>(),
             Delta.data_ptr<float>(),

@@ -71,6 +71,8 @@ class _TritonBlockSparseGraphTransformerConv(BaseConvolution):
         self.attn_scores_multiplier = torch.rsqrt(torch.tensor(self.head_dim)).item()
 
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        x = torch.nn.functional.layer_norm(x, (self.feature_dim,))
+
         qkv: torch.Tensor = self.qkv_proj(x)
         q, k, v = qkv.split(self.feature_dim, -1)
 
