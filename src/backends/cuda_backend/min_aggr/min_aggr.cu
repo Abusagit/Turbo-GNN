@@ -231,6 +231,165 @@ __global__ void unpack_results_kernel(
     }
 }
 
+// 2D kernel: blockIdx.x = node, threadIdx.x = feature, threadIdx.y = edge tile
+// uses shared memory tree reduction across tiles instead of packed atomicMin
+template <typename cuda_t>
+__global__ void min_aggr_forward_heavy_kernel_2d(
+    const int* __restrict__ nodes,
+    const int* __restrict__ edge_ptr,
+    const int* __restrict__ edge_idx,
+    const cuda_t* __restrict__ X,
+    cuda_t* __restrict__ out,
+    int* __restrict__ argmin,
+    int d
+) {
+    constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    using Tile = TileOps<VW, cuda_t>;
+    constexpr int EPV = Tile::ELEM_PER_VEC;
+
+    int i = blockIdx.x;
+    int v = nodes[i];
+
+    int row_start = edge_ptr[v];
+    int row_end   = edge_ptr[v + 1];
+    const int degree = row_end - row_start;
+
+    int fid = threadIdx.x; // feature dimension
+    int tid = threadIdx.y; // tile index
+
+    const int F_BLOCK = blockDim.x;
+    const int TILES_Y = blockDim.y;
+    const int SHMEM_STRIDE = F_BLOCK * EPV;
+
+    extern __shared__ unsigned char shared_mem[];
+    float* shmem_val = reinterpret_cast<float*>(shared_mem);
+    int* shmem_idx = reinterpret_cast<int*>(shmem_val + (TILES_Y * SHMEM_STRIDE));
+
+    cuda_t inf_val = make_cuda_value<cuda_t>(INFINITY);
+    cuda_t zero_val = make_cuda_value<cuda_t>(0.0f);
+
+    int tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;
+    int start = row_start + tid * tile_size_ceil;
+    int end = min(start + tile_size_ceil, row_end);
+
+    int node_stride = v * d;
+    const int d_vec = d / EPV;
+
+    for (int fv = fid; fv < d_vec; fv += F_BLOCK) {
+        const int base_f = fv * EPV;
+
+        cuda_t best_vals[EPV];
+        int best_srcs[EPV];
+        #pragma unroll
+        for (int e = 0; e < EPV; ++e) {
+            best_vals[e] = inf_val;
+            best_srcs[e] = -1;
+        }
+
+        for (int eid = start; eid < end; ++eid) {
+            int src = edge_idx[eid];
+            auto val = Tile::load(&X[src * d], fv);
+            #pragma unroll
+            for (int e = 0; e < EPV; ++e) {
+                cuda_t v_e = Tile::extract(val, e);
+                if (v_e < best_vals[e]) { best_vals[e] = v_e; best_srcs[e] = src; }
+            }
+        }
+
+        // Write to shmem (convert to float for cross-tile reduction)
+        #pragma unroll
+        for (int e = 0; e < EPV; ++e) {
+            shmem_val[tid * SHMEM_STRIDE + fid * EPV + e] = cuda_to_float(best_vals[e]);
+            shmem_idx[tid * SHMEM_STRIDE + fid * EPV + e] = best_srcs[e];
+        }
+
+        __syncthreads();
+
+        // Tree reduction across tiles
+        for (int offset = TILES_Y / 2; offset > 0; offset /= 2) {
+            if (tid < offset) {
+                #pragma unroll
+                for (int e = 0; e < EPV; ++e) {
+                    const int a = tid * SHMEM_STRIDE + fid * EPV + e;
+                    const int b = (tid + offset) * SHMEM_STRIDE + fid * EPV + e;
+
+                    const float val_a = shmem_val[a];
+                    const int idx_a = shmem_idx[a];
+                    const float val_b = shmem_val[b];
+                    const int idx_b = shmem_idx[b];
+
+                    if (val_b < val_a || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
+                        shmem_val[a] = val_b;
+                        shmem_idx[a] = idx_b;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // Vectorized final write
+        if (tid == 0) {
+            cuda_t result[EPV];
+            #pragma unroll
+            for (int e = 0; e < EPV; ++e) {
+                int best_idx = shmem_idx[fid * EPV + e];
+                result[e] = (best_idx >= 0) ? make_cuda_value<cuda_t>(shmem_val[fid * EPV + e]) : zero_val;
+                argmin[node_stride + base_f + e] = best_idx;
+            }
+            Tile::store_vec(&out[node_stride], fv, Tile::build(result));
+        }
+
+        __syncthreads();
+    }
+
+    // scalar tail for d % EPV != 0 (compiles away for EPV=1)
+    if (d % EPV != 0) {
+        const int tail_f = d_vec * EPV;
+
+        // only fid==0 does actual edge scanning; others contribute inf/-1.
+        float local_min = INFINITY;
+        int local_arg = -1;
+
+        if (fid == 0) {
+            for (int eid = start; eid < end; ++eid) {
+                int src = edge_idx[eid];
+                float fval = cuda_to_float(X[src * d + tail_f]);
+                if (fval < local_min) { local_min = fval; local_arg = src; }
+            }
+        }
+
+        shmem_val[tid * SHMEM_STRIDE + fid] = local_min;
+        shmem_idx[tid * SHMEM_STRIDE + fid] = local_arg;
+
+        __syncthreads();
+
+        for (int offset = TILES_Y / 2; offset > 0; offset /= 2) {
+            if (tid < offset && fid == 0) {
+                const int a = tid * SHMEM_STRIDE;
+                const int b = (tid + offset) * SHMEM_STRIDE;
+
+                const float val_a = shmem_val[a];
+                const int idx_a = shmem_idx[a];
+                const float val_b = shmem_val[b];
+                const int idx_b = shmem_idx[b];
+
+                if (val_b < val_a || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
+                    shmem_val[a] = val_b;
+                    shmem_idx[a] = idx_b;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0 && fid == 0) {
+            float best_val = shmem_val[0];
+            int best_idx = shmem_idx[0];
+            out[node_stride + tail_f] = (best_idx >= 0) ? make_cuda_value<cuda_t>(best_val) : zero_val;
+            argmin[node_stride + tail_f] = best_idx;
+        }
+    }
+}
+
 template <typename cuda_t>
 __global__ void min_aggr_backward_typed(
     const cuda_t* __restrict__ grad_out,
@@ -285,7 +444,10 @@ void min_aggr_forward_partitioned_cuda(
     at::Tensor& out,
     at::Tensor& argmin,
     int warps_per_block = 8,
-    int edges_per_block_heavy_nodes = 128
+    int edges_per_block_heavy_nodes = 128,
+    bool use_2d_kernel = false,
+    int features_per_block = 32,
+    int tiles_y = 8
 ) {
 
     const int d = X.size(1);
@@ -334,60 +496,91 @@ void min_aggr_forward_partitioned_cuda(
     const int num_heavy = heavy_nodes.numel();
 
     if (num_heavy > 0) {
-        constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
+        if (use_2d_kernel) {
+            // 2D kernel path: shared memory tree reduction, no packed buffer needed
+            std::visit([&](auto typeInfo) {
+                using torch_t = typename decltype(typeInfo)::TorchType;
+                using cuda_t = typename decltype(typeInfo)::CudaType;
 
-        auto packed = at::full(
-            {num_heavy, d},
-            static_cast<int64_t>(PACKED_INIT),
-            at::TensorOptions().dtype(torch::kInt64).device(X.device())
-        );
+                auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
+                auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
 
-        std::visit([&](auto typeInfo, auto edges_const, auto warps_const) {
-            using torch_t = typename decltype(typeInfo)::TorchType;
-            using cuda_t = typename decltype(typeInfo)::CudaType;
-            constexpr int EDGES_PER_BLOCK = edges_const.value;
-            constexpr int WARPS_PER_BLOCK = warps_const.value;
-            constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+                constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
+                constexpr int EPV = TileOps<VW, cuda_t>::ELEM_PER_VEC;
 
-            auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
+                dim3 grid(num_heavy);
+                dim3 block(features_per_block, tiles_y);
 
-            dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                size_t shmem_size = (size_t)tiles_y * (size_t)features_per_block * EPV * (sizeof(float) + sizeof(int));
 
-            min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, cuda_t><<<grid, THREADS_PER_BLOCK>>>(
-                heavy_nodes.data_ptr<int>(),
-                edge_ptr.data_ptr<int>(),
-                edge_idx.data_ptr<int>(),
-                X_ptr,
-                reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
-                d
+                min_aggr_forward_heavy_kernel_2d<cuda_t><<<grid, block, shmem_size>>>(
+                    heavy_nodes.data_ptr<int>(),
+                    edge_ptr.data_ptr<int>(),
+                    edge_idx.data_ptr<int>(),
+                    X_ptr,
+                    out_ptr,
+                    argmin.data_ptr<int>(),
+                    d
+                );
+            },
+            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type())
             );
-        },
-        MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
-        MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
-        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
-        );
+        } else {
+            constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
 
-        std::visit([&](auto typeInfo, auto warps_const) {
-            using torch_t = typename decltype(typeInfo)::TorchType;
-            using cuda_t = typename decltype(typeInfo)::CudaType;
-            constexpr int WARPS_PER_BLOCK = warps_const.value;
-            constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
-
-            auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
-
-            int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-            unpack_results_kernel<cuda_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
-                reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
-                heavy_nodes.data_ptr<int>(),
-                out_ptr,
-                argmin.data_ptr<int>(),
-                num_heavy,
-                d
+            auto packed = at::full(
+                {num_heavy, d},
+                static_cast<int64_t>(PACKED_INIT),
+                at::TensorOptions().dtype(torch::kInt64).device(X.device())
             );
-        },
-        MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
-        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
-        );
+
+            std::visit([&](auto typeInfo, auto edges_const, auto warps_const) {
+                using torch_t = typename decltype(typeInfo)::TorchType;
+                using cuda_t = typename decltype(typeInfo)::CudaType;
+                constexpr int EDGES_PER_BLOCK = edges_const.value;
+                constexpr int WARPS_PER_BLOCK = warps_const.value;
+                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+                auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
+
+                dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+
+                min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, cuda_t><<<grid, THREADS_PER_BLOCK>>>(
+                    heavy_nodes.data_ptr<int>(),
+                    edge_ptr.data_ptr<int>(),
+                    edge_idx.data_ptr<int>(),
+                    X_ptr,
+                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                    d
+                );
+            },
+            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
+            MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
+            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            );
+
+            std::visit([&](auto typeInfo, auto warps_const) {
+                using torch_t = typename decltype(typeInfo)::TorchType;
+                using cuda_t = typename decltype(typeInfo)::CudaType;
+                constexpr int WARPS_PER_BLOCK = warps_const.value;
+                constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+                auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
+
+                int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+                unpack_results_kernel<cuda_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
+                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                    heavy_nodes.data_ptr<int>(),
+                    out_ptr,
+                    argmin.data_ptr<int>(),
+                    num_heavy,
+                    d
+                );
+            },
+            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
+            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            );
+        }
     }
     CUDA_KERNEL_CHECK();
 }

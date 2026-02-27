@@ -20,7 +20,10 @@ void min_aggr_forward_partitioned_cuda(
     at::Tensor& out,
     at::Tensor& argmin,
     int warps_per_block = 8,
-    int edges_per_block_heavy_nodes = 128
+    int edges_per_block_heavy_nodes = 128,
+    bool use_2d_kernel = false,
+    int features_per_block = 32,
+    int tiles_y = 8
 );
 
 at::Tensor min_aggr_backward_torch(
@@ -57,7 +60,10 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     at::Tensor heavy_nodes,
     int max_degree,
     int warps_per_block = 8,
-    int edges_per_block_heavy_nodes = 128
+    int edges_per_block_heavy_nodes = 128,
+    bool use_2d_kernel = false,
+    int features_per_block = 32,
+    int tiles_y = 8
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
@@ -74,7 +80,7 @@ std::vector<at::Tensor> min_aggr_forward_partitioned_torch(
     auto out = torch::empty({num_nodes, d}, X.options());
     auto argmin = torch::empty({num_nodes, d}, edge_ptr.options());
 
-    min_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, argmin, warps_per_block, edges_per_block_heavy_nodes);
+    min_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, argmin, warps_per_block, edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y);
     return {out, argmin};
 }
 
@@ -90,6 +96,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Min aggregation forward (partitioned)",
           py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("X"),
           py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("max_degree"),
-          py::arg("warps_per_block") = 8, py::arg("edges_per_block_heavy_nodes") = 128
+          py::arg("warps_per_block") = 8, py::arg("edges_per_block_heavy_nodes") = 128,
+          py::arg("use_2d_kernel") = false, py::arg("features_per_block") = 32,
+          py::arg("tiles_y") = 8
         );
 }

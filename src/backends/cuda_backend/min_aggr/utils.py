@@ -45,9 +45,30 @@ def min_aggr_forward(edge_ptr: torch.Tensor, edge_idx: torch.Tensor, X: torch.Te
     return min_aggr_cuda.min_aggr_forward(edge_ptr, edge_idx, X)
 
 
-def min_aggr_forward_partitioned(edge_ptr, edge_idx, X, light, heavy, warps_per_block, edges_per_block_heavy_nodes):
+def min_aggr_forward_partitioned(
+    edge_ptr,
+    edge_idx,
+    X,
+    light,
+    heavy,
+    warps_per_block,
+    edges_per_block_heavy_nodes,
+    use_2d_kernel=False,
+    features_per_block=32,
+    tiles_y=8,
+):
     return min_aggr_cuda.min_aggr_forward_partitioned(
-        edge_ptr, edge_idx, X, light, heavy, 131070, warps_per_block, edges_per_block_heavy_nodes
+        edge_ptr,
+        edge_idx,
+        X,
+        light,
+        heavy,
+        131070,
+        warps_per_block,
+        edges_per_block_heavy_nodes,
+        use_2d_kernel,
+        features_per_block,
+        tiles_y,
     )
 
 
@@ -75,6 +96,9 @@ class MinAggrFunction(torch.autograd.Function):
         max_degree,
         warps_per_block,
         edges_per_block_heavy_nodes,
+        use_2d_kernel=False,
+        features_per_block=32,
+        tiles_y=8,
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
@@ -98,7 +122,17 @@ class MinAggrFunction(torch.autograd.Function):
                 warps_per_block = next_power_of_two(warps_per_block)
 
         out, argmin = min_aggr_cuda.min_aggr_forward_partitioned(
-            edge_ptr, edge_idx, X, light, heavy, max_degree, warps_per_block, edges_per_block_heavy_nodes
+            edge_ptr,
+            edge_idx,
+            X,
+            light,
+            heavy,
+            max_degree,
+            warps_per_block,
+            edges_per_block_heavy_nodes,
+            use_2d_kernel,
+            features_per_block,
+            tiles_y,
         )
         ctx.save_for_backward(argmin)
         ctx.num_src_nodes = X.size(0)
@@ -111,7 +145,7 @@ class MinAggrFunction(torch.autograd.Function):
         (argmin,) = ctx.saved_tensors
         num_src_nodes = ctx.num_src_nodes
         grad_x = min_aggr_cuda.min_aggr_backward(grad_out, argmin, num_src_nodes, ctx.warps_per_block)
-        return None, None, grad_x, None, None, None, None, None
+        return None, None, grad_x, None, None, None, None, None, None, None, None
 
 
 def min_aggr(
@@ -123,7 +157,20 @@ def min_aggr(
     max_degree: int,
     warps_per_block: int,
     edges_per_block_heavy_nodes: int,
+    use_2d_kernel: bool = False,
+    features_per_block: int = 32,
+    tiles_y: int = 8,
 ):
     return MinAggrFunction.apply(
-        edge_ptr, edge_idx, X, light, heavy, max_degree, warps_per_block, edges_per_block_heavy_nodes
+        edge_ptr,
+        edge_idx,
+        X,
+        light,
+        heavy,
+        max_degree,
+        warps_per_block,
+        edges_per_block_heavy_nodes,
+        use_2d_kernel,
+        features_per_block,
+        tiles_y,
     )
