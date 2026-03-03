@@ -14,17 +14,17 @@ from torch.utils.cpp_extension import load
 
 path = __file__.replace("utils.py", "")
 
-sources = ["min_aggr.cu", "min_aggr_base.cu"]
+sources = ["reduction_aggr.cu", "reduction_aggr_base.cu"]
 repo_root_path = Path(__file__).parent.parent.parent.parent.parent
-build_path = repo_root_path / "build/min_aggr"
+build_path = repo_root_path / "build/reduction_aggr"
 if not build_path.is_dir():
     build_path.mkdir(parents=True)
 
 WARP_SIZE = 32
 FOUR_BYTES_CONSTANT = 4
 
-min_aggr_cuda = load(
-    name="min_aggr_cuda",
+reduction_aggr_cuda = load(
+    name="reduction_aggr_cuda",
     build_directory=str(build_path),
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
@@ -32,20 +32,13 @@ min_aggr_cuda = load(
         "--use_fast_math",
         "--generate-line-info",
     ],
-    extra_include_paths=[
-        # *glob.glob(str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True),
-        "/usr/local/cuda/include"
-    ],
+    extra_include_paths=["/usr/local/cuda/include"],
     sources=[path + s for s in sources],
     verbose=True,
 )
 
 
-def min_aggr_forward(edge_ptr: torch.Tensor, edge_idx: torch.Tensor, X: torch.Tensor):
-    return min_aggr_cuda.min_aggr_forward(edge_ptr, edge_idx, X)
-
-
-def min_aggr_forward_partitioned(
+def reduction_aggr_forward_partitioned(
     edge_ptr,
     edge_idx,
     X,
@@ -56,8 +49,9 @@ def min_aggr_forward_partitioned(
     use_2d_kernel=False,
     features_per_block=32,
     tiles_y=8,
+    reduce="min",
 ):
-    return min_aggr_cuda.min_aggr_forward_partitioned(
+    return reduction_aggr_cuda.reduction_aggr_forward_partitioned(
         edge_ptr,
         edge_idx,
         X,
@@ -69,6 +63,7 @@ def min_aggr_forward_partitioned(
         use_2d_kernel,
         features_per_block,
         tiles_y,
+        reduce,
     )
 
 
@@ -83,7 +78,7 @@ def next_power_of_two(x):
     return x
 
 
-class MinAggrFunction(torch.autograd.Function):
+class ReductionAggrFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(
@@ -99,6 +94,7 @@ class MinAggrFunction(torch.autograd.Function):
         use_2d_kernel=False,
         features_per_block=32,
         tiles_y=8,
+        reduce="min",
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
@@ -111,7 +107,7 @@ class MinAggrFunction(torch.autograd.Function):
         if num_threads_needed < num_of_threads_invoked:
             warps_per_block_needed = ceil(num_threads_needed / WARP_SIZE)
             warnings.warn(
-                f"Number of threads involved for MinAggr is {num_of_threads_invoked} "
+                f"Number of threads involved for ReductionAggr is {num_of_threads_invoked} "
                 f"({warps_per_block} warps per thread block requested). "
                 f"However, number of threads needed is {num_threads_needed} "
                 f"({warps_per_block_needed} warps). Setting this value instead."
@@ -121,7 +117,7 @@ class MinAggrFunction(torch.autograd.Function):
             if warps_per_block not in {1, 2, 4, 8, 16, 32, 64}:
                 warps_per_block = next_power_of_two(warps_per_block)
 
-        out, argmin = min_aggr_cuda.min_aggr_forward_partitioned(
+        out, arg_idx = reduction_aggr_cuda.reduction_aggr_forward_partitioned(
             edge_ptr,
             edge_idx,
             X,
@@ -133,8 +129,9 @@ class MinAggrFunction(torch.autograd.Function):
             use_2d_kernel,
             features_per_block,
             tiles_y,
+            reduce,
         )
-        ctx.save_for_backward(argmin)
+        ctx.save_for_backward(arg_idx)
         ctx.num_src_nodes = X.size(0)
         ctx.warps_per_block = warps_per_block
         return out
@@ -142,13 +139,13 @@ class MinAggrFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out: torch.Tensor):
-        (argmin,) = ctx.saved_tensors
+        (arg_idx,) = ctx.saved_tensors
         num_src_nodes = ctx.num_src_nodes
-        grad_x = min_aggr_cuda.min_aggr_backward(grad_out, argmin, num_src_nodes, ctx.warps_per_block)
-        return None, None, grad_x, None, None, None, None, None, None, None, None
+        grad_x = reduction_aggr_cuda.reduction_aggr_backward(grad_out, arg_idx, num_src_nodes, ctx.warps_per_block)
+        return None, None, grad_x, None, None, None, None, None, None, None, None, None
 
 
-def min_aggr(
+def reduction_aggr(
     edge_ptr: torch.Tensor,
     edge_idx: torch.Tensor,
     X: torch.Tensor,
@@ -160,8 +157,9 @@ def min_aggr(
     use_2d_kernel: bool = False,
     features_per_block: int = 32,
     tiles_y: int = 8,
+    reduce: str = "min",
 ):
-    return MinAggrFunction.apply(
+    return ReductionAggrFunction.apply(
         edge_ptr,
         edge_idx,
         X,
@@ -173,4 +171,5 @@ def min_aggr(
         use_2d_kernel,
         features_per_block,
         tiles_y,
+        reduce,
     )

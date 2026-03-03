@@ -837,3 +837,42 @@ struct TileOps<8, cuda_t> {
         }
     }
 };
+
+// =============================================================================
+// ReductionOps<Op> — compile-time traits for min/max reduction kernels
+// =============================================================================
+
+enum class ReductionOp { MIN, MAX };
+
+template <ReductionOp Op>
+struct ReductionOps;
+
+template <>
+struct ReductionOps<ReductionOp::MIN> {
+    static constexpr float IDENTITY = INFINITY;          // +inf
+    static constexpr unsigned long long PACKED_IDENTITY = 0xff800000ffffffffULL;
+
+    template <typename cuda_t>
+    static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) { return a < b; }
+
+    static __device__ __forceinline__ bool is_better_f(float a, float b) { return a < b; }
+
+    static __device__ __forceinline__ unsigned long long atomic_reduce(
+        unsigned long long* addr, unsigned long long val
+    ) { return atomicMin(addr, val); }
+};
+
+template <>
+struct ReductionOps<ReductionOp::MAX> {
+    static constexpr float IDENTITY = -INFINITY;         // -inf
+    static constexpr unsigned long long PACKED_IDENTITY = 0x007fffffffffffffULL;
+
+    template <typename cuda_t>
+    static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) { return a > b; }
+
+    static __device__ __forceinline__ bool is_better_f(float a, float b) { return a > b; }
+
+    static __device__ __forceinline__ unsigned long long atomic_reduce(
+        unsigned long long* addr, unsigned long long val
+    ) { return atomicMax(addr, val); }
+};

@@ -9,7 +9,7 @@ from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import gatv2_aggr
 from .gt_aggr.utils import graph_transformer_aggr
-from .min_aggr.utils import min_aggr
+from .reduction_aggr.utils import reduction_aggr
 from .spmm_aggr.utils import spmm_aggr
 
 doc = """
@@ -17,21 +17,22 @@ CUDA backend: wraps cuda-written kernels .
 """
 
 
-class _CudaMinAggrConv(nn.Module):
+class _CudaReductionAggrConv(nn.Module):
     """
-    Min-aggregation convolution using custom CUDA extension.
+    Reduction-aggregation (min/max) convolution using custom CUDA extension.
 
     Expects:
       - x: [N, F] float32 cuda
       - graph: (edge_ptr, edge_idx) where
             edge_ptr: [N+1] int32 cuda
             edge_idx: [E]   int32 cuda
-      - light/heavy node partitions are stored as buffers inside MinAggr module
+      - light/heavy node partitions are stored as buffers inside the module
     """
 
     def __init__(
         self,
         /,
+        reduce: str = "min",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -40,6 +41,7 @@ class _CudaMinAggrConv(nn.Module):
 
         self.warps_per_block = warps_per_block
         self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
+        self.reduce = reduce
 
     def forward(
         self,
@@ -54,7 +56,7 @@ class _CudaMinAggrConv(nn.Module):
         light = graph.light_nodes
         heavy = graph.heavy_nodes
 
-        return min_aggr(
+        return reduction_aggr(
             edge_ptr,
             edge_idx,
             x,
@@ -63,21 +65,20 @@ class _CudaMinAggrConv(nn.Module):
             graph.max_degree,
             self.warps_per_block,
             self.edges_per_block_heavy_nodes,
+            reduce=self.reduce,
         )
 
 
 class _CudaSimpleAggrConv(BaseConvolution):
     def __init__(
         self,
-        aggr_type: Literal["min"] = "min",
+        aggr_type: Literal["min", "max"] = "min",
         *,
         bias: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(bias=bias, **kwargs)
-        if aggr_type != "min":
-            raise NotImplementedError(f"Only aggr_type='min' is implemented, got {aggr_type}")
-        self.conv = _CudaMinAggrConv(**kwargs)
+        self.conv = _CudaReductionAggrConv(reduce=aggr_type, **kwargs)
 
     def forward(
         self,
@@ -276,7 +277,7 @@ class CUDABackend(BaseBackend):
         """Factory for CUDA convolution layers.
 
         Args:
-            conv_type (str): 'gat_v2', 'min_aggr', 'gt', 'sum_aggr', 'mean_aggr', 'gcn'.
+            conv_type (str): 'gat_v2', 'min_aggr', 'max_aggr', 'gt', 'sum_aggr', 'mean_aggr', 'gcn'.
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments for CUDA layers.
 
@@ -293,6 +294,12 @@ class CUDABackend(BaseBackend):
             case "min_aggr":
                 return _CudaSimpleAggrConv(
                     aggr_type="min",
+                    bias=False,
+                    **kwargs,
+                )
+            case "max_aggr":
+                return _CudaSimpleAggrConv(
+                    aggr_type="max",
                     bias=False,
                     **kwargs,
                 )

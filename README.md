@@ -213,7 +213,7 @@ Requires: `pandas`, `comet_ml` (if `--use_comet`), and all backends listed in `-
 | cuGraph | Library wrapper | `cugraph` | gcn, mean_aggr, sum_aggr, min_aggr, max_aggr, gat_v2, gt |
 | cuSPARSE | Library wrapper | `cusparse`, `cusparse_precomputed_bwd` | gcn, sum_aggr, mean_aggr, random_walk |
 | TCGNN | Library wrapper | `tcgnn` | gcn, agnn |
-| CUDA | Custom CUDA | `cuda` | gcn, sum_aggr, mean_aggr, min_aggr, gat_v2, gt |
+| CUDA | Custom CUDA | `cuda` | gcn, sum_aggr, mean_aggr, min_aggr, max_aggr, gat_v2, gt |
 | CUDA Test | Custom CUDA | `cuda_test` | mean_aggr, dot_aggr |
 | FuseGNN | Custom CUDA | `fusegnn` | gcn, gat |
 | DFGNN | Custom CUDA | `dfgnn` | gt |

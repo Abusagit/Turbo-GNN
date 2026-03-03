@@ -4,7 +4,7 @@ import numpy as np
 import ogb
 import torch
 
-from src.backends.cuda_backend.min_aggr.utils import min_aggr, min_aggr_forward, min_aggr_forward_partitioned
+from src.backends.cuda_backend.reduction_aggr.utils import reduction_aggr, reduction_aggr_forward_partitioned
 from src.data.datasets import load_pyg_single_graph
 
 
@@ -92,7 +92,7 @@ def split_nodes_by_degree_quantile(edge_ptr, quantile=0.9):
     return light, heavy
 
 
-def dgl_min_aggr(g, x):
+def dgl_reduction_aggr(g, x):
     out = dgl.ops.copy_u_min(g, x)
     out[out.isinf()] = 0
     return out
@@ -276,7 +276,7 @@ def benchmark_performance(device):
         # Warm-up
         for _ in range(10):
             x_ours.grad = None
-            out_ours = min_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
+            out_ours = reduction_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
             out_ours.backward(grad_output)
 
         torch.cuda.synchronize()
@@ -287,12 +287,12 @@ def benchmark_performance(device):
         start = time.time()
         for _ in range(num_iters):
             with torch.no_grad():
-                _ = min_aggr_forward_partitioned(edge_ptr, edge_idx, x_ours.detach(), light, heavy)
+                _ = reduction_aggr_forward_partitioned(edge_ptr, edge_idx, x_ours.detach(), light, heavy)
         torch.cuda.synchronize()
         cuda_fwd_time = (time.time() - start) / num_iters * 1000.0
 
         x_ours.grad = None
-        out_ours = min_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
+        out_ours = reduction_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
@@ -305,7 +305,7 @@ def benchmark_performance(device):
         start = time.time()
         for _ in range(num_iters):
             x_ours.grad = None
-            out_ours = min_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
+            out_ours = reduction_aggr(edge_ptr, edge_idx, x_ours, light, heavy)
             out_ours.backward(grad_output)
         torch.cuda.synchronize()
         cuda_total_time = (time.time() - start) / num_iters * 1000.0
@@ -315,7 +315,7 @@ def benchmark_performance(device):
         # Warm-up
         for _ in range(10):
             x_dgl.grad = None
-            out_dgl = dgl_min_aggr(g, x_dgl)
+            out_dgl = dgl_reduction_aggr(g, x_dgl)
             out_dgl.backward(grad_output)
         torch.cuda.synchronize()
 
@@ -324,13 +324,13 @@ def benchmark_performance(device):
         start = time.time()
         for _ in range(num_iters):
             with torch.no_grad():
-                _ = dgl_min_aggr(g, x_dgl.detach())
+                _ = dgl_reduction_aggr(g, x_dgl.detach())
         torch.cuda.synchronize()
         dgl_fwd_time = (time.time() - start) / num_iters * 1000.0
 
         # Backward only
         x_dgl.grad = None
-        out_dgl = dgl_min_aggr(g, x_dgl)
+        out_dgl = dgl_reduction_aggr(g, x_dgl)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
@@ -344,7 +344,7 @@ def benchmark_performance(device):
         start = time.time()
         for _ in range(num_iters):
             x_dgl.grad = None
-            out_dgl = dgl_min_aggr(g, x_dgl)
+            out_dgl = dgl_reduction_aggr(g, x_dgl)
             out_dgl.backward(grad_output)
         torch.cuda.synchronize()
         dgl_total_time = (time.time() - start) / num_iters * 1000.0
@@ -424,7 +424,7 @@ def benchmark_real_graphs(device):
                 # Warm-up
                 for _ in range(5):
                     x_cuda.grad = None
-                    out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
+                    out_cuda = reduction_aggr(indptr, indices, x_cuda, light, heavy)
                     out_cuda.backward(grad_output)
                 torch.cuda.synchronize()
 
@@ -435,13 +435,13 @@ def benchmark_real_graphs(device):
                 start = time.time()
                 for _ in range(num_iters):
                     with torch.no_grad():
-                        _ = min_aggr_forward_partitioned(indptr, indices, x_cuda.detach(), light, heavy)
+                        _ = reduction_aggr_forward_partitioned(indptr, indices, x_cuda.detach(), light, heavy)
                 torch.cuda.synchronize()
                 cuda_fwd_time = (time.time() - start) / num_iters * 1000.0
 
                 # Backward only
                 x_cuda.grad = None
-                out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
+                out_cuda = reduction_aggr(indptr, indices, x_cuda, light, heavy)
 
                 torch.cuda.synchronize()
                 start = time.time()
@@ -458,7 +458,7 @@ def benchmark_real_graphs(device):
                 start = time.time()
                 for _ in range(num_iters):
                     x_cuda.grad = None
-                    out_cuda = min_aggr(indptr, indices, x_cuda, light, heavy)
+                    out_cuda = reduction_aggr(indptr, indices, x_cuda, light, heavy)
                     out_cuda.backward(grad_output)
                 torch.cuda.synchronize()
                 cuda_total_time = (time.time() - start) / num_iters * 1000.0
@@ -471,7 +471,7 @@ def benchmark_real_graphs(device):
                 # Warm-up
                 for _ in range(5):
                     x_dgl.grad = None
-                    out_dgl = dgl_min_aggr(g, x_dgl)
+                    out_dgl = dgl_reduction_aggr(g, x_dgl)
                     out_dgl.backward(grad_output)
                 torch.cuda.synchronize()
 
@@ -480,13 +480,13 @@ def benchmark_real_graphs(device):
                 start = time.time()
                 for _ in range(num_iters):
                     with torch.no_grad():
-                        _ = dgl_min_aggr(g, x_dgl.detach())
+                        _ = dgl_reduction_aggr(g, x_dgl.detach())
                 torch.cuda.synchronize()
                 dgl_fwd_time = (time.time() - start) / num_iters * 1000.0
 
                 # Backward only
                 x_dgl.grad = None
-                out_dgl = dgl_min_aggr(g, x_dgl)
+                out_dgl = dgl_reduction_aggr(g, x_dgl)
 
                 torch.cuda.synchronize()
                 start = time.time()
@@ -503,7 +503,7 @@ def benchmark_real_graphs(device):
                 start = time.time()
                 for _ in range(num_iters):
                     x_dgl.grad = None
-                    out_dgl = dgl_min_aggr(g, x_dgl)
+                    out_dgl = dgl_reduction_aggr(g, x_dgl)
                     out_dgl.backward(grad_output)
                 torch.cuda.synchronize()
                 dgl_total_time = (time.time() - start) / num_iters * 1000.0

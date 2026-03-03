@@ -1,15 +1,16 @@
 #include "../common.cuh"
 
-template <typename cuda_t>
-__global__ void min_aggr_forward_light_kernel_1d(
+template <typename cuda_t, ReductionOp Op>
+__global__ void reduction_aggr_forward_light_kernel_1d(
     const int* __restrict__ light_nodes_indices,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
     const cuda_t* __restrict__ X,
     cuda_t* __restrict__ out,
-    int* __restrict__ argmin,
+    int* __restrict__ arg_idx,
     int d
 ) {
+    using ROps = ReductionOps<Op>;
     constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     using Tile = TileOps<VW, cuda_t>;
     constexpr int EPV = Tile::ELEM_PER_VEC;
@@ -24,7 +25,7 @@ __global__ void min_aggr_forward_light_kernel_1d(
 
     int node_stride = v * d;
 
-    cuda_t inf_val = make_cuda_value<cuda_t>(INFINITY);
+    cuda_t identity_val = make_cuda_value<cuda_t>(ROps::IDENTITY);
     cuda_t zero_val = make_cuda_value<cuda_t>(0.0f);
 
     const int d_vec = d / EPV;
@@ -36,7 +37,7 @@ __global__ void min_aggr_forward_light_kernel_1d(
         int best_srcs[EPV];
         #pragma unroll
         for (int e = 0; e < EPV; ++e) {
-            best_vals[e] = inf_val;
+            best_vals[e] = identity_val;
             best_srcs[e] = -1;
         }
 
@@ -46,7 +47,7 @@ __global__ void min_aggr_forward_light_kernel_1d(
             #pragma unroll
             for (int e = 0; e < EPV; ++e) {
                 cuda_t v_e = Tile::extract(val, e);
-                if (v_e < best_vals[e]) { best_vals[e] = v_e; best_srcs[e] = src; }
+                if (ROps::is_better(v_e, best_vals[e])) { best_vals[e] = v_e; best_srcs[e] = src; }
             }
         }
 
@@ -54,7 +55,7 @@ __global__ void min_aggr_forward_light_kernel_1d(
         #pragma unroll
         for (int e = 0; e < EPV; ++e) {
             result[e] = (best_srcs[e] != -1) ? best_vals[e] : zero_val;
-            argmin[node_stride + base_f + e] = best_srcs[e];
+            arg_idx[node_stride + base_f + e] = best_srcs[e];
         }
         Tile::store_vec(&out[node_stride], fv, Tile::build(result));
     }
@@ -62,15 +63,15 @@ __global__ void min_aggr_forward_light_kernel_1d(
     // Scalar tail for d % EPV != 0 (compiles away for EPV=1)
     if (d % EPV != 0 && tid == 0) {
         for (int f = d_vec * EPV; f < d; ++f) {
-            cuda_t best_val = inf_val;
+            cuda_t best_val = identity_val;
             int best_src = -1;
             for (int eid = row_start; eid < row_end; ++eid) {
                 int src = edge_idx[eid];
                 cuda_t val = X[src * d + f];
-                if (val < best_val) { best_val = val; best_src = src; }
+                if (ROps::is_better(val, best_val)) { best_val = val; best_src = src; }
             }
             out[node_stride + f] = (best_src != -1) ? best_val : zero_val;
-            argmin[node_stride + f] = best_src;
+            arg_idx[node_stride + f] = best_src;
         }
     }
 }
@@ -120,8 +121,8 @@ __device__ __forceinline__ void unpack_val_idx(
 
 
 // 2D kernel: blockIdx.x = node, blockIdx.y = edge chunk
-template<int EDGES_PER_BLOCK, typename cuda_t>
-__global__ void min_aggr_forward_heavy_kernel(
+template<int EDGES_PER_BLOCK, typename cuda_t, ReductionOp Op>
+__global__ void reduction_aggr_forward_heavy_kernel(
     const int* __restrict__ heavy_nodes_indices,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
@@ -129,6 +130,7 @@ __global__ void min_aggr_forward_heavy_kernel(
     unsigned long long* __restrict__ packed,
     int d
 ) {
+    using ROps = ReductionOps<Op>;
     constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     using Tile = TileOps<VW, cuda_t>;
     constexpr int EPV = Tile::ELEM_PER_VEC;
@@ -149,7 +151,7 @@ __global__ void min_aggr_forward_heavy_kernel(
     }
 
     int tid = threadIdx.x;
-    cuda_t inf_val = make_cuda_value<cuda_t>(INFINITY);
+    cuda_t identity_val = make_cuda_value<cuda_t>(ROps::IDENTITY);
 
     const int d_vec = d / EPV;
 
@@ -160,7 +162,7 @@ __global__ void min_aggr_forward_heavy_kernel(
         int best_srcs[EPV];
         #pragma unroll
         for (int e = 0; e < EPV; ++e) {
-            best_vals[e] = inf_val;
+            best_vals[e] = identity_val;
             best_srcs[e] = -1;
         }
 
@@ -171,7 +173,7 @@ __global__ void min_aggr_forward_heavy_kernel(
             #pragma unroll
             for (int e = 0; e < EPV; ++e) {
                 cuda_t v_e = Tile::extract(val, e);
-                if (v_e < best_vals[e]) { best_vals[e] = v_e; best_srcs[e] = src; }
+                if (ROps::is_better(v_e, best_vals[e])) { best_vals[e] = v_e; best_srcs[e] = src; }
             }
         }
 
@@ -179,7 +181,7 @@ __global__ void min_aggr_forward_heavy_kernel(
         for (int e = 0; e < EPV; ++e) {
             if (best_srcs[e] >= 0) {
                 unsigned long long new_val = pack_val_idx(cuda_to_float(best_vals[e]), best_srcs[e]);
-                atomicMin(&packed[node_idx * d + base_f + e], new_val);
+                ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
             }
         }
     }
@@ -187,19 +189,19 @@ __global__ void min_aggr_forward_heavy_kernel(
     // scalar tail for d % EPV != 0
     if (d % EPV != 0 && tid == 0) {
         for (int f = d_vec * EPV; f < d; ++f) {
-            cuda_t local_min = inf_val;
+            cuda_t local_best = identity_val;
             int local_arg = -1;
 
             #pragma unroll
             for (int eid = chunk_start; eid < chunk_end; ++eid) {
                 int src = edge_idx[eid];
                 cuda_t val = X[src * d + f];
-                if (val < local_min) { local_min = val; local_arg = src; }
+                if (ROps::is_better(val, local_best)) { local_best = val; local_arg = src; }
             }
 
             if (local_arg >= 0) {
-                unsigned long long new_val = pack_val_idx(cuda_to_float(local_min), local_arg);
-                atomicMin(&packed[node_idx * d + f], new_val);
+                unsigned long long new_val = pack_val_idx(cuda_to_float(local_best), local_arg);
+                ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
             }
         }
     }
@@ -211,7 +213,7 @@ __global__ void unpack_results_kernel(
     const unsigned long long* __restrict__ packed,
     const int* __restrict__ nodes,
     cuda_t* __restrict__ out,
-    int* __restrict__ argmin,
+    int* __restrict__ arg_idx,
     int num_nodes,
     int d
 ) {
@@ -227,22 +229,23 @@ __global__ void unpack_results_kernel(
         unpack_val_idx(packed[node_idx * d + f], val, idx);
 
         out[v * d + f] = (idx > -1) ? make_cuda_value<cuda_t>(val) : make_cuda_value<cuda_t>(0.0f);
-        argmin[v * d + f] = idx;
+        arg_idx[v * d + f] = idx;
     }
 }
 
 // 2D kernel: blockIdx.x = node, threadIdx.x = feature, threadIdx.y = edge tile
-// uses shared memory tree reduction across tiles instead of packed atomicMin
-template <typename cuda_t>
-__global__ void min_aggr_forward_heavy_kernel_2d(
+// uses shared memory tree reduction across tiles instead of packed atomicMin/Max
+template <typename cuda_t, ReductionOp Op>
+__global__ void reduction_aggr_forward_heavy_kernel_2d(
     const int* __restrict__ nodes,
     const int* __restrict__ edge_ptr,
     const int* __restrict__ edge_idx,
     const cuda_t* __restrict__ X,
     cuda_t* __restrict__ out,
-    int* __restrict__ argmin,
+    int* __restrict__ arg_idx,
     int d
 ) {
+    using ROps = ReductionOps<Op>;
     constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     using Tile = TileOps<VW, cuda_t>;
     constexpr int EPV = Tile::ELEM_PER_VEC;
@@ -265,7 +268,7 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
     float* shmem_val = reinterpret_cast<float*>(shared_mem);
     int* shmem_idx = reinterpret_cast<int*>(shmem_val + (TILES_Y * SHMEM_STRIDE));
 
-    cuda_t inf_val = make_cuda_value<cuda_t>(INFINITY);
+    cuda_t identity_val = make_cuda_value<cuda_t>(ROps::IDENTITY);
     cuda_t zero_val = make_cuda_value<cuda_t>(0.0f);
 
     int tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;
@@ -282,7 +285,7 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
         int best_srcs[EPV];
         #pragma unroll
         for (int e = 0; e < EPV; ++e) {
-            best_vals[e] = inf_val;
+            best_vals[e] = identity_val;
             best_srcs[e] = -1;
         }
 
@@ -292,7 +295,7 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
             #pragma unroll
             for (int e = 0; e < EPV; ++e) {
                 cuda_t v_e = Tile::extract(val, e);
-                if (v_e < best_vals[e]) { best_vals[e] = v_e; best_srcs[e] = src; }
+                if (ROps::is_better(v_e, best_vals[e])) { best_vals[e] = v_e; best_srcs[e] = src; }
             }
         }
 
@@ -318,7 +321,7 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
                     const float val_b = shmem_val[b];
                     const int idx_b = shmem_idx[b];
 
-                    if (val_b < val_a || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
+                    if (ROps::is_better_f(val_b, val_a) || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
                         shmem_val[a] = val_b;
                         shmem_idx[a] = idx_b;
                     }
@@ -334,7 +337,7 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
             for (int e = 0; e < EPV; ++e) {
                 int best_idx = shmem_idx[fid * EPV + e];
                 result[e] = (best_idx >= 0) ? make_cuda_value<cuda_t>(shmem_val[fid * EPV + e]) : zero_val;
-                argmin[node_stride + base_f + e] = best_idx;
+                arg_idx[node_stride + base_f + e] = best_idx;
             }
             Tile::store_vec(&out[node_stride], fv, Tile::build(result));
         }
@@ -346,19 +349,19 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
     if (d % EPV != 0) {
         const int tail_f = d_vec * EPV;
 
-        // only fid==0 does actual edge scanning; others contribute inf/-1.
-        float local_min = INFINITY;
+        // only fid==0 does actual edge scanning; others contribute identity/-1.
+        float local_best = ROps::IDENTITY;
         int local_arg = -1;
 
         if (fid == 0) {
             for (int eid = start; eid < end; ++eid) {
                 int src = edge_idx[eid];
                 float fval = cuda_to_float(X[src * d + tail_f]);
-                if (fval < local_min) { local_min = fval; local_arg = src; }
+                if (ROps::is_better_f(fval, local_best)) { local_best = fval; local_arg = src; }
             }
         }
 
-        shmem_val[tid * SHMEM_STRIDE + fid] = local_min;
+        shmem_val[tid * SHMEM_STRIDE + fid] = local_best;
         shmem_idx[tid * SHMEM_STRIDE + fid] = local_arg;
 
         __syncthreads();
@@ -373,7 +376,7 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
                 const float val_b = shmem_val[b];
                 const int idx_b = shmem_idx[b];
 
-                if (val_b < val_a || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
+                if (ROps::is_better_f(val_b, val_a) || (val_b == val_a && idx_b >= 0 && (idx_a < 0 || idx_b < idx_a))) {
                     shmem_val[a] = val_b;
                     shmem_idx[a] = idx_b;
                 }
@@ -385,15 +388,15 @@ __global__ void min_aggr_forward_heavy_kernel_2d(
             float best_val = shmem_val[0];
             int best_idx = shmem_idx[0];
             out[node_stride + tail_f] = (best_idx >= 0) ? make_cuda_value<cuda_t>(best_val) : zero_val;
-            argmin[node_stride + tail_f] = best_idx;
+            arg_idx[node_stride + tail_f] = best_idx;
         }
     }
 }
 
 template <typename cuda_t>
-__global__ void min_aggr_backward_typed(
+__global__ void reduction_aggr_backward_typed(
     const cuda_t* __restrict__ grad_out,
-    const int*   __restrict__ argmin,
+    const int*   __restrict__ arg_idx,
     cuda_t* __restrict__ grad_x,
     int num_nodes,
     int d
@@ -416,7 +419,7 @@ __global__ void min_aggr_backward_typed(
         auto grad_v = Tile::load(&grad_out[base_offset], fv);
         #pragma unroll
         for (int e = 0; e < EPV; ++e) {
-            int src = argmin[base_offset + base_f + e];
+            int src = arg_idx[base_offset + base_f + e];
             if (src >= 0) {
                 atomicAdd(&grad_x[src * d + base_f + e], Tile::extract(grad_v, e));
             }
@@ -426,7 +429,7 @@ __global__ void min_aggr_backward_typed(
     // scalar tail for d % EPV != 0
     if (d % EPV != 0 && tid == 0) {
         for (int f = d_vec * EPV; f < d; ++f) {
-            int src = argmin[base_offset + f];
+            int src = arg_idx[base_offset + f];
             if (src >= 0) {
                 atomicAdd(&grad_x[src * d + f], grad_out[base_offset + f]);
             }
@@ -434,7 +437,8 @@ __global__ void min_aggr_backward_typed(
     }
 }
 
-void min_aggr_forward_partitioned_cuda(
+template <ReductionOp Op>
+void reduction_aggr_forward_partitioned_cuda_impl(
     const at::Tensor& edge_ptr,
     const at::Tensor& edge_idx,
     const at::Tensor& X,
@@ -442,13 +446,14 @@ void min_aggr_forward_partitioned_cuda(
     const at::Tensor& heavy_nodes,
     int max_degree,
     at::Tensor& out,
-    at::Tensor& argmin,
-    int warps_per_block = 8,
-    int edges_per_block_heavy_nodes = 128,
-    bool use_2d_kernel = false,
-    int features_per_block = 32,
-    int tiles_y = 8
+    at::Tensor& arg_idx,
+    int warps_per_block,
+    int edges_per_block_heavy_nodes,
+    bool use_2d_kernel,
+    int features_per_block,
+    int tiles_y
 ) {
+    using ROps = ReductionOps<Op>;
 
     const int d = X.size(1);
     const int num_out_nodes = out.size(0);
@@ -478,18 +483,18 @@ void min_aggr_forward_partitioned_cuda(
             auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
             auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
 
-            min_aggr_forward_light_kernel_1d<cuda_t><<<num_light, THREADS_PER_BLOCK>>>(
+            reduction_aggr_forward_light_kernel_1d<cuda_t, Op><<<num_light, THREADS_PER_BLOCK>>>(
                 light_nodes.data_ptr<int>(),
                 edge_ptr.data_ptr<int>(),
                 edge_idx.data_ptr<int>(),
                 X_ptr,
                 out_ptr,
-                argmin.data_ptr<int>(),
+                arg_idx.data_ptr<int>(),
                 d
             );
         },
         MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
-        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)  // 64*32=2048
+        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
         );
     }
 
@@ -513,20 +518,20 @@ void min_aggr_forward_partitioned_cuda(
 
                 size_t shmem_size = (size_t)tiles_y * (size_t)features_per_block * EPV * (sizeof(float) + sizeof(int));
 
-                min_aggr_forward_heavy_kernel_2d<cuda_t><<<grid, block, shmem_size>>>(
+                reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op><<<grid, block, shmem_size>>>(
                     heavy_nodes.data_ptr<int>(),
                     edge_ptr.data_ptr<int>(),
                     edge_idx.data_ptr<int>(),
                     X_ptr,
                     out_ptr,
-                    argmin.data_ptr<int>(),
+                    arg_idx.data_ptr<int>(),
                     d
                 );
             },
             MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type())
             );
         } else {
-            constexpr unsigned long long PACKED_INIT = 0xff800000ffffffffULL;
+            constexpr unsigned long long PACKED_INIT = ROps::PACKED_IDENTITY;
 
             auto packed = at::full(
                 {num_heavy, d},
@@ -545,12 +550,12 @@ void min_aggr_forward_partitioned_cuda(
 
                 dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
-                min_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, cuda_t><<<grid, THREADS_PER_BLOCK>>>(
+                reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, cuda_t, Op><<<grid, THREADS_PER_BLOCK>>>(
                     heavy_nodes.data_ptr<int>(),
                     edge_ptr.data_ptr<int>(),
                     edge_idx.data_ptr<int>(),
                     X_ptr,
-                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                    reinterpret_cast<unsigned long long*>(packed.template data_ptr<int64_t>()),
                     d
                 );
             },
@@ -569,10 +574,10 @@ void min_aggr_forward_partitioned_cuda(
 
                 int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
                 unpack_results_kernel<cuda_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
-                    reinterpret_cast<unsigned long long*>(packed.data_ptr<int64_t>()),
+                    reinterpret_cast<unsigned long long*>(packed.template data_ptr<int64_t>()),
                     heavy_nodes.data_ptr<int>(),
                     out_ptr,
-                    argmin.data_ptr<int>(),
+                    arg_idx.data_ptr<int>(),
                     num_heavy,
                     d
                 );
@@ -585,9 +590,40 @@ void min_aggr_forward_partitioned_cuda(
     CUDA_KERNEL_CHECK();
 }
 
-void min_aggr_backward_cuda(
+void reduction_aggr_forward_partitioned_cuda(
+    const at::Tensor& edge_ptr,
+    const at::Tensor& edge_idx,
+    const at::Tensor& X,
+    const at::Tensor& light_nodes,
+    const at::Tensor& heavy_nodes,
+    int max_degree,
+    at::Tensor& out,
+    at::Tensor& arg_idx,
+    int warps_per_block,
+    int edges_per_block_heavy_nodes,
+    bool use_2d_kernel,
+    int features_per_block,
+    int tiles_y,
+    const std::string& reduce
+) {
+    if (reduce == "min") {
+        reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MIN>(
+            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree,
+            out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
+            use_2d_kernel, features_per_block, tiles_y);
+    } else if (reduce == "max") {
+        reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
+            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree,
+            out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
+            use_2d_kernel, features_per_block, tiles_y);
+    } else {
+        TORCH_CHECK(false, "Unsupported reduce: " + reduce);
+    }
+}
+
+void reduction_aggr_backward_cuda(
     const at::Tensor& grad_out,
-    const at::Tensor& argmin,
+    const at::Tensor& arg_idx,
     at::Tensor& grad_x,
     int warps_per_block = 8
 ) {
@@ -606,9 +642,9 @@ void min_aggr_backward_cuda(
 
         const dim3 threads(THREADS_PER_BLOCK);
 
-        min_aggr_backward_typed<cuda_t><<<blocks, threads>>>(
+        reduction_aggr_backward_typed<cuda_t><<<blocks, threads>>>(
             grad_out_ptr,
-            argmin.data_ptr<int>(),
+            arg_idx.data_ptr<int>(),
             grad_x_ptr,
             num_nodes,
             d
