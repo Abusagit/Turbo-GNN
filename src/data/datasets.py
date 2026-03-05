@@ -348,7 +348,7 @@ class GraphSample:
             )
 
             deg = counts_fwd
-            quantile = self.kernel_related_kwargs.get("huge_degree_threshold_quantile", -1)
+            quantile = self.kernel_related_kwargs.get("huge_degree_threshold_quantile", 0.95)
 
             if quantile != -1:
                 huge_degree_threshold_quantile = torch.quantile(deg.float(), quantile).item()

@@ -3,7 +3,8 @@
 constexpr int kWarpsPerBlock = 4;
 
 template<int D_CONST, typename cuda_t>
-__global__ void GraphAttentionForward_CSR_MH_v2_D(
+__global__ void __launch_bounds__(kWarpsPerBlock * kWarpSize)
+GraphAttentionForward_CSR_MH_v2_D(
     const int N,
     const int H,
     const cuda_t* __restrict__ Q,
@@ -21,7 +22,7 @@ __global__ void GraphAttentionForward_CSR_MH_v2_D(
 ) {
     static_assert(D_CONST % 32 == 0, "D_CONST must be multiple of 32 for this fast path");
 
-    constexpr int VW = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
     constexpr int EPV = Tile::ELEM_PER_VEC;
     constexpr int VEC_D = D_CONST / EPV;
@@ -196,7 +197,8 @@ __global__ void GraphAttentionForward_CSR_MH_v2_D(
 
 // D[i,h] = sum_d dO[i,h,d] * O[i,h,d]
 template<int D_CONST, typename cuda_t>
-__global__ void compute_D_mh_kernel_D(
+__global__ void __launch_bounds__(kWarpSize)
+compute_D_mh_kernel_D(
     const cuda_t* __restrict__ dO,   // [N, H, D]
     const cuda_t* __restrict__ O_in, // [N, H, D]
     float* __restrict__ D_out,       // [N, H]
@@ -209,7 +211,7 @@ __global__ void compute_D_mh_kernel_D(
 ) {
     static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
 
-    constexpr int VW = (sizeof(cuda_t) <= 2) ? 8 : 4;
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
     constexpr int EPV = Tile::ELEM_PER_VEC;
     constexpr int D_VEC = D_CONST / EPV;
@@ -246,7 +248,8 @@ __global__ void compute_D_mh_kernel_D(
 // logsumexp and Delta are [N, H].
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
 template<int D_CONST, typename cuda_t>
-__global__ void graph_attn_backward_csrT_kernel_D(
+__global__ void __launch_bounds__(kWarpSize)
+graph_attn_backward_csrT_kernel_D(
     int64_t N,
     int64_t H,
     const int* __restrict__ row_ptr_T,   // [N+1], CSR^T row pointers
@@ -262,12 +265,12 @@ __global__ void graph_attn_backward_csrT_kernel_D(
     const float* __restrict__ Delta,     // [N, H]
     float scale,
     cuda_t* __restrict__ dQ,             // [N, H, D] (contiguous)
-    cuda_t* __restrict__ dK,             // [N, H, D] (contiguous)
+    float* __restrict__ dK,              // [N, H, D] (contiguous, float32 for atomicAdd)
     cuda_t* __restrict__ dV              // [N, H, D] (contiguous)
 ) {
     static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
 
-    constexpr int VW = (sizeof(cuda_t) <= 2) ? 8 : 4;
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
     constexpr int EPV = Tile::ELEM_PER_VEC;
     constexpr int D_VEC = D_CONST / EPV;
@@ -379,8 +382,8 @@ __global__ void graph_attn_backward_csrT_kernel_D(
         const float dS        = alpha * (dP_ij - Delta_i);
         const float dS_scaled = dS * scale;
 
-        // 2) accumulate dV_j, dQ_j in float32 shared; atomicAdd dK_i (typed, contiguous)
-        cuda_t* dK_i_base = dK + out_ih;
+        // 2) accumulate dV_j, dQ_j in float32 shared; atomicAdd dK_i (float32, contiguous)
+        float* dK_i_base = dK + out_ih;
 
         for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
             int base_f = fv * EPV;
@@ -390,7 +393,7 @@ __global__ void graph_attn_backward_csrT_kernel_D(
 
             Tile::weighted_accum(&gv_shared[base_f], alpha, dOi);
             Tile::weighted_accum(&gq_shared[base_f], dS_scaled, ki);
-            Tile::gt_atomic_add_scaled(dK_i_base, base_f, dS_scaled, qj);
+            Tile::atomic_add_scaled_f32(dK_i_base, base_f, dS_scaled, qj);
         }
     }
 
@@ -577,10 +580,10 @@ graph_attention_backward_csr_mh_cuda(
     auto f32_options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
     auto typed_options = torch::TensorOptions().dtype(input_dtype).device(Q.device());
 
-    // dQ, dV, dK match input dtype; dK uses typed atomicAdd
+    // dQ, dV match input dtype; dK accumulates in float32 to avoid bf16/fp16 atomicAdd contention
     torch::Tensor dQ = torch::empty({N, H, D}, typed_options);
     torch::Tensor dV = torch::empty({N, H, D}, typed_options);
-    torch::Tensor dK = torch::zeros({N, H, D}, typed_options);
+    torch::Tensor dK_f32 = torch::zeros({N, H, D}, f32_options);
 
     // Delta[i,h] = <O[i,h,:], dO[i,h,:]>
     torch::Tensor Delta = torch::empty({N, H}, f32_options);
@@ -626,7 +629,7 @@ graph_attention_backward_csr_mh_cuda(
         // qj + vj as cuda_t, gq + gv as float
         size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + 2 * DC * sizeof(float);
 
-        auto* dK_ptr = reinterpret_cast<cuda_t*>(dK.data_ptr<torch_t>());
+        auto* dK_ptr = dK_f32.data_ptr<float>();
 
         graph_attn_backward_csrT_kernel_D<DC, cuda_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
             N, H,
@@ -645,6 +648,10 @@ graph_attention_backward_csr_mh_cuda(
        MakeIntVariant<32, 64, 128, 256>((int)D));
 
     CUDA_KERNEL_CHECK();
+
+    // Convert float32 dK accumulator back to input dtype
+    torch::Tensor dK = dK_f32.to(input_dtype);
+
     return std::make_tuple(dQ, dK, dV);
 }
 

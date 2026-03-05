@@ -5,7 +5,8 @@
 // =============================================================================
 
 template<int D_CONST, typename cuda_t>
-__global__ void GATv2Forward_Kernel(
+__global__ void __launch_bounds__(kMaxThreadsInWarp)
+GATv2Forward_Kernel(
     size_t N,
     size_t H,
     size_t D,
@@ -22,10 +23,7 @@ __global__ void GATv2Forward_Kernel(
     float* __restrict__ d_logsumexp_out,
     float negative_slope
 ) {
-    // compile-time VW selection
-    constexpr bool is_fp32 = (sizeof(cuda_t) == 4);
-    constexpr int VW = (D_CONST <= 64) ? (is_fp32 ? 1 : 2)
-                                       : (is_fp32 ? 4 : 8);
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
     using vec_t = typename Tile::vec_t;
     using ns_t  = typename Tile::ns_t;
@@ -142,7 +140,8 @@ __global__ void GATv2Forward_Kernel(
 // Unified GATv2 Backward AL kernel (computes grad_a, grad_l, G)
 // =============================================================================
 template<int D_CONST, typename cuda_t>
-__global__ void GATv2Backward_AL(
+__global__ void __launch_bounds__(kMaxThreadsInWarp)
+GATv2Backward_AL(
     size_t N, size_t H, size_t D,
     const cuda_t* __restrict__ grad_h,
     int64_t stride_gh_n,
@@ -162,10 +161,7 @@ __global__ void GATv2Backward_AL(
     cuda_t* __restrict__ grad_l, // [N, H, D]
     float* __restrict__ d_G      // [N, H]
 ) {
-    // Compile-time VW selection (same as forward)
-    constexpr bool is_fp32 = (sizeof(cuda_t) == 4);
-    constexpr int VW = (D_CONST <= 64) ? (is_fp32 ? 1 : 2)
-                                       : (is_fp32 ? 4 : 8);
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
     using vec_t = typename Tile::vec_t;
     using ns_t  = typename Tile::ns_t;
@@ -334,7 +330,8 @@ __global__ void GATv2Backward_AL(
 // Unified GATv2 Backward R kernel (computes grad_r)
 // =============================================================================
 template<int D_CONST, typename cuda_t>
-__global__ void GATv2Backward_R(
+__global__ void __launch_bounds__(kMaxThreadsInWarp)
+GATv2Backward_R(
     size_t N, size_t H, size_t D,
     const cuda_t* __restrict__ grad_h,
     int64_t stride_gh_n,
@@ -353,9 +350,7 @@ __global__ void GATv2Backward_R(
     float negative_slope,
     cuda_t* __restrict__ grad_r              // [N, H, D]
 ) {
-    constexpr bool is_fp32 = (sizeof(cuda_t) == 4);
-    constexpr int VW = (D_CONST <= 64) ? (is_fp32 ? 1 : 2)
-                                       : (is_fp32 ? 4 : 8);
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
     using vec_t = typename Tile::vec_t;
     using ns_t  = typename Tile::ns_t;
@@ -472,11 +467,12 @@ __global__ void GATv2Backward_R(
 
 
 template<int grad_A_reduce_row_chunk_size, typename cuda_t>
-__global__ void ReduceGradAKernel(
+__global__ void __launch_bounds__(kMaxThreadsInWarp * kMaxThreadsInWarp)
+ReduceGradAKernel(
     size_t N, size_t H, size_t D,
 
     const float* __restrict__ grad_a,        // [N, H, D] always float32
-    cuda_t* __restrict__ d_grad_a_reduced_out // [H, D] output in input dtype
+    float* __restrict__ d_grad_a_reduced_out // [H, D] output in float32
 ){
 
     //head inbex
@@ -534,11 +530,7 @@ __global__ void ReduceGradAKernel(
     if (ty == 0 && fx < (int)D && head_h < (int)H) {
         // output layout: [H, D] contiguous
         size_t out_idx = (size_t)head_h * D + (size_t)fx;
-        if constexpr (sizeof(cuda_t) == 4) {
-            atomicAdd(d_grad_a_reduced_out + out_idx, result_accum[tx]);
-        } else {
-            atomicAdd(d_grad_a_reduced_out + out_idx, make_cuda_value<cuda_t>(result_accum[tx]));
-        }
+        atomicAdd(d_grad_a_reduced_out + out_idx, result_accum[tx]);
     }
 }
 
@@ -577,7 +569,7 @@ void GATv2Backward_CSR_Impl(
     cuda_t* grad_l,            // [N, H, D]
     cuda_t* grad_r,            // [N, H, D]
     float* grad_a,             // [N, H, D] always float32
-    cuda_t* d_grad_a_reduced   // [H, D] output in input dtype
+    float* d_grad_a_reduced    // [H, D] output in float32
 ) {
     dim3 nThreads(kMaxThreadsInWarp);
     dim3 nBlocks(N, H);
@@ -805,8 +797,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor grad_r = torch::empty({N, H, D}, typed_options);
     // grad_a: always float32 (internal)
     torch::Tensor grad_a = torch::empty({N, H, D}, f32_options);
-    // grad_a_reduced: directly in input dtype (atomicAdd converts inside kernel)
-    torch::Tensor grad_a_reduced = torch::zeros({H, D}, typed_options);
+    // grad_a_reduced: accumulate in float32 to avoid bf16/fp16 atomicAdd contention
+    torch::Tensor grad_a_reduced_f32 = torch::zeros({H, D}, f32_options);
 
     const int* d_row_ptr     = row_ptr.data_ptr<int>();
     const int* d_col_idx     = col_idx.data_ptr<int>();
@@ -831,7 +823,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         auto* attn_ptr   = reinterpret_cast<const cuda_t*>(attn_vec.data_ptr<torch_t>());
         auto* grad_l_ptr = reinterpret_cast<cuda_t*>(grad_l.data_ptr<torch_t>());
         auto* grad_r_ptr = reinterpret_cast<cuda_t*>(grad_r.data_ptr<torch_t>());
-        auto* grad_a_reduced_ptr = reinterpret_cast<cuda_t*>(grad_a_reduced.data_ptr<torch_t>());
+        auto* grad_a_reduced_ptr = grad_a_reduced_f32.data_ptr<float>();
 
         GATv2Backward_CSR_Impl<DC, cuda_t>(
             N, H, D,
@@ -850,6 +842,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
        MakeIntVariant<32, 64, 128, 256>((int)D));
 
     CUDA_KERNEL_CHECK();
+
+    torch::Tensor grad_a_reduced = grad_a_reduced_f32.to(input_dtype);
 
     return {grad_l, grad_r, grad_a_reduced};
 }

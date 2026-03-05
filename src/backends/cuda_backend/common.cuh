@@ -426,6 +426,19 @@ __device__ __forceinline__ float4 f4_mul(float4 a, float4 b) {
 }
 
 // =============================================================================
+// SelectVW: pick widest VW where D/EPV >= THREADS_PER_D (all threads active).
+// Falls back to narrowest VW if no width satisfies the constraint.
+// Available: fp32 → {4, 1}, 16-bit → {8, 2}.
+// =============================================================================
+template<int D_CONST, typename cuda_t, int THREADS_PER_D = 32>
+struct SelectVW {
+    static constexpr bool is_fp32 = (sizeof(cuda_t) == 4);
+    static constexpr int value = is_fp32
+        ? ((D_CONST / 4 >= THREADS_PER_D) ? 4 : 1)
+        : ((D_CONST / 8 >= THREADS_PER_D) ? 8 : 2);
+};
+
+// =============================================================================
 // TileOps<VW, cuda_t> — vectorized load/compute/store traits for forward kernel
 // =============================================================================
 
@@ -490,8 +503,8 @@ struct TileOps<1, float> {
     static __device__ __forceinline__ vec_t build(const float* arr) { return arr[0]; }
     static __device__ __forceinline__ vec_t build_from_float(const float* arr) { return arr[0]; }
 
-    // --- GT backward: typed atomic add of scalar * vec ---
-    static __device__ __forceinline__ void gt_atomic_add_scaled(
+    // --- GT backward: float32 atomic add of scalar * vec ---
+    static __device__ __forceinline__ void atomic_add_scaled_f32(
         float* ptr, int base_f, float scalar, vec_t v
     ) {
         atomicAdd(&ptr[base_f], scalar * v);
@@ -573,8 +586,8 @@ struct TileOps<4, float> {
         return {arr[0], arr[1], arr[2], arr[3]};
     }
 
-    // --- GT backward: typed atomic add of scalar * vec ---
-    static __device__ __forceinline__ void gt_atomic_add_scaled(
+    // --- GT backward: float32 atomic add of scalar * vec ---
+    static __device__ __forceinline__ void atomic_add_scaled_f32(
         float* ptr, int base_f, float scalar, vec_t v
     ) {
         atomicAdd(&ptr[base_f + 0], scalar * v.x);
@@ -676,15 +689,13 @@ struct TileOps<2, cuda_t> {
         return Ops::from_float2(make_float2(arr[0], arr[1]));
     }
 
-    // --- GT backward: typed atomic add of scalar * vec ---
-    static __device__ __forceinline__ void gt_atomic_add_scaled(
-        cuda_t* ptr, int base_f, float scalar, vec_t v
+    // --- GT backward: float32 atomic add of scalar * vec ---
+    static __device__ __forceinline__ void atomic_add_scaled_f32(
+        float* ptr, int base_f, float scalar, vec_t v
     ) {
-        vec2_t sv = Ops::from_float(scalar);
-        vec2_t prod = Ops::mul(sv, v);
-        const cuda_t* elems = reinterpret_cast<const cuda_t*>(&prod);
-        atomicAdd(&ptr[base_f],     elems[0]);
-        atomicAdd(&ptr[base_f + 1], elems[1]);
+        float2 vf = Ops::to_float2(v);
+        atomicAdd(&ptr[base_f],     scalar * vf.x);
+        atomicAdd(&ptr[base_f + 1], scalar * vf.y);
     }
 };
 
@@ -823,17 +834,15 @@ struct TileOps<8, cuda_t> {
         return result;
     }
 
-    // --- GT backward: typed atomic add of scalar * vec ---
-    static __device__ __forceinline__ void gt_atomic_add_scaled(
-        cuda_t* ptr, int base_f, float scalar, vec_t v
+    // --- GT backward: float32 atomic add of scalar * vec ---
+    static __device__ __forceinline__ void atomic_add_scaled_f32(
+        float* ptr, int base_f, float scalar, vec_t v
     ) {
-        vec2_t sv = Ops::from_float(scalar);
         #pragma unroll
         for (int p = 0; p < 4; ++p) {
-            vec2_t prod = Ops::mul(sv, v.v[p]);
-            const cuda_t* elems = reinterpret_cast<const cuda_t*>(&prod);
-            atomicAdd(&ptr[base_f + p * 2],     elems[0]);
-            atomicAdd(&ptr[base_f + p * 2 + 1], elems[1]);
+            float2 vf = Ops::to_float2(v.v[p]);
+            atomicAdd(&ptr[base_f + p * 2],     scalar * vf.x);
+            atomicAdd(&ptr[base_f + p * 2 + 1], scalar * vf.y);
         }
     }
 };

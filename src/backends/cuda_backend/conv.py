@@ -294,13 +294,11 @@ class CUDABackend(BaseBackend):
             case "min_aggr":
                 return _CudaSimpleAggrConv(
                     aggr_type="min",
-                    bias=False,
                     **kwargs,
                 )
             case "max_aggr":
                 return _CudaSimpleAggrConv(
                     aggr_type="max",
-                    bias=False,
                     **kwargs,
                 )
             case "gt":

@@ -6,7 +6,7 @@ encoder:
       conv_type: null  # leave to null -- insert during runtime
       backend: null    # leave to null -- insert during runtime
       in_channels: auto
-      out_channels: 128
+      out_channels: 256
       heads: 8         # used by graph attention-like convolutions (GAT/GATv2/Graph Transformer)
       norm: layer
       activation: silu
@@ -17,7 +17,7 @@ encoder:
       conv_type: null  # leave to null -- insert during runtime
       backend: null    # leave to null -- insert during runtime
       in_channels: auto
-      out_channels: 128
+      out_channels: 256
       heads: 8         # used by graph attention-like convolutions (GAT/GATv2/Graph Transformer)
       norm: layer
       activation: silu
