@@ -5,7 +5,7 @@ from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import AutotuneConfig, BaseBackend, BaseConvolution, TunableParam
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import gatv2_aggr
 from .gt_aggr.utils import graph_transformer_aggr
@@ -38,10 +38,18 @@ class _CudaReductionAggrConv(nn.Module):
         super().__init__()
         warps_per_block = kwargs.get("warps_per_block", 8)
         edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
+        use_2d_kernel = kwargs.get("use_2d_kernel", False)
+        features_per_block = kwargs.get("features_per_block", 32)
+        tiles_y = kwargs.get("tiles_y", 8)
 
+        self.forward_warps_per_block = warps_per_block
+        self.forward_edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
         self.warps_per_block = warps_per_block
         self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
         self.reduce = reduce
+        self.forward_use_2d_kernel = use_2d_kernel
+        self.forward_features_per_block = features_per_block
+        self.forward_tiles_y = tiles_y
 
     def forward(
         self,
@@ -63,8 +71,11 @@ class _CudaReductionAggrConv(nn.Module):
             light,
             heavy,
             graph.max_degree,
-            self.warps_per_block,
-            self.edges_per_block_heavy_nodes,
+            self.forward_warps_per_block,
+            self.forward_edges_per_block_heavy_nodes,
+            self.forward_use_2d_kernel,
+            self.forward_features_per_block,
+            self.forward_tiles_y,
             reduce=self.reduce,
         )
 
@@ -89,6 +100,20 @@ class _CudaSimpleAggrConv(BaseConvolution):
         **kwargs: Any,
     ) -> torch.Tensor:
         return self.conv(x, graph, edge_weight=edge_weight, **kwargs)
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
+            TunableParam("forward_edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
+            TunableParam("forward_use_2d_kernel", [True, False], default=False),
+            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
+            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
+        ]
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99, 0.999], default=-1),
+        ]
 
 
 class _CUDAGATv2Conv(BaseConvolution):
@@ -115,7 +140,7 @@ class _CUDAGATv2Conv(BaseConvolution):
 
         self.negative_slope = negative_slope
         self.heads = heads
-        self.grad_A_reduce_row_chunk_size = kwargs.get("grad_A_reduce_row_chunk_size", 512)
+        self.backward_grad_A_reduce_row_chunk_size = kwargs.get("grad_A_reduce_row_chunk_size", 512)
 
         self.feature_dim = feature_dim
         self.head_dim = feature_dim
@@ -163,11 +188,29 @@ class _CUDAGATv2Conv(BaseConvolution):
             x_right,
             self.attn_weights.data,
             self.negative_slope,
-            self.grad_A_reduce_row_chunk_size,
+            self.backward_grad_A_reduce_row_chunk_size,
         ).view(-1, self.heads * self.head_dim)
 
         out = self._outer_proj(out)
         return out
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return []
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("backward_grad_A_reduce_row_chunk_size", [16, 32, 64, 128, 256, 512, 1024, 2048], default=512),
+        ]
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("backward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
 
 
 class _CudaGraphTransformerConv(BaseConvolution):
@@ -230,6 +273,16 @@ class _CudaGraphTransformerConv(BaseConvolution):
         ).view(-1, self.feature_dim)
         return out
 
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("backward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
 
 class _CudaSpMMConv(BaseConvolution):
     """cuSPARSE SpMM convolution using AdjacencyForwardBackwardWithNodeBuckets.
@@ -284,15 +337,18 @@ class CUDABackend(BaseBackend):
         Returns:
             BaseConvolution: An instance of the requested CUDA conv.
         """
+        autotune = kwargs.pop("autotune", False)
+        autotune_config = kwargs.pop("autotune_config", None)
+
         feature_dim = kwargs.pop("feature_dim")
 
         ct = conv_type.lower()
         match ct:
             case "gat_v2":
                 heads = kwargs.pop("heads")
-                return _CUDAGATv2Conv(feature_dim=feature_dim, heads=heads, **kwargs)
+                conv = _CUDAGATv2Conv(feature_dim=feature_dim, heads=heads, **kwargs)
             case "min_aggr":
-                return _CudaSimpleAggrConv(
+                conv = _CudaSimpleAggrConv(
                     aggr_type="min",
                     **kwargs,
                 )
@@ -303,7 +359,7 @@ class CUDABackend(BaseBackend):
                 )
             case "gt":
                 heads = kwargs.pop("heads")
-                return _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
+                conv = _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
             case "sum_aggr":
                 return _CudaSpMMConv(
                     norm_type="none",
@@ -322,5 +378,10 @@ class CUDABackend(BaseBackend):
                     cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
                     block_dim=kwargs.get("block_dim", 256),
                 )
+            case _:
+                raise KeyError(f"Unsupported conv_type for CUDA backend: {conv_type}")
 
-        raise KeyError(f"Unsupported conv_type for CUDA backend: {conv_type}")
+        if autotune:
+            conv.enable_autotune(config=autotune_config)
+
+        return conv

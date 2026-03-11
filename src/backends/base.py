@@ -7,12 +7,18 @@ implementations and convolution layers in the benchmarking framework.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 import torch
 import torch.nn as nn
+
+from src.data.datasets import GraphSample
+
+logger = logging.getLogger(__name__)
 
 __doc__ = """
 Base module for backend implementations.
@@ -46,6 +52,62 @@ class GraphFormat(Enum):
     DGL_GRAPH = "dgl_graph"
     CSR = "csr"
     COO = "coo"
+
+
+@dataclass
+class TunableParam:
+    """A single tunable parameter for autotuning grid search.
+
+    Attributes:
+        name: Prefixed param name (e.g. 'forward_warps_per_block').
+        values: Candidate values for grid search.
+        default: Default value when not tuning.
+    """
+
+    name: str
+    values: list
+    default: Any
+
+
+@dataclass
+class AutotuneConfig:
+    """Configuration for the autotuning engine.
+
+    Attributes:
+        warmup: Number of warmup iterations before timing.
+        iters: Number of timed iterations.
+        tune_backward: Whether to include backward pass in timing.
+        cache_dir: Directory for JSON cache files. None disables caching.
+        use_cache: Whether to load from cache if available.
+    """
+
+    warmup: int = 10
+    iters: int = 50
+    tune_backward: bool = False
+    cache_dir: str | None = None
+    use_cache: bool = True
+
+
+def _autotune_forward_pre_hook(module: BaseConvolution, args):
+    """Lazy autotuning: triggers on first forward when autotune is enabled."""
+    if not (module._autotune_enabled and not module._is_tuned and not module._is_autotuning):
+        return None
+
+    x = args[0]
+    graph = args[1] if len(args) > 1 else None
+    graph_sample = module._graph_sample_ref
+
+    # also accept GraphSample passed directly as graph arg.
+    if graph_sample is None and graph is not None and isinstance(graph, GraphSample):
+        graph_sample = graph
+
+    if graph_sample is None:
+        logger.warning("autotune=True but no GraphSample available. Skipping autotuning.")
+        module._is_tuned = True
+        return None
+
+    module.autotune(x, graph_sample)
+    return None
 
 
 class BaseBackend(ABC):
@@ -113,6 +175,13 @@ class BaseConvolution(nn.Module):
         self.use_bias = bias
         self.dropout = dropout
 
+        # autotuning state
+        self._autotune_enabled: bool = False
+        self._is_tuned: bool = False
+        self._is_autotuning: bool = False
+        self._autotune_config: AutotuneConfig = AutotuneConfig()
+        self._graph_sample_ref: GraphSample | None = None
+
     @abstractmethod
     def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
         """Perform forward pass of the graph convolution.
@@ -126,3 +195,74 @@ class BaseConvolution(nn.Module):
             Output node features of shape [num_nodes, feature_dim]
         """
         pass
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        """Return kernel parameter search space for autotuning.
+
+        Override in subclasses to declare tunable kernel parameters.
+        """
+        return []
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        """Return graph parameter search space for autotuning.
+
+        Override in subclasses to declare tunable graph-level parameters.
+        """
+        return []
+
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
+        """Backward-pass kernel parameter search space."""
+        return []
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        """Backward-pass graph parameter search space."""
+        return []
+
+    def configure(self, **kwargs: Any) -> None:
+        """Apply tunable parameter values.
+
+        Sets attributes using the full prefixed names from TunableParam.
+        Subclasses can override to delegate to inner convolutions or
+        apply custom logic.
+        """
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def autotune(self, x: torch.Tensor, graph_sample: GraphSample, config: AutotuneConfig | None = None) -> dict:
+        """Explicitly run autotuning to find optimal parameters.
+
+        Args:
+            x: Input node features for benchmarking.
+            graph_sample: GraphSample instance (needed for graph param tuning).
+            config: Optional config override.
+
+        Returns:
+            Dict of best parameter name -> value mappings.
+        """
+        from src.backends.autotune import run_autotune
+
+        if config is not None:
+            self._autotune_config = config
+
+        self._is_autotuning = True
+        try:
+            best = run_autotune(self, x, graph_sample, self._autotune_config)
+        finally:
+            self._is_autotuning = False
+
+        self._is_tuned = True
+        return best
+
+    def enable_autotune(self, config: AutotuneConfig | None = None, graph_sample: GraphSample | None = None) -> None:
+        """Enable lazy autotuning that triggers on first forward() call.
+
+        Args:
+            config: Optional autotuning configuration.
+            graph_sample: Optional GraphSample for graph param tuning.
+        """
+        self._autotune_enabled = True
+        if config is not None:
+            self._autotune_config = config
+        if graph_sample is not None:
+            self._graph_sample_ref = graph_sample
+        self.register_forward_pre_hook(_autotune_forward_pre_hook)

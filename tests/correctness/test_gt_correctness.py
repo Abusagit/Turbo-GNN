@@ -70,8 +70,10 @@ def build_cuda_graph(edge_index: torch.Tensor, num_nodes: int):
         forward_indices=fwd_indices.int(),
         backward_indptr=bwd_indptr.int(),
         backward_indices=bwd_indices.int(),
-        light_nodes=all_nodes,
-        heavy_nodes=empty_nodes,
+        forward_light_nodes=all_nodes,
+        forward_heavy_nodes=empty_nodes,
+        backward_light_nodes=all_nodes,
+        backward_heavy_nodes=empty_nodes,
     )
 
 

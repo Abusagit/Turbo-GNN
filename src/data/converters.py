@@ -632,8 +632,10 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     forward_indices: torch.Tensor
     backward_indptr: torch.Tensor
     backward_indices: torch.Tensor
-    light_nodes: torch.Tensor
-    heavy_nodes: torch.Tensor
+    forward_light_nodes: torch.Tensor
+    forward_heavy_nodes: torch.Tensor
+    backward_light_nodes: torch.Tensor
+    backward_heavy_nodes: torch.Tensor
 
     max_degree: int = -1
     _device: torch.device = torch.device("cpu")
@@ -644,6 +646,15 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         self.max_degree = degrees.max().item()
         assert self.max_degree != -1
 
+    # Back-compat aliases: light_nodes / heavy_nodes → forward buckets
+    @property
+    def light_nodes(self) -> torch.Tensor:
+        return self.forward_light_nodes
+
+    @property
+    def heavy_nodes(self) -> torch.Tensor:
+        return self.forward_heavy_nodes
+
     @property
     def device(self) -> torch.device:
         return self._device
@@ -653,8 +664,10 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         self.forward_indices = self.forward_indices.to(device)
         self.backward_indptr = self.backward_indptr.to(device)
         self.backward_indices = self.backward_indices.to(device)
-        self.light_nodes = self.light_nodes.to(device)
-        self.heavy_nodes = self.heavy_nodes.to(device)
+        self.forward_light_nodes = self.forward_light_nodes.to(device)
+        self.forward_heavy_nodes = self.forward_heavy_nodes.to(device)
+        self.backward_light_nodes = self.backward_light_nodes.to(device)
+        self.backward_heavy_nodes = self.backward_heavy_nodes.to(device)
         torch.cuda.empty_cache()
 
         return self
