@@ -39,6 +39,7 @@ gatv2_kernels = load(
 
 class gatv2_function(torch.autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
         indptr_forward: torch.Tensor,
@@ -51,6 +52,9 @@ class gatv2_function(torch.autograd.Function):
         negative_slope: float,
         grad_A_reduce_row_chunk_size: int,
     ):
+        if torch.is_autocast_enabled():
+            attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
+
         output, logsumexp = gatv2_kernels.forward(
             x_left,
             x_right,
@@ -59,7 +63,6 @@ class gatv2_function(torch.autograd.Function):
             attention_weights,
             negative_slope,
         )
-
         ctx.negative_slope = negative_slope
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
         ctx.heads = x_left.shape[1]
@@ -79,6 +82,7 @@ class gatv2_function(torch.autograd.Function):
         return output
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         (
             x_left,

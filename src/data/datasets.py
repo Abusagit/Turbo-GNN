@@ -366,7 +366,7 @@ class GraphSample:
             )
 
             kwargs = self.kernel_related_kwargs
-            fallback_q = kwargs.get("huge_degree_threshold_quantile", -1)
+            fallback_q = kwargs.get("huge_degree_threshold_quantile", 0.95)
 
             fwd_quantile = kwargs.get("forward_huge_degree_threshold_quantile", fallback_q)
             fwd_light, fwd_heavy = _bucket_nodes_by_degree(counts_fwd, fwd_quantile)

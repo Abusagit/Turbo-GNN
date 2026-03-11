@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--avg-degree", type=int, default=10)
     p.add_argument("--feature_dim", type=int, default=128)
     p.add_argument("--heads", type=int, default=1)
-    p.add_argument("--mode", type=str, default="forward", choices=["forward", "train"])
+    p.add_argument("--mode", type=str, default="forward", choices=["forward", "backward"])
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--amp", type=str, default="none", choices=["none", "bf16", "fp16"])
@@ -82,7 +82,7 @@ def main() -> int:
     # graph + features
     if args.dataset is None:
         edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
-        x = torch.randn(args.num_nodes, args.feature_dim).to(device)
+        x = torch.randn(args.num_nodes, args.feature_dim, requires_grad=True).to(device)
 
         graph = GraphSample(
             backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
@@ -103,7 +103,7 @@ def main() -> int:
                     conv_backend=args.backend,
                 )
             )
-        x = torch.randn(graph.num_nodes, args.feature_dim).to(device)
+        x = torch.randn(graph.num_nodes, args.feature_dim, requires_grad=True).to(device)
     graph = graph.graph_repr
 
     # conv
@@ -122,28 +122,22 @@ def main() -> int:
     elif args.amp == "fp16":
         amp_dtype = torch.float16
 
-    def _fn_forward() -> None:
+    def _fn_forward() -> torch.Tensor:
         if amp_dtype is not None and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 _ = conv(x, graph)
         else:
             _ = conv(x, graph)
+        return _
 
-    def _fn_train() -> None:
-        opt = torch.optim.SGD(conv.parameters(), lr=1e-3)
-        opt.zero_grad(set_to_none=True)
-        if amp_dtype is not None and device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                out = conv(x, graph)
-                loss = (out**2).sum() * 1e-6
-            loss.backward()
-        else:
-            out = conv(x, graph)
-            loss = (out**2).sum() * 1e-6
-            loss.backward()
-        opt.step()
+    Y = _fn_forward().requires_grad_(True)
+    grad_output = torch.randn_like(x)
 
-    fn = _fn_forward if args.mode == "forward" else _fn_train
+    def _fn_backward() -> None:
+        nonlocal grad_output, Y
+        Y.backward(grad_output, retain_graph=True)
+
+    fn = _fn_forward if args.mode == "forward" else _fn_backward
     res: MicrobenchResult = time_callable(fn, warmup=args.warmup, iters=args.iters, do_memory_profile=False)
 
     base_dict = {

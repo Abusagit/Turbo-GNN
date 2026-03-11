@@ -1,11 +1,9 @@
 training:
   # Trainer (maps to TrainingConfig)
   epochs: 500
-  learning_rate: 0.0001          # initial LR (also mirrored in optimizer.lr below)
-  weight_decay: 0.0005
   batch_size: 1                 # single-graph datasets → batch=1
   accumulation_steps: 1
-  use_amp: false                # trainer uses autocast(dtype=bfloat16)
+  use_amp: true                # trainer uses autocast(dtype=bfloat16)
   clip_grad_norm: null
   patience: 100
   device: cuda

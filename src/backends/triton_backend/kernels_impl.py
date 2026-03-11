@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import triton
@@ -6,6 +7,26 @@ import triton.language as tl
 
 from src.data.converters import WSBFormat
 from src.utils.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
+
+_TORCH_TO_TRITON_DTYPE = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+}
+
+_AUTOTUNE_DISABLED = os.environ.get("TRITON_AUTOTUNE_DISABLED", "0") == "1"
+
+
+def _low_precision(t: torch.Tensor) -> torch.Tensor:
+    """fp16/bf16 pass through; fp32 defaults to fp16."""
+    if t.dtype in (torch.float16, torch.bfloat16):
+        return t
+    return t.half()
+
+
+def _triton_dtype(t: torch.Tensor):
+    """Map a PyTorch 16-bit dtype to the Triton equivalent."""
+    return _TORCH_TO_TRITON_DTYPE[t.dtype]
+
 
 # --- Triton autotune config spaces ------------------------------------------
 _LOOP_CONFIGS = [(1, False), (2, True), (3, True)]  # (LOOP_NUM_STAGES, WARP_SPECIALIZE)
@@ -24,13 +45,18 @@ FLASHATTN_AUTOTUNE_CONFIGS = [
     for ls, ws in _LOOP_CONFIGS
 ]
 
+_SAFE_CONFIG = [triton.Config({"LOOP_NUM_STAGES": 1, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=1)]
+
+_SPMM_ACTIVE_CONFIGS = _SAFE_CONFIG if _AUTOTUNE_DISABLED else SPMM_AUTOTUNE_CONFIGS
+_FLASHATTN_ACTIVE_CONFIGS = _SAFE_CONFIG if _AUTOTUNE_DISABLED else FLASHATTN_AUTOTUNE_CONFIGS
+
 #####################################################
 ################# GraphConv Kernels #################
 #####################################################
 
 
 @triton.autotune(
-    configs=SPMM_AUTOTUNE_CONFIGS,
+    configs=_SPMM_ACTIVE_CONFIGS,
     key=["N", "F"],
 )
 @triton.jit
@@ -50,6 +76,7 @@ def wsb_spmm_kernel_tc(
     TCB_WIDTH: tl.constexpr,
     TCB_SIZE: tl.constexpr,
     TILE_K: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
     LOOP_NUM_STAGES: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
 ):
@@ -103,7 +130,7 @@ def wsb_spmm_kernel_tc(
 
         # compute weight address
         w_ptr = weights_ptr + tcb_idx * TCB_SIZE + w_row_idx * TCB_WIDTH + local_col
-        W_full = tl.load(w_ptr, mask=valid_tcb, other=0.0).to(tl.float16)
+        W_full = tl.load(w_ptr, mask=valid_tcb, other=0.0).to(COMPUTE_DTYPE)
 
         # build column indices [16]
         col_idx_local = k_offs % TCB_WIDTH  # [0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7]
@@ -119,7 +146,7 @@ def wsb_spmm_kernel_tc(
             X_ptr + cols_full[:, None] * stride_xn + global_f[None, :] * stride_xf,
             mask=valid_col[:, None],
             other=0.0,
-        ).to(tl.float16)
+        ).to(COMPUTE_DTYPE)
 
         # tensor core matmul
         # acc[16, F] += W_full[16, 16] @ X_tile[16, F]
@@ -138,9 +165,8 @@ def wsb_spmm_tc_forward(wsb, X: torch.Tensor) -> torch.Tensor:
 
     Y = torch.empty_like(X)  # NOTE for now it's fp32
 
-    # use fp16 here
-    weights = wsb.weights.half()
-    X_fp16 = X.half()
+    X_lp = _low_precision(X)
+    weights = wsb.weights.to(X_lp.dtype)
 
     grid = (wsb.num_row_windows,)
 
@@ -148,25 +174,26 @@ def wsb_spmm_tc_forward(wsb, X: torch.Tensor) -> torch.Tensor:
         wsb.tcb_row_offset,
         wsb.col_idx,
         weights,
-        X_fp16,
+        X_lp,
         Y,
         N,
         F,
-        X_fp16.stride(0),
-        X_fp16.stride(1),
+        X_lp.stride(0),
+        X_lp.stride(1),
         Y.stride(0),
         Y.stride(1),
         ROW_WINDOW_SIZE=ROW_WINDOW_SIZE,
         TCB_WIDTH=TCB_WIDTH,
         TCB_SIZE=TCB_SIZE,
         TILE_K=16,
+        COMPUTE_DTYPE=_triton_dtype(X_lp),
     )
 
     return Y
 
 
 @triton.autotune(
-    configs=SPMM_AUTOTUNE_CONFIGS,
+    configs=_SPMM_ACTIVE_CONFIGS,
     key=["N", "F"],
 )
 @triton.jit
@@ -186,6 +213,7 @@ def wsb_spmm_backward_kernel_tc(
     TCB_WIDTH: tl.constexpr,
     TCB_SIZE: tl.constexpr,
     TILE_K: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
     LOOP_NUM_STAGES: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
 ):
@@ -219,7 +247,7 @@ def wsb_spmm_backward_kernel_tc(
         G_ptr + global_rows[:, None] * stride_gn + global_f[None, :] * stride_gf,
         mask=row_mask[:, None] & f_mask[None, :],
         other=0.0,
-    ).to(tl.float16)
+    ).to(COMPUTE_DTYPE)
 
     num_pairs = (num_tcbs + 1) // 2
 
@@ -236,7 +264,7 @@ def wsb_spmm_backward_kernel_tc(
         valid_tcb_t = tcb_idx_for_t < tcb_end
 
         w_t_ptr = weights_ptr + tcb_idx_for_t * TCB_SIZE + in_row_idx * TCB_WIDTH + local_col_t
-        W_T = tl.load(w_t_ptr, mask=valid_tcb_t, other=0.0).to(tl.float16)
+        W_T = tl.load(w_t_ptr, mask=valid_tcb_t, other=0.0).to(COMPUTE_DTYPE)
 
         # W_T[16, 16] @ G[16, F] -> [16, BLOCK_F]
         contrib = tl.dot(W_T, G_tile, out_dtype=tl.float32)
@@ -273,8 +301,8 @@ def wsb_spmm_backward_tc(wsb, grad_output: torch.Tensor) -> torch.Tensor:
 
     grad_input = torch.zeros_like(grad_output)
 
-    weights = wsb.weights.half()
-    G = grad_output.half()
+    G = _low_precision(grad_output)
+    weights = wsb.weights.to(G.dtype)
 
     grid = (wsb.num_row_windows,)
 
@@ -294,6 +322,7 @@ def wsb_spmm_backward_tc(wsb, grad_output: torch.Tensor) -> torch.Tensor:
         TCB_WIDTH=TCB_WIDTH,
         TCB_SIZE=TCB_SIZE,
         TILE_K=16,
+        COMPUTE_DTYPE=_triton_dtype(G),
     )
 
     return grad_input
@@ -333,7 +362,7 @@ class WSBSpMM(torch.autograd.Function):
 ################# Graph Transformer Kernels #########
 #####################################################
 @triton.autotune(
-    configs=FLASHATTN_AUTOTUNE_CONFIGS,
+    configs=_FLASHATTN_ACTIVE_CONFIGS,
     key=["num_nodes", "D"],
 )
 @triton.jit
@@ -372,6 +401,7 @@ def wsb_flashattn_tc_forward_kernel(
     ROW_WINDOW_SIZE: tl.constexpr,
     TCB_WIDTH: tl.constexpr,
     TILE_K: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
     LOOP_NUM_STAGES: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
 ):
@@ -385,10 +415,10 @@ def wsb_flashattn_tc_forward_kernel(
 
     d_offs = tl.arange(0, D)
 
-    # load Q block [16, D] (fp16)
-    q_ptrs = Q_ptr + rows[:, None] * stride_qn + head_id * stride_qh + d_offs[None, :] * stride_qd
+    # load K block [16, D] at row positions (row = aggregation target = "dst")
+    k_ptrs = K_ptr + rows[:, None] * stride_kn + head_id * stride_kh + d_offs[None, :] * stride_kd
 
-    Q_block = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+    K_block = tl.load(k_ptrs, mask=row_mask[:, None], other=0.0).to(COMPUTE_DTYPE)
 
     # online softmax state
     m_i = tl.full((ROW_WINDOW_SIZE,), -float("inf"), dtype=tl.float32)
@@ -427,16 +457,17 @@ def wsb_flashattn_tc_forward_kernel(
         # validity of each column (second half only if has_tcb_1) for this head
         col_valid = tl.where(in_second_half, has_tcb_1, has_tcb_0)  # [16]
 
-        # K, V loads [16, D], unmasked (cols are always valid indices; padded cols are 0)
-        k_ptrs = K_ptr + cols[:, None] * stride_kn + head_id * stride_kh + d_offs[None, :] * stride_kd
+        # Q, V loads [16, D] at column positions (col = neighbor = "src")
+        q_ptrs = Q_ptr + cols[:, None] * stride_qn + head_id * stride_qh + d_offs[None, :] * stride_qd
 
         v_ptrs = V_ptr + cols[:, None] * stride_vn + head_id * stride_vh + d_offs[None, :] * stride_vd
 
-        K_block = tl.load(k_ptrs).to(tl.float16)
-        V_block = tl.load(v_ptrs).to(tl.float16)
+        Q_block = tl.load(q_ptrs).to(COMPUTE_DTYPE)
+        V_block = tl.load(v_ptrs).to(COMPUTE_DTYPE)
 
-        # QK^T -> logits [16, 16], fp32
-        logits = tl.dot(Q_block, tl.trans(K_block)) * scale
+        # K[row] @ Q[col]^T -> logits [16, 16], fp32
+        # = K[dst] · Q[src] which matches DGL's q[src] · k[dst]
+        logits = tl.dot(K_block, tl.trans(Q_block)) * scale
 
         # load bitmaps for both TCBs
         bm_lo_0 = tl.load(bitmap_ptr + safe_tcb_0 * 2 + 0)
@@ -483,8 +514,9 @@ def wsb_flashattn_tc_forward_kernel(
         exp_scale = tl.exp(m_i - m_new)
         exp_scale = tl.where(m_i > -float("inf"), exp_scale, 0.0)
 
-        # exp(logits - m_new)
+        # exp(logits - m_new); guard NaN from exp(-inf - (-inf))
         exp_logits = tl.exp(logits - m_new[:, None])
+        exp_logits = tl.where(full_mask, exp_logits, 0.0)
         l_block = tl.sum(exp_logits, axis=1)
 
         # update l_i
@@ -492,7 +524,7 @@ def wsb_flashattn_tc_forward_kernel(
 
         # update acc = exp_scale * acc + exp_logits @ V
         acc *= exp_scale[:, None]
-        acc = tl.dot(exp_logits.to(tl.float16), V_block, acc=acc)
+        acc = tl.dot(exp_logits.to(COMPUTE_DTYPE), V_block, acc=acc)
 
         m_i = m_new
         l_i = l_new
@@ -534,7 +566,7 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale):
 
     assert Q.is_cuda and K.is_cuda and V.is_cuda
     assert Q.shape == K.shape == V.shape
-    assert Q.dtype == torch.float16, "Q must be fp16 for tensor cores"
+    assert Q.dtype in (torch.float16, torch.bfloat16), "Q must be fp16 or bf16 for tensor cores"
 
     N, H, D = Q.shape
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
@@ -579,13 +611,14 @@ def wsb_flashattn_tc_forward(wsb, Q, K, V, scale):
         ROW_WINDOW_SIZE=ROW_WINDOW_SIZE,
         TCB_WIDTH=TCB_WIDTH,
         TILE_K=16,
+        COMPUTE_DTYPE=_triton_dtype(Q),
     )
 
     return output, logsumexp
 
 
 @triton.autotune(
-    configs=FLASHATTN_AUTOTUNE_CONFIGS,
+    configs=_FLASHATTN_ACTIVE_CONFIGS,
     key=["num_nodes", "D"],
 )
 @triton.jit
@@ -644,9 +677,15 @@ def wsb_flashattn_tc_backward_kernel(
     ROW_WINDOW_SIZE: tl.constexpr,
     TCB_WIDTH: tl.constexpr,
     TILE_K: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
     LOOP_NUM_STAGES: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
 ):
+    """Backward kernel with K at rows (aggregation target) and Q, V at cols (neighbors).
+
+    Forward was: O[row] = softmax(K[row] @ Q[col].T * scale) @ V[col]
+    Backward computes: dK[row] (local accum), dQ[col] and dV[col] (atomic scatter).
+    """
     rw_id = tl.program_id(0)
     head_id = tl.program_id(1)
 
@@ -656,15 +695,12 @@ def wsb_flashattn_tc_backward_kernel(
 
     d_offs = tl.arange(0, D)
 
-    # Q [16, D] fp16
-    q_ptrs = Q_ptr + rows[:, None] * stride_qn + head_id * stride_qh + d_offs[None, :] * stride_qd
-
-    Q_block = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+    # K [16, D] at row positions (matches forward: K at rows)
+    k_ptrs = K_ptr + rows[:, None] * stride_kn + head_id * stride_kh + d_offs[None, :] * stride_kd
+    K_block = tl.load(k_ptrs, mask=row_mask[:, None], other=0.0).to(COMPUTE_DTYPE)
 
     # O, dO [16, D] fp32
-
     o_ptrs = O_ptr + rows[:, None] * stride_on + head_id * stride_oh + d_offs[None, :] * stride_od
-
     do_ptrs = dO_ptr + rows[:, None] * stride_don + head_id * stride_doh + d_offs[None, :] * stride_dod
 
     O_block = tl.load(o_ptrs, mask=row_mask[:, None], other=0.0)
@@ -674,11 +710,11 @@ def wsb_flashattn_tc_backward_kernel(
     l_ptrs = L_ptr + rows * stride_ln + head_id * stride_lh
     L_vec = tl.load(l_ptrs, mask=row_mask, other=-float("inf"))
 
-    # D_vec = sum_j dO_ij * O_ij [16]
+    # D_vec[i] = sum_d dO[i,d] * O[i,d]
     D_vec = tl.sum(dO_block * O_block, axis=1)
 
-    # dQ accumulator [16, D]
-    dQ_acc = tl.zeros((ROW_WINDOW_SIZE, D), dtype=tl.float32)
+    # dK accumulator [16, D] — accumulated locally at rows
+    dK_acc = tl.zeros((ROW_WINDOW_SIZE, D), dtype=tl.float32)
 
     # TCB range for this row-window
     tcb_start = tl.load(tcb_row_offset_ptr + rw_id)
@@ -709,16 +745,15 @@ def wsb_flashattn_tc_backward_kernel(
 
         col_valid = tl.where(in_second_half, has_tcb_1, has_tcb_0)  # [16]
 
-        # K, V [16, D], unmasked
-        k_ptrs = K_ptr + cols[:, None] * stride_kn + head_id * stride_kh + d_offs[None, :] * stride_kd
-
+        # Q, V [16, D] at column positions (col = neighbor = "src")
+        q_ptrs = Q_ptr + cols[:, None] * stride_qn + head_id * stride_qh + d_offs[None, :] * stride_qd
         v_ptrs = V_ptr + cols[:, None] * stride_vn + head_id * stride_vh + d_offs[None, :] * stride_vd
 
-        K_block = tl.load(k_ptrs).to(tl.float16)
-        V_block = tl.load(v_ptrs).to(tl.float16)
+        Q_block = tl.load(q_ptrs).to(COMPUTE_DTYPE)
+        V_block = tl.load(v_ptrs).to(COMPUTE_DTYPE)
 
-        # S = Q K^T [16,16] fp32
-        S_block = tl.dot(Q_block, tl.trans(K_block)) * scale
+        # S = K[row] @ Q[col]^T [16,16] fp32 (matches forward convention)
+        S_block = tl.dot(K_block, tl.trans(Q_block)) * scale
 
         # bitmaps
         bm_lo_0 = tl.load(bitmap_ptr + safe_tcb_0 * 2 + 0)
@@ -755,7 +790,7 @@ def wsb_flashattn_tc_backward_kernel(
         P_block = tl.where(full_mask, P_block, 0.0)
 
         # dV = P^T @ dO  [16, D]
-        dV_block = tl.dot(tl.trans(P_block).to(tl.float16), dO_block.to(tl.float16)).to(tl.float32)
+        dV_block = tl.dot(tl.trans(P_block).to(COMPUTE_DTYPE), dO_block.to(COMPUTE_DTYPE)).to(tl.float32)
 
         # atomically add dV
         dv_ptrs = dV_ptr + cols[:, None] * stride_dvn + head_id * stride_dvh + d_offs[None, :] * stride_dvd
@@ -764,28 +799,31 @@ def wsb_flashattn_tc_backward_kernel(
         tl.atomic_add(dv_ptrs, dV_block, mask=atomic_mask_dv)
 
         # dP = dO @ V^T [16, 16]
-        dP_block = tl.dot(dO_block.to(tl.float16), tl.trans(V_block)).to(tl.float32)
+        dP_block = tl.dot(dO_block.to(COMPUTE_DTYPE), tl.trans(V_block)).to(tl.float32)
 
         # softmax backward: dS = P * (dP - D_vec[:,None])
         dS_block = P_block * (dP_block - D_vec[:, None])
         dS_block = tl.where(full_mask, dS_block, 0.0)
 
-        # dQ += dS @ K [16, D]
-        dQ_acc = tl.dot(dS_block.to(tl.float16), K_block, acc=dQ_acc)
+        # chain rule through S = K@Q.T * scale: d(K@Q.T) = dS * scale
+        dS_scaled = dS_block * scale
 
-        # dK = dS^T @ Q [16, D]
-        dK_block = tl.dot(tl.trans(dS_block).to(tl.float16), Q_block).to(tl.float32)
+        # dK[row] += dS_scaled @ Q[col] [16, D] — local accumulation at rows
+        dK_acc = tl.dot(dS_scaled.to(COMPUTE_DTYPE), Q_block, acc=dK_acc)
 
-        # atomically add dK
-        dk_ptrs = dK_ptr + cols[:, None] * stride_dkn + head_id * stride_dkh + d_offs[None, :] * stride_dkd
+        # dQ[col] = dS_scaled^T @ K[row] [16, D] — scattered to cols
+        dQ_block = tl.dot(tl.trans(dS_scaled).to(COMPUTE_DTYPE), K_block).to(tl.float32)
 
-        atomic_mask_dk = col_valid[:, None]
-        tl.atomic_add(dk_ptrs, dK_block, mask=atomic_mask_dk)
+        # atomically add dQ to column nodes
+        dq_ptrs = dQ_ptr + cols[:, None] * stride_dqn + head_id * stride_dqh + d_offs[None, :] * stride_dqd
 
-    # write dQ (no atomics needed, each row window owns its rows)
-    dq_ptrs = dQ_ptr + rows[:, None] * stride_dqn + head_id * stride_dqh + d_offs[None, :] * stride_dqd
+        atomic_mask_dq = col_valid[:, None]
+        tl.atomic_add(dq_ptrs, dQ_block, mask=atomic_mask_dq)
 
-    tl.store(dq_ptrs, dQ_acc, mask=row_mask[:, None])
+    # write dK at rows (no atomics needed, each row window owns its rows)
+    dk_ptrs = dK_ptr + rows[:, None] * stride_dkn + head_id * stride_dkh + d_offs[None, :] * stride_dkd
+
+    tl.store(dk_ptrs, dK_acc, mask=row_mask[:, None])
 
 
 def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
@@ -815,9 +853,10 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
     assert L.shape == (N, H), f"L must be [N, H], got {L.shape}"
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
 
-    dQ = torch.empty_like(Q, dtype=torch.float32)
-    # dK/dV are updated with atomics -> must be zero-initialized
-    dK = torch.zeros_like(K, dtype=torch.float32)
+    # dQ/dV are scattered with atomics -> must be zero-initialized
+    dQ = torch.zeros_like(Q, dtype=torch.float32)
+    # dK is accumulated locally at rows -> no atomics
+    dK = torch.empty_like(K, dtype=torch.float32)
     dV = torch.zeros_like(V, dtype=torch.float32)
 
     grid = (wsb.num_row_windows, H)
@@ -877,6 +916,7 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
         ROW_WINDOW_SIZE=ROW_WINDOW_SIZE,
         TCB_WIDTH=TCB_WIDTH,
         TILE_K=16,
+        COMPUTE_DTYPE=_triton_dtype(Q),
     )
 
     return dQ, dK, dV
@@ -887,9 +927,9 @@ class WSBGraphTransformer(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, wsb: WSBFormat, scale: float) -> torch.Tensor:
-        Q = Q.half()
-        K = K.half()
-        V = V.half()
+        Q = _low_precision(Q)
+        K = K.to(Q.dtype)
+        V = V.to(Q.dtype)
 
         ctx.wsb = wsb
         ctx.scale = scale

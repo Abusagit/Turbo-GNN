@@ -1,0 +1,335 @@
+"""
+GATv2 correctness tests: CUDA backend vs DGL reference, plus low-precision tests.
+
+Tests:
+  - fp32: CUDA vs DGL forward & backward
+  - fp16/bf16: CUDA (low-precision) vs DGL (fp32) forward & backward
+"""
+
+import sys
+from pathlib import Path
+
+import dgl
+import pytest
+import torch
+
+from src.backends.registry import BackendRegistry
+from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets, build_csr_as_is
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def make_undirected_graph(N: int, E_approx: int, device: str = "cuda", seed: int = 42):
+    """Random undirected graph with self-loops, deduplicated.
+
+    Returns edge_index [2, E] on *device*.
+    """
+    # gen = torch.Generator(device=device).manual_seed(seed)
+    src = torch.randint(0, N, (E_approx,), device=device)
+    dst = torch.randint(0, N, (E_approx,), device=device)
+    # Make undirected
+    src_all = torch.cat([src, dst])
+    dst_all = torch.cat([dst, src])
+    # Add self-loops
+    self_nodes = torch.arange(N, device=device)
+    src_all = torch.cat([src_all, self_nodes])
+    dst_all = torch.cat([dst_all, self_nodes])
+    edge_index = torch.stack([src_all, dst_all], dim=0)
+    # Deduplicate
+    flat = edge_index[0] * N + edge_index[1]
+    flat_unique = torch.unique(flat)
+    row = flat_unique // N
+    col = flat_unique % N
+    return torch.stack([row, col], dim=0)
+
+
+def build_cuda_graph(edge_index: torch.Tensor, num_nodes: int):
+    """Build AdjacencyForwardBackwardWithNodeBuckets from edge_index [2, E].
+
+    Forward CSR: rows=dst, cols=src (do_transpose=True)
+    Backward CSR: rows=src, cols=dst (do_transpose=False)
+    """
+    fwd_indptr, fwd_indices, _, _ = build_csr_as_is(
+        edge_index,
+        edge_weight=None,
+        num_nodes=num_nodes,
+        do_transpose=True,
+    )
+    bwd_indptr, bwd_indices, _, _ = build_csr_as_is(
+        edge_index,
+        edge_weight=None,
+        num_nodes=num_nodes,
+        do_transpose=False,
+    )
+    all_nodes = torch.arange(num_nodes, device=edge_index.device)
+    empty_nodes = torch.tensor([], dtype=torch.long, device=edge_index.device)
+    return AdjacencyForwardBackwardWithNodeBuckets(
+        forward_indptr=fwd_indptr.int(),
+        forward_indices=fwd_indices.int(),
+        backward_indptr=bwd_indptr.int(),
+        backward_indices=bwd_indices.int(),
+        forward_light_nodes=all_nodes,
+        forward_heavy_nodes=empty_nodes,
+        backward_light_nodes=all_nodes,
+        backward_heavy_nodes=empty_nodes,
+    )
+
+
+def build_dgl_graph(edge_index: torch.Tensor, num_nodes: int, device: str = "cuda"):
+    """Build a DGL graph from edge_index [2, E]."""
+    src, dst = edge_index[0], edge_index[1]
+    g = dgl.graph((src, dst), num_nodes=num_nodes)
+    return g.to(device)
+
+
+def share_gatv2_weights(cuda_layer, dgl_layer):
+    """Copy weights from DGL GATv2 layer to CUDA GATv2 layer.
+
+    Weight mapping:
+      cuda.left_right_projection.weight[:H*D] = dgl._conv.fc_dst.weight  (left = dst)
+      cuda.left_right_projection.weight[H*D:] = dgl._conv.fc_src.weight  (right = src)
+      cuda.attn_weights = dgl._conv.attn.squeeze(0)  ([1,H,D] -> [H,D])
+      cuda._outer_proj.weight = dgl._outer_proj.weight
+    """
+    H = cuda_layer.heads
+    D = cuda_layer.head_dim
+
+    with torch.no_grad():
+        cuda_layer.left_right_projection.weight.data[: H * D].copy_(dgl_layer._conv.fc_dst.weight.data)
+        cuda_layer.left_right_projection.weight.data[H * D :].copy_(dgl_layer._conv.fc_src.weight.data)
+        if cuda_layer.left_right_projection.bias is not None:
+            cuda_layer.left_right_projection.bias.data[: H * D].copy_(dgl_layer._conv.fc_dst.bias.data)
+            cuda_layer.left_right_projection.bias.data[H * D :].copy_(dgl_layer._conv.fc_src.bias.data)
+
+        cuda_layer.attn_weights.data.copy_(dgl_layer._conv.attn.data.squeeze(0))
+
+        cuda_layer._outer_proj.weight.data.copy_(dgl_layer._outer_proj.weight.data)
+        if cuda_layer._outer_proj.bias is not None:
+            cuda_layer._outer_proj.bias.data.copy_(dgl_layer._outer_proj.bias.data)
+
+
+# ---------------------------------------------------------------------------
+# fp32: CUDA vs DGL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_nodes", [64, 200])
+@pytest.mark.parametrize("feature_dim", [32, 128])
+@pytest.mark.parametrize("heads", [1, 2, 4])
+def test_gatv2_cuda_vs_dgl_forward(num_nodes, feature_dim, heads):
+    """fp32 forward: CUDA GATv2 vs DGL GATv2."""
+    device = "cuda"
+    # torch.manual_seed(42)
+
+    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+
+    cuda_backend = BackendRegistry.get_backend("cuda")
+    dgl_backend = BackendRegistry.get_backend("dgl")
+
+    # breakpoint()
+    cuda_layer = cuda_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        bias=False,
+    ).to(device)
+    dgl_layer = dgl_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        feat_drop=0.0,
+        attn_drop=0.0,
+        residual=False,
+        share_weights=False,
+        bias=False,
+    ).to(device)
+
+    share_gatv2_weights(cuda_layer, dgl_layer)
+
+    cuda_graph = build_cuda_graph(edge_index, num_nodes)
+    dgl_graph = build_dgl_graph(edge_index, num_nodes, device)
+
+    x = torch.randn(num_nodes, feature_dim, device=device)
+
+    cuda_out = cuda_layer(x, cuda_graph)
+    dgl_out = dgl_layer(x, dgl_graph)
+
+    assert not cuda_out.isnan().any(), "CUDA output contains NaN"
+    assert not dgl_out.isnan().any(), "DGL output contains NaN"
+    assert torch.allclose(cuda_out, dgl_out, atol=1e-4, rtol=1e-4), (
+        f"CUDA vs DGL forward mismatch: "
+        f"max|diff|={(cuda_out - dgl_out).abs().max().item():.3e}, "
+        f"mean|diff|={(cuda_out - dgl_out).abs().mean().item():.3e}"
+    )
+
+
+@pytest.mark.parametrize("num_nodes", [64, 200])
+@pytest.mark.parametrize("feature_dim", [32, 128])
+@pytest.mark.parametrize("heads", [1, 2, 4])
+def test_gatv2_cuda_vs_dgl_backward(num_nodes, feature_dim, heads):
+    """fp32 backward: compare input gradients between CUDA and DGL."""
+    device = "cuda"
+    # torch.manual_seed(42)
+
+    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+
+    cuda_backend = BackendRegistry.get_backend("cuda")
+    dgl_backend = BackendRegistry.get_backend("dgl")
+
+    cuda_layer = cuda_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        bias=False,
+    ).to(device)
+    dgl_layer = dgl_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        feat_drop=0.0,
+        attn_drop=0.0,
+        residual=False,
+        share_weights=False,
+        bias=False,
+    ).to(device)
+
+    share_gatv2_weights(cuda_layer, dgl_layer)
+
+    cuda_graph = build_cuda_graph(edge_index, num_nodes)
+    dgl_graph = build_dgl_graph(edge_index, num_nodes, device)
+
+    x_cuda = torch.randn(num_nodes, feature_dim, device=device, requires_grad=True)
+    x_dgl = x_cuda.detach().clone().requires_grad_(True)
+
+    cuda_out = cuda_layer(x_cuda, cuda_graph)
+    dgl_out = dgl_layer(x_dgl, dgl_graph)
+
+    cuda_out.sum().backward()
+    dgl_out.sum().backward()
+
+    assert x_cuda.grad is not None, "No CUDA gradient"
+    assert x_dgl.grad is not None, "No DGL gradient"
+    assert not x_cuda.grad.isnan().any(), "CUDA grad contains NaN"
+    assert torch.allclose(x_cuda.grad, x_dgl.grad, atol=1e-4, rtol=1e-4), (
+        f"CUDA vs DGL backward mismatch: "
+        f"max|diff|={(x_cuda.grad - x_dgl.grad).abs().max().item():.3e}, "
+        f"mean|diff|={(x_cuda.grad - x_dgl.grad).abs().mean().item():.3e}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Low-precision: CUDA (fp16/bf16) vs DGL (fp32)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_nodes", [64, 200])
+@pytest.mark.parametrize("feature_dim", [32, 128])
+@pytest.mark.parametrize("heads", [2, 4])
+def test_gatv2_cuda_low_precision_forward(dtype, num_nodes, feature_dim, heads):
+    """Low-precision forward: CUDA at fp16/bf16 vs DGL fp32 reference."""
+    device = "cuda"
+    # torch.manual_seed(42)
+
+    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+
+    cuda_backend = BackendRegistry.get_backend("cuda")
+    dgl_backend = BackendRegistry.get_backend("dgl")
+
+    # DGL layer in fp32 as reference
+    dgl_layer = dgl_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        feat_drop=0.0,
+        attn_drop=0.0,
+        residual=False,
+        share_weights=False,
+        bias=False,
+    ).to(device)
+
+    # CUDA layer — share weights from DGL, then cast to low precision
+    cuda_layer = cuda_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        bias=False,
+    ).to(device)
+    share_gatv2_weights(cuda_layer, dgl_layer)
+    cuda_layer = cuda_layer.to(dtype)
+
+    cuda_graph = build_cuda_graph(edge_index, num_nodes)
+    dgl_graph = build_dgl_graph(edge_index, num_nodes, device)
+
+    x = torch.randn(num_nodes, feature_dim, device=device)
+
+    cuda_out = cuda_layer(x.to(dtype), cuda_graph)
+    dgl_out = dgl_layer(x, dgl_graph)
+
+    cuda_f32 = cuda_out.float()
+    dgl_f32 = dgl_out.float()
+
+    assert not cuda_f32.isnan().any(), "CUDA output contains NaN"
+    assert torch.allclose(cuda_f32, dgl_f32, atol=5e-2, rtol=5e-2), (
+        f"Low-precision forward mismatch ({dtype}): "
+        f"max|diff|={(cuda_f32 - dgl_f32).abs().max().item():.3e}, "
+        f"mean|diff|={(cuda_f32 - dgl_f32).abs().mean().item():.3e}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_nodes", [64, 200])
+@pytest.mark.parametrize("feature_dim", [32, 128])
+@pytest.mark.parametrize("heads", [2, 4])
+def test_gatv2_cuda_low_precision_backward(dtype, num_nodes, feature_dim, heads):
+    """Low-precision backward: CUDA at fp16/bf16 vs DGL fp32 reference gradients."""
+    device = "cuda"
+    torch.manual_seed(94)
+
+    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+
+    cuda_backend = BackendRegistry.get_backend("cuda")
+    dgl_backend = BackendRegistry.get_backend("dgl")
+
+    dgl_layer = dgl_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        feat_drop=0.0,
+        attn_drop=0.0,
+        residual=False,
+        share_weights=False,
+        bias=False,
+    ).to(device)
+
+    cuda_layer = cuda_backend.create_conv(
+        "gat_v2",
+        feature_dim=feature_dim,
+        heads=heads,
+        bias=False,
+    ).to(device)
+    share_gatv2_weights(cuda_layer, dgl_layer)
+    cuda_layer = cuda_layer.to(dtype)
+
+    cuda_graph = build_cuda_graph(edge_index, num_nodes)
+    dgl_graph = build_dgl_graph(edge_index, num_nodes, device)
+
+    x_cuda = torch.randn(num_nodes, feature_dim, device=device, dtype=dtype, requires_grad=True)
+    x_dgl = x_cuda.detach().float().clone().requires_grad_(True)
+
+    cuda_out = cuda_layer(x_cuda, cuda_graph)
+    dgl_out = dgl_layer(x_dgl, dgl_graph)
+
+    cuda_out.sum().backward()
+    dgl_out.sum().backward()
+
+    assert x_cuda.grad is not None, "No CUDA gradient"
+    assert x_dgl.grad is not None, "No DGL gradient"
+    assert not x_cuda.grad.isnan().any(), "CUDA grad contains NaN"
+    assert torch.allclose(x_cuda.grad.float(), x_dgl.grad.float(), atol=2e-1), (
+        f"Low-precision backward mismatch ({dtype}): "
+        f"max|diff|={(x_cuda.grad.float() - x_dgl.grad.float()).abs().max().item():.3e}, "
+        f"mean|diff|={(x_cuda.grad.float() - x_dgl.grad.float()).abs().mean().item():.3e}"
+    )

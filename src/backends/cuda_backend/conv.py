@@ -9,28 +9,30 @@ from ..base import AutotuneConfig, BaseBackend, BaseConvolution, TunableParam
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import gatv2_aggr
 from .gt_aggr.utils import graph_transformer_aggr
-from .min_aggr.utils import min_aggr
+from .reduction_aggr.utils import reduction_aggr
+from .spmm_aggr.utils import spmm_aggr
 
 doc = """
 CUDA backend: wraps cuda-written kernels .
 """
 
 
-class _CudaMinAggrConv(nn.Module):
+class _CudaReductionAggrConv(nn.Module):
     """
-    Min-aggregation convolution using custom CUDA extension.
+    Reduction-aggregation (min/max) convolution using custom CUDA extension.
 
     Expects:
       - x: [N, F] float32 cuda
       - graph: (edge_ptr, edge_idx) where
             edge_ptr: [N+1] int32 cuda
             edge_idx: [E]   int32 cuda
-      - light/heavy node partitions are stored as buffers inside MinAggr module
+      - light/heavy node partitions are stored as buffers inside the module
     """
 
     def __init__(
         self,
         /,
+        reduce: str = "min",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -44,6 +46,7 @@ class _CudaMinAggrConv(nn.Module):
         self.forward_edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
         self.warps_per_block = warps_per_block
         self.edges_per_block_heavy_nodes = edges_per_block_heavy_nodes
+        self.reduce = reduce
         self.forward_use_2d_kernel = use_2d_kernel
         self.forward_features_per_block = features_per_block
         self.forward_tiles_y = tiles_y
@@ -61,7 +64,7 @@ class _CudaMinAggrConv(nn.Module):
         light = graph.light_nodes
         heavy = graph.heavy_nodes
 
-        return min_aggr(
+        return reduction_aggr(
             edge_ptr,
             edge_idx,
             x,
@@ -73,21 +76,20 @@ class _CudaMinAggrConv(nn.Module):
             self.forward_use_2d_kernel,
             self.forward_features_per_block,
             self.forward_tiles_y,
+            reduce=self.reduce,
         )
 
 
 class _CudaSimpleAggrConv(BaseConvolution):
     def __init__(
         self,
-        aggr_type: Literal["min"] = "min",
+        aggr_type: Literal["min", "max"] = "min",
         *,
         bias: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(bias=bias, **kwargs)
-        if aggr_type != "min":
-            raise NotImplementedError(f"Only aggr_type='min' is implemented, got {aggr_type}")
-        self.conv = _CudaMinAggrConv(**kwargs)
+        self.conv = _CudaReductionAggrConv(reduce=aggr_type, **kwargs)
 
     def forward(
         self,
@@ -282,6 +284,40 @@ class _CudaGraphTransformerConv(BaseConvolution):
         ]
 
 
+class _CudaSpMMConv(BaseConvolution):
+    """cuSPARSE SpMM convolution using AdjacencyForwardBackwardWithNodeBuckets.
+
+    Supports float32, float16, bfloat16 features via mixed-precision cuSPARSE.
+    """
+
+    def __init__(
+        self,
+        norm_type: str = "none",
+        cu_sparse_algorithm_id: int = -1,
+        block_dim: int = 256,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(bias=False, dropout=0.0)
+        self.norm_type = norm_type
+        self.cu_sparse_algorithm_id = cu_sparse_algorithm_id
+        self.block_dim = block_dim
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return spmm_aggr(
+            x,
+            graph.forward_indptr,
+            graph.forward_indices,
+            self.norm_type,
+            self.cu_sparse_algorithm_id,
+            self.block_dim,
+        )
+
+
 @BackendRegistry.register_backend("cuda")
 class CUDABackend(BaseBackend):
     """Backend that instantiates CUDA-based convolutions."""
@@ -294,7 +330,7 @@ class CUDABackend(BaseBackend):
         """Factory for CUDA convolution layers.
 
         Args:
-            conv_type (str): 'gat_v2' or 'min_aggr' currently.
+            conv_type (str): 'gat_v2', 'min_aggr', 'max_aggr', 'gt', 'sum_aggr', 'mean_aggr', 'gcn'.
             feature_dim (int): Input (and output) feature size.
             **kwargs (Any): Extra arguments for CUDA layers.
 
@@ -314,12 +350,34 @@ class CUDABackend(BaseBackend):
             case "min_aggr":
                 conv = _CudaSimpleAggrConv(
                     aggr_type="min",
-                    bias=False,
+                    **kwargs,
+                )
+            case "max_aggr":
+                return _CudaSimpleAggrConv(
+                    aggr_type="max",
                     **kwargs,
                 )
             case "gt":
                 heads = kwargs.pop("heads")
                 conv = _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
+            case "sum_aggr":
+                return _CudaSpMMConv(
+                    norm_type="none",
+                    cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
+                    block_dim=kwargs.get("block_dim", 256),
+                )
+            case "mean_aggr":
+                return _CudaSpMMConv(
+                    norm_type="right",
+                    cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
+                    block_dim=kwargs.get("block_dim", 256),
+                )
+            case "gcn":
+                return _CudaSpMMConv(
+                    norm_type="both",
+                    cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
+                    block_dim=kwargs.get("block_dim", 256),
+                )
             case _:
                 raise KeyError(f"Unsupported conv_type for CUDA backend: {conv_type}")
 

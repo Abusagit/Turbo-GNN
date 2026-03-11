@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from src.backends.cuda_backend.min_aggr.utils import min_aggr, min_aggr_forward_partitioned
+from src.backends.cuda_backend.reduction_aggr.utils import reduction_aggr, reduction_aggr_forward_partitioned
 
 
 def zero_inf(x):
@@ -31,7 +31,7 @@ def partition_nodes(indptr: torch.Tensor, threshold=100):
 
 
 def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False, fpb=32, tiles=8):
-    out, argmin = min_aggr_forward_partitioned(
+    out, argmin = reduction_aggr_forward_partitioned(
         indptr, indices, x, light, heavy, warps, epb, use_2d_kernel=use_2d, features_per_block=fpb, tiles_y=tiles
     )
     out = zero_inf(out)
@@ -39,7 +39,7 @@ def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False
 
 
 def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False, fpb=32, tiles=8):
-    out = min_aggr(
+    out = reduction_aggr(
         indptr,
         indices,
         x,
@@ -98,12 +98,12 @@ def test_2d_kernel_vs_atomic_kernel(dtype, num_features, fpb, tiles):
     x_2d = torch.randn(N, num_features, device=device, dtype=dtype, requires_grad=True)
     x_atomic = x_2d.detach().clone().requires_grad_(True)
 
-    out_2d_grad = min_aggr(
+    out_2d_grad = reduction_aggr(
         indptr, indices, x_2d, light, heavy, 131070, 8, 128, use_2d_kernel=True, features_per_block=fpb, tiles_y=tiles
     )
     out_2d_grad = zero_inf(out_2d_grad)
 
-    out_atomic_grad = min_aggr(
+    out_atomic_grad = reduction_aggr(
         indptr,
         indices,
         x_atomic,
