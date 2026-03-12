@@ -10,6 +10,8 @@ dataset/*
 
 /build/
 
+dist/
+
 runs/
 
 .venv*/*

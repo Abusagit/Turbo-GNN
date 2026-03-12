@@ -1,0 +1,132 @@
+name: Build and publish wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build wheels (3 Pythons × 12 configs = 36 parallel jobs)
+  # ---------------------------------------------------------------------------
+  build:
+    name: "py${{ matrix.python-version }} / torch${{ matrix.config.torch }} / ${{ matrix.config.cuda_tag }}"
+    runs-on: ubuntu-latest
+    container:
+      image: "nvidia/cuda:${{ matrix.config.docker_cuda }}-devel-ubuntu22.04"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        config:
+          - { torch: "2.4.1", cuda_tag: "cu121", docker_cuda: "12.1.1" }
+          - { torch: "2.4.1", cuda_tag: "cu124", docker_cuda: "12.4.1" }
+          - { torch: "2.5.1", cuda_tag: "cu121", docker_cuda: "12.1.1" }
+          - { torch: "2.5.1", cuda_tag: "cu124", docker_cuda: "12.4.1" }
+          - { torch: "2.6.0", cuda_tag: "cu124", docker_cuda: "12.4.1" }
+          - { torch: "2.6.0", cuda_tag: "cu126", docker_cuda: "12.6.3" }
+          - { torch: "2.7.0", cuda_tag: "cu126", docker_cuda: "12.6.3" }
+          - { torch: "2.7.0", cuda_tag: "cu128", docker_cuda: "12.8.1" }
+          - { torch: "2.8.0", cuda_tag: "cu126", docker_cuda: "12.6.3" }
+          - { torch: "2.8.0", cuda_tag: "cu128", docker_cuda: "12.8.1" }
+          - { torch: "2.9.1", cuda_tag: "cu126", docker_cuda: "12.6.3" }
+          - { torch: "2.9.1", cuda_tag: "cu128", docker_cuda: "12.8.1" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python ${{ matrix.python-version }} from deadsnakes
+        run: |
+          apt-get update
+          apt-get install -y software-properties-common
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install -y \
+            python${{ matrix.python-version }} \
+            python${{ matrix.python-version }}-dev \
+            python${{ matrix.python-version }}-venv \
+            python${{ matrix.python-version }}-distutils || true
+          python${{ matrix.python-version }} -m ensurepip --upgrade || true
+          python${{ matrix.python-version }} -m pip install --upgrade pip setuptools wheel ninja
+
+      - name: Install PyTorch
+        run: |
+          python${{ matrix.python-version }} -m pip install \
+            torch==${{ matrix.config.torch }} \
+            --index-url https://download.pytorch.org/whl/${{ matrix.config.cuda_tag }}
+
+      - name: Build wheel
+        env:
+          TURBO_GNN_LOCAL_VERSION: "torch${{ matrix.config.torch }}.${{ matrix.config.cuda_tag }}"
+          TORCH_CUDA_ARCH_LIST: "7.0 7.5 8.0 8.6 8.9 9.0"
+          MAX_JOBS: "4"
+        run: |
+          python${{ matrix.python-version }} -m pip wheel . \
+            --no-deps --no-build-isolation --wheel-dir dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "wheel-torch${{ matrix.config.torch }}-${{ matrix.config.cuda_tag }}-py${{ matrix.python-version }}"
+          path: dist/*.whl
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Build sdist (no CUDA needed)
+  # ---------------------------------------------------------------------------
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build frontend
+        run: pip install build
+
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Create GitHub Release + publish sdist to PyPI (tag pushes only)
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release
+    needs: [build, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+      - name: Publish sdist to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          # Only publish the sdist (*.tar.gz), not the local-version wheels
+          # which PyPI would reject.
+          skip-existing: true

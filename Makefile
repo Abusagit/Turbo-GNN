@@ -21,7 +21,7 @@ FIND_LINKS := --find-links $(PYG_URL) --find-links $(DGL_URL)
 NO_ISO := --no-build-isolation
 
 _install-torch:
-	$(PIP) install torch wheel numpy
+	$(PIP) install torch==$(TORCH_VERSION) wheel numpy
 
 install: _install-torch
 	$(PIP) install -e . $(NO_ISO) $(FIND_LINKS)

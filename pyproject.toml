@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=65.0", "wheel", "torch>=2.0.0"]
+requires = ["setuptools>=65.0", "wheel", "torch>=2.0.0", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -36,7 +36,7 @@ dependencies = ["torch>=2.0.0", "numpy<2.0"]
 
 [project.optional-dependencies]
 research = [
-    "torch==2.4.0",
+    "torch>=2.4.0,<2.5.0",
     "numpy<2.0",
     "scipy>=1.7.0",
     "pandas>=1.5.0",
