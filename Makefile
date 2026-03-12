@@ -18,19 +18,23 @@ DGL_URL := https://data.dgl.ai/wheels/torch-2.4/$(CUDA_VERSION)/repo.html
 
 
 FIND_LINKS := --find-links $(PYG_URL) --find-links $(DGL_URL)
+NO_ISO := --no-build-isolation
 
-install:
-	$(PIP) install -e . $(FIND_LINKS)
+_install-torch:
+	$(PIP) install torch wheel numpy
 
-install-dev: _install-dev setup-hooks test
+install: _install-torch
+	$(PIP) install -e . $(NO_ISO) $(FIND_LINKS)
+
+install-dev: _install-torch _install-dev setup-hooks test
 
 _install-dev:
-	$(PIP) install -e ".[dev]" $(FIND_LINKS)
+	$(PIP) install -e ".[dev]" $(NO_ISO) $(FIND_LINKS)
 
-install-full: _install-full _install-tcgnn setup-hooks test
+install-full: _install-torch _install-full _install-tcgnn setup-hooks test
 
 _install-full:
-	$(PIP) install -e ".[full]" $(FIND_LINKS)
+	$(PIP) install -e ".[full]" $(NO_ISO) $(FIND_LINKS)
 
 _install-tcgnn:
 	mkdir -p thirdparty
@@ -42,23 +46,23 @@ test:
 	$(PYTHON) -m pytest tests/ -v
 
 format:
-	ruff format src/ scripts/ tests/
+	ruff format src/ scripts/ tests/ turbo_gnn/
 	@echo "✅ Code formatted with ruff"
 
 lint:
-	ruff check src/ scripts/ tests/
+	ruff check src/ scripts/ tests/ turbo_gnn/
 	@echo "✅ Linting complete"
 
 lint-fix:
-	ruff check --fix src/ scripts/ tests/
+	ruff check --fix src/ scripts/ tests/ turbo_gnn/
 	@echo "✅ Auto-fixed linting issues"
 
 # check both format and lint (without modifying files)
 check:
 	@echo "Checking code format..."
-	ruff format --check src/ scripts/ tests/
+	ruff format --check src/ scripts/ tests/ turbo_gnn/
 	@echo "Checking code quality..."
-	ruff check src/ scripts/ tests/
+	ruff check src/ scripts/ tests/ turbo_gnn/
 	@echo "✅ All checks passed"
 
 setup-hooks:
@@ -82,9 +86,9 @@ clean:
 
 help:
 	@echo "Available targets:"
-	@echo "  install           - Install base dependencies"
-	@echo "  install-dev       - Install with dev dependencies"
-	@echo "  install-full      - Install everything (default: cu124)"
+	@echo "  install           - Install turbo-gnn (base: torch only)"
+	@echo "  install-dev       - Install with dev/test dependencies"
+	@echo "  install-full      - Install everything + TCGNN (default: cu124)"
 	@echo "  test              - Run all tests"
 	@echo "  setup-hooks       - Setup pre-commit hooks"
 	@echo "  run-hooks         - Run pre-commit hooks"

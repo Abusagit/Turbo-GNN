@@ -16,25 +16,29 @@ path = __file__.replace("utils.py", "")
 sources = ["mean_aggr_base.cu"]
 repo_root_path = Path(__file__).parent.parent.parent.parent.parent
 build_path = repo_root_path / "build/mean_aggr_test_reordering"
-if not build_path.is_dir():
-    build_path.mkdir(parents=True)
 
-mean_aggr_cuda = load(
-    name="mean_aggr_cuda",
-    build_directory=str(build_path),
-    extra_cflags=["-O3"],
-    extra_cuda_cflags=[
-        "-O3",
-        "--use_fast_math",
-        "--generate-line-info",
-    ],
-    extra_include_paths=[
-        # *glob.glob(str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True),
-        "/usr/local/cuda/include"
-    ],
-    sources=[path + s for s in sources],
-    verbose=True,
-)
+_mean_aggr_cuda = None
+
+
+def _get_mean_aggr_cuda():
+    global _mean_aggr_cuda
+    if _mean_aggr_cuda is None:
+        if not build_path.is_dir():
+            build_path.mkdir(parents=True)
+        _mean_aggr_cuda = load(
+            name="mean_aggr_cuda",
+            build_directory=str(build_path),
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "--generate-line-info",
+            ],
+            extra_include_paths=["/usr/local/cuda/include"],
+            sources=[path + s for s in sources],
+            verbose=True,
+        )
+    return _mean_aggr_cuda
 
 
 class MeanAggrFunction(torch.autograd.Function):
@@ -49,7 +53,7 @@ class MeanAggrFunction(torch.autograd.Function):
         use_second_access,
         use_vectorized_loads,
     ):
-        out = mean_aggr_cuda.mean_aggr_forward(
+        out = _get_mean_aggr_cuda().mean_aggr_forward(
             edge_ptr,
             edge_idx,
             X,

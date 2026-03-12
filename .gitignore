@@ -12,7 +12,7 @@ dataset/*
 
 runs/
 
-.venv/*
+.venv*/*
 
 *.egg-info
 

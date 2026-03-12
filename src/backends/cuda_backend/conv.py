@@ -5,7 +5,7 @@ from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 
-from ..base import AutotuneConfig, BaseBackend, BaseConvolution, TunableParam
+from ..base import BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import GATv2AggrKernel, gatv2_aggr
 from .gt_aggr.utils import GraphTransformerAggrKernel, graph_transformer_aggr

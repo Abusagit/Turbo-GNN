@@ -6,7 +6,6 @@ from torch.utils.cpp_extension import load
 
 path = Path(__file__).parent
 build_path = path.parent.parent.parent / "build/dfgnn"
-build_path.mkdir(parents=True, exist_ok=True)
 
 if os.environ.get("CUDA_HOME") is None:
     os.environ["CUDA_HOME"] = "/usr/local/cuda"
@@ -25,15 +24,33 @@ sources = [
 
 extra_include_path = ["csrc/util/"]
 
-dfgnn_ops = load(
-    # NOTE: C++ sources use `PYBIND11_MODULE(fused_gtconv, m)` (and `ind`).
-    # `load(name=...)` must match the exported `PyInit_<name>` symbol.
-    name="fused_gtconv",
-    build_directory=str(build_path),
-    # Don't override `_GLIBCXX_USE_CXX11_ABI`; PyTorch already provides the correct one.
-    extra_cflags=["-O3"],
-    extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_80"],
-    extra_include_paths=[f"{cuda_path}/include", str(path)] + extra_include_path,
-    sources=[str(path / s) for s in sources],
-    verbose=True,
-)
+_dfgnn_ops = None
+
+
+def _get_dfgnn_ops():
+    global _dfgnn_ops
+    if _dfgnn_ops is None:
+        build_path.mkdir(parents=True, exist_ok=True)
+        _dfgnn_ops = load(
+            # NOTE: C++ sources use `PYBIND11_MODULE(fused_gtconv, m)` (and `ind`).
+            # `load(name=...)` must match the exported `PyInit_<name>` symbol.
+            name="fused_gtconv",
+            build_directory=str(build_path),
+            # Don't override `_GLIBCXX_USE_CXX11_ABI`; PyTorch already provides the correct one.
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_80"],
+            extra_include_paths=[f"{cuda_path}/include", str(path)] + extra_include_path,
+            sources=[str(path / s) for s in sources],
+            verbose=True,
+        )
+    return _dfgnn_ops
+
+
+class _LazyOps:
+    """Proxy that defers JIT compilation until first attribute access."""
+
+    def __getattr__(self, name):
+        return getattr(_get_dfgnn_ops(), name)
+
+
+dfgnn_ops = _LazyOps()

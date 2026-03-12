@@ -1,4 +1,4 @@
-#include "../common.cuh"
+#include "common.cuh"
 
 constexpr int kWarpsPerBlock = 4;
 
@@ -662,34 +662,4 @@ graph_attention_backward_csr_mh_cuda(
     torch::Tensor dK = dK_f32.to(input_dtype);
 
     return std::make_tuple(dQ, dK, dV);
-}
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(
-        "gt_forward_csr_mh",
-        &graph_attention_forward_csr_mh_cuda,
-        "Graph Transformer forward (CSR, multi-head, FlashAttn2-style) - returns (O, logsumexp)",
-        py::arg("row_ptr"),
-        py::arg("col_idx"),
-        py::arg("Q"),
-        py::arg("K"),
-        py::arg("V"),
-        py::arg("scale")
-    );
-
-    m.def(
-        "gt_backward_csr_mh",
-        &graph_attention_backward_csr_mh_cuda,
-        "Graph Transformer backward (CSR^T, multi-head, FlashAttn2-style) - returns (dQ, dK, dV)",
-        py::arg("row_ptr_T"),
-        py::arg("col_idx_T"),
-        py::arg("Q"),
-        py::arg("K"),
-        py::arg("V"),
-        py::arg("O"),
-        py::arg("dO"),
-        py::arg("logsumexp"),
-        py::arg("scale")
-    );
 }

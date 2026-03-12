@@ -1,4 +1,4 @@
-#include "../common.cuh"
+#include "common.cuh"
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
@@ -849,30 +849,4 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor grad_a_reduced = grad_a_reduced_f32.to(input_dtype);
 
     return {grad_l, grad_r, grad_a_reduced};
-}
-
-
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)",
-          py::arg("l"),
-          py::arg("r"),
-          py::arg("row_ptr"),
-          py::arg("col_idx"),
-          py::arg("attn_vec"),
-          py::arg("negative_slope") = 0.2f);
-
-    m.def("backward", &gatv2_backward_cuda, "GATv2 backward pass (CUDA)",
-          py::arg("grad_h"),
-          py::arg("l"),
-          py::arg("r"),
-          py::arg("row_ptr"),
-          py::arg("col_idx"),
-          py::arg("row_ptr_T"),
-          py::arg("col_idx_T"),
-          py::arg("attn_vec"),
-          py::arg("logsumexp"),
-          py::arg("negative_slope") = 0.2f,
-          py::arg("grad_A_reduce_row_chunk_size") = 512);
 }

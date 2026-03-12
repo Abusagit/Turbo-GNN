@@ -1567,7 +1567,7 @@ class TestInlineAutotune:
     def setup_method(self):
         TunableKernel._shared_instances.clear()
 
-    @patch("src.benchmarking.microbench.time_callable")
+    @patch("turbo_gnn._timer.time_callable")
     def test_inline_autotune_tunes_kernel_and_graph(self, mock_tc, graph_repr):
         # _TestKernel has 2 graph combos x 2 kernel combos = 4 trials
         ms_values = [10.0, 5.0, 3.0, 8.0]
@@ -1587,7 +1587,7 @@ class TestInlineAutotune:
         assert "kernel_config" in result
         assert "graph_repr" in result
 
-    @patch("src.benchmarking.microbench.time_callable")
+    @patch("turbo_gnn._timer.time_callable")
     def test_inline_autotune_returns_best(self, mock_tc, graph_repr):
         # Best is trial 2 (graph combo 1, kernel combo 0) → 1.0 ms
         ms_values = [10.0, 10.0, 1.0, 10.0]
@@ -1606,7 +1606,7 @@ class TestInlineAutotune:
         # Trial 2: graph combo index=1 (q=0.9), kernel combo index=0 (block_size=64)
         assert result["kernel_config"] == {"forward_block_size": 64}
 
-    @patch("src.benchmarking.microbench.time_callable")
+    @patch("turbo_gnn._timer.time_callable")
     def test_inline_autotune_no_params(self, mock_tc, graph_repr):
         kernel = DummyKernel()  # no tunable params
         result = kernel._inline_autotune(torch.randn(100, 16), graph_repr)
@@ -1623,7 +1623,7 @@ class TestTunableKernelCallAutotune:
     def setup_method(self):
         TunableKernel._shared_instances.clear()
 
-    @patch("src.benchmarking.microbench.time_callable")
+    @patch("turbo_gnn._timer.time_callable")
     def test_call_with_autotune_true(self, mock_tc, graph_repr):
         ms_values = [5.0, 3.0, 8.0, 10.0]
         counter = {"n": 0}
@@ -1643,7 +1643,7 @@ class TestTunableKernelCallAutotune:
         assert result is not None
         assert counter["n"] == 4  # 2 graph x 2 kernel combos
 
-    @patch("src.benchmarking.microbench.time_callable")
+    @patch("turbo_gnn._timer.time_callable")
     def test_call_with_autotune_caches(self, mock_tc, graph_repr):
         ms_values = [5.0, 3.0, 8.0, 10.0]
         counter = {"n": 0}

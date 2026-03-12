@@ -20,7 +20,6 @@ all_sources = [
 
 repo_root_path = Path(__file__).parent.parent.parent.parent
 build_path = repo_root_path / "build/fuseGNN"
-build_path.mkdir(parents=True, exist_ok=True)
 
 extra_cflags = ["-O3", "-fPIC"]
 extra_cuda_cflags = [
@@ -33,18 +32,35 @@ extra_cuda_cflags = [
 ]
 extra_ldflags = ["-lcusparse"]
 
-fgnn_ops = load(
-    name="fgnn_ops",
-    build_directory=str(build_path),
-    extra_cflags=extra_cflags,
-    extra_cuda_cflags=extra_cuda_cflags,
-    extra_ldflags=extra_ldflags,
-    extra_include_paths=[str(path / "cuda"), "/usr/local/cuda/include"],  # Add cuda/ to include path
-    sources=[str(path / s) for s in all_sources],
-    verbose=True,
-    with_cuda=True,
-)
+_fgnn_ops = None
 
+
+def _get_fgnn_ops():
+    global _fgnn_ops
+    if _fgnn_ops is None:
+        build_path.mkdir(parents=True, exist_ok=True)
+        _fgnn_ops = load(
+            name="fgnn_ops",
+            build_directory=str(build_path),
+            extra_cflags=extra_cflags,
+            extra_cuda_cflags=extra_cuda_cflags,
+            extra_ldflags=extra_ldflags,
+            extra_include_paths=[str(path / "cuda"), "/usr/local/cuda/include"],
+            sources=[str(path / s) for s in all_sources],
+            verbose=True,
+            with_cuda=True,
+        )
+    return _fgnn_ops
+
+
+class _LazyOps:
+    """Proxy that defers JIT compilation until first attribute access."""
+
+    def __getattr__(self, name):
+        return getattr(_get_fgnn_ops(), name)
+
+
+fgnn_ops = _LazyOps()
 fgnn_agg = fgnn_ops
 fgnn_format = fgnn_ops
 fgnn_gcn = fgnn_ops

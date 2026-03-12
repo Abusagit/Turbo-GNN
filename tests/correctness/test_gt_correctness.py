@@ -218,6 +218,7 @@ def test_gt_cuda_vs_dgl_backward(num_nodes, feature_dim, heads):
 # # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
 @pytest.mark.parametrize("num_nodes", [48, 128])
 @pytest.mark.parametrize("feature_dim", [256, 512])
 @pytest.mark.parametrize("heads", [4, 8])
@@ -268,6 +269,7 @@ def test_gt_triton_vs_dgl_forward(num_nodes, feature_dim, heads):
     )
 
 
+@pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
 @pytest.mark.parametrize("num_nodes", [48, 128])
 @pytest.mark.parametrize("feature_dim", [256, 512])
 @pytest.mark.parametrize("heads", [4, 8])
@@ -322,7 +324,15 @@ def test_gt_triton_vs_dgl_backward(num_nodes, feature_dim, heads):
 # ---------------------------------------------------------------------------
 # Low-precision: CUDA vs CUDA fp32 / Triton vs Triton fp32
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("backend", ["cuda", "triton_block_sparse"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "cuda",
+        pytest.param(
+            "triton_block_sparse", marks=pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
+        ),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_nodes", [64, 200])
 @pytest.mark.parametrize("feature_dim", [512])
@@ -371,7 +381,15 @@ def test_gt_low_precision_forward(backend, dtype, num_nodes, feature_dim, heads)
     )
 
 
-@pytest.mark.parametrize("backend", ["cuda", "triton_block_sparse"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "cuda",
+        pytest.param(
+            "triton_block_sparse", marks=pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
+        ),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_nodes", [64, 200])
 @pytest.mark.parametrize("feature_dim", [512])

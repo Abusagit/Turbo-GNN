@@ -16,27 +16,31 @@ sources = ["cusparse_spmm.cpp", "edge_norm_kernels.cu"]
 
 repo_root_path = Path(__file__).parent.parent.parent.parent
 build_path = repo_root_path / "build/cusparse"
-if not build_path.is_dir():
-    build_path.mkdir(parents=True)
 
-cuda_kernels = load(
-    name="cuda_kernels",
-    build_directory=str(build_path),
-    extra_cflags=["-O3"],
-    extra_cuda_cflags=[
-        "-O3",
-        "--use_fast_math",
-        "-arch=sm_80",
-        "--generate-line-info",
-        "-lcusparse",
-    ],
-    extra_include_paths=[
-        # *glob.glob(str(repo_root_path / ".venv/lib/python3.11/site-packages/**/include"), recursive=True),
-        os.environ["CUDA_HOME"]
-    ],
-    sources=[path + s for s in sources],
-    verbose=True,
-)
+_cuda_kernels = None
+
+
+def _get_cuda_kernels():
+    global _cuda_kernels
+    if _cuda_kernels is None:
+        if not build_path.is_dir():
+            build_path.mkdir(parents=True)
+        _cuda_kernels = load(
+            name="cuda_kernels",
+            build_directory=str(build_path),
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "-arch=sm_80",
+                "--generate-line-info",
+                "-lcusparse",
+            ],
+            extra_include_paths=[os.environ["CUDA_HOME"]],
+            sources=[path + s for s in sources],
+            verbose=True,
+        )
+    return _cuda_kernels
 
 
 def csr_SPMM_normalized(
@@ -76,7 +80,7 @@ def csr_SPMM_normalized(
     else:
         edge_weights_gpu = edge_weights.to(features.device).to(torch.float32)
 
-    out = cuda_kernels.csr_SPMM_normalized(
+    out = _get_cuda_kernels().csr_SPMM_normalized(
         indptr, indices, features.contiguous(), edge_weights_gpu, norm, algorithm, use_cache, do_transpose_a, block_dim
     )
 

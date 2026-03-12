@@ -450,25 +450,3 @@ void clear_graph_cache() {
     std::lock_guard<std::mutex> lock(cache_mutex);
     graph_cache.clear();
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("csr_SPMM", &csr_SPMM, "Optimized and cached csr_SPMM (backward compatibility)",
-          py::arg("indptr"), py::arg("indices"), py::arg("features"),
-          py::arg("algorithm") = -1, py::arg("use_cache") = true, py::arg("do_transpose_a") = false,
-          py::arg("block_dim") = BLOCK_DIM);
-
-    m.def("csr_SPMM_normalized", &csr_SPMM_normalized, "Optimized and cached csr_SPMM with normalization",
-          py::arg("indptr"), py::arg("indices"), py::arg("features"),
-          py::arg("edge_weights"), py::arg("norm") = "none", py::arg("algorithm") = -1,
-          py::arg("use_cache") = true, py::arg("do_transpose_a") = false,
-          py::arg("block_dim") = BLOCK_DIM);
-
-    m.def("find_best_algorithm", &find_best_algorithm, "Find best cuSPARSE algorithm for given graph (backward compatibility)");
-
-    m.def("find_best_algorithm_normalized", &find_best_algorithm_normalized,
-          "Find best cuSPARSE algorithm for given graph with normalization",
-          py::arg("indptr"), py::arg("indices"), py::arg("features"), py::arg("edge_weights"),
-          py::arg("norm") = "none", py::arg("block_dim") = BLOCK_DIM);
-
-    m.def("clear_graph_cache", &clear_graph_cache, "Clear graph cache");
-}

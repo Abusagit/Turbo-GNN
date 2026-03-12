@@ -1,6 +1,4 @@
-#include "../common.cuh"
-
-namespace py = pybind11;
+#include "common.cuh"
 
 
 void reduction_aggr_backward_cuda(
@@ -98,22 +96,4 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
 
     reduction_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y, reduce);
     return {out, arg_idx};
-}
-
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("reduction_aggr_backward", &reduction_aggr_backward_torch,
-          "Reduction aggregation backward",
-          py::arg("grad_out"), py::arg("arg_idx"), py::arg("num_src_nodes"),
-          py::arg("warps_per_block") = 8
-        );
-    m.def("reduction_aggr_forward_partitioned", &reduction_aggr_forward_partitioned_torch,
-          "Reduction aggregation forward (partitioned)",
-          py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("X"),
-          py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("max_degree"),
-          py::arg("warps_per_block") = 8, py::arg("edges_per_block_heavy_nodes") = 128,
-          py::arg("use_2d_kernel") = false, py::arg("features_per_block") = 32,
-          py::arg("tiles_y") = 8, py::arg("reduce") = "min"
-        );
 }
