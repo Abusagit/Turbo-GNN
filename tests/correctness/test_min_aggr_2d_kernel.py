@@ -2,32 +2,48 @@ import pytest
 import torch
 
 from src.backends.cuda_backend.reduction_aggr.utils import reduction_aggr, reduction_aggr_forward_partitioned
+from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 
 
 def zero_inf(x):
     return torch.where(torch.isinf(x), torch.zeros_like(x), x)
 
 
-def create_simple_graph(device, num_nodes=100, num_edges=500):
-    src = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int32)
-    dst = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int32)
+def create_simple_graph(device, num_nodes=100, num_edges=500, index_dtype=torch.int32):
+    src = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    dst = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
 
-    indptr = torch.zeros(num_nodes + 1, device=device, dtype=torch.int32)
+    indptr = torch.zeros(num_nodes + 1, device=device, dtype=torch.int64)
     for i in range(num_edges):
         indptr[dst[i].item() + 1] += 1
-    indptr = torch.cumsum(indptr, dim=0).to(torch.int32)
+    indptr = torch.cumsum(indptr, dim=0)
 
-    sorted_idx = torch.argsort(dst.long()).to(torch.int32)
-    indices = src[sorted_idx].to(torch.int32)
+    sorted_idx = torch.argsort(dst)
+    indices = src[sorted_idx]
 
-    return indptr, indices
+    return indptr.to(index_dtype), indices.to(index_dtype)
 
 
 def partition_nodes(indptr: torch.Tensor, threshold=100):
     deg = indptr[1:] - indptr[:-1]
-    light = torch.nonzero(deg <= threshold, as_tuple=True)[0].to(torch.int32).to(indptr.device)
-    heavy = torch.nonzero(deg > threshold, as_tuple=True)[0].to(torch.int32).to(indptr.device)
+    index_dtype = indptr.dtype
+    light = torch.nonzero(deg <= threshold, as_tuple=True)[0].to(index_dtype).to(indptr.device)
+    heavy = torch.nonzero(deg > threshold, as_tuple=True)[0].to(index_dtype).to(indptr.device)
     return light, heavy
+
+
+def make_graph_repr(indptr, indices, light, heavy):
+    """Wrap raw tensors into AdjacencyForwardBackwardWithNodeBuckets."""
+    return AdjacencyForwardBackwardWithNodeBuckets(
+        forward_indptr=indptr,
+        forward_indices=indices,
+        backward_indptr=indptr,
+        backward_indices=indices,
+        forward_light_nodes=light,
+        forward_heavy_nodes=heavy,
+        backward_light_nodes=light,
+        backward_heavy_nodes=heavy,
+    )
 
 
 def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False, fpb=32, tiles=8):
@@ -39,15 +55,12 @@ def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False
 
 
 def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128, use_2d=False, fpb=32, tiles=8):
+    graph = make_graph_repr(indptr, indices, light, heavy)
     out = reduction_aggr(
-        indptr,
-        indices,
+        graph,
         x,
-        light,
-        heavy,
-        131070,
-        warps,
-        epb,
+        warps_per_block=warps,
+        edges_per_block_heavy_nodes=epb,
         use_2d_kernel=use_2d,
         features_per_block=fpb,
         tiles_y=tiles,
@@ -98,20 +111,23 @@ def test_2d_kernel_vs_atomic_kernel(dtype, num_features, fpb, tiles):
     x_2d = torch.randn(N, num_features, device=device, dtype=dtype, requires_grad=True)
     x_atomic = x_2d.detach().clone().requires_grad_(True)
 
+    graph = make_graph_repr(indptr, indices, light, heavy)
     out_2d_grad = reduction_aggr(
-        indptr, indices, x_2d, light, heavy, 131070, 8, 128, use_2d_kernel=True, features_per_block=fpb, tiles_y=tiles
+        graph,
+        x_2d,
+        warps_per_block=8,
+        edges_per_block_heavy_nodes=128,
+        use_2d_kernel=True,
+        features_per_block=fpb,
+        tiles_y=tiles,
     )
     out_2d_grad = zero_inf(out_2d_grad)
 
     out_atomic_grad = reduction_aggr(
-        indptr,
-        indices,
+        graph,
         x_atomic,
-        light,
-        heavy,
-        131070,
-        8,
-        128,
+        warps_per_block=8,
+        edges_per_block_heavy_nodes=128,
         use_2d_kernel=False,
         features_per_block=fpb,
         tiles_y=tiles,

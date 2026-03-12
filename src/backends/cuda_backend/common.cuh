@@ -165,6 +165,88 @@ inline std::variant<TTypeInfo<T>...> MakeTypeVariant(at::ScalarType type) {
     return result;
 }
 
+// =============================================================================
+// Index type dispatch infrastructure
+// =============================================================================
+
+// Index type info: maps C++ integer type -> c10::ScalarType
+template <typename T>
+struct IndexTypeInfo {
+    using Type = T;
+};
+
+template <>
+struct IndexTypeInfo<int32_t> {
+    using Type = int32_t;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::Int;
+};
+
+template <>
+struct IndexTypeInfo<int64_t> {
+    using Type = int64_t;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::Long;
+};
+
+template <>
+struct IndexTypeInfo<uint32_t> {
+    using Type = uint32_t;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::UInt32;
+};
+
+template <>
+struct IndexTypeInfo<uint64_t> {
+    using Type = uint64_t;
+    static constexpr c10::ScalarType ScalarType = c10::ScalarType::UInt64;
+};
+
+// Sentinel traits: universal "invalid index" for all types
+// For signed: -1. For unsigned: max value (all-ones bit pattern).
+// cast(-1) gives all-ones for both signed and unsigned.
+template <typename index_t>
+struct IndexSentinel {
+    static constexpr index_t INVALID = static_cast<index_t>(-1);
+    static __device__ __forceinline__ bool is_valid(index_t idx) {
+        return idx != INVALID;
+    }
+};
+
+// Runtime dispatch to compile-time index type
+template <typename... IndexTypes>
+std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {
+    std::variant<IndexTypeInfo<IndexTypes>...> result;
+    bool found = false;
+    ([&] {
+        if (IndexTypeInfo<IndexTypes>::ScalarType == type) {
+            result.template emplace<IndexTypeInfo<IndexTypes>>();
+            found = true;
+        }
+    }(), ...);
+    if (!found) {
+        throw std::runtime_error("Unsupported index scalar type");
+    }
+    return result;
+}
+
+// Helper to extract typed pointer from tensor using untyped data_ptr()
+// Uses void* cast to avoid PyTorch's scalar-type assertion that may
+// not handle uint types correctly in all versions.
+template <typename index_t>
+const index_t* index_ptr(const at::Tensor& t) {
+    return static_cast<const index_t*>(t.data_ptr());
+}
+
+template <typename index_t>
+index_t* index_ptr_mut(at::Tensor& t) {
+    return static_cast<index_t*>(t.data_ptr());
+}
+
+// Check whether a scalar type is a supported index type
+inline bool is_supported_index_type(at::ScalarType type) {
+    return type == at::kInt || type == at::kLong ||
+           type == c10::ScalarType::UInt32 || type == c10::ScalarType::UInt64;
+}
+
+
 template <typename cuda_t>
 __device__ __forceinline__ cuda_t make_cuda_value(float val);
 

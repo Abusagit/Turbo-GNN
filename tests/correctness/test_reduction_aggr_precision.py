@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from src.backends.cuda_backend.reduction_aggr.utils import reduction_aggr, reduction_aggr_forward_partitioned
+from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 from src.data.datasets import load_pyg_single_graph
 
 
@@ -9,26 +10,41 @@ def zero_inf(x):
     return torch.where(torch.isinf(x), torch.zeros_like(x), x)
 
 
-def create_simple_graph(device, num_nodes=100, num_edges=500):
-    src = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int32)
-    dst = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int32)
+def create_simple_graph(device, num_nodes=100, num_edges=500, index_dtype=torch.int32):
+    src = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    dst = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
 
-    indptr = torch.zeros(num_nodes + 1, device=device, dtype=torch.int32)
+    indptr = torch.zeros(num_nodes + 1, device=device, dtype=torch.int64)
     for i in range(num_edges):
         indptr[dst[i].item() + 1] += 1
-    indptr = torch.cumsum(indptr, dim=0).to(torch.int32)
+    indptr = torch.cumsum(indptr, dim=0)
 
-    sorted_idx = torch.argsort(dst.long()).to(torch.int32)
-    indices = src[sorted_idx].to(torch.int32)
+    sorted_idx = torch.argsort(dst)
+    indices = src[sorted_idx]
 
-    return indptr, indices
+    return indptr.to(index_dtype), indices.to(index_dtype)
 
 
 def partition_nodes(indptr: torch.Tensor, threshold=100):
     deg = indptr[1:] - indptr[:-1]
-    light = torch.nonzero(deg <= threshold, as_tuple=True)[0].to(torch.int32).to(indptr.device)
-    heavy = torch.nonzero(deg > threshold, as_tuple=True)[0].to(torch.int32).to(indptr.device)
+    index_dtype = indptr.dtype
+    light = torch.nonzero(deg <= threshold, as_tuple=True)[0].to(index_dtype).to(indptr.device)
+    heavy = torch.nonzero(deg > threshold, as_tuple=True)[0].to(index_dtype).to(indptr.device)
     return light, heavy
+
+
+def make_graph_repr(indptr, indices, light, heavy):
+    """Wrap raw tensors into AdjacencyForwardBackwardWithNodeBuckets."""
+    return AdjacencyForwardBackwardWithNodeBuckets(
+        forward_indptr=indptr,
+        forward_indices=indices,
+        backward_indptr=indptr,
+        backward_indices=indices,
+        forward_light_nodes=light,
+        forward_heavy_nodes=heavy,
+        backward_light_nodes=light,
+        backward_heavy_nodes=heavy,
+    )
 
 
 def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min", use_2d=False, fpb=32, tiles=8):
@@ -50,15 +66,12 @@ def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min"
 
 
 def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min", use_2d=False, fpb=32, tiles=8):
+    graph = make_graph_repr(indptr, indices, light, heavy)
     out = reduction_aggr(
-        indptr,
-        indices,
+        graph,
         x,
-        light,
-        heavy,
-        131070,
-        warps,
-        epb,
+        warps_per_block=warps,
+        edges_per_block_heavy_nodes=epb,
         use_2d_kernel=use_2d,
         features_per_block=fpb,
         tiles_y=tiles,
@@ -75,7 +88,8 @@ def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min
 @pytest.mark.parametrize("num_features", [16, 64, 128])
 @pytest.mark.parametrize("reduce", ["min", "max"])
 @pytest.mark.parametrize("use_2d_kernel", [False, True])
-def test_forward_matches_fp32_reference(dtype, num_features, reduce, use_2d_kernel):
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_forward_matches_fp32_reference(dtype, num_features, reduce, use_2d_kernel, index_dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -87,7 +101,7 @@ def test_forward_matches_fp32_reference(dtype, num_features, reduce, use_2d_kern
 
     N = 200
     E = 1000
-    indptr, indices = create_simple_graph(device, N, E)
+    indptr, indices = create_simple_graph(device, N, E, index_dtype=index_dtype)
     light, heavy = partition_nodes(indptr)
 
     x = torch.randn(N, num_features, device=device, dtype=dtype)
@@ -120,7 +134,8 @@ def test_forward_matches_fp32_reference(dtype, num_features, reduce, use_2d_kern
 @pytest.mark.parametrize("num_features", [16, 64, 128])
 @pytest.mark.parametrize("reduce", ["min", "max"])
 @pytest.mark.parametrize("use_2d_kernel", [False, True])
-def test_backward_matches_fp32_reference(dtype, num_features, reduce, use_2d_kernel):
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_backward_matches_fp32_reference(dtype, num_features, reduce, use_2d_kernel, index_dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -129,7 +144,7 @@ def test_backward_matches_fp32_reference(dtype, num_features, reduce, use_2d_ker
 
     N = 200
     E = 1000
-    indptr, indices = create_simple_graph(device, N, E)
+    indptr, indices = create_simple_graph(device, N, E, index_dtype=index_dtype)
     light, heavy = partition_nodes(indptr)
 
     x = torch.randn(N, num_features, device=device, dtype=dtype, requires_grad=True)
@@ -180,29 +195,22 @@ def test_real_dataset_matches_fp32_reference(dtype, reduce, use_2d_kernel):
     x = torch.randn(N, F, device=device, dtype=dtype, requires_grad=True)
     x_ref = x.detach().float().requires_grad_(True)
 
+    graph = make_graph_repr(indptr, indices, light, heavy)
     out = reduction_aggr(
-        indptr,
-        indices,
+        graph,
         x,
-        light,
-        heavy,
-        131070,
-        8,
-        128,
+        warps_per_block=8,
+        edges_per_block_heavy_nodes=128,
         use_2d_kernel=use_2d_kernel,
         features_per_block=32,
         tiles_y=8,
         reduce=reduce,
     )
     out_ref = reduction_aggr(
-        indptr,
-        indices,
+        graph,
         x_ref,
-        light,
-        heavy,
-        131070,
-        8,
-        128,
+        warps_per_block=8,
+        edges_per_block_heavy_nodes=128,
         use_2d_kernel=use_2d_kernel,
         features_per_block=32,
         tiles_y=8,
@@ -242,6 +250,71 @@ def test_real_dataset_matches_fp32_reference(dtype, reduce, use_2d_kernel):
         rtol=rtol_bwd,
         msg=f"Backward mismatch on Cora vs fp32 ref for {dtype}, reduce={reduce}, kernel={kernel_type}",
     )
+
+
+def _reinterpret_graph_unsigned(indptr, indices, light, heavy, unsigned_dtype):
+    """Reinterpret signed int32 graph tensors as unsigned (zero-copy .view())."""
+    return (
+        indptr.view(unsigned_dtype),
+        indices.view(unsigned_dtype),
+        light.view(unsigned_dtype),
+        heavy.view(unsigned_dtype),
+    )
+
+
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("use_2d_kernel", [False, True])
+@pytest.mark.parametrize("unsigned_dtype", [torch.uint32])
+def test_forward_unsigned_index(reduce, use_2d_kernel, unsigned_dtype):
+    """Verify that unsigned index types produce the same results as signed int32."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    N, E, F = 200, 1000, 64
+    indptr, indices = create_simple_graph(device, N, E, index_dtype=torch.int32)
+    light, heavy = partition_nodes(indptr)
+
+    x = torch.randn(N, F, device=device, dtype=torch.float32)
+
+    out_signed, _ = run_forward(indptr, indices, x, light, heavy, reduce=reduce, use_2d=use_2d_kernel)
+
+    u_indptr, u_indices, u_light, u_heavy = _reinterpret_graph_unsigned(indptr, indices, light, heavy, unsigned_dtype)
+    out_unsigned, _ = run_forward(u_indptr, u_indices, x, u_light, u_heavy, reduce=reduce, use_2d=use_2d_kernel)
+
+    torch.testing.assert_close(
+        zero_inf(out_unsigned),
+        zero_inf(out_signed),
+        atol=1e-5,
+        rtol=1e-4,
+        msg=f"Unsigned {unsigned_dtype} output differs from int32 for reduce={reduce}, 2d={use_2d_kernel}",
+    )
+
+
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("unsigned_dtype", [torch.uint32])
+def test_backward_unsigned_index(reduce, unsigned_dtype):
+    """Verify backward pass with unsigned index types."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    N, E, F = 200, 1000, 64
+    indptr, indices = create_simple_graph(device, N, E, index_dtype=torch.int32)
+    light, heavy = partition_nodes(indptr)
+
+    u_indptr, u_indices, u_light, u_heavy = _reinterpret_graph_unsigned(indptr, indices, light, heavy, unsigned_dtype)
+
+    x = torch.randn(N, F, device=device, dtype=torch.float32, requires_grad=True)
+    grad_x = run_backward(u_indptr, u_indices, x, u_light, u_heavy, reduce=reduce)
+
+    assert grad_x is not None, "Gradient should be computed"
+    assert grad_x.shape == x.shape, "Gradient shape mismatch"
+    assert not torch.isnan(grad_x).any(), "Gradient contains NaN"
 
 
 @pytest.mark.parametrize("warps", [1, 2, 4, 8, 16])

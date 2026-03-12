@@ -17,6 +17,7 @@ from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 from src.data.converters import (
     AdjacencyForwardBackwardWithNodeBuckets,
     WSBFormat,
+    _bucket_nodes_by_degree,
     build_csr_as_is,
     get_cugraph_with_gcn_weights,
     normalize_adj,
@@ -110,32 +111,6 @@ def ensure_cpu_device(func):
         return res
 
     return wrapper
-
-
-# ----------------------------- Helper functions ----------------------------- #
-
-
-def _bucket_nodes_by_degree(
-    degree_counts: torch.Tensor,
-    quantile: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Partition nodes into light/heavy buckets based on degree quantile.
-
-    Args:
-        degree_counts: Per-node degree counts.
-        quantile: Quantile threshold (-1 disables, putting all nodes in light).
-
-    Returns:
-        (light_node_indices, heavy_node_indices)
-    """
-    if quantile != -1:
-        thresh = torch.quantile(degree_counts.float(), quantile).item()
-    else:
-        thresh = degree_counts.max().item() + 1
-
-    light = (degree_counts < thresh).nonzero(as_tuple=False).view(-1)
-    heavy = (degree_counts >= thresh).nonzero(as_tuple=False).view(-1)
-    return light, heavy
 
 
 # ------------------------- Canonical sample container ------------------------- #
@@ -368,22 +343,31 @@ class GraphSample:
             kwargs = self.kernel_related_kwargs
             fallback_q = kwargs.get("huge_degree_threshold_quantile", 0.95)
 
+            # Determine index dtype: use kernel_related_kwargs if specified, else keep native dtype
+            index_dtype_name = kwargs.get("index_dtype", None)
+            if index_dtype_name is not None:
+                index_dtype = (
+                    getattr(torch, index_dtype_name) if isinstance(index_dtype_name, str) else index_dtype_name
+                )
+            else:
+                index_dtype = row_ptr_fwd.dtype  # native dtype from build_csr_as_is
+
             fwd_quantile = kwargs.get("forward_huge_degree_threshold_quantile", fallback_q)
-            fwd_light, fwd_heavy = _bucket_nodes_by_degree(counts_fwd, fwd_quantile)
+            fwd_light, fwd_heavy = _bucket_nodes_by_degree(counts_fwd, fwd_quantile, index_dtype=index_dtype)
 
             bwd_quantile = kwargs.get("backward_huge_degree_threshold_quantile", fallback_q)
-            bwd_light, bwd_heavy = _bucket_nodes_by_degree(counts_bwd, bwd_quantile)
+            bwd_light, bwd_heavy = _bucket_nodes_by_degree(counts_bwd, bwd_quantile, index_dtype=index_dtype)
 
             graph = self._to_default_device(
                 AdjacencyForwardBackwardWithNodeBuckets(
-                    forward_indptr=self._to_int32(row_ptr_fwd),
-                    forward_indices=self._to_int32(cols_fwd),
-                    backward_indptr=self._to_int32(row_ptr_bwd),
-                    backward_indices=self._to_int32(cols_bwd),
-                    forward_light_nodes=self._to_int32(fwd_light),
-                    forward_heavy_nodes=self._to_int32(fwd_heavy),
-                    backward_light_nodes=self._to_int32(bwd_light),
-                    backward_heavy_nodes=self._to_int32(bwd_heavy),
+                    forward_indptr=row_ptr_fwd.to(index_dtype),
+                    forward_indices=cols_fwd.to(index_dtype),
+                    backward_indptr=row_ptr_bwd.to(index_dtype),
+                    backward_indices=cols_bwd.to(index_dtype),
+                    forward_light_nodes=fwd_light.to(index_dtype),
+                    forward_heavy_nodes=fwd_heavy.to(index_dtype),
+                    backward_light_nodes=bwd_light.to(index_dtype),
+                    backward_heavy_nodes=bwd_heavy.to(index_dtype),
                 )
             )
 

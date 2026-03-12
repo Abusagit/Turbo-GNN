@@ -28,12 +28,20 @@ from src.backends.autotune import (
     _apply_best_config,
     _build_combinations,
     run_autotune,
+    run_autotune_kernel,
 )
 from src.backends.base import (
     AutotuneConfig,
     BaseConvolution,
+    TunableKernel,
     TunableParam,
     _autotune_forward_pre_hook,
+    _InlineAutotuneCache,
+    with_autotune,
+)
+from src.data.converters import (
+    AdjacencyForwardBackwardWithNodeBuckets,
+    _bucket_nodes_by_degree,
 )
 
 # ---------------------------------------------------------------------------
@@ -887,3 +895,776 @@ class TestEndToEnd:
         assert ctr["n"] == 0
         assert r1 == r2
         assert conv2.forward_block_size == conv1.forward_block_size
+
+
+# ===================================================================
+# Dummy TunableKernel subclasses
+# ===================================================================
+
+
+class DummyKernel(TunableKernel):
+    """Minimal kernel with no tunable params."""
+
+    def __init__(self):
+        super().__init__()
+        self.call_count = 0
+
+    def _execute(self, *args, **kwargs):
+        self.call_count += 1
+        return torch.zeros(4)
+
+
+class TunableDummyKernel(TunableKernel):
+    """Kernel with forward kernel + graph tunable params."""
+
+    def __init__(self):
+        super().__init__()
+        self.forward_warps_per_block = 8
+        self.forward_tile_size = 32
+
+    def _execute(self, *args, **kwargs):
+        return torch.zeros(4)
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_warps_per_block", [4, 8, 16], default=8),
+            TunableParam("forward_tile_size", [16, 32], default=32),
+        ]
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.99], default=-1),
+        ]
+
+    def make_forward_bench_fn(self, x, graph_repr, **kwargs):
+        def _bench():
+            return self._execute(graph_repr, x)
+
+        return _bench
+
+
+class BackwardTunableKernel(TunableKernel):
+    """Kernel with backward kernel params."""
+
+    def __init__(self):
+        super().__init__()
+        self.backward_grad_chunk = 512
+
+    def _execute(self, *args, **kwargs):
+        return torch.zeros(4)
+
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam("backward_grad_chunk", [128, 256, 512], default=512)]
+
+    def make_backward_bench_fn(self, x, graph_repr, **kwargs):
+        def _bench():
+            return self._execute(graph_repr, x)
+
+        return _bench
+
+
+class KernelOnlyTunableKernel(TunableKernel):
+    """Kernel with only forward kernel params."""
+
+    def __init__(self):
+        super().__init__()
+        self.forward_block_size = 128
+
+    def _execute(self, *args, **kwargs):
+        return torch.zeros(4)
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam("forward_block_size", [64, 128, 256], default=128)]
+
+
+# ===================================================================
+# Tests — TunableKernel ABC
+# ===================================================================
+
+
+class TestTunableKernel:
+    def test_cannot_instantiate_abc(self):
+        with pytest.raises(TypeError):
+            TunableKernel()
+
+    def test_default_tunable_params_empty(self):
+        k = DummyKernel()
+        assert k.get_tunable_forward_kernel_params() == []
+        assert k.get_tunable_forward_graph_params() == []
+        assert k.get_tunable_backward_kernel_params() == []
+        assert k.get_tunable_backward_graph_params() == []
+
+    def test_configure_sets_attrs(self):
+        k = TunableDummyKernel()
+        k.configure(forward_warps_per_block=16, forward_tile_size=64)
+        assert k.forward_warps_per_block == 16
+        assert k.forward_tile_size == 64
+
+    def test_configure_creates_new_attrs(self):
+        k = DummyKernel()
+        k.configure(new_param=42)
+        assert k.new_param == 42
+
+    def test_name_property(self):
+        assert DummyKernel().name == "DummyKernel"
+        assert TunableDummyKernel().name == "TunableDummyKernel"
+
+    def test_initial_state(self):
+        k = DummyKernel()
+        assert k._autotune_enabled is False
+        assert k._is_tuned is False
+        assert k._is_autotuning is False
+        assert isinstance(k._autotune_config, AutotuneConfig)
+
+    def test_callable(self):
+        k = DummyKernel()
+        result = k()  # __call__ -> _execute
+        assert k.call_count == 1
+        assert result.shape == (4,)
+
+    def test_tunable_params_returned(self):
+        k = TunableDummyKernel()
+        fwd_k = k.get_tunable_forward_kernel_params()
+        fwd_g = k.get_tunable_forward_graph_params()
+        assert len(fwd_k) == 2
+        assert len(fwd_g) == 1
+        assert fwd_k[0].name == "forward_warps_per_block"
+
+    def test_make_forward_bench_fn_default_delegates_to_execute(self):
+        k = DummyKernel()
+        bench_fn = k.make_forward_bench_fn(torch.zeros(4), None)
+        result = bench_fn()
+        assert result.shape == (4,)
+        assert k.call_count == 1
+
+
+# ===================================================================
+# Tests — run_autotune_kernel
+# ===================================================================
+
+
+class TestRunAutotuneKernel:
+    @patch("src.backends.autotune._microbench.time_callable")
+    def test_no_tunable_params_early_return(self, mock_tc, graph_sample, x_tensor):
+        result = run_autotune_kernel(DummyKernel(), x_tensor, graph_sample, AutotuneConfig())
+        assert result == {}
+        mock_tc.assert_not_called()
+
+    @patch("src.backends.autotune._microbench")
+    def test_kernel_only_grid_search(self, mock_mb, graph_sample, x_tensor):
+        mock_mb.time_callable, ctr = _make_time_callable_mock([5.0, 2.0, 8.0])
+
+        kernel = KernelOnlyTunableKernel()
+        result = run_autotune_kernel(kernel, x_tensor, graph_sample, AutotuneConfig())
+
+        assert ctr["n"] == 3
+        assert result == {"forward_block_size": 128}
+        assert kernel.forward_block_size == 128
+
+    @patch("src.backends.autotune._microbench")
+    def test_mixed_grid_search(self, mock_mb, graph_sample, x_tensor):
+        # TunableDummyKernel: 2 graph x (3 kernel_a x 2 kernel_b) = 12 trials
+        ms = [10.0] * 12
+        ms[4] = 1.0  # trial 4 is fastest
+        mock_mb.time_callable, ctr = _make_time_callable_mock(ms)
+
+        kernel = TunableDummyKernel()
+        result = run_autotune_kernel(kernel, x_tensor, graph_sample, AutotuneConfig())
+
+        assert ctr["n"] == 12
+        assert result == {
+            "forward_huge_degree_threshold_quantile": -1,
+            "forward_warps_per_block": 16,
+            "forward_tile_size": 16,
+        }
+
+    @patch("src.backends.autotune._microbench")
+    def test_applies_best_config(self, mock_mb, graph_sample, x_tensor):
+        mock_mb.time_callable, _ = _make_time_callable_mock([10.0, 1.0, 10.0])
+
+        kernel = KernelOnlyTunableKernel()
+        run_autotune_kernel(kernel, x_tensor, graph_sample, AutotuneConfig())
+        assert kernel.forward_block_size == 128
+
+    @patch("src.backends.autotune._microbench")
+    def test_backward_tuning(self, mock_mb, graph_sample, x_tensor):
+        mock_mb.time_callable, ctr = _make_time_callable_mock([10.0, 2.0, 8.0])
+
+        kernel = BackwardTunableKernel()
+        result = run_autotune_kernel(kernel, x_tensor, graph_sample, AutotuneConfig(tune_backward=True))
+
+        assert ctr["n"] == 3
+        assert result == {"backward_grad_chunk": 256}
+        assert kernel.backward_grad_chunk == 256
+
+    @patch("src.backends.autotune._microbench")
+    def test_cache_save(self, mock_mb, graph_sample, x_tensor, tmp_cache_dir):
+        mock_mb.time_callable, _ = _make_time_callable_mock([5.0, 2.0, 8.0])
+
+        run_autotune_kernel(
+            KernelOnlyTunableKernel(),
+            x_tensor,
+            graph_sample,
+            AutotuneConfig(cache_dir=tmp_cache_dir),
+        )
+
+        trial_dir = Path(tmp_cache_dir) / "KernelOnlyTunableKernel"
+        assert trial_dir.is_dir()
+        files = list(trial_dir.glob("*.json"))
+        assert len(files) == 3
+
+    @patch("src.backends.autotune._microbench")
+    def test_cache_hit_skips_search(self, mock_mb, graph_sample, x_tensor, tmp_cache_dir):
+        mock_mb.time_callable, ctr = _make_time_callable_mock([5.0, 2.0, 8.0])
+
+        cfg = AutotuneConfig(cache_dir=tmp_cache_dir)
+        r1 = run_autotune_kernel(KernelOnlyTunableKernel(), x_tensor, graph_sample, cfg)
+
+        ctr["n"] = 0
+        r2 = run_autotune_kernel(KernelOnlyTunableKernel(), x_tensor, graph_sample, cfg)
+
+        assert ctr["n"] == 0
+        assert r1 == r2
+
+
+# ===================================================================
+# Tests — TunableKernel.autotune() method
+# ===================================================================
+
+
+class TestTunableKernelAutotune:
+    @patch("src.backends.autotune.run_autotune_kernel")
+    def test_delegates_to_run_autotune_kernel(self, mock_run, graph_sample, x_tensor):
+        mock_run.return_value = {"forward_block_size": 64}
+        kernel = KernelOnlyTunableKernel()
+        result = kernel.autotune(x_tensor, graph_sample)
+
+        mock_run.assert_called_once_with(kernel, x_tensor, graph_sample, kernel._autotune_config)
+        assert result == {"forward_block_size": 64}
+        assert kernel._is_tuned is True
+
+    @patch("src.backends.autotune.run_autotune_kernel")
+    def test_config_override(self, mock_run, graph_sample, x_tensor):
+        mock_run.return_value = {}
+        kernel = KernelOnlyTunableKernel()
+        cfg = AutotuneConfig(warmup=1, iters=5)
+        kernel.autotune(x_tensor, graph_sample, config=cfg)
+
+        assert kernel._autotune_config is cfg
+        mock_run.assert_called_once_with(kernel, x_tensor, graph_sample, cfg)
+
+    @patch("src.backends.autotune.run_autotune_kernel", side_effect=RuntimeError("boom"))
+    def test_resets_flag_on_error(self, mock_run, graph_sample, x_tensor):
+        kernel = KernelOnlyTunableKernel()
+        with pytest.raises(RuntimeError, match="boom"):
+            kernel.autotune(x_tensor, graph_sample)
+        assert kernel._is_autotuning is False
+        assert kernel._is_tuned is False
+
+    @patch("src.backends.autotune.run_autotune_kernel")
+    def test_is_autotuning_true_during_run(self, mock_run, graph_sample, x_tensor):
+        captured = {}
+
+        def side_effect(k, x, gs, cfg):
+            captured["during"] = k._is_autotuning
+            return {}
+
+        mock_run.side_effect = side_effect
+        kernel = KernelOnlyTunableKernel()
+        kernel.autotune(x_tensor, graph_sample)
+        assert captured["during"] is True
+        assert kernel._is_autotuning is False
+
+
+# ===================================================================
+# Tests — BaseConvolution delegation to kernel callables
+# ===================================================================
+
+
+class DelegatingConv(BaseConvolution):
+    """Conv that registers a TunableDummyKernel."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel = TunableDummyKernel()
+        self.register_kernel(self.kernel)
+
+    def forward(self, x, graph, **kwargs):
+        return x
+
+
+class MultiKernelConv(BaseConvolution):
+    """Conv that registers multiple kernels."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.k1 = KernelOnlyTunableKernel()
+        self.k2 = BackwardTunableKernel()
+        self.register_kernel(self.k1)
+        self.register_kernel(self.k2)
+
+    def forward(self, x, graph, **kwargs):
+        return x
+
+
+class TestBaseConvolutionDelegation:
+    def test_register_kernel(self):
+        conv = DelegatingConv()
+        assert len(conv._kernel_callables) == 1
+        assert conv._kernel_callables[0] is conv.kernel
+
+    def test_delegates_forward_kernel_params(self):
+        conv = DelegatingConv()
+        params = conv.get_tunable_forward_kernel_params()
+        assert len(params) == 2
+        assert params[0].name == "forward_warps_per_block"
+        assert params[1].name == "forward_tile_size"
+
+    def test_delegates_forward_graph_params(self):
+        conv = DelegatingConv()
+        params = conv.get_tunable_forward_graph_params()
+        assert len(params) == 1
+        assert params[0].name == "forward_huge_degree_threshold_quantile"
+
+    def test_delegates_backward_params(self):
+        conv = DelegatingConv()
+        assert conv.get_tunable_backward_kernel_params() == []
+        assert conv.get_tunable_backward_graph_params() == []
+
+    def test_configure_routes_to_kernel(self):
+        conv = DelegatingConv()
+        conv.configure(forward_warps_per_block=16, forward_tile_size=64)
+        assert conv.kernel.forward_warps_per_block == 16
+        assert conv.kernel.forward_tile_size == 64
+
+    def test_configure_unknown_param_on_self(self):
+        conv = DelegatingConv()
+        conv.configure(forward_warps_per_block=16, custom_param=42)
+        assert conv.kernel.forward_warps_per_block == 16
+        assert conv.custom_param == 42
+
+    def test_multi_kernel_aggregates_params(self):
+        conv = MultiKernelConv()
+        fwd_k = conv.get_tunable_forward_kernel_params()
+        bwd_k = conv.get_tunable_backward_kernel_params()
+        assert len(fwd_k) == 1  # from KernelOnlyTunableKernel
+        assert fwd_k[0].name == "forward_block_size"
+        assert len(bwd_k) == 1  # from BackwardTunableKernel
+        assert bwd_k[0].name == "backward_grad_chunk"
+
+    def test_multi_kernel_configure_routes_correctly(self):
+        conv = MultiKernelConv()
+        conv.configure(forward_block_size=256, backward_grad_chunk=128)
+        assert conv.k1.forward_block_size == 256
+        assert conv.k2.backward_grad_chunk == 128
+
+    def test_no_kernel_callables_configure_fallback(self):
+        """Conv with no registered kernels uses setattr fallback."""
+        conv = DummyConv()
+        conv.configure(forward_warps_per_block=16)
+        assert conv.forward_warps_per_block == 16
+
+    @patch("src.backends.autotune._microbench")
+    def test_autotune_via_delegation(self, mock_mb, graph_sample, x_tensor):
+        """end-to-end: autotune on a conv with registered kernel."""
+        # DelegatingConv uses TunableDummyKernel: 2 graph x 6 kernel = 12 trials
+        ms = [10.0] * 12
+        ms[4] = 1.0
+        mock_mb.time_callable, ctr = _make_time_callable_mock(ms)
+
+        conv = DelegatingConv()
+        result = conv.autotune(x_tensor, graph_sample)
+
+        assert ctr["n"] == 12
+        assert "forward_warps_per_block" in result
+        assert conv._is_tuned is True
+
+    @patch("src.backends.autotune._microbench")
+    def test_enable_autotune_triggers_on_forward(self, mock_mb, graph_sample, x_tensor):
+        ms = [10.0] * 12
+        ms[4] = 1.0
+        mock_mb.time_callable, ctr = _make_time_callable_mock(ms)
+
+        conv = DelegatingConv()
+        conv.enable_autotune(graph_sample=graph_sample)
+        assert not conv._is_tuned
+        conv(x_tensor, graph_sample.graph_repr)
+        assert conv._is_tuned
+
+
+# ===================================================================
+# Helper: create a real AdjacencyForwardBackwardWithNodeBuckets
+# ===================================================================
+
+
+def _make_graph_repr(num_nodes=100, avg_degree=5):
+    """Create a simple graph repr for testing."""
+    indptr = torch.zeros(num_nodes + 1, dtype=torch.int32)
+    degrees = torch.randint(1, avg_degree * 2, (num_nodes,))
+    indptr[1:] = degrees.cumsum(0)
+    num_edges = indptr[-1].item()
+    indices = torch.randint(0, num_nodes, (num_edges,), dtype=torch.int32)
+
+    all_nodes = torch.arange(num_nodes, dtype=torch.int32)
+    return AdjacencyForwardBackwardWithNodeBuckets(
+        forward_indptr=indptr,
+        forward_indices=indices,
+        backward_indptr=indptr.clone(),
+        backward_indices=indices.clone(),
+        forward_light_nodes=all_nodes,
+        forward_heavy_nodes=torch.tensor([], dtype=torch.int32),
+        backward_light_nodes=all_nodes,
+        backward_heavy_nodes=torch.tensor([], dtype=torch.int32),
+    )
+
+
+@pytest.fixture
+def graph_repr():
+    return _make_graph_repr()
+
+
+# ===================================================================
+# Tests — repartition
+# ===================================================================
+
+
+class TestRepartition:
+    def test_repartition_creates_new_instance(self, graph_repr):
+        new_graph = graph_repr.repartition(forward_huge_degree_threshold_quantile=0.9)
+        assert new_graph is not graph_repr
+
+    def test_repartition_shares_csr_tensors(self, graph_repr):
+        new_graph = graph_repr.repartition(forward_huge_degree_threshold_quantile=0.9)
+        assert new_graph.forward_indptr is graph_repr.forward_indptr
+        assert new_graph.forward_indices is graph_repr.forward_indices
+        assert new_graph.backward_indptr is graph_repr.backward_indptr
+        assert new_graph.backward_indices is graph_repr.backward_indices
+
+    def test_repartition_changes_forward_buckets(self, graph_repr):
+        new_graph = graph_repr.repartition(forward_huge_degree_threshold_quantile=0.5)
+        # With 50th percentile, there should be some heavy nodes
+        assert new_graph.forward_heavy_nodes.numel() > 0
+        total = new_graph.forward_light_nodes.numel() + new_graph.forward_heavy_nodes.numel()
+        assert total == graph_repr.forward_indptr.numel() - 1
+
+    def test_repartition_changes_backward_buckets(self, graph_repr):
+        new_graph = graph_repr.repartition(backward_huge_degree_threshold_quantile=0.5)
+        assert new_graph.backward_heavy_nodes.numel() > 0
+        total = new_graph.backward_light_nodes.numel() + new_graph.backward_heavy_nodes.numel()
+        assert total == graph_repr.backward_indptr.numel() - 1
+
+    def test_repartition_no_kwargs_unchanged(self, graph_repr):
+        new_graph = graph_repr.repartition()
+        assert new_graph.forward_light_nodes is graph_repr.forward_light_nodes
+        assert new_graph.forward_heavy_nodes is graph_repr.forward_heavy_nodes
+
+    def test_repartition_preserves_max_degree(self, graph_repr):
+        new_graph = graph_repr.repartition(forward_huge_degree_threshold_quantile=0.9)
+        assert new_graph.max_degree == graph_repr.max_degree
+
+
+# ===================================================================
+# Tests — _InlineAutotuneCache
+# ===================================================================
+
+
+class TestInlineAutotuneCache:
+    def test_lookup_empty_returns_none(self, graph_repr):
+        cache = _InlineAutotuneCache()
+        assert cache.lookup(graph_repr, 16) is None
+
+    def test_store_and_lookup(self, graph_repr):
+        cache = _InlineAutotuneCache()
+        result = {"kernel_config": {"warps": 8}, "graph_repr": graph_repr}
+        cache.store(graph_repr, 16, result)
+        cached = cache.lookup(graph_repr, 16)
+        assert cached is result
+
+    def test_different_feat_dim_miss(self, graph_repr):
+        cache = _InlineAutotuneCache()
+        result = {"kernel_config": {}, "graph_repr": graph_repr}
+        cache.store(graph_repr, 16, result)
+        assert cache.lookup(graph_repr, 32) is None
+
+    def test_different_graph_miss(self):
+        cache = _InlineAutotuneCache()
+        g1 = _make_graph_repr(50)
+        g2 = _make_graph_repr(60)
+        result = {"kernel_config": {}, "graph_repr": g1}
+        cache.store(g1, 16, result)
+        assert cache.lookup(g2, 16) is None
+
+    def test_cached_value_includes_graph_repr(self, graph_repr):
+        cache = _InlineAutotuneCache()
+        repartitioned = graph_repr.repartition(forward_huge_degree_threshold_quantile=0.9)
+        result = {"kernel_config": {"warps": 4}, "graph_repr": repartitioned}
+        cache.store(graph_repr, 16, result)
+        cached = cache.lookup(graph_repr, 16)
+        assert cached["graph_repr"] is repartitioned
+
+
+# ===================================================================
+# Tests — with_autotune decorator
+# ===================================================================
+
+
+class _TestKernel(TunableKernel):
+    """Test kernel for decorator tests."""
+
+    def __init__(self, reduce="sum", **kwargs):
+        super().__init__()
+        self.reduce = reduce
+        self.forward_block_size = 128
+        self.execute_calls = []
+
+    def _execute(self, graph, x, **kwargs):
+        self.execute_calls.append((graph, x, kwargs))
+        return x * 2
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam("forward_block_size", [64, 128], default=128)]
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9], default=-1),
+        ]
+
+
+class TestWithAutotuneDecorator:
+    def setup_method(self):
+        # Clear singleton cache between tests
+        TunableKernel._shared_instances.clear()
+
+    def test_decorator_accepts_autotune_kwarg(self, graph_repr):
+        """The wrapper accepts autotune and autotune_config kwargs."""
+        called = []
+
+        @with_autotune(_TestKernel, init_params=("reduce",))
+        def my_fn(graph, x, block_size=128, reduce="sum"):
+            called.append(True)
+            return x
+
+        x = torch.randn(100, 16)
+        # Without autotune — should call original
+        my_fn(graph_repr, x, reduce="sum", autotune=False)
+        assert len(called) == 1
+
+        # autotune_config is also accepted without error
+        my_fn(graph_repr, x, reduce="sum", autotune=False, autotune_config=None)
+        assert len(called) == 2
+
+    def test_non_autotune_passthrough(self, graph_repr):
+        called = []
+
+        @with_autotune(_TestKernel, init_params=("reduce",))
+        def my_fn(graph, x, reduce="sum"):
+            called.append(True)
+            return x + 1
+
+        x = torch.randn(100, 16)
+        result = my_fn(graph_repr, x, reduce="sum")
+        assert len(called) == 1
+        assert torch.equal(result, x + 1)
+
+    def test_non_autotune_default(self, graph_repr):
+        """Without autotune kwarg, calls original function."""
+        called = []
+
+        @with_autotune(_TestKernel)
+        def my_fn(graph, x):
+            called.append(True)
+            return x
+
+        x = torch.randn(100, 16)
+        my_fn(graph_repr, x)
+        assert len(called) == 1
+
+    @patch("src.backends.base._InlineAutotuneCache.lookup", return_value=None)
+    @patch("src.backends.base.TunableKernel._inline_autotune")
+    def test_autotune_routes_to_kernel(self, mock_autotune, mock_lookup, graph_repr):
+        mock_autotune.return_value = {"kernel_config": {}, "graph_repr": graph_repr}
+
+        @with_autotune(_TestKernel, init_params=("reduce",))
+        def my_fn(graph, x, reduce="sum"):
+            return x
+
+        x = torch.randn(100, 16)
+        my_fn(graph_repr, x, reduce="sum", autotune=True)
+        mock_autotune.assert_called_once()
+
+    def test_preserves_function_name(self):
+        @with_autotune(_TestKernel)
+        def my_special_fn(graph, x):
+            return x
+
+        assert my_special_fn.__name__ == "my_special_fn"
+
+
+# ===================================================================
+# Tests — _get_or_create singleton
+# ===================================================================
+
+
+class TestGetOrCreate:
+    def setup_method(self):
+        TunableKernel._shared_instances.clear()
+
+    def test_same_kwargs_returns_same_instance(self):
+        k1 = _TestKernel._get_or_create(reduce="sum")
+        k2 = _TestKernel._get_or_create(reduce="sum")
+        assert k1 is k2
+
+    def test_different_kwargs_returns_different_instances(self):
+        k1 = _TestKernel._get_or_create(reduce="sum")
+        k2 = _TestKernel._get_or_create(reduce="min")
+        assert k1 is not k2
+
+    def test_no_kwargs_returns_same_instance(self):
+        k1 = _TestKernel._get_or_create()
+        k2 = _TestKernel._get_or_create()
+        assert k1 is k2
+
+    def test_different_classes_return_different_instances(self):
+        k1 = _TestKernel._get_or_create()
+        k2 = DummyKernel._get_or_create()
+        assert k1 is not k2
+
+
+# ===================================================================
+# Tests — per-kernel caching
+# ===================================================================
+
+
+class TestPerKernelCaching:
+    def setup_method(self):
+        TunableKernel._shared_instances.clear()
+
+    def test_different_kernels_cache_independently(self, graph_repr):
+        k1 = _TestKernel._get_or_create(reduce="sum")
+        k2 = _TestKernel._get_or_create(reduce="min")
+
+        r1_graph = graph_repr.repartition(forward_huge_degree_threshold_quantile=0.9)
+        r2_graph = graph_repr.repartition(forward_huge_degree_threshold_quantile=0.5)
+
+        k1._inline_cache.store(graph_repr, 16, {"kernel_config": {"forward_block_size": 64}, "graph_repr": r1_graph})
+        k2._inline_cache.store(graph_repr, 16, {"kernel_config": {"forward_block_size": 128}, "graph_repr": r2_graph})
+
+        c1 = k1._inline_cache.lookup(graph_repr, 16)
+        c2 = k2._inline_cache.lookup(graph_repr, 16)
+
+        assert c1["kernel_config"]["forward_block_size"] == 64
+        assert c2["kernel_config"]["forward_block_size"] == 128
+        assert c1["graph_repr"] is r1_graph
+        assert c2["graph_repr"] is r2_graph
+
+
+# ===================================================================
+# Tests — inline autotune
+# ===================================================================
+
+
+class TestInlineAutotune:
+    def setup_method(self):
+        TunableKernel._shared_instances.clear()
+
+    @patch("src.benchmarking.microbench.time_callable")
+    def test_inline_autotune_tunes_kernel_and_graph(self, mock_tc, graph_repr):
+        # _TestKernel has 2 graph combos x 2 kernel combos = 4 trials
+        ms_values = [10.0, 5.0, 3.0, 8.0]
+        counter = {"n": 0}
+
+        def fake(fn, warmup=10, iters=50, do_memory_profile=False):
+            idx = counter["n"] % len(ms_values)
+            counter["n"] += 1
+            return FakeMicrobenchResult(iters=iters, ms_per_iter=ms_values[idx])
+
+        mock_tc.side_effect = fake
+
+        kernel = _TestKernel(reduce="sum")
+        result = kernel._inline_autotune(torch.randn(100, 16), graph_repr)
+
+        assert counter["n"] == 4
+        assert "kernel_config" in result
+        assert "graph_repr" in result
+
+    @patch("src.benchmarking.microbench.time_callable")
+    def test_inline_autotune_returns_best(self, mock_tc, graph_repr):
+        # Best is trial 2 (graph combo 1, kernel combo 0) → 1.0 ms
+        ms_values = [10.0, 10.0, 1.0, 10.0]
+        counter = {"n": 0}
+
+        def fake(fn, warmup=10, iters=50, do_memory_profile=False):
+            idx = counter["n"] % len(ms_values)
+            counter["n"] += 1
+            return FakeMicrobenchResult(iters=iters, ms_per_iter=ms_values[idx])
+
+        mock_tc.side_effect = fake
+
+        kernel = _TestKernel(reduce="sum")
+        result = kernel._inline_autotune(torch.randn(100, 16), graph_repr)
+
+        # Trial 2: graph combo index=1 (q=0.9), kernel combo index=0 (block_size=64)
+        assert result["kernel_config"] == {"forward_block_size": 64}
+
+    @patch("src.benchmarking.microbench.time_callable")
+    def test_inline_autotune_no_params(self, mock_tc, graph_repr):
+        kernel = DummyKernel()  # no tunable params
+        result = kernel._inline_autotune(torch.randn(100, 16), graph_repr)
+        assert result == {"kernel_config": {}, "graph_repr": graph_repr}
+        mock_tc.assert_not_called()
+
+
+# ===================================================================
+# Tests — TunableKernel.__call__ autotune path
+# ===================================================================
+
+
+class TestTunableKernelCallAutotune:
+    def setup_method(self):
+        TunableKernel._shared_instances.clear()
+
+    @patch("src.benchmarking.microbench.time_callable")
+    def test_call_with_autotune_true(self, mock_tc, graph_repr):
+        ms_values = [5.0, 3.0, 8.0, 10.0]
+        counter = {"n": 0}
+
+        def fake(fn, warmup=10, iters=50, do_memory_profile=False):
+            idx = counter["n"] % len(ms_values)
+            counter["n"] += 1
+            return FakeMicrobenchResult(iters=iters, ms_per_iter=ms_values[idx])
+
+        mock_tc.side_effect = fake
+
+        kernel = _TestKernel(reduce="sum")
+        x = torch.randn(100, 16)
+        result = kernel(graph_repr, x, autotune=True)
+
+        # Should have autotuned and produced a result
+        assert result is not None
+        assert counter["n"] == 4  # 2 graph x 2 kernel combos
+
+    @patch("src.benchmarking.microbench.time_callable")
+    def test_call_with_autotune_caches(self, mock_tc, graph_repr):
+        ms_values = [5.0, 3.0, 8.0, 10.0]
+        counter = {"n": 0}
+
+        def fake(fn, warmup=10, iters=50, do_memory_profile=False):
+            idx = counter["n"] % len(ms_values)
+            counter["n"] += 1
+            return FakeMicrobenchResult(iters=iters, ms_per_iter=ms_values[idx])
+
+        mock_tc.side_effect = fake
+
+        kernel = _TestKernel(reduce="sum")
+        x = torch.randn(100, 16)
+        kernel(graph_repr, x, autotune=True)  # first call: autotunes
+        n_after_first = counter["n"]
+        kernel(graph_repr, x, autotune=True)  # second call: cached
+        assert counter["n"] == n_after_first  # no additional benchmark calls
+
+    def test_call_without_autotune(self, graph_repr):
+        kernel = _TestKernel(reduce="sum")
+        x = torch.randn(100, 16)
+        result = kernel(graph_repr, x)
+        assert len(kernel.execute_calls) == 1
+        assert torch.equal(result, x * 2)

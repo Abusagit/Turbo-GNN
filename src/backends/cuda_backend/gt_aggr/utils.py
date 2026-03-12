@@ -10,6 +10,9 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load
 
+from src.backends.base import TunableKernel, TunableParam, with_autotune
+from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
+
 path = __file__.replace("utils.py", "")
 sources = ["graph_transformer.cu"]
 
@@ -72,5 +75,69 @@ class _FusedGraphAttention(torch.autograd.Function):
         return None, None, None, None, dQ, dK, dV, None
 
 
-def graph_transformer_aggr(edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale):
-    return _FusedGraphAttention.apply(edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale)
+class GraphTransformerAggrKernel(TunableKernel):
+    """Tunable kernel callable for fused graph transformer attention."""
+
+    def __init__(self):
+        super().__init__()
+
+    def _execute(self, graph, x, *, Q=None, K=None, V=None, scale=None, **kwargs):
+        return _FusedGraphAttention.apply(
+            graph.forward_indptr,
+            graph.forward_indices,
+            graph.backward_indptr,
+            graph.backward_indices,
+            Q,
+            K,
+            V,
+            scale,
+        )
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
+    def get_tunable_backward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("backward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
+    def make_forward_bench_fn(self, x, graph_repr, **kwargs):
+        Q = kwargs["Q"]
+        K = kwargs["K"]
+        V = kwargs["V"]
+        scale = kwargs["scale"]
+
+        def _bench():
+            return self._execute(
+                graph_repr,
+                x,
+                Q=Q,
+                K=K,
+                V=V,
+                scale=scale,
+            )
+
+        return _bench
+
+
+@with_autotune(GraphTransformerAggrKernel)
+def graph_transformer_aggr(
+    graph: AdjacencyForwardBackwardWithNodeBuckets,
+    x: torch.Tensor,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    return _FusedGraphAttention.apply(
+        graph.forward_indptr,
+        graph.forward_indices,
+        graph.backward_indptr,
+        graph.backward_indices,
+        Q,
+        K,
+        V,
+        scale,
+    )

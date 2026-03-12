@@ -12,6 +12,9 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load
 
+from src.backends.base import TunableKernel, TunableParam, with_autotune
+from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
+
 path = __file__.replace("utils.py", "")
 
 sources = ["reduction_aggr.cu", "reduction_aggr_base.cu"]
@@ -145,27 +148,67 @@ class ReductionAggrFunction(torch.autograd.Function):
         return None, None, grad_x, None, None, None, None, None, None, None, None, None
 
 
+class ReductionAggrKernel(TunableKernel):
+    """Tunable kernel callable for reduction aggregation (min/max)."""
+
+    def __init__(self, reduce: str = "min", **kwargs):
+        super().__init__()
+        self.reduce = reduce
+        self.forward_warps_per_block = kwargs.get("warps_per_block", 8)
+        self.forward_edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
+        self.forward_use_2d_kernel = kwargs.get("use_2d_kernel", False)
+        self.forward_features_per_block = kwargs.get("features_per_block", 32)
+        self.forward_tiles_y = kwargs.get("tiles_y", 8)
+
+    def _execute(self, graph, x, **kwargs):
+        return ReductionAggrFunction.apply(
+            graph.forward_indptr,
+            graph.forward_indices,
+            x,
+            graph.light_nodes,
+            graph.heavy_nodes,
+            graph.max_degree,
+            self.forward_warps_per_block,
+            self.forward_edges_per_block_heavy_nodes,
+            self.forward_use_2d_kernel,
+            self.forward_features_per_block,
+            self.forward_tiles_y,
+            self.reduce,
+        )
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
+            TunableParam("forward_edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
+            TunableParam("forward_use_2d_kernel", [True, False], default=False),
+            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
+            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
+        ]
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99, 0.999], default=-1),
+        ]
+
+
+@with_autotune(ReductionAggrKernel, init_params=("reduce",))
 def reduction_aggr(
-    edge_ptr: torch.Tensor,
-    edge_idx: torch.Tensor,
+    graph: AdjacencyForwardBackwardWithNodeBuckets,
     X: torch.Tensor,
-    light,
-    heavy,
-    max_degree: int,
-    warps_per_block: int,
-    edges_per_block_heavy_nodes: int,
+    warps_per_block: int = 8,
+    edges_per_block_heavy_nodes: int = 128,
     use_2d_kernel: bool = False,
     features_per_block: int = 32,
     tiles_y: int = 8,
     reduce: str = "min",
-):
+) -> torch.Tensor:
     return ReductionAggrFunction.apply(
-        edge_ptr,
-        edge_idx,
+        graph.forward_indptr,
+        graph.forward_indices,
         X,
-        light,
-        heavy,
-        max_degree,
+        graph.light_nodes,
+        graph.heavy_nodes,
+        graph.max_degree,
         warps_per_block,
         edges_per_block_heavy_nodes,
         use_2d_kernel,

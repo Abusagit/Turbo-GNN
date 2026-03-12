@@ -3,14 +3,30 @@ import dgl.function as fn
 import torch
 
 from src.backends.cuda_backend.reduction_aggr.utils import reduction_aggr, reduction_aggr_forward_partitioned
+from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 from src.data.datasets import load_pyg_single_graph
 
 
 def partition_nodes(indptr, threshold=100):
     deg = indptr[1:] - indptr[:-1]
-    light = torch.nonzero(deg <= threshold, as_tuple=True)[0].to(torch.int32).to(indptr.device)
-    heavy = torch.nonzero(deg > threshold, as_tuple=True)[0].to(torch.int32).to(indptr.device)
+    index_dtype = indptr.dtype
+    light = torch.nonzero(deg <= threshold, as_tuple=True)[0].to(index_dtype).to(indptr.device)
+    heavy = torch.nonzero(deg > threshold, as_tuple=True)[0].to(index_dtype).to(indptr.device)
     return light, heavy
+
+
+def make_graph_repr(indptr, indices, light, heavy):
+    """Wrap raw tensors into AdjacencyForwardBackwardWithNodeBuckets."""
+    return AdjacencyForwardBackwardWithNodeBuckets(
+        forward_indptr=indptr,
+        forward_indices=indices,
+        backward_indptr=indptr,
+        backward_indices=indices,
+        forward_light_nodes=light,
+        forward_heavy_nodes=heavy,
+        backward_light_nodes=light,
+        backward_heavy_nodes=heavy,
+    )
 
 
 def check_dataset(name: str, device, reduce="min"):
@@ -50,7 +66,8 @@ def check_dataset(name: str, device, reduce="min"):
     mean_diff_fwd = (out_cuda - out_dgl).abs().mean().item()
     print(f"[{name}] forward: mean |diff| = {mean_diff_fwd:.3e}")
 
-    out_cuda2 = reduction_aggr(indptr, indices, x1, light, heavy, 131070, 8, 128, reduce=reduce)
+    graph = make_graph_repr(indptr, indices, light, heavy)
+    out_cuda2 = reduction_aggr(graph, x1, reduce=reduce)
     out_cuda2[out_cuda2.isinf()] = 0
     out_cuda2.backward(grad_output)
     grad_x_cuda = x1.grad.detach().clone()

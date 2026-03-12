@@ -18,15 +18,15 @@ from typing import Any
 import torch
 
 import src.benchmarking.microbench as _microbench
-from src.backends.base import AutotuneConfig, BaseConvolution, TunableParam
+from src.backends.base import AutotuneConfig, BaseConvolution, TunableKernel, TunableParam
 from src.data.datasets import GraphSample
 
 logger = logging.getLogger(__name__)
 
 
 def _get_gpu_name(device) -> str:
-    """Return the GPU device name, or ``"cpu"`` when CUDA is unavailable."""
-    if torch.cuda.is_available():
+    """Return the GPU device name, or ``"cpu"`` when not on a CUDA device."""
+    if torch.cuda.is_available() and getattr(device, "type", None) == "cuda":
         return torch.cuda.get_device_properties(device).name  # type: ignore
     return "cpu"
 
@@ -115,12 +115,16 @@ def _build_combinations(params: list[TunableParam]) -> list[dict[str, Any]]:
 
 
 def _apply_best_config(
-    conv: BaseConvolution,
+    target,
     graph_sample: GraphSample,
     best_config: dict[str, Any],
     graph_params: list[TunableParam],
 ) -> None:
-    """Apply the best configuration, separating graph from kernel params."""
+    """Apply the best configuration, separating graph from kernel params.
+
+    ``target`` can be a :class:`BaseConvolution` or :class:`TunableKernel` —
+    anything with a ``configure(**kwargs)`` method.
+    """
     graph_param_names = {p.name for p in graph_params}
 
     graph_cfg = {k: v for k, v in best_config.items() if k in graph_param_names}
@@ -132,11 +136,11 @@ def _apply_best_config(
         graph_sample.update_graph_repr_with_new_hyperparameters(current_kwargs)
 
     if kernel_cfg:
-        conv.configure(**kernel_cfg)
+        target.configure(**kernel_cfg)
 
 
 def _grid_search(
-    conv: BaseConvolution,
+    target,
     x: torch.Tensor,
     graph_sample: GraphSample,
     config: AutotuneConfig,
@@ -144,7 +148,7 @@ def _grid_search(
     graph_params: list[TunableParam],
     make_bench_fn,
     *,
-    conv_class_name: str,
+    target_name: str,
     feature_dim: int,
     gpu_name: str,
 ) -> tuple[dict[str, Any], float]:
@@ -155,14 +159,15 @@ def _grid_search(
     parameter space changes.
 
     Args:
-        conv: The convolution module to tune.
+        target: The convolution or kernel callable to tune (anything with
+            ``configure(**kwargs)``).
         x: Input features for benchmarking.
         graph_sample: GraphSample instance for graph param tuning.
         config: Autotuning configuration.
         kernel_params: Kernel parameters to search over.
         graph_params: Graph parameters to search over.
-        make_bench_fn: Callable(conv, x, graph_repr) -> zero-arg callable for timing.
-        conv_class_name: Class name of *conv* (for cache keys).
+        make_bench_fn: Callable(target, x, graph_repr) -> zero-arg callable for timing.
+        target_name: Name of *target* (for cache keys / logging).
         feature_dim: Input feature dimensionality (for cache keys).
         gpu_name: GPU device name string (for cache keys).
 
@@ -177,7 +182,7 @@ def _grid_search(
     total_trials = len(graph_combos) * len(kernel_combos)
     logger.info(
         "Grid search %s: %d graph combos x %d kernel combos = %d total trials",
-        conv_class_name,
+        target_name,
         len(graph_combos),
         len(kernel_combos),
         total_trials,
@@ -205,26 +210,26 @@ def _grid_search(
 
             # apply kernel params
             if kernel_cfg:
-                conv.configure(**kernel_cfg)
+                target.configure(**kernel_cfg)
 
             # per-trial cache lookup
             trial_key = None
             ms = None
             if use_cache:
                 trial_key = AutotuneCache.compute_trial_key(
-                    conv_class_name,
+                    target_name,
                     feature_dim,
                     graph_sample.num_nodes,
                     graph_sample.num_edges,
                     gpu_name,
                     combined_cfg,
                 )
-                ms = AutotuneCache.load_trial(config.cache_dir, conv_class_name, trial_key)  # type: ignore
+                ms = AutotuneCache.load_trial(config.cache_dir, target_name, trial_key)  # type: ignore
                 if ms is not None:
                     logger.debug("Trial %d/%d: %s -> %.3f ms (cached)", trial, total_trials, combined_cfg, ms)
 
             if ms is None:
-                bench_fn = make_bench_fn(conv, x, graph_repr)
+                bench_fn = make_bench_fn(target, x, graph_repr)
                 result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
                 ms = result.ms_per_iter
                 logger.debug("Trial %d/%d: %s -> %.3f ms", trial, total_trials, combined_cfg, ms)
@@ -233,14 +238,14 @@ def _grid_search(
                 if save_cache:
                     if trial_key is None:
                         trial_key = AutotuneCache.compute_trial_key(
-                            conv_class_name,
+                            target_name,
                             feature_dim,
                             graph_sample.num_nodes,
                             graph_sample.num_edges,
                             gpu_name,
                             combined_cfg,
                         )
-                    AutotuneCache.save_trial(config.cache_dir, conv_class_name, trial_key, ms)  # type: ignore
+                    AutotuneCache.save_trial(config.cache_dir, target_name, trial_key, ms)  # type: ignore
 
             if ms < best_ms:
                 best_ms = ms
@@ -282,7 +287,7 @@ def run_autotune(
         logger.info("No tunable parameters declared. Skipping autotuning.")
         return {}
 
-    conv_class_name = type(conv).__name__
+    target_name = type(conv).__name__
     feature_dim = x.shape[1] if x.ndim > 1 else 1
     gpu_name = _get_gpu_name(x.device)
 
@@ -299,7 +304,7 @@ def run_autotune(
 
             return _bench
 
-        logger.info("Autotuning %s forward pass:", conv_class_name)
+        logger.info("Autotuning %s forward pass:", target_name)
         best_fwd, fwd_ms = _grid_search(
             conv,
             x,
@@ -308,7 +313,7 @@ def run_autotune(
             fwd_kernel_params,
             fwd_graph_params,
             _make_fwd_bench,
-            conv_class_name=conv_class_name,
+            target_name=target_name,
             feature_dim=feature_dim,
             gpu_name=gpu_name,
         )
@@ -327,7 +332,7 @@ def run_autotune(
 
             return _bench
 
-        logger.info("Autotuning %s backward pass:", conv_class_name)
+        logger.info("Autotuning %s backward pass:", target_name)
         best_bwd, bwd_ms = _grid_search(
             conv,
             x,
@@ -336,7 +341,7 @@ def run_autotune(
             bwd_kernel_params,
             bwd_graph_params,
             _make_bwd_bench,
-            conv_class_name=conv_class_name,
+            target_name=target_name,
             feature_dim=feature_dim,
             gpu_name=gpu_name,
         )
@@ -346,9 +351,103 @@ def run_autotune(
     best_config = {**best_fwd, **best_bwd}
     all_graph_params = fwd_graph_params + bwd_graph_params
 
-    logger.info("Autotuning %s complete. Best config: %s", conv_class_name, best_config)
+    logger.info("Autotuning %s complete. Best config: %s", target_name, best_config)
 
     # apply best config
     _apply_best_config(conv, graph_sample, best_config, all_graph_params)
+
+    return best_config
+
+
+def run_autotune_kernel(
+    kernel: TunableKernel,
+    x: torch.Tensor,
+    graph_sample: GraphSample,
+    config: AutotuneConfig,
+) -> dict:
+    """Autotuning search for a :class:`TunableKernel` callable.
+
+    Uses ``kernel.make_forward_bench_fn`` / ``kernel.make_backward_bench_fn``
+    to construct timing callables instead of ``conv.forward()``.
+
+    Args:
+        kernel: The kernel callable to tune.
+        x: Input features for benchmarking.
+        graph_sample: GraphSample instance for graph param tuning.
+        config: Autotuning configuration.
+
+    Returns:
+        Dict of best parameter name -> value mappings.
+    """
+    fwd_kernel_params = kernel.get_tunable_forward_kernel_params()
+    fwd_graph_params = kernel.get_tunable_forward_graph_params()
+    bwd_kernel_params = kernel.get_tunable_backward_kernel_params() if config.tune_backward else []
+    bwd_graph_params = kernel.get_tunable_backward_graph_params() if config.tune_backward else []
+
+    all_params = fwd_kernel_params + fwd_graph_params + bwd_kernel_params + bwd_graph_params
+
+    if not all_params:
+        logger.info("No tunable parameters declared on %s. Skipping autotuning.", kernel.name)
+        return {}
+
+    target_name = kernel.name
+    feature_dim = x.shape[1] if x.ndim > 1 else 1
+    gpu_name = _get_gpu_name(x.device)
+
+    best_fwd: dict[str, Any] = {}
+    best_bwd: dict[str, Any] = {}
+
+    # --- fwd grid search ---
+    fwd_params = fwd_kernel_params + fwd_graph_params
+    if fwd_params:
+
+        def _make_fwd_bench(k, xi, g):
+            return k.make_forward_bench_fn(xi, g)
+
+        logger.info("Autotuning %s forward pass:", target_name)
+        best_fwd, fwd_ms = _grid_search(
+            kernel,
+            x,
+            graph_sample,
+            config,
+            fwd_kernel_params,
+            fwd_graph_params,
+            _make_fwd_bench,
+            target_name=target_name,
+            feature_dim=feature_dim,
+            gpu_name=gpu_name,
+        )
+        logger.info("Forward best: %s (%.3f ms)", best_fwd, fwd_ms)
+
+    # --- bwd grid search ---
+    bwd_params = bwd_kernel_params + bwd_graph_params
+    if config.tune_backward and bwd_params:
+
+        def _make_bwd_bench(k, xi, g):
+            return k.make_backward_bench_fn(xi, g)
+
+        logger.info("Autotuning %s backward pass:", target_name)
+        best_bwd, bwd_ms = _grid_search(
+            kernel,
+            x,
+            graph_sample,
+            config,
+            bwd_kernel_params,
+            bwd_graph_params,
+            _make_bwd_bench,
+            target_name=target_name,
+            feature_dim=feature_dim,
+            gpu_name=gpu_name,
+        )
+        logger.info("Backward best: %s (%.3f ms)", best_bwd, bwd_ms)
+
+    # merge (no overlap by design)
+    best_config = {**best_fwd, **best_bwd}
+    all_graph_params = fwd_graph_params + bwd_graph_params
+
+    logger.info("Autotuning %s complete. Best config: %s", target_name, best_config)
+
+    # apply best config
+    _apply_best_config(kernel, graph_sample, best_config, all_graph_params)
 
     return best_config

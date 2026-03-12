@@ -63,8 +63,8 @@ def build_cuda_graph(edge_index: torch.Tensor, num_nodes: int):
         num_nodes=num_nodes,
         do_transpose=False,
     )
-    all_nodes = torch.arange(num_nodes, device=edge_index.device)
-    empty_nodes = torch.tensor([], dtype=torch.long, device=edge_index.device)
+    all_nodes = torch.arange(num_nodes, device=edge_index.device, dtype=torch.int32)
+    empty_nodes = torch.tensor([], dtype=torch.int32, device=edge_index.device)
     return AdjacencyForwardBackwardWithNodeBuckets(
         forward_indptr=fwd_indptr.int(),
         forward_indices=fwd_indices.int(),

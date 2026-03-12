@@ -2,7 +2,7 @@
 
 constexpr int kWarpsPerBlock = 4;
 
-template<int D_CONST, typename cuda_t>
+template<int D_CONST, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(kWarpsPerBlock * kWarpSize)
 GraphAttentionForward_CSR_MH_v2_D(
     const int N,
@@ -13,8 +13,8 @@ GraphAttentionForward_CSR_MH_v2_D(
     const int64_t stride_q_n, const int64_t stride_q_h,
     const int64_t stride_k_n, const int64_t stride_k_h,
     const int64_t stride_v_n, const int64_t stride_v_h,
-    const int* __restrict__ row_ptr,
-    const int* __restrict__ col_idx,
+    const index_t* __restrict__ row_ptr,
+    const index_t* __restrict__ col_idx,
     cuda_t* __restrict__ O,
     const int64_t stride_o_n, const int64_t stride_o_h,
     float* __restrict__ logsumexp,
@@ -38,9 +38,9 @@ GraphAttentionForward_CSR_MH_v2_D(
         return;
     }
 
-    const int edge_start    = row_ptr[node_i];
-    const int edge_end      = row_ptr[node_i + 1];
-    const int num_neighbors = edge_end - edge_start;
+    const index_t edge_start    = row_ptr[node_i];
+    const index_t edge_end      = row_ptr[node_i + 1];
+    const int num_neighbors = static_cast<int>(edge_end - edge_start);
 
     // Shared memory layout (unchanged):
     // k_shared[D_CONST] as cuda_t
@@ -92,7 +92,7 @@ GraphAttentionForward_CSR_MH_v2_D(
 
     // neighbor loop
     for (int e = warp_id; e < num_neighbors; e += kWarpsPerBlock) {
-        const int j = __ldg(&col_idx[edge_start + e]);
+        const index_t j = __ldg(&col_idx[edge_start + e]);
 
         const cuda_t* q_base = Q + j * stride_q_n + head_h * stride_q_h;
         const cuda_t* v_base = V + j * stride_v_n + head_h * stride_v_h;
@@ -247,13 +247,13 @@ compute_D_mh_kernel_D(
 // Q, K, V may be non-contiguous in N,H dims (e.g. from split/view).
 // logsumexp and Delta are [N, H].
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
-template<int D_CONST, typename cuda_t>
+template<int D_CONST, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(kWarpSize)
 graph_attn_backward_csrT_kernel_D(
     int64_t N,
     int64_t H,
-    const int* __restrict__ row_ptr_T,   // [N+1], CSR^T row pointers
-    const int* __restrict__ col_idx_T,   // [E],   CSR^T col indices
+    const index_t* __restrict__ row_ptr_T,   // [N+1], CSR^T row pointers
+    const index_t* __restrict__ col_idx_T,   // [E],   CSR^T col indices
     const cuda_t* __restrict__ Q,        // [N, H, D]
     const cuda_t* __restrict__ K,        // [N, H, D]
     const cuda_t* __restrict__ V,        // [N, H, D]
@@ -283,9 +283,9 @@ graph_attn_backward_csrT_kernel_D(
         return;
     }
 
-    int edge_start    = row_ptr_T[node_j];
-    int edge_end      = row_ptr_T[node_j + 1];
-    int num_incoming  = edge_end - edge_start;
+    index_t edge_start    = row_ptr_T[node_j];
+    index_t edge_end      = row_ptr_T[node_j + 1];
+    int num_incoming  = static_cast<int>(edge_end - edge_start);
 
     // Contiguous offset for output dQ, dV (freshly allocated, always contiguous)
     const size_t out_jh = (node_j * H + head_h) * D_CONST;
@@ -337,17 +337,17 @@ graph_attn_backward_csrT_kernel_D(
     __syncwarp(FULL_WARP_MASK);
 
     for (int e = 0; e < num_incoming; ++e) {
-        int node_i = 0;
+        index_t node_i = 0;
         if (lane == 0) {
             node_i = __ldg(&col_idx_T[edge_start + e]);
         }
         node_i = __shfl_sync(FULL_WARP_MASK, node_i, 0);
 
-        if ((unsigned)node_i >= (unsigned)N) continue;
+        if (node_i >= N) continue;
 
-        const cuda_t* ki_base  = K  + (size_t)node_i * stride_k_n + (size_t)head_h * stride_k_h;
+        const cuda_t* ki_base  = K  + node_i * stride_k_n + head_h * stride_k_h;
         // dO is contiguous (checked by TORCH_CHECK)
-        const size_t out_ih = ((size_t)node_i * (size_t)H + (size_t)head_h) * (size_t)D_CONST;
+        const size_t out_ih = static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
         const cuda_t* dOi_base = dO + out_ih;
 
         // 1) dot(k_i, q_j) and dP_ij = <dO_i, v_j>
@@ -371,7 +371,7 @@ graph_attn_backward_csrT_kernel_D(
 
         float L_i = 0.0f, Delta_i = 0.0f;
         if (lane == 0) {
-            const size_t idx_ih = (size_t)node_i * (size_t)H + (size_t)head_h;
+            const size_t idx_ih = static_cast<size_t>(node_i) * static_cast<size_t>(H) + static_cast<size_t>(head_h);
             L_i     = __ldg(&logsumexp[idx_ih]);
             Delta_i = __ldg(&Delta[idx_ih]);
         }
@@ -432,8 +432,11 @@ graph_attention_forward_csr_mh_cuda(
     TORCH_CHECK(Q.dtype() == torch::kFloat32 || Q.dtype() == torch::kFloat16 || Q.dtype() == torch::kBFloat16,
                 "Q must be float32, float16, or bfloat16");
 
-    TORCH_CHECK(row_ptr.dtype() == torch::kInt32 && col_idx.dtype() == torch::kInt32,
-                "row_ptr, col_idx must be int32");
+    auto idx_dtype = row_ptr.scalar_type();
+    TORCH_CHECK(is_supported_index_type(idx_dtype),
+                "row_ptr must be int32, int64, uint32, or uint64");
+    TORCH_CHECK(col_idx.scalar_type() == idx_dtype,
+                "col_idx must have same dtype as row_ptr");
 
     const int N = Q.size(0);
     const int H = Q.size(1);
@@ -461,7 +464,8 @@ graph_attention_forward_csr_mh_cuda(
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256,
                 "GT forward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    std::visit([&](auto typeInfo, auto d_c) {
+    std::visit([&](auto idxInfo, auto typeInfo, auto d_c) {
+        using index_t = typename decltype(idxInfo)::Type;
         using torch_t = typename decltype(typeInfo)::TorchType;
         using cuda_t = typename decltype(typeInfo)::CudaType;
         constexpr int DC = decltype(d_c)::value;
@@ -478,19 +482,20 @@ graph_attention_forward_csr_mh_cuda(
                      + kWarpsPerBlock * DC * sizeof(float)
                      + 2 * kWarpsPerBlock * sizeof(float);
 
-        GraphAttentionForward_CSR_MH_v2_D<DC, cuda_t><<<blocks, threads, shmem, stream>>>(
+        GraphAttentionForward_CSR_MH_v2_D<DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
             N, H,
             Q_ptr, K_ptr, V_ptr,
             q_strides[0], q_strides[1],
             k_strides[0], k_strides[1],
             v_strides[0], v_strides[1],
-            row_ptr.data_ptr<int>(), col_idx.data_ptr<int>(),
+            index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
             O_ptr,
             o_strides[0], o_strides[1],
             lse.data_ptr<float>(),
             scale
         );
-    }, MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
+    }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
+       MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
        MakeIntVariant<32, 64, 128, 256>(D));
 
     CUDA_KERNEL_CHECK();
@@ -532,9 +537,11 @@ graph_attention_backward_csr_mh_cuda(
     TORCH_CHECK(Q.dtype() == torch::kFloat32 || Q.dtype() == torch::kFloat16 || Q.dtype() == torch::kBFloat16,
                 "Q must be float32, float16, or bfloat16");
 
-    TORCH_CHECK(row_ptr_T.dtype() == torch::kInt32 &&
-                col_idx_T.dtype() == torch::kInt32,
-                "row_ptr_T, col_idx_T must be int32");
+    auto idx_dtype = row_ptr_T.scalar_type();
+    TORCH_CHECK(is_supported_index_type(idx_dtype),
+                "row_ptr_T must be int32, int64, uint32, or uint64");
+    TORCH_CHECK(col_idx_T.scalar_type() == idx_dtype,
+                "col_idx_T must have same dtype as row_ptr_T");
 
     TORCH_CHECK(logsumexp.dtype() == torch::kFloat32,
                 "logsumexp must be float32");
@@ -606,7 +613,8 @@ graph_attention_backward_csr_mh_cuda(
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256,
                 "GT backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    std::visit([&](auto typeInfo, auto d_c) {
+    std::visit([&](auto idxInfo, auto typeInfo, auto d_c) {
+        using index_t = typename decltype(idxInfo)::Type;
         using torch_t = typename decltype(typeInfo)::TorchType;
         using cuda_t = typename decltype(typeInfo)::CudaType;
         constexpr int DC = decltype(d_c)::value;
@@ -631,9 +639,9 @@ graph_attention_backward_csr_mh_cuda(
 
         auto* dK_ptr = dK_f32.data_ptr<float>();
 
-        graph_attn_backward_csrT_kernel_D<DC, cuda_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
+        graph_attn_backward_csrT_kernel_D<DC, cuda_t, index_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
             N, H,
-            row_ptr_T.data_ptr<int>(), col_idx_T.data_ptr<int>(),
+            index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
             Q_ptr, K_ptr, V_ptr,
             q_strides[0], q_strides[1],
             k_strides[0], k_strides[1],
@@ -644,7 +652,8 @@ graph_attention_backward_csr_mh_cuda(
             scale,
             dQ_ptr, dK_ptr, dV_ptr
         );
-    }, MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
+    }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
+       MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
        MakeIntVariant<32, 64, 128, 256>((int)D));
 
     CUDA_KERNEL_CHECK();

@@ -626,6 +626,35 @@ class AdjacencyForwardBackwardCSR:
         return self
 
 
+def _bucket_nodes_by_degree(
+    degree_counts: torch.Tensor,
+    quantile: float,
+    index_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Partition nodes into light/heavy buckets based on degree quantile.
+
+    Args:
+        degree_counts: Per-node degree counts.
+        quantile: Quantile threshold (-1 disables, putting all nodes in light).
+        index_dtype: If provided, cast output indices to this dtype to match
+            the graph's index tensor dtype. If None, keep native int64.
+
+    Returns:
+        (light_node_indices, heavy_node_indices)
+    """
+    if quantile != -1:
+        thresh = torch.quantile(degree_counts.float(), quantile).item()
+    else:
+        thresh = degree_counts.max().item() + 1
+
+    light = (degree_counts < thresh).nonzero(as_tuple=False).view(-1)
+    heavy = (degree_counts >= thresh).nonzero(as_tuple=False).view(-1)
+    if index_dtype is not None:
+        light = light.to(index_dtype)
+        heavy = heavy.to(index_dtype)
+    return light, heavy
+
+
 @dataclass
 class AdjacencyForwardBackwardWithNodeBuckets:
     forward_indptr: torch.Tensor
@@ -642,9 +671,35 @@ class AdjacencyForwardBackwardWithNodeBuckets:
 
     def __post_init__(self):
         self._device = self.forward_indptr.device
-        degrees = self.forward_indptr[1:] - self.forward_indptr[:-1]
+        # Validate all index tensors share the same dtype
+        idx_dtype = self.forward_indptr.dtype
+        for name, t in [
+            ("forward_indices", self.forward_indices),
+            ("backward_indptr", self.backward_indptr),
+            ("backward_indices", self.backward_indices),
+            ("forward_light_nodes", self.forward_light_nodes),
+            ("forward_heavy_nodes", self.forward_heavy_nodes),
+            ("backward_light_nodes", self.backward_light_nodes),
+            ("backward_heavy_nodes", self.backward_heavy_nodes),
+        ]:
+            assert t.dtype == idx_dtype, f"{name} dtype {t.dtype} doesn't match forward_indptr dtype {idx_dtype}"
+        self.index_dtype = idx_dtype
+
+        # Compute degrees — use signed view for arithmetic since PyTorch
+        # doesn't implement arithmetic ops for unsigned integer types.
+        indptr = self._to_signed_view(self.forward_indptr)
+        degrees = indptr[1:] - indptr[:-1]
         self.max_degree = degrees.max().item()
         assert self.max_degree != -1
+
+    @staticmethod
+    def _to_signed_view(t: torch.Tensor) -> torch.Tensor:
+        """View unsigned index tensor as its signed counterpart for arithmetic."""
+        if t.dtype == torch.uint32:
+            return t.view(torch.int32)
+        elif t.dtype == torch.uint64:
+            return t.view(torch.int64)
+        return t
 
     # Back-compat aliases: light_nodes / heavy_nodes → forward buckets
     @property
@@ -658,6 +713,34 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     @property
     def device(self) -> torch.device:
         return self._device
+
+    def repartition(self, **kwargs) -> "AdjacencyForwardBackwardWithNodeBuckets":
+        """New instance with same CSR but re-bucketed nodes. CSR tensors are shared."""
+        fwd_q = kwargs.get("forward_huge_degree_threshold_quantile")
+        bwd_q = kwargs.get("backward_huge_degree_threshold_quantile")
+
+        fwd_light, fwd_heavy = self.forward_light_nodes, self.forward_heavy_nodes
+        bwd_light, bwd_heavy = self.backward_light_nodes, self.backward_heavy_nodes
+
+        if fwd_q is not None:
+            fwd_indptr = self._to_signed_view(self.forward_indptr)
+            fwd_degrees = fwd_indptr[1:] - fwd_indptr[:-1]
+            fwd_light, fwd_heavy = _bucket_nodes_by_degree(fwd_degrees, fwd_q, index_dtype=self.index_dtype)
+        if bwd_q is not None:
+            bwd_indptr = self._to_signed_view(self.backward_indptr)
+            bwd_degrees = bwd_indptr[1:] - bwd_indptr[:-1]
+            bwd_light, bwd_heavy = _bucket_nodes_by_degree(bwd_degrees, bwd_q, index_dtype=self.index_dtype)
+
+        return AdjacencyForwardBackwardWithNodeBuckets(
+            forward_indptr=self.forward_indptr,
+            forward_indices=self.forward_indices,
+            backward_indptr=self.backward_indptr,
+            backward_indices=self.backward_indices,
+            forward_light_nodes=fwd_light,
+            forward_heavy_nodes=fwd_heavy,
+            backward_light_nodes=bwd_light,
+            backward_heavy_nodes=bwd_heavy,
+        )
 
     def to(self, device) -> "AdjacencyForwardBackwardWithNodeBuckets":
         self.forward_indptr = self.forward_indptr.to(device)
