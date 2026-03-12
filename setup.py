@@ -2,7 +2,6 @@ import os
 import re
 
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -34,11 +33,16 @@ if _local:
 if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0 7.5 8.0 8.6 8.9 9.0"
 
-setup(
-    name="turbo-gnn",
-    version=version,
-    packages=find_packages(include=["turbo_gnn*", "src*", "scripts*"]),
-    ext_modules=[
+# ---------------------------------------------------------------------------
+# CUDA extension — gracefully degrade when CUDA is unavailable (e.g. sdist)
+# ---------------------------------------------------------------------------
+ext_modules = []
+cmdclass = {}
+
+try:
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+    ext_modules = [
         CUDAExtension(
             name="turbo_gnn._C",
             sources=[
@@ -57,6 +61,16 @@ setup(
                 "nvcc": ["-O3", "--use_fast_math", "--generate-line-info"],
             },
         ),
-    ],
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+    ]
+    cmdclass = {"build_ext": BuildExtension.with_options(use_ninja=True)}
+except (ImportError, OSError):
+    # No CUDA toolkit — sdist / metadata queries still work
+    pass
+
+setup(
+    name="turbo-gnn",
+    version=version,
+    packages=find_packages(include=["turbo_gnn*", "src*", "scripts*"]),
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
 )
