@@ -42,20 +42,21 @@ cmdclass = {}
 try:
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-    # Find cusparse headers/libs from pip-installed nvidia packages
-    # (avoids requiring system CUDA cusparse-dev)
+    # Find headers/libs from pip-installed nvidia packages (cublas, cusparse, etc.)
+    # so we don't need the full system CUDA toolkit — only nvcc is required.
     _extra_include = []
     _extra_libdir = []
     try:
-        import nvidia.cusparse as _nv_cusparse
+        import nvidia
 
-        _nv_root = os.path.dirname(_nv_cusparse.__file__)
-        _inc = os.path.join(_nv_root, "include")
-        _lib = os.path.join(_nv_root, "lib")
-        if os.path.isdir(_inc):
-            _extra_include.append(_inc)
-        if os.path.isdir(_lib):
-            _extra_libdir.append(_lib)
+        _nvidia_root = os.path.dirname(nvidia.__file__)
+        for _pkg in os.listdir(_nvidia_root):
+            _inc = os.path.join(_nvidia_root, _pkg, "include")
+            _lib = os.path.join(_nvidia_root, _pkg, "lib")
+            if os.path.isdir(_inc):
+                _extra_include.append(_inc)
+            if os.path.isdir(_lib):
+                _extra_libdir.append(_lib)
     except ImportError:
         pass
 
