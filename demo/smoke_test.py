@@ -83,7 +83,8 @@ def test_reduction_aggr(graph, N, F, dtype, reduce):
         X = torch.randn(N, F, device="cuda", dtype=dtype, requires_grad=True)
         out = reduction_aggr(graph, X, reduce=reduce)
         check_output(out, (N, F), tag)
-        out.sum().backward()
+        out.backward(torch.randn_like(out))
+        # breakpoint()
         check_grad(X, tag)
 
     run_test(tag, _run)
