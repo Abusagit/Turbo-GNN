@@ -31,7 +31,7 @@ if _local:
 # Default CUDA architectures if not already set (V100 → H100)
 # ---------------------------------------------------------------------------
 if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.5 8.0 8.6 8.9 9.0"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0 8.6 8.9 9.0"
 
 # ---------------------------------------------------------------------------
 # CUDA extension — gracefully degrade when CUDA is unavailable (e.g. sdist)

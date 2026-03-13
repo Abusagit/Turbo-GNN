@@ -84,7 +84,7 @@ jobs:
       - name: Build wheel
         env:
           TURBO_GNN_LOCAL_VERSION: "torch${{ matrix.config.torch }}.${{ matrix.config.cuda_tag }}"
-          TORCH_CUDA_ARCH_LIST: "7.5 8.0 8.6 8.9 9.0"
+          TORCH_CUDA_ARCH_LIST: "8.0 8.6 8.9 9.0"
           MAX_JOBS: "2"
         run: |
           pip wheel . --no-deps --no-build-isolation --wheel-dir dist/
