@@ -17,8 +17,9 @@ defaults:
 jobs:
   # ---------------------------------------------------------------------------
   # Job 1: Build wheels (3 Pythons × 12 configs = 36 parallel jobs)
-  # Approach from flash-attention / llama-cpp-python:
-  #   bare ubuntu-22.04 + actions/setup-python + Jimver/cuda-toolkit (local .run)
+  # Approach from flash-attention:
+  #   bare ubuntu-22.04 + actions/setup-python + Jimver/cuda-toolkit (nvcc only)
+  #   cusparse headers come from pip-installed nvidia-cusparse-cu12
   # ---------------------------------------------------------------------------
   build:
     name: "py${{ matrix.python-version }} / torch${{ matrix.config.torch }} / ${{ matrix.config.cuda_tag }}"
@@ -66,8 +67,8 @@ jobs:
         id: cuda-toolkit
         with:
           cuda: "${{ matrix.config.cuda_version }}"
-          method: local
-          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc"]'
 
       - name: Install build dependencies
         run: pip install --upgrade pip setuptools wheel ninja

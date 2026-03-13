@@ -42,6 +42,23 @@ cmdclass = {}
 try:
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+    # Find cusparse headers/libs from pip-installed nvidia packages
+    # (avoids requiring system CUDA cusparse-dev)
+    _extra_include = []
+    _extra_libdir = []
+    try:
+        import nvidia.cusparse as _nv_cusparse
+
+        _nv_root = os.path.dirname(_nv_cusparse.__file__)
+        _inc = os.path.join(_nv_root, "include")
+        _lib = os.path.join(_nv_root, "lib")
+        if os.path.isdir(_inc):
+            _extra_include.append(_inc)
+        if os.path.isdir(_lib):
+            _extra_libdir.append(_lib)
+    except ImportError:
+        pass
+
     ext_modules = [
         CUDAExtension(
             name="turbo_gnn._C",
@@ -54,7 +71,8 @@ try:
                 "csrc/spmm/cusparse_spmm.cpp",
                 "csrc/spmm/edge_norm_kernels.cu",
             ],
-            include_dirs=[os.path.join(this_dir, "csrc")],
+            include_dirs=[os.path.join(this_dir, "csrc")] + _extra_include,
+            library_dirs=_extra_libdir,
             libraries=["cusparse"],
             extra_compile_args={
                 "cxx": ["-O3"],
