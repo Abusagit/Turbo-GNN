@@ -134,11 +134,15 @@ jobs:
 
       - name: Create linker symlinks for nvidia pip packages
         run: |
-          NVIDIA_DIR=$(python -c "import nvidia, os; print(os.path.dirname(nvidia.__file__))")
-          find "$NVIDIA_DIR" -name '*.so.*' -type f | while read lib; do
-            base=$(echo "$lib" | sed 's/\.so\..*/.so/')
-            [ -e "$base" ] || ln -s "$lib" "$base"
-          done
+          NVIDIA_DIR=$(python -c "import nvidia; print(nvidia.__path__[0])" 2>/dev/null) || NVIDIA_DIR=""
+          if [ -n "$NVIDIA_DIR" ]; then
+            find "$NVIDIA_DIR" -name '*.so.*' -type f | while read lib; do
+              base=$(echo "$lib" | sed 's/\.so\..*/.so/')
+              [ -e "$base" ] || ln -s "$lib" "$base"
+            done
+          else
+            echo "nvidia namespace package not found, skipping symlinks"
+          fi
 
       - name: Restore build cache
         uses: actions/cache/restore@v4

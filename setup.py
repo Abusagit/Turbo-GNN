@@ -159,7 +159,7 @@ if not SKIP_CUDA_BUILD:
         try:
             import nvidia
 
-            _nvidia_root = os.path.dirname(nvidia.__file__)
+            _nvidia_root = nvidia.__path__[0]
             for _pkg in os.listdir(_nvidia_root):
                 _inc = os.path.join(_nvidia_root, _pkg, "include")
                 _lib = os.path.join(_nvidia_root, _pkg, "lib")
