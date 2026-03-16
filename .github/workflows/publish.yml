@@ -99,6 +99,7 @@ jobs:
   publish_package:
     name: Publish package
     needs: [build_wheels]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     environment: pypi
     steps:
@@ -124,6 +125,7 @@ jobs:
   update_index:
     name: Update GitHub Pages wheel index
     needs: [build_wheels]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Generate PEP 503 index from release assets
