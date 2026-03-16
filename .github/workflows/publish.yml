@@ -1,0 +1,156 @@
+# This workflow will:
+# - Create a new Github release
+# - Build wheels for supported architectures
+# - Deploy the wheels to the Github release
+# - Release the static code to PyPI
+# - Update a GitHub Pages index for --find-links installs
+
+name: Build wheels and deploy
+
+on:
+  create:
+    tags:
+      - v*
+
+permissions:
+  contents: write
+  id-token: write
+  pages: write
+
+jobs:
+  setup_release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      release-version: ${{ steps.extract_branch.outputs.branch }}
+    steps:
+      - name: Get the tag version
+        id: extract_branch
+        run: echo "branch=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        shell: bash
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create ${{ steps.extract_branch.outputs.branch }} --repo $GITHUB_REPOSITORY --title ${{ steps.extract_branch.outputs.branch }} --generate-notes
+        shell: bash
+
+  build_wheels:
+    name: Build Wheel
+    needs: setup_release
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        torch-version: ["2.4.1", "2.5.1", "2.6.0", "2.7.1", "2.8.0", "2.9.1", "2.10.0"]
+        cuda-version: ["12.4.1", "12.6.3", "12.8.1", "12.9.1", "13.0.1"]
+        cxx11_abi: ["FALSE", "TRUE"]
+        exclude:
+          # torch 2.4: only CUDA 12.4
+          - { torch-version: "2.4.1", cuda-version: "12.6.3" }
+          - { torch-version: "2.4.1", cuda-version: "12.8.1" }
+          - { torch-version: "2.4.1", cuda-version: "12.9.1" }
+          - { torch-version: "2.4.1", cuda-version: "13.0.1" }
+          # torch 2.5: only CUDA 12.4
+          - { torch-version: "2.5.1", cuda-version: "12.6.3" }
+          - { torch-version: "2.5.1", cuda-version: "12.8.1" }
+          - { torch-version: "2.5.1", cuda-version: "12.9.1" }
+          - { torch-version: "2.5.1", cuda-version: "13.0.1" }
+          # torch 2.6: only CUDA 12.6
+          - { torch-version: "2.6.0", cuda-version: "12.4.1" }
+          - { torch-version: "2.6.0", cuda-version: "12.8.1" }
+          - { torch-version: "2.6.0", cuda-version: "12.9.1" }
+          - { torch-version: "2.6.0", cuda-version: "13.0.1" }
+          # torch 2.7: only CUDA 12.8
+          - { torch-version: "2.7.1", cuda-version: "12.4.1" }
+          - { torch-version: "2.7.1", cuda-version: "12.6.3" }
+          - { torch-version: "2.7.1", cuda-version: "12.9.1" }
+          - { torch-version: "2.7.1", cuda-version: "13.0.1" }
+          # torch 2.8: only CUDA 12.9
+          - { torch-version: "2.8.0", cuda-version: "12.4.1" }
+          - { torch-version: "2.8.0", cuda-version: "12.6.3" }
+          - { torch-version: "2.8.0", cuda-version: "12.8.1" }
+          - { torch-version: "2.8.0", cuda-version: "13.0.1" }
+          # torch 2.9: CUDA 12.9 + 13.0
+          - { torch-version: "2.9.1", cuda-version: "12.4.1" }
+          - { torch-version: "2.9.1", cuda-version: "12.6.3" }
+          - { torch-version: "2.9.1", cuda-version: "12.8.1" }
+          # torch 2.10: CUDA 12.9 + 13.0
+          - { torch-version: "2.10.0", cuda-version: "12.4.1" }
+          - { torch-version: "2.10.0", cuda-version: "12.6.3" }
+          - { torch-version: "2.10.0", cuda-version: "12.8.1" }
+          # No Python 3.13 for torch 2.4/2.5
+          - { torch-version: "2.4.1", python-version: "3.13" }
+          - { torch-version: "2.5.1", python-version: "3.13" }
+          # CXX11_ABI=FALSE only for torch <=2.6 (2.7+ defaults to TRUE)
+          - { torch-version: "2.7.1", cxx11_abi: "FALSE" }
+          - { torch-version: "2.8.0", cxx11_abi: "FALSE" }
+          - { torch-version: "2.9.1", cxx11_abi: "FALSE" }
+          - { torch-version: "2.10.0", cxx11_abi: "FALSE" }
+    uses: ./.github/workflows/_build.yml
+    with:
+      runs-on: ubuntu-22.04
+      python-version: ${{ matrix.python-version }}
+      cuda-version: ${{ matrix.cuda-version }}
+      torch-version: ${{ matrix.torch-version }}
+      cxx11_abi: ${{ matrix.cxx11_abi }}
+      release-version: ${{ needs.setup_release.outputs.release-version }}
+      upload-to-release: true
+
+  publish_package:
+    name: Publish package
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          pip install ninja packaging wheel psutil
+          # Install latest setuptools with support for pypi metadata 2.2 (improved compat w/ uv)
+          pip install setuptools==75.8.0
+          # We don't want to download anything CUDA-related here
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build core package
+        env:
+          TURBO_GNN_SKIP_CUDA_BUILD: "TRUE"
+        run: |
+          python setup.py sdist --dist-dir=dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  update_index:
+    name: Update GitHub Pages wheel index
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate PEP 503 index from release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PACKAGE="turbo-gnn"
+          NORM="turbo-gnn"
+
+          mkdir -p "whl/${NORM}"
+
+          # Fetch all .whl asset URLs across every release
+          gh api --paginate "repos/${{ github.repository }}/releases" \
+            --jq '.[].assets[]
+                  | select(.name | endswith(".whl"))
+                  | "\(.name) \(.browser_download_url)"' \
+          | while read -r name url; do
+              echo "<a href=\"${url}\">${name}</a><br>" >> "whl/${NORM}/index.html"
+            done
+
+          # Root index (lists packages)
+          echo "<a href=\"${NORM}/\">${NORM}</a><br>" > whl/index.html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./whl
+          destination_dir: whl
