@@ -175,6 +175,7 @@ class gatv2_function(torch.autograd.Function):
 
 class _FusedGraphAttention(torch.autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale):
         out, logsumexp = _C.gt_forward_csr_mh(edge_ptr, edge_idx, Q, K, V, scale)
 
@@ -185,6 +186,7 @@ class _FusedGraphAttention(torch.autograd.Function):
         return out
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp = ctx.saved_tensors
         scale = ctx.scale
@@ -200,6 +202,7 @@ class _CudaSpMMConvFn(torch.autograd.Function):
     """cuSPARSE SpMM with AdjacencyForwardBackwardWithNodeBuckets graph format."""
 
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, x, forward_indptr, forward_indices, norm_type, cu_sparse_algorithm_id, block_dim):
         ctx.save_for_backward(forward_indptr, forward_indices)
         ctx.norm_type = norm_type
@@ -218,6 +221,7 @@ class _CudaSpMMConvFn(torch.autograd.Function):
         )
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, *grad_outputs):
         forward_indptr, forward_indices = ctx.saved_tensors
         grad_x = csr_SPMM_normalized(

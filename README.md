@@ -7,18 +7,140 @@ are all driven by YAML configs.
 
 ## Installation
 
-Requires Python >= 3.10 and CUDA 12.x.
+Requires Python >= 3.10 and a CUDA-capable GPU.
+
+### Into an existing environment (with PyTorch already installed)
 
 ```bash
-# Recommended: venv + full install (includes PyG, DGL, cuGraph, Triton, dev tools, pre-commit hooks)
-python3.11 -m venv .venv && source .venv/bin/activate && python -m pip install -U pip
-make install-full
+pip install --no-build-isolation turbo-gnn
 ```
 
-Custom CUDA backends (cuda, fusegnn, dfgnn) compile on first import via `torch.utils.cpp_extension`.
+`--no-build-isolation` lets setup.py detect your existing torch/CUDA version and auto-download
+the matching pre-built wheel from GitHub Releases.
 
-For other install targets (base only, dev only) see the `Makefile`. A conda alternative is available
-via `environment.yml`, though it does not support `make test` or pre-commit hooks.
+### Fresh install (new environment)
+
+```bash
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+pip install --no-build-isolation turbo-gnn
+```
+
+### Alternative: `--find-links`
+
+```bash
+pip install turbo-gnn --find-links https://abusagit.github.io/Turbo-GNN/whl/turbo-gnn/
+```
+
+### Pre-release version
+
+```bash
+pip install --no-build-isolation --pre turbo-gnn
+```
+
+### Build from source
+
+```bash
+TURBO_GNN_FORCE_BUILD=TRUE pip install --no-build-isolation turbo-gnn
+```
+
+### Dev/research editable install
+
+```bash
+git clone https://github.com/Abusagit/Turbo-GNN.git && cd Turbo-GNN
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+pip install --no-build-isolation -e ".[research]"
+```
+
+### Supported configurations
+
+| PyTorch | CUDA | Python | CXX11 ABI |
+|---------|------|--------|-----------|
+| 2.4.1   | 12.4 | 3.10-3.12 | TRUE, FALSE |
+| 2.5.1   | 12.4 | 3.10-3.12 | TRUE, FALSE |
+| 2.6.0   | 12.6 | 3.10-3.13 | TRUE, FALSE |
+| 2.7.1   | 12.8 | 3.10-3.13 | TRUE |
+| 2.8.0   | 12.9 | 3.10-3.13 | TRUE |
+| 2.9.1   | 12.9, 13.0 | 3.10-3.13 | TRUE |
+| 2.10.0  | 12.9, 13.0 | 3.10-3.13 | TRUE |
+
+### Smoke test
+
+```bash
+python demo/smoke_test.py
+```
+
+## Usage
+
+### Graph construction
+
+```python
+import torch
+from turbo_gnn import AdjacencyForwardBackwardWithNodeBuckets
+
+# From COO edge_index [2, E]
+edge_index = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+graph = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
+    edge_index, num_nodes=3
+).to("cuda")
+
+# From pre-computed CSR (forward + backward)
+graph = AdjacencyForwardBackwardWithNodeBuckets.from_csr(
+    fwd_indptr, fwd_indices, bwd_indptr, bwd_indices
+).to("cuda")
+
+# From DGL graph
+graph = AdjacencyForwardBackwardWithNodeBuckets.from_dgl(dgl_graph).to("cuda")
+
+# For cuSPARSE ops (require int32 indices)
+graph_i32 = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
+    edge_index, num_nodes=N, index_dtype=torch.int32
+).to("cuda")
+```
+
+### Kernel calls
+
+```python
+from turbo_gnn import reduction_aggr, gatv2_aggr, graph_transformer_aggr, spmm_aggr
+
+# Reduction (min/max) aggregation
+out = reduction_aggr(graph, X, reduce="min")       # [N, F]
+
+# GATv2 attention aggregation
+out = gatv2_aggr(graph, x, x_neighbors=x_nb,
+                 attention_weights=attn, negative_slope=0.2)  # [N, H, D]
+
+# Graph Transformer (Q/K/V attention)
+out = graph_transformer_aggr(graph, x, Q=Q, K=K, V=V,
+                              scale=1.0/D**0.5)    # [N, H, D]
+
+# cuSPARSE SpMM (fp32 only, requires int32 indices)
+out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
+                norm_type="none", cu_sparse_algorithm_id=-1, block_dim=256)
+```
+
+### Autotuning
+
+All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`) support
+autotuning, which grid-searches over kernel parameters (warps per block, edges per block,
+etc.) and graph repartitioning quantiles to find the fastest configuration.
+
+```python
+from turbo_gnn import AutotuneConfig
+
+# Default autotuning (10 warmup + 50 timed iterations)
+out = reduction_aggr(graph, X, reduce="min", autotune=True)
+
+# Custom autotuning config
+config = AutotuneConfig(warmup=5, iters=20, tune_backward=True)
+out = graph_transformer_aggr(graph, x, Q=Q, K=K, V=V, scale=scale,
+                              autotune=True, autotune_config=config)
+
+# Results are cached per graph + feature shape — subsequent calls are fast
+out = reduction_aggr(graph, X, reduce="min", autotune=True)  # cache hit
+```
+
+`spmm_aggr` and `csr_SPMM_normalized` are cuSPARSE wrappers and do not support autotuning.
 
 ## Quick Start
 
@@ -253,19 +375,22 @@ See the YAML files in each directory for the full set of available options.
 │   ├── unit/             # Unit tests
 │   ├── integration/      # End-to-end pipeline tests
 │   └── performance/      # Performance regression tests
-├── Makefile              # Install, test, lint, format targets
 └── pyproject.toml        # Package metadata & tool config
 ```
 
 ## Testing
-
+quick test on functionality:
 ```bash
-make test                  # Run all tests (pytest)
-pytest tests/              # Equivalent
-pytest tests/correctness/  # Backend correctness only
-pytest tests/unit/         # Unit tests only
+python demo/smoke_test.py  # Quick launch of all kernels
+```
 
-bash tests/integration/launch_training_pipeline.sh  # Integration smoke test
+
+**using `pytest`:**
+```bash
+pytest tests/                                        # Full test suite
+pytest tests/correctness/                            # Backend correctness only
+pytest tests/unit/                                   # Unit tests only
+bash tests/integration/launch_training_pipeline.sh   # Integration smoke test
 ```
 
 ## CLI Entry Points
