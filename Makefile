@@ -1,18 +1,17 @@
-.PHONY: install install-dev install-full clean test format check run-hooks update-hooks
+.PHONY: venv install install-dev install-full clean test format check run-hooks update-hooks
 
-# get path to current makefile
+PYTHON_BIN   ?= $(HOME)/micromamba/envs/graph_ml/bin/python
+CUDA_VERSION ?= cu124
+CUDA_HOME    ?= /usr/local/cuda-12.4
+
 MKFILE_PATH := $(realpath $(lastword $(MAKEFILE_LIST)))
 MKFILE_DIR  := $(dir $(MKFILE_PATH))
 
-# NOTE ONLY WORKS WITH .venv
 VENV_DIR   := $(MKFILE_DIR)/.venv
 PYTHON     := $(VENV_DIR)/bin/python3
 PIP        := $(VENV_DIR)/bin/pip3
 
-CUDA_VERSION ?= cu124
 TORCH_VERSION := 2.4.1
-
-
 PYG_URL := https://data.pyg.org/whl/torch-$(TORCH_VERSION)+$(CUDA_VERSION).html
 DGL_URL := https://data.dgl.ai/wheels/torch-2.4/$(CUDA_VERSION)/repo.html
 
@@ -20,21 +19,30 @@ DGL_URL := https://data.dgl.ai/wheels/torch-2.4/$(CUDA_VERSION)/repo.html
 FIND_LINKS := --find-links $(PYG_URL) --find-links $(DGL_URL)
 NO_ISO := --no-build-isolation
 
-_install-torch:
-	$(PIP) install torch==$(TORCH_VERSION) wheel numpy
+venv:
+	@if [ ! -d "$(VENV_DIR)" ]; then \
+		echo "Creating virtual environment with $(PYTHON_BIN)..."; \
+		$(PYTHON_BIN) -m venv $(VENV_DIR); \
+		$(PIP) install -U pip; \
+	else \
+		echo "Virtual environment already exists at $(VENV_DIR)"; \
+	fi
+
+_install-torch: venv
+	$(PIP) install torch==$(TORCH_VERSION) wheel numpy ninja packaging psutil "setuptools>=77.0"
 
 install: _install-torch
-	$(PIP) install -e . $(NO_ISO) $(FIND_LINKS)
+	CUDA_HOME=$(CUDA_HOME) $(PIP) install -e . $(NO_ISO) $(FIND_LINKS)
 
 install-dev: _install-torch _install-dev setup-hooks test
 
 _install-dev:
-	$(PIP) install -e ".[dev]" $(NO_ISO) $(FIND_LINKS)
+	CUDA_HOME=$(CUDA_HOME) $(PIP) install -e ".[dev]" $(NO_ISO) $(FIND_LINKS)
 
 install-full: _install-torch _install-full _install-tcgnn setup-hooks test
 
 _install-full:
-	$(PIP) install -e ".[full]" $(NO_ISO) $(FIND_LINKS)
+	CUDA_HOME=$(CUDA_HOME) $(PIP) install -e ".[full]" $(NO_ISO) $(FIND_LINKS)
 
 _install-tcgnn:
 	mkdir -p thirdparty
@@ -66,15 +74,15 @@ check:
 	@echo "✅ All checks passed"
 
 setup-hooks:
-	pre-commit install
-	pre-commit install --hook-type commit-msg
+	$(VENV_DIR)/bin/pre-commit install
+	$(VENV_DIR)/bin/pre-commit install --hook-type commit-msg
 	@echo "✅ Pre-commit hooks installed"
 
 run-hooks:
-	pre-commit run --all-files
+	$(VENV_DIR)/bin/pre-commit run --all-files
 
 update-hooks:
-	pre-commit autoupdate
+	$(VENV_DIR)/bin/pre-commit autoupdate
 	@echo "✅ Hooks updated"
 
 clean:
@@ -98,3 +106,5 @@ help:
 	@echo "  lint-fix          - Run ruff linting with fixes if applicable"
 	@echo "  check             - Run ruff format check + linting"
 	@echo "  clean             - Clean build artifacts"
+	@echo ""
+	@echo "Override defaults: make install CUDA_VERSION=cu128 PYTHON_BIN=/path/to/python"
