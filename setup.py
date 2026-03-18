@@ -1,13 +1,13 @@
 import os
+import platform
 import re
 import sys
-import platform
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
-from setuptools import setup, find_packages
-from packaging.version import parse, Version
+from packaging.version import Version, parse
+from setuptools import find_packages, setup
 
 PACKAGE_NAME = "turbo_gnn"
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,9 +16,7 @@ FORCE_BUILD = os.getenv("TURBO_GNN_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("TURBO_GNN_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 FORCE_CXX11_ABI = os.getenv("TURBO_GNN_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
-BASE_WHEEL_URL = (
-    "https://github.com/Abusagit/Turbo-GNN/releases/download/{tag_name}/{wheel_name}"
-)
+BASE_WHEEL_URL = "https://github.com/Abusagit/Turbo-GNN/releases/download/{tag_name}/{wheel_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +69,7 @@ def get_wheel_url():
         f"+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}"
         f"-{python_version}-{python_version}-{platform_name}.whl"
     )
-    wheel_url = BASE_WHEEL_URL.format(
-        tag_name=f"v{pkg_version}", wheel_name=wheel_filename
-    )
+    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{pkg_version}", wheel_name=wheel_filename)
     return wheel_url, wheel_filename
 
 
@@ -102,9 +98,7 @@ class CachedWheelsCommand(_bdist_wheel):
                 os.makedirs(self.dist_dir)
 
             impl_tag, abi_tag, plat_tag = self.get_tag()
-            archive_basename = (
-                f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
-            )
+            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
             wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
             os.rename(wheel_filename, wheel_path)
         except (urllib.error.HTTPError, urllib.error.URLError):
@@ -121,7 +115,7 @@ cmdclass = {}
 if not SKIP_CUDA_BUILD:
     try:
         import torch
-        from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+        from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
         # NinjaBuildExtension — auto-calculates MAX_JOBS to prevent OOM
         class NinjaBuildExtension(BuildExtension):
@@ -129,17 +123,11 @@ if not SKIP_CUDA_BUILD:
                 if not os.environ.get("MAX_JOBS"):
                     import psutil
 
-                    max_num_jobs_cores = max(1, os.cpu_count() // 2)
-                    free_memory_gb = (
-                        psutil.virtual_memory().available / (1024**3)
-                    )
+                    max_num_jobs_cores = max(1, os.cpu_count() // 2)  # type: ignore
+                    free_memory_gb = psutil.virtual_memory().available / (1024**3)
                     # ~5GB per NVCC thread, assume 2 NVCC threads
-                    max_num_jobs_memory = max(
-                        1, int(free_memory_gb / (5 * 2))
-                    )
-                    max_jobs = max(
-                        1, min(max_num_jobs_cores, max_num_jobs_memory)
-                    )
+                    max_num_jobs_memory = max(1, int(free_memory_gb / (5 * 2)))
+                    max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
                     print(
                         f"Auto set MAX_JOBS to `{max_jobs}`. "
                         "If you see memory pressure, use a lower MAX_JOBS=N value."

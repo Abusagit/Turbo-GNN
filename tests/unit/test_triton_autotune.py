@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
-
+# pytestmark = pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
 from triton.runtime.autotuner import Autotuner
 
 from src.backends.triton_backend.kernels_impl import (

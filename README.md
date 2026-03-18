@@ -45,11 +45,11 @@ TURBO_GNN_FORCE_BUILD=TRUE pip install --no-build-isolation turbo-gnn
 
 ### Dev/research editable install
 
+We developed the library using python3.11 and torch==2.4.1 due to the fixed range of dependencies for Deep Graph Library. To install exact dev environment, use `Makefile`. For building from source in the clean environment, you need to have python with header files. Use `make install-*` commands and modify `PYTHON_BIN` accordingly:
+
 ```bash
 git clone https://github.com/Abusagit/Turbo-GNN.git && cd Turbo-GNN
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
-pip install --no-build-isolation -e ".[research]"
+make install-full PYTHON_BIN=<path_to_python_3.11>
 ```
 
 ### Supported configurations

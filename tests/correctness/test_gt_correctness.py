@@ -218,7 +218,7 @@ def test_gt_cuda_vs_dgl_backward(num_nodes, feature_dim, heads):
 # # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
+# @pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
 @pytest.mark.parametrize("num_nodes", [48, 128])
 @pytest.mark.parametrize("feature_dim", [256, 512])
 @pytest.mark.parametrize("heads", [4, 8])
@@ -269,7 +269,7 @@ def test_gt_triton_vs_dgl_forward(num_nodes, feature_dim, heads):
     )
 
 
-@pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
+# @pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
 @pytest.mark.parametrize("num_nodes", [48, 128])
 @pytest.mark.parametrize("feature_dim", [256, 512])
 @pytest.mark.parametrize("heads", [4, 8])
@@ -328,9 +328,10 @@ def test_gt_triton_vs_dgl_backward(num_nodes, feature_dim, heads):
     "backend",
     [
         "cuda",
-        pytest.param(
-            "triton_block_sparse", marks=pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
-        ),
+        "triton_block_sparse",
+        # pytest.param(
+        #     "triton_block_sparse", marks=pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
+        # ),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -385,9 +386,10 @@ def test_gt_low_precision_forward(backend, dtype, num_nodes, feature_dim, heads)
     "backend",
     [
         "cuda",
-        pytest.param(
-            "triton_block_sparse", marks=pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
-        ),
+        "triton_block_sparse",
+        # pytest.param(
+        #     "triton_block_sparse", marks=pytest.mark.skip(reason="Requires triton>=3.1.0 for warp_specialize support")
+        # ),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

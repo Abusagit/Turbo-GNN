@@ -31,15 +31,18 @@ venv:
 _install-torch: venv
 	$(PIP) install torch==$(TORCH_VERSION) wheel numpy ninja packaging psutil "setuptools>=77.0"
 
+_patch-triton:
+	$(PIP) install -U triton
+
 install: _install-torch
 	CUDA_HOME=$(CUDA_HOME) $(PIP) install -e . $(NO_ISO) $(FIND_LINKS)
 
-install-dev: _install-torch _install-dev setup-hooks test
+install-dev: _install-torch _install-dev _patch-triton setup-hooks test
 
 _install-dev:
 	CUDA_HOME=$(CUDA_HOME) $(PIP) install -e ".[dev]" $(NO_ISO) $(FIND_LINKS)
 
-install-full: _install-torch _install-full _install-tcgnn setup-hooks test
+install-full: _install-torch _install-full _patch-triton _install-tcgnn setup-hooks test
 
 _install-full:
 	CUDA_HOME=$(CUDA_HOME) $(PIP) install -e ".[full]" $(NO_ISO) $(FIND_LINKS)
