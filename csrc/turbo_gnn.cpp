@@ -31,7 +31,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("row_ptr_T"), py::arg("col_idx_T"),
           py::arg("attn_vec"), py::arg("logsumexp"),
           py::arg("negative_slope") = 0.2f,
-          py::arg("grad_A_reduce_row_chunk_size") = 512);
+          py::arg("grad_A_reduce_row_chunk_size") = 512,
+          py::arg("is_symmetric_csr") = true);
 
     // Graph Transformer aggregation
     m.def("gt_forward_csr_mh", &graph_attention_forward_csr_mh_cuda,

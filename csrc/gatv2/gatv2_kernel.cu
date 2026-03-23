@@ -538,6 +538,8 @@ ReduceGradAKernel(
 // Launcher for backward pass
 // =============================================================================
 
+
+// TODO перенести is_symmetric вот сюда в темплейт
 template<int D_CONST, typename cuda_t, typename index_t>
 void GATv2Backward_CSR_Impl(
     // inputs
@@ -618,6 +620,295 @@ void GATv2Backward_CSR_Impl(
     }, MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(grad_A_reduce_row_chunk_size));
 
     CUDA_CHECK(cudaFree(d_G));
+}
+
+// =============================================================================
+// Fused GATv2 Backward kernel for undirected CSR
+// =============================================================================
+template<int D_CONST, typename cuda_t, typename index_t>
+__global__ void __launch_bounds__(kMaxThreadsInWarp)
+GATv2Backward_Fused_Undirected(
+    size_t N, size_t H, size_t D,
+    const cuda_t* __restrict__ grad_h,
+    int64_t stride_gh_n,
+    int64_t stride_gh_h,
+    const cuda_t* __restrict__ d_l,
+    int64_t stride_l_n,
+    int64_t stride_l_h,
+    const cuda_t* __restrict__ d_r,
+    int64_t stride_r_n,
+    int64_t stride_r_h,
+    const index_t* __restrict__ d_row_ptr,
+    const index_t* __restrict__ d_col_idx,
+    const cuda_t* __restrict__ d_attn_vec,   // [H, D]
+    const float* __restrict__ d_logsumexp,   // [N, H]
+    float negative_slope,
+    cuda_t* __restrict__ grad_l,             // [N, H, D]
+    float*  __restrict__ grad_r_f32,         // [N, H, D] float32
+    float*  __restrict__ grad_a_reduced_f32  // [H, D] float32
+) {
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
+    using Tile = TileOps<VW, cuda_t>;
+    using vec_t = typename Tile::vec_t;
+    using ns_t  = typename Tile::ns_t;
+
+    constexpr int NUM_VECS       = D_CONST / Tile::ELEM_PER_VEC;
+    constexpr int VECS_PER_LANE  = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+
+    int node_i = blockIdx.x;
+    int head_h = blockIdx.y;
+    int lane   = threadIdx.x % kMaxThreadsInWarp;
+
+    if (node_i >= (int)N || head_h >= (int)H) return;
+
+    index_t edge_start   = d_row_ptr[node_i];
+    index_t edge_end     = d_row_ptr[node_i + 1];
+    int num_neighbors = static_cast<int>(edge_end - edge_start);
+
+    // Shared memory layout:
+    //   li_sh:     D_CONST * sizeof(cuda_t)
+    //   ghi_sh:    D_CONST * sizeof(cuda_t)
+    //   grada_sh:  D_CONST * sizeof(float)   (float32 accumulators)
+    //   gradli_sh: D_CONST * sizeof(float)   (float32 accumulators)
+    extern __shared__ char sh_raw[];
+    cuda_t* li_sh     = reinterpret_cast<cuda_t*>(sh_raw);
+    cuda_t* ghi_sh    = li_sh + D_CONST;
+    float*  grada_sh  = reinterpret_cast<float*>(ghi_sh + D_CONST);
+    float*  gradli_sh = grada_sh + D_CONST;
+
+    cuda_t* grad_l_base    = grad_l + ((int64_t)node_i * H + head_h) * D_CONST;
+    const cuda_t* li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
+    const cuda_t* ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
+    const cuda_t* a_base   = d_attn_vec + head_h * D_CONST;
+
+    // Handle isolated nodes: write zeros
+    if (num_neighbors == 0) {
+        for (int v = lane; v < NUM_VECS; v += kMaxThreadsInWarp) {
+            Tile::write_zero(grad_l_base, v);
+        }
+        return;
+    }
+
+    // 0 float32 accumulators and load li, ghi via 128-bit transactions
+    {
+        constexpr int f4_count_f = D_CONST / 4;
+        float4* grada_f4  = reinterpret_cast<float4*>(grada_sh);
+        float4* gradli_f4 = reinterpret_cast<float4*>(gradli_sh);
+        for (int i = lane; i < f4_count_f; i += kMaxThreadsInWarp) {
+            grada_f4[i]  = make_float4(0.f, 0.f, 0.f, 0.f);
+            gradli_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+
+        constexpr int f4_count = (D_CONST * (int)sizeof(cuda_t)) / 16;
+        const float4* li_src_f4  = reinterpret_cast<const float4*>(li_base);
+        const float4* ghi_src_f4 = reinterpret_cast<const float4*>(ghi_base);
+        float4* li_sh_f4  = reinterpret_cast<float4*>(li_sh);
+        float4* ghi_sh_f4 = reinterpret_cast<float4*>(ghi_sh);
+        for (int i = lane; i < f4_count; i += kMaxThreadsInWarp) {
+            li_sh_f4[i]  = li_src_f4[i];
+            ghi_sh_f4[i] = ghi_src_f4[i];
+        }
+    }
+    __syncthreads();
+
+    ns_t ns = Tile::make_ns(negative_slope);
+    float L_i = d_logsumexp[node_i * H + head_h];
+
+    // pass 1: compute G_{i,h} = sum_j alpha_ij * <grad_h_i, r_j>
+    float G_i_h = 0.f;
+
+    for (int k = 0; k < num_neighbors; ++k) {
+        index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
+        const cuda_t* rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+
+        float e_lane = 0.f;
+        float p_lane = 0.f;
+        #pragma unroll
+        for (int t = 0; t < VECS_PER_LANE; ++t) {
+            int v = lane + kMaxThreadsInWarp * t;
+            if (v < NUM_VECS) {
+                vec_t lv  = Tile::load(li_sh, v);
+                vec_t rv  = Tile::load(rj_base, v);
+                vec_t av  = Tile::load(a_base, v);
+                vec_t ghv = Tile::load(ghi_sh, v);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+                p_lane += Tile::dot_product(ghv, rv);
+            }
+        }
+        float e_ij = warp_reduce_sum(e_lane);
+        float p_ij = warp_reduce_sum(p_lane);
+
+        float alpha_ij = recompute_alpha(e_ij, L_i);
+        G_i_h = fmaf(alpha_ij, p_ij, G_i_h);
+    }
+
+    // pass 2: accumulate gradients
+    for (int k = 0; k < num_neighbors; ++k) {
+        index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
+        const cuda_t* rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+
+        float e_lane = 0.f;
+        float p_lane = 0.f;
+        #pragma unroll
+        for (int t = 0; t < VECS_PER_LANE; ++t) {
+            int v = lane + kMaxThreadsInWarp * t;
+            if (v < NUM_VECS) {
+                vec_t lv  = Tile::load(li_sh, v);
+                vec_t rv  = Tile::load(rj_base, v);
+                vec_t av  = Tile::load(a_base, v);
+                vec_t ghv = Tile::load(ghi_sh, v);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+                p_lane += Tile::dot_product(ghv, rv);
+            }
+        }
+        float e_ij = warp_reduce_sum(e_lane);
+        float p_ij = warp_reduce_sum(p_lane);
+
+        float alpha_ij  = recompute_alpha(e_ij, L_i);
+        float grad_e_ij = alpha_ij * (p_ij - G_i_h);
+
+        #pragma unroll
+        for (int t = 0; t < VECS_PER_LANE; ++t) {
+            int v = lane + kMaxThreadsInWarp * t;
+            if (v < NUM_VECS) {
+                vec_t lv  = Tile::load(li_sh, v);
+                vec_t rv  = Tile::load(rj_base, v);
+                vec_t av  = Tile::load(a_base, v);
+                vec_t ghv = Tile::load(ghi_sh, v);
+
+                int base_f = v * Tile::ELEM_PER_VEC;
+
+                Tile::gatv2_accum_grad_al(&grada_sh[base_f], &gradli_sh[base_f], grad_e_ij, lv, rv, av, negative_slope);
+
+                float gradr_local[Tile::ELEM_PER_VEC];
+                #pragma unroll
+                for (int u = 0; u < Tile::ELEM_PER_VEC; ++u) {
+                    gradr_local[u] = 0.f;
+                }
+
+                Tile::gatv2_accum_grad_r(gradr_local, alpha_ij, ghv, grad_e_ij, lv, rv, av, negative_slope);
+
+                int64_t gradr_base = ((int64_t)neighbor_j * H + head_h) * D_CONST + base_f;
+                #pragma unroll
+                for (int u = 0; u < Tile::ELEM_PER_VEC; ++u) {
+                    atomicAdd(grad_r_f32 + gradr_base + u, gradr_local[u]);
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // Write grad_l (cuda_t) to global memory
+    #pragma unroll
+    for (int t = 0; t < VECS_PER_LANE; ++t) {
+        int v = lane + kMaxThreadsInWarp * t;
+        if (v < NUM_VECS) {
+            int base_f = v * Tile::ELEM_PER_VEC;
+            Tile::write_typed(grad_l_base, v, &gradli_sh[base_f]);
+        }
+    }
+
+    // Reduce this block's local grad_a directly into global [H, D].
+    #pragma unroll
+    for (int t = 0; t < VECS_PER_LANE; ++t) {
+        int v = lane + kMaxThreadsInWarp * t;
+        if (v < NUM_VECS) {
+            int base_f = v * Tile::ELEM_PER_VEC;
+            int64_t grad_a_base = (int64_t)head_h * D_CONST + base_f;
+            #pragma unroll
+            for (int u = 0; u < Tile::ELEM_PER_VEC; ++u) {
+                atomicAdd(grad_a_reduced_f32 + grad_a_base + u, grada_sh[base_f + u]);
+            }
+        }
+    }
+}
+
+template<typename cuda_t>
+__global__ void CastFloatToTypedKernel(
+    const float* __restrict__ src,
+    cuda_t* __restrict__ dst,
+    int64_t numel
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) {
+        dst[idx] = static_cast<cuda_t>(src[idx]);
+    }
+}
+
+template<int D_CONST, typename cuda_t, typename index_t>
+void GATv2Backward_Fused_Undirected_Impl(
+    // inputs
+    size_t N, size_t H, size_t D,
+
+    const cuda_t* grad_h,
+    int64_t stride_gh_n,
+    int64_t stride_gh_h,
+
+    const cuda_t* d_l,
+    int64_t stride_l_n,
+    int64_t stride_l_h,
+
+    const cuda_t* d_r,
+    int64_t stride_r_n,
+    int64_t stride_r_h,
+
+    const index_t* d_row_ptr,
+    const index_t* d_col_idx,
+    const cuda_t* d_attn_vec,
+    const float* d_logsumexp,  // [N, H]
+    float negative_slope,
+    cudaStream_t stream,
+
+    // outputs
+    cuda_t* grad_l,            // [N, H, D]
+    cuda_t* grad_r,            // [N, H, D]
+    float* d_grad_a_reduced    // [H, D] output in float32
+) {
+    dim3 nThreads(kMaxThreadsInWarp);
+    dim3 nBlocks(N, H);
+
+    float* grad_r_f32 = nullptr;
+    CUDA_CHECK(cudaMalloc(&grad_r_f32, N * H * D * sizeof(float)));
+    CUDA_CHECK(cudaMemsetAsync(grad_r_f32, 0, N * H * D * sizeof(float), stream));
+
+    // shared memory:
+    //   li_sh     : D_CONST * sizeof(cuda_t)
+    //   ghi_sh    : D_CONST * sizeof(cuda_t)
+    //   grada_sh  : D_CONST * sizeof(float)
+    //   gradli_sh : D_CONST * sizeof(float)
+    size_t shmem = 2 * D_CONST * sizeof(cuda_t) + 2 * D_CONST * sizeof(float);
+
+    GATv2Backward_Fused_Undirected<D_CONST, cuda_t, index_t>
+        <<<nBlocks, nThreads, shmem, stream>>>(
+            N, H, D,
+            grad_h, stride_gh_n, stride_gh_h,
+            d_l, stride_l_n, stride_l_h,
+            d_r, stride_r_n, stride_r_h,
+            d_row_ptr, d_col_idx,
+            d_attn_vec,
+            d_logsumexp,
+            negative_slope,
+            grad_l,
+            grad_r_f32,
+            d_grad_a_reduced_f32
+        );
+
+    CUDA_KERNEL_CHECK();
+
+    // grad_r_f32 -> typed grad_r
+    {
+        int64_t numel = (int64_t)N * H * D;
+        int threads = 256;
+        int blocks = (int)((numel + threads - 1) / threads);
+
+        CastFloatToTypedKernel<cuda_t><<<blocks, threads, 0, stream>>>(
+            grad_r_f32, grad_r, numel
+        );
+    }
+
+    CUDA_KERNEL_CHECK();
+    CUDA_CHECK(cudaFree(grad_r_f32));
 }
 
 
@@ -730,7 +1021,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor attn_vec,       // [H, D] - attention vector (saved)
     torch::Tensor logsumexp,      // [N, H] - logsumexp (saved)
     float negative_slope,
-    int grad_A_reduce_row_chunk_size
+    int grad_A_reduce_row_chunk_size,
+    bool is_symmetric_csr
 ) {
     TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
     TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
@@ -813,11 +1105,12 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256,
                 "GATv2 backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    std::visit([&](auto idxInfo, auto typeInfo, auto d_c) {
+    std::visit([&](auto idxInfo, auto typeInfo, auto d_c, auto symInfo) {
         using index_t = typename decltype(idxInfo)::Type;
         using torch_t = typename decltype(typeInfo)::TorchType;
         using cuda_t = typename decltype(typeInfo)::CudaType;
         constexpr int DC = decltype(d_c)::value;
+        constexpr bool IS_SYMMETRIC = decltype(symInfo)::value;
 
         auto* grad_h_ptr = reinterpret_cast<const cuda_t*>(grad_h.data_ptr<torch_t>());
         auto* l_ptr      = reinterpret_cast<const cuda_t*>(l.data_ptr<torch_t>());
@@ -827,22 +1120,37 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         auto* grad_r_ptr = reinterpret_cast<cuda_t*>(grad_r.data_ptr<torch_t>());
         auto* grad_a_reduced_ptr = grad_a_reduced_f32.data_ptr<float>();
 
-        GATv2Backward_CSR_Impl<DC, cuda_t, index_t>(
-            N, H, D,
-            grad_h_ptr, stride_gh_n, stride_gh_h,
-            l_ptr, stride_l_n, stride_l_h,
-            r_ptr, stride_r_n, stride_r_h,
-            index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
-            index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
-            attn_ptr, d_logsumexp,
-            negative_slope,
-            grad_A_reduce_row_chunk_size,
-            stream,
-            grad_l_ptr, grad_r_ptr, d_grad_a, grad_a_reduced_ptr
-        );
+        if constexpr (IS_SYMMETRIC) {
+            GATv2Backward_Fused_Undirected_Impl<DC, cuda_t, index_t>(
+                N, H, D,
+                grad_h_ptr, stride_gh_n, stride_gh_h,
+                l_ptr, stride_l_n, stride_l_h,
+                r_ptr, stride_r_n, stride_r_h,
+                index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
+                attn_ptr, d_logsumexp,
+                negative_slope,
+                stream,
+                grad_l_ptr, grad_r_ptr, grad_a_reduced_ptr
+            );
+        } else {
+            GATv2Backward_CSR_Impl<DC, cuda_t, index_t>(
+                N, H, D,
+                grad_h_ptr, stride_gh_n, stride_gh_h,
+                l_ptr, stride_l_n, stride_l_h,
+                r_ptr, stride_r_n, stride_r_h,
+                index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
+                index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
+                attn_ptr, d_logsumexp,
+                negative_slope,
+                grad_A_reduce_row_chunk_size,
+                stream,
+                grad_l_ptr, grad_r_ptr, d_grad_a, grad_a_reduced_ptr
+            );
+        }
     }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
        MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-       MakeIntVariant<32, 64, 128, 256>((int)D));
+       MakeIntVariant<32, 64, 128, 256>((int)D),
+       MakeBoolVariant(is_symmetric_csr));
 
     CUDA_KERNEL_CHECK();
 

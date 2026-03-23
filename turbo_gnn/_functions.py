@@ -105,6 +105,7 @@ class gatv2_function(torch.autograd.Function):
         attention_weights,
         negative_slope,
         grad_A_reduce_row_chunk_size,
+        is_symmetric_csr,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -121,6 +122,7 @@ class gatv2_function(torch.autograd.Function):
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
         ctx.heads = x_left.shape[1]
         ctx.head_dim = x_left.shape[2]
+        ctx.is_symmetric_csr = is_symmetric_csr
 
         ctx.save_for_backward(
             x_left,
@@ -156,6 +158,7 @@ class gatv2_function(torch.autograd.Function):
 
         negative_slope = ctx.negative_slope
         grad_A_reduce_row_chunk_size = ctx.grad_A_reduce_row_chunk_size
+        is_symmetric_csr = ctx.is_symmetric_csr
         grad_x_left, grad_x_right, grad_attention = _C.gatv2_backward(
             grad_output,
             x_left,
@@ -168,9 +171,10 @@ class gatv2_function(torch.autograd.Function):
             logsumexp,
             negative_slope,
             grad_A_reduce_row_chunk_size,
+            is_symmetric_csr,
         )
 
-        return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None, None
+        return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None, None, None
 
 
 class _FusedGraphAttention(torch.autograd.Function):

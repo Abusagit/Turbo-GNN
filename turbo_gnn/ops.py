@@ -66,6 +66,7 @@ def gatv2_aggr(
         attention_weights,
         negative_slope,
         grad_A_reduce_row_chunk_size,
+        graph.is_symmetric_csr,
     )
 
 

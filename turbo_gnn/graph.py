@@ -79,8 +79,12 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     backward_heavy_nodes: torch.Tensor
 
     max_degree: int = -1
+    is_symmetric_csr: bool = False
+
     _device: torch.device = torch.device("cpu")
 
+    # TODO: переопределить здесь is_symmetric (или внутри каждой static функции)
+    # TODO: тест на то что is_symmetric выдает правильное значение (True только если граф симметричный)
     def __post_init__(self):
         self._device = self.forward_indptr.device
         idx_dtype = self.forward_indptr.dtype
@@ -195,6 +199,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             backward_heavy_nodes=bwd_heavy,
         )
 
+    # не гарантируется что придут упорядоченные тензоры
     @classmethod
     def from_csr(
         cls,

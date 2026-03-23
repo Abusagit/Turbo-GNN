@@ -165,6 +165,16 @@ inline std::variant<TTypeInfo<T>...> MakeTypeVariant(at::ScalarType type) {
     return result;
 }
 
+inline std::variant<std::false_type, std::true_type> MakeBoolVariant(bool value) {
+    std::variant<std::false_type, std::true_type> result;
+    if (value) {
+        result.template emplace<std::true_type>();
+    } else {
+        result.template emplace<std::false_type>();
+    }
+    return result;
+}
+
 // =============================================================================
 // Index type dispatch infrastructure
 // =============================================================================

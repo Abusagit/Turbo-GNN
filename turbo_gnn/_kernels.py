@@ -69,6 +69,7 @@ class GATv2AggrKernel(TunableKernel):
             attention_weights,
             negative_slope,
             self.backward_grad_A_reduce_row_chunk_size,
+            graph.is_symmetric_csr,
         )
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:

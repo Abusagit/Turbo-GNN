@@ -54,7 +54,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor attn_vec,
     torch::Tensor logsumexp,
     float negative_slope,
-    int grad_A_reduce_row_chunk_size
+    int grad_A_reduce_row_chunk_size,
+    bool is_symmetric_csr
 );
 
 // ============================================================================
