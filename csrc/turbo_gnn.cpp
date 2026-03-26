@@ -22,7 +22,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gatv2_forward", &gatv2_forward_cuda,
           "GATv2 forward pass (CUDA)",
           py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),
-          py::arg("attn_vec"), py::arg("negative_slope") = 0.2f);
+          py::arg("attn_vec"), py::arg("negative_slope") = 0.2f,
+          py::arg("light_nodes"), py::arg("heavy_nodes"),
+          py::arg("light_warps_per_block") = 1,
+          py::arg("heavy_warps_per_block") = 8);
 
     m.def("gatv2_backward", &gatv2_backward_cuda,
           "GATv2 backward pass (CUDA)",
@@ -31,20 +34,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("row_ptr_T"), py::arg("col_idx_T"),
           py::arg("attn_vec"), py::arg("logsumexp"),
           py::arg("negative_slope") = 0.2f,
-          py::arg("grad_A_reduce_row_chunk_size") = 512);
+          py::arg("grad_A_reduce_row_chunk_size") = 512,
+          py::arg("fwd_light_nodes"), py::arg("fwd_heavy_nodes"),
+          py::arg("bwd_light_nodes"), py::arg("bwd_heavy_nodes"),
+          py::arg("light_warps_per_block") = 1,
+          py::arg("heavy_warps_per_block") = 8);
 
     // Graph Transformer aggregation
     m.def("gt_forward_csr_mh", &graph_attention_forward_csr_mh_cuda,
           "Graph Transformer forward (CSR, multi-head)",
           py::arg("row_ptr"), py::arg("col_idx"),
-          py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("scale"));
+          py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("scale"),
+          py::arg("light_nodes"), py::arg("heavy_nodes"),
+          py::arg("light_warps_per_block") = 4,
+          py::arg("heavy_warps_per_block") = 8);
 
     m.def("gt_backward_csr_mh", &graph_attention_backward_csr_mh_cuda,
           "Graph Transformer backward (CSR^T, multi-head)",
           py::arg("row_ptr_T"), py::arg("col_idx_T"),
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("O"), py::arg("dO"), py::arg("logsumexp"),
-          py::arg("scale"));
+          py::arg("scale"),
+          py::arg("light_nodes"), py::arg("heavy_nodes"),
+          py::arg("light_warps_per_block") = 1,
+          py::arg("heavy_warps_per_block") = 8);
 
     // SpMM
     m.def("csr_SPMM_normalized", &csr_SPMM_normalized,

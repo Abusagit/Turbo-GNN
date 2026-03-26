@@ -105,6 +105,14 @@ class gatv2_function(torch.autograd.Function):
         attention_weights,
         negative_slope,
         grad_A_reduce_row_chunk_size,
+        fwd_light_nodes,
+        fwd_heavy_nodes,
+        bwd_light_nodes,
+        bwd_heavy_nodes,
+        forward_light_warps,
+        forward_heavy_warps,
+        backward_light_warps,
+        backward_heavy_warps,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -116,9 +124,15 @@ class gatv2_function(torch.autograd.Function):
             indices_forward,
             attention_weights,
             negative_slope,
+            fwd_light_nodes,
+            fwd_heavy_nodes,
+            forward_light_warps,
+            forward_heavy_warps,
         )
         ctx.negative_slope = negative_slope
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
+        ctx.backward_light_warps = backward_light_warps
+        ctx.backward_heavy_warps = backward_heavy_warps
         ctx.heads = x_left.shape[1]
         ctx.head_dim = x_left.shape[2]
 
@@ -131,6 +145,10 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            fwd_light_nodes,
+            fwd_heavy_nodes,
+            bwd_light_nodes,
+            bwd_heavy_nodes,
         )
 
         return output
@@ -147,6 +165,10 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            fwd_light_nodes,
+            fwd_heavy_nodes,
+            bwd_light_nodes,
+            bwd_heavy_nodes,
         ) = ctx.saved_tensors
 
         num_heads = ctx.heads
@@ -154,8 +176,6 @@ class gatv2_function(torch.autograd.Function):
 
         grad_output = grad_output.view(-1, num_heads, head_dim)
 
-        negative_slope = ctx.negative_slope
-        grad_A_reduce_row_chunk_size = ctx.grad_A_reduce_row_chunk_size
         grad_x_left, grad_x_right, grad_attention = _C.gatv2_backward(
             grad_output,
             x_left,
@@ -166,36 +186,108 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
-            negative_slope,
-            grad_A_reduce_row_chunk_size,
+            ctx.negative_slope,
+            ctx.grad_A_reduce_row_chunk_size,
+            fwd_light_nodes,
+            fwd_heavy_nodes,
+            bwd_light_nodes,
+            bwd_heavy_nodes,
+            ctx.backward_light_warps,
+            ctx.backward_heavy_warps,
         )
 
-        return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None, None
+        # 4 CSR tensors + 3 gradients + 10 non-Variable args = 17 total
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 10
 
 
 class _FusedGraphAttention(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
-    def forward(ctx, edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale):
-        out, logsumexp = _C.gt_forward_csr_mh(edge_ptr, edge_idx, Q, K, V, scale)
+    def forward(
+        ctx,
+        edge_ptr,
+        edge_idx,
+        edge_ptr_T,
+        edge_idx_T,
+        Q,
+        K,
+        V,
+        scale,
+        fwd_light_nodes,
+        fwd_heavy_nodes,
+        bwd_light_nodes,
+        bwd_heavy_nodes,
+        forward_light_warps,
+        forward_heavy_warps,
+        backward_light_warps,
+        backward_heavy_warps,
+    ):
+        out, logsumexp = _C.gt_forward_csr_mh(
+            edge_ptr,
+            edge_idx,
+            Q,
+            K,
+            V,
+            scale,
+            fwd_light_nodes,
+            fwd_heavy_nodes,
+            forward_light_warps,
+            forward_heavy_warps,
+        )
 
         ctx.scale = scale
         ctx.num_heads = Q.shape[1]
         ctx.head_dim = Q.shape[2]
-        ctx.save_for_backward(edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp)
+        ctx.backward_light_warps = backward_light_warps
+        ctx.backward_heavy_warps = backward_heavy_warps
+        ctx.save_for_backward(
+            edge_ptr_T,
+            edge_idx_T,
+            Q,
+            K,
+            V,
+            out,
+            logsumexp,
+            bwd_light_nodes,
+            bwd_heavy_nodes,
+        )
         return out
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
-        edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp = ctx.saved_tensors
+        (
+            edge_ptr_T,
+            edge_idx_T,
+            Q,
+            K,
+            V,
+            out,
+            logsumexp,
+            bwd_light_nodes,
+            bwd_heavy_nodes,
+        ) = ctx.saved_tensors
         scale = ctx.scale
         num_heads = ctx.num_heads
         head_dim = ctx.head_dim
         grad_output = grad_output.view(-1, num_heads, head_dim)
 
-        dQ, dK, dV = _C.gt_backward_csr_mh(edge_ptr_T, edge_idx_T, Q, K, V, out, grad_output, logsumexp, scale)
-        return None, None, None, None, dQ, dK, dV, None
+        dQ, dK, dV = _C.gt_backward_csr_mh(
+            edge_ptr_T,
+            edge_idx_T,
+            Q,
+            K,
+            V,
+            out,
+            grad_output,
+            logsumexp,
+            scale,
+            bwd_light_nodes,
+            bwd_heavy_nodes,
+            ctx.backward_light_warps,
+            ctx.backward_heavy_warps,
+        )
+        return (None,) * 4 + (dQ, dK, dV) + (None,) * 10
 
 
 class _CudaSpMMConvFn(torch.autograd.Function):

@@ -55,6 +55,10 @@ def gatv2_aggr(
     attention_weights: torch.Tensor,
     negative_slope: float,
     grad_A_reduce_row_chunk_size: int = 512,
+    forward_light_warps: int = 1,
+    forward_heavy_warps: int = 8,
+    backward_light_warps: int = 1,
+    backward_heavy_warps: int = 8,
 ) -> torch.Tensor:
     return gatv2_function.apply(
         graph.forward_indptr,
@@ -66,6 +70,14 @@ def gatv2_aggr(
         attention_weights,
         negative_slope,
         grad_A_reduce_row_chunk_size,
+        graph.forward_light_nodes,
+        graph.forward_heavy_nodes,
+        graph.backward_light_nodes,
+        graph.backward_heavy_nodes,
+        forward_light_warps,
+        forward_heavy_warps,
+        backward_light_warps,
+        backward_heavy_warps,
     )
 
 
@@ -77,6 +89,10 @@ def graph_transformer_aggr(
     K: torch.Tensor,
     V: torch.Tensor,
     scale: float,
+    forward_light_warps: int = 4,
+    forward_heavy_warps: int = 8,
+    backward_light_warps: int = 1,
+    backward_heavy_warps: int = 8,
 ) -> torch.Tensor:
     return _FusedGraphAttention.apply(
         graph.forward_indptr,
@@ -87,6 +103,14 @@ def graph_transformer_aggr(
         K,
         V,
         scale,
+        graph.forward_light_nodes,
+        graph.forward_heavy_nodes,
+        graph.backward_light_nodes,
+        graph.backward_heavy_nodes,
+        forward_light_warps,
+        forward_heavy_warps,
+        backward_light_warps,
+        backward_heavy_warps,
     )
 
 

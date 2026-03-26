@@ -40,7 +40,11 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor row_ptr,
     torch::Tensor col_idx,
     torch::Tensor attn_vec,
-    float negative_slope
+    float negative_slope,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    int light_warps_per_block = 1,
+    int heavy_warps_per_block = 8
 );
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
@@ -54,7 +58,13 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor attn_vec,
     torch::Tensor logsumexp,
     float negative_slope,
-    int grad_A_reduce_row_chunk_size
+    int grad_A_reduce_row_chunk_size,
+    torch::Tensor fwd_light_nodes,
+    torch::Tensor fwd_heavy_nodes,
+    torch::Tensor bwd_light_nodes,
+    torch::Tensor bwd_heavy_nodes,
+    int light_warps_per_block = 1,
+    int heavy_warps_per_block = 8
 );
 
 // ============================================================================
@@ -68,7 +78,11 @@ graph_attention_forward_csr_mh_cuda(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
-    float scale
+    float scale,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    int light_warps_per_block = 4,
+    int heavy_warps_per_block = 8
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
@@ -81,7 +95,11 @@ graph_attention_backward_csr_mh_cuda(
     torch::Tensor O,
     torch::Tensor dO,
     torch::Tensor logsumexp,
-    float scale
+    float scale,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    int light_warps_per_block = 1,
+    int heavy_warps_per_block = 8
 );
 
 // ============================================================================

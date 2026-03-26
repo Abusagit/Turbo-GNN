@@ -1,9 +1,7 @@
 #include "common.cuh"
 
-constexpr int kWarpsPerBlock = 4;
-
-template<int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(kWarpsPerBlock * kWarpSize)
+template<int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize)
 GraphAttentionForward_CSR_MH_v2_D(
     const int N,
     const int H,
@@ -15,6 +13,7 @@ GraphAttentionForward_CSR_MH_v2_D(
     const int64_t stride_v_n, const int64_t stride_v_h,
     const index_t* __restrict__ row_ptr,
     const index_t* __restrict__ col_idx,
+    const index_t* __restrict__ node_indices,  // node indirection: node_i = node_indices[blockIdx.x]
     cuda_t* __restrict__ O,
     const int64_t stride_o_n, const int64_t stride_o_h,
     float* __restrict__ logsumexp,
@@ -29,7 +28,7 @@ GraphAttentionForward_CSR_MH_v2_D(
     constexpr int TILES = (VEC_D + kWarpSize - 1) / kWarpSize;
     constexpr int ACCS_PER_LANE = TILES * EPV;
 
-    const int node_i  = blockIdx.x;
+    const int node_i  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
     const int warp_id = threadIdx.x / kWarpSize;
     const int lane_id = threadIdx.x % kWarpSize;
@@ -44,14 +43,14 @@ GraphAttentionForward_CSR_MH_v2_D(
 
     // Shared memory layout (unchanged):
     // k_shared[D_CONST] as cuda_t
-    // warp_out[kWarpsPerBlock * D_CONST] as float
-    // warp_max[kWarpsPerBlock] as float
-    // warp_sum[kWarpsPerBlock] as float
+    // warp_out[WARPS_PER_BLOCK * D_CONST] as float
+    // warp_max[WARPS_PER_BLOCK] as float
+    // warp_sum[WARPS_PER_BLOCK] as float
     extern __shared__ char sh_raw[];
     cuda_t* k_shared = reinterpret_cast<cuda_t*>(sh_raw);
     float*  warp_out = reinterpret_cast<float*>(sh_raw + D_CONST * sizeof(cuda_t));
-    float*  warp_max = warp_out + kWarpsPerBlock * D_CONST;
-    float*  warp_sum = warp_max + kWarpsPerBlock;
+    float*  warp_max = warp_out + WARPS_PER_BLOCK * D_CONST;
+    float*  warp_sum = warp_max + WARPS_PER_BLOCK;
 
     float* my_out = warp_out + warp_id * D_CONST;
 
@@ -76,7 +75,7 @@ GraphAttentionForward_CSR_MH_v2_D(
         const cuda_t* k_base = K + node_i * stride_k_n + head_h * stride_k_h;
         const float4* k_src = reinterpret_cast<const float4*>(k_base);
         float4* k_sh = reinterpret_cast<float4*>(k_shared);
-        for (int i = threadIdx.x; i < NUM_K_LOADS; i += kWarpsPerBlock * kWarpSize) {
+        for (int i = threadIdx.x; i < NUM_K_LOADS; i += WARPS_PER_BLOCK * kWarpSize) {
             k_sh[i] = k_src[i];
         }
     }
@@ -91,7 +90,7 @@ GraphAttentionForward_CSR_MH_v2_D(
     }
 
     // neighbor loop
-    for (int e = warp_id; e < num_neighbors; e += kWarpsPerBlock) {
+    for (int e = warp_id; e < num_neighbors; e += WARPS_PER_BLOCK) {
         const index_t j = __ldg(&col_idx[edge_start + e]);
 
         const cuda_t* q_base = Q + j * stride_q_n + head_h * stride_q_h;
@@ -150,15 +149,15 @@ GraphAttentionForward_CSR_MH_v2_D(
 
         if (lane_id == 0) {
             #pragma unroll
-            for (int w = 0; w < kWarpsPerBlock; ++w) {
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
                 global_max = fmaxf(global_max, warp_max[w]);
             }
             #pragma unroll
-            for (int w = 0; w < kWarpsPerBlock; ++w) {
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
                 global_sum = fmaf(warp_sum[w], __expf(warp_max[w] - global_max), global_sum);
             }
             #pragma unroll
-            for (int w = 0; w < kWarpsPerBlock; ++w) {
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
                 warp_sum[w] = __expf(warp_max[w] - global_max); // scale_w
             }
 
@@ -180,7 +179,7 @@ GraphAttentionForward_CSR_MH_v2_D(
                     combined[ep] = 0.0f;
                     int d_idx = vi * EPV + ep;
                     #pragma unroll
-                    for (int w = 0; w < kWarpsPerBlock; ++w) {
+                    for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
                         combined[ep] = fmaf(warp_sum[w], warp_out[w * D_CONST + d_idx], combined[ep]);
                     }
                     combined[ep] *= inv_sum;
@@ -247,13 +246,14 @@ compute_D_mh_kernel_D(
 // Q, K, V may be non-contiguous in N,H dims (e.g. from split/view).
 // logsumexp and Delta are [N, H].
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
-template<int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(kWarpSize)
+template<int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize)
 graph_attn_backward_csrT_kernel_D(
     int64_t N,
     int64_t H,
     const index_t* __restrict__ row_ptr_T,   // [N+1], CSR^T row pointers
     const index_t* __restrict__ col_idx_T,   // [E],   CSR^T col indices
+    const index_t* __restrict__ node_indices, // node indirection
     const cuda_t* __restrict__ Q,        // [N, H, D]
     const cuda_t* __restrict__ K,        // [N, H, D]
     const cuda_t* __restrict__ V,        // [N, H, D]
@@ -275,9 +275,10 @@ graph_attn_backward_csrT_kernel_D(
     constexpr int EPV = Tile::ELEM_PER_VEC;
     constexpr int D_VEC = D_CONST / EPV;
 
-    int node_j = blockIdx.x;
-    int head_h = blockIdx.y;
-    int lane   = threadIdx.x; // 0..31
+    const int node_j = static_cast<int>(node_indices[blockIdx.x]);
+    const int head_h = blockIdx.y;
+    const int warp_id = threadIdx.x / kWarpSize;
+    const int lane    = threadIdx.x % kWarpSize;
 
     if (node_j >= N || head_h >= H) {
         return;
@@ -290,27 +291,33 @@ graph_attn_backward_csrT_kernel_D(
     // Contiguous offset for output dQ, dV (freshly allocated, always contiguous)
     const size_t out_jh = (node_j * H + head_h) * D_CONST;
 
-    // nothing to do if this node has no incoming edges
+    // nothing to do if this node has no incoming edges — all warps write zeros and return
     if (num_incoming == 0) {
-        for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
-            Tile::write_zero(dQ + out_jh, fv);
-            Tile::write_zero(dV + out_jh, fv);
+        if (warp_id == 0) {
+            for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
+                Tile::write_zero(dQ + out_jh, fv);
+                Tile::write_zero(dV + out_jh, fv);
+            }
         }
         return;
     }
 
-    // Shared memory layout (unified):
-    // qj_shared: D_CONST * sizeof(cuda_t)
-    // vj_shared: D_CONST * sizeof(cuda_t)
-    // gq_shared: D_CONST * sizeof(float)
-    // gv_shared: D_CONST * sizeof(float)
+    // Shared memory layout:
+    // qj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
+    // vj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
+    // warp_gq:   WARPS_PER_BLOCK * D_CONST * sizeof(float)       -- per-warp dQ accumulators
+    // warp_gv:   WARPS_PER_BLOCK * D_CONST * sizeof(float)       -- per-warp dV accumulators
     extern __shared__ char sh_raw[];
     cuda_t* qj_shared = reinterpret_cast<cuda_t*>(sh_raw);
     cuda_t* vj_shared = qj_shared + D_CONST;
-    float*  gq_shared = reinterpret_cast<float*>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
-    float*  gv_shared = gq_shared + D_CONST;
+    float*  warp_gq   = reinterpret_cast<float*>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
+    float*  warp_gv   = warp_gq + WARPS_PER_BLOCK * D_CONST;
 
-    // Load qj, vj via 128-bit transactions (stride-aware)
+    // Per-warp accumulator pointers
+    float* my_gq = warp_gq + warp_id * D_CONST;
+    float* my_gv = warp_gv + warp_id * D_CONST;
+
+    // Cooperative load of qj, vj using all threads across all warps
     {
         constexpr int ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);
         constexpr int NUM_LOADS = D_CONST / ELEMS_PER_F4;
@@ -318,25 +325,26 @@ graph_attn_backward_csrT_kernel_D(
         const float4* vj_src = reinterpret_cast<const float4*>(V + node_j * stride_v_n + head_h * stride_v_h);
         float4* qj_sh_f4 = reinterpret_cast<float4*>(qj_shared);
         float4* vj_sh_f4 = reinterpret_cast<float4*>(vj_shared);
-        for (int i = lane; i < NUM_LOADS; i += kWarpSize) {
+        for (int i = threadIdx.x; i < NUM_LOADS; i += WARPS_PER_BLOCK * kWarpSize) {
             qj_sh_f4[i] = qj_src[i];
             vj_sh_f4[i] = vj_src[i];
         }
     }
 
-    // Zero float32 gradient accumulators
+    // Zero per-warp float32 gradient accumulators
     {
         constexpr int NUM_F4 = D_CONST / 4;
-        float4* gq_f4 = reinterpret_cast<float4*>(gq_shared);
-        float4* gv_f4 = reinterpret_cast<float4*>(gv_shared);
+        float4* my_gq_f4 = reinterpret_cast<float4*>(my_gq);
+        float4* my_gv_f4 = reinterpret_cast<float4*>(my_gv);
         for (int i = lane; i < NUM_F4; i += kWarpSize) {
-            gq_f4[i] = {0.f, 0.f, 0.f, 0.f};
-            gv_f4[i] = {0.f, 0.f, 0.f, 0.f};
+            my_gq_f4[i] = {0.f, 0.f, 0.f, 0.f};
+            my_gv_f4[i] = {0.f, 0.f, 0.f, 0.f};
         }
     }
-    __syncwarp(FULL_WARP_MASK);
+    __syncthreads();
 
-    for (int e = 0; e < num_incoming; ++e) {
+    // Warp-strided edge loop
+    for (int e = warp_id; e < num_incoming; e += WARPS_PER_BLOCK) {
         index_t node_i = 0;
         if (lane == 0) {
             node_i = __ldg(&col_idx_T[edge_start + e]);
@@ -346,7 +354,6 @@ graph_attn_backward_csrT_kernel_D(
         if (node_i >= N) continue;
 
         const cuda_t* ki_base  = K  + node_i * stride_k_n + head_h * stride_k_h;
-        // dO is contiguous (checked by TORCH_CHECK)
         const size_t out_ih = static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
         const cuda_t* dOi_base = dO + out_ih;
 
@@ -382,7 +389,7 @@ graph_attn_backward_csrT_kernel_D(
         const float dS        = alpha * (dP_ij - Delta_i);
         const float dS_scaled = dS * scale;
 
-        // 2) accumulate dV_j, dQ_j in float32 shared; atomicAdd dK_i (float32, contiguous)
+        // 2) accumulate dV_j, dQ_j in per-warp float32 shared; atomicAdd dK_i
         float* dK_i_base = dK + out_ih;
 
         for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
@@ -391,20 +398,39 @@ graph_attn_backward_csrT_kernel_D(
             auto dOi = Tile::load(dOi_base, fv);
             auto qj  = Tile::load(qj_shared, fv);
 
-            Tile::weighted_accum(&gv_shared[base_f], alpha, dOi);
-            Tile::weighted_accum(&gq_shared[base_f], dS_scaled, ki);
+            Tile::weighted_accum(&my_gv[base_f], alpha, dOi);
+            Tile::weighted_accum(&my_gq[base_f], dS_scaled, ki);
             Tile::atomic_add_scaled_f32(dK_i_base, base_f, dS_scaled, qj);
         }
     }
 
-    // 3) write dQ_j and dV_j: convert float32 accumulators to cuda_t (contiguous output)
-    cuda_t* dQ_base = dQ + out_jh;
-    cuda_t* dV_base = dV + out_jh;
+    // 3) Cross-warp reduction: warp 0 sums all per-warp accumulators and writes output
+    __syncthreads();
 
-    for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
-        int base_f = fv * EPV;
-        Tile::write_typed(dQ_base, fv, &gq_shared[base_f]);
-        Tile::write_typed(dV_base, fv, &gv_shared[base_f]);
+    if (warp_id == 0) {
+        cuda_t* dQ_base = dQ + out_jh;
+        cuda_t* dV_base = dV + out_jh;
+
+        for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
+            int base_f = fv * EPV;
+            float gq_sum[EPV];
+            float gv_sum[EPV];
+            #pragma unroll
+            for (int ep = 0; ep < EPV; ++ep) {
+                gq_sum[ep] = 0.f;
+                gv_sum[ep] = 0.f;
+            }
+            #pragma unroll
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
+                #pragma unroll
+                for (int ep = 0; ep < EPV; ++ep) {
+                    gq_sum[ep] += warp_gq[w * D_CONST + base_f + ep];
+                    gv_sum[ep] += warp_gv[w * D_CONST + base_f + ep];
+                }
+            }
+            Tile::write_typed(dQ_base, fv, gq_sum);
+            Tile::write_typed(dV_base, fv, gv_sum);
+        }
     }
 }
 
@@ -416,7 +442,11 @@ graph_attention_forward_csr_mh_cuda(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
-    float scale
+    float scale,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    int light_warps_per_block,
+    int heavy_warps_per_block
 ) {
 
     at::cuda::CUDAGuard device_guard(Q.device());
@@ -458,45 +488,58 @@ graph_attention_forward_csr_mh_cuda(
 
     auto o_strides = O.strides();
 
-    dim3 blocks(N, H);
-    dim3 threads(kWarpsPerBlock * kWarpSize);  // 128 threads
-
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256,
                 "GT forward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    std::visit([&](auto idxInfo, auto typeInfo, auto d_c) {
-        using index_t = typename decltype(idxInfo)::Type;
-        using torch_t = typename decltype(typeInfo)::TorchType;
-        using cuda_t = typename decltype(typeInfo)::CudaType;
-        constexpr int DC = decltype(d_c)::value;
+    // Lambda to launch the kernel for a bucket of nodes with a given warp count
+    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+        if (num_nodes_bucket == 0) return;
 
-        auto* Q_ptr = reinterpret_cast<const cuda_t*>(Q.data_ptr<torch_t>());
-        auto* K_ptr = reinterpret_cast<const cuda_t*>(K.data_ptr<torch_t>());
-        auto* V_ptr = reinterpret_cast<const cuda_t*>(V.data_ptr<torch_t>());
-        auto* O_ptr = reinterpret_cast<cuda_t*>(O.data_ptr<torch_t>());
+        std::visit([&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+            using index_t = typename decltype(idxInfo)::Type;
+            using torch_t = typename decltype(typeInfo)::TorchType;
+            using cuda_t = typename decltype(typeInfo)::CudaType;
+            constexpr int DC = decltype(d_c)::value;
+            constexpr int W = decltype(warp_c)::value;
 
-        // k_shared: DC * sizeof(cuda_t)
-        // warp_out: kWarpsPerBlock * DC * sizeof(float)
-        // warp_max + warp_sum: 2 * kWarpsPerBlock * sizeof(float)
-        size_t shmem = DC * sizeof(cuda_t)
-                     + kWarpsPerBlock * DC * sizeof(float)
-                     + 2 * kWarpsPerBlock * sizeof(float);
+            auto* Q_ptr = reinterpret_cast<const cuda_t*>(Q.data_ptr<torch_t>());
+            auto* K_ptr = reinterpret_cast<const cuda_t*>(K.data_ptr<torch_t>());
+            auto* V_ptr = reinterpret_cast<const cuda_t*>(V.data_ptr<torch_t>());
+            auto* O_ptr = reinterpret_cast<cuda_t*>(O.data_ptr<torch_t>());
 
-        GraphAttentionForward_CSR_MH_v2_D<DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
-            N, H,
-            Q_ptr, K_ptr, V_ptr,
-            q_strides[0], q_strides[1],
-            k_strides[0], k_strides[1],
-            v_strides[0], v_strides[1],
-            index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
-            O_ptr,
-            o_strides[0], o_strides[1],
-            lse.data_ptr<float>(),
-            scale
-        );
-    }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-       MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-       MakeIntVariant<32, 64, 128, 256>(D));
+            size_t shmem = DC * sizeof(cuda_t)
+                         + W * DC * sizeof(float)
+                         + 2 * W * sizeof(float);
+
+            dim3 blocks(num_nodes_bucket, H);
+            dim3 threads(W * kWarpSize);
+
+            GraphAttentionForward_CSR_MH_v2_D<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                N, H,
+                Q_ptr, K_ptr, V_ptr,
+                q_strides[0], q_strides[1],
+                k_strides[0], k_strides[1],
+                v_strides[0], v_strides[1],
+                index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
+                index_ptr<index_t>(node_indices),
+                O_ptr,
+                o_strides[0], o_strides[1],
+                lse.data_ptr<float>(),
+                scale
+            );
+        }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
+           MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
+           MakeIntVariant<32, 64, 128, 256>(D),
+           warp_variant);
+    };
+
+    // Light nodes
+    launch_bucket(light_nodes, light_nodes.numel(),
+                  MakeIntVariant<1, 2, 4>(light_warps_per_block));
+
+    // Heavy nodes
+    launch_bucket(heavy_nodes, heavy_nodes.numel(),
+                  MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
 
     CUDA_KERNEL_CHECK();
 
@@ -506,15 +549,19 @@ graph_attention_forward_csr_mh_cuda(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 graph_attention_backward_csr_mh_cuda(
-    torch::Tensor row_ptr_T,   // [N+1], int32, CSR^T
-    torch::Tensor col_idx_T,   // [E],   int32, CSR^T
+    torch::Tensor row_ptr_T,   // [N+1], CSR^T
+    torch::Tensor col_idx_T,   // [E],   CSR^T
     torch::Tensor Q,           // [N, H, D]
     torch::Tensor K,           // [N, H, D]
     torch::Tensor V,           // [N, H, D]
     torch::Tensor O,           // [N, H, D] (forward output)
     torch::Tensor dO,          // [N, H, D]
     torch::Tensor logsumexp,   // [N, H],   float32
-    float scale
+    float scale,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    int light_warps_per_block,
+    int heavy_warps_per_block
 ) {
     TORCH_CHECK(row_ptr_T.is_cuda() && col_idx_T.is_cuda(),
                 "CSR^T indices must be CUDA");
@@ -604,57 +651,84 @@ graph_attention_backward_csr_mh_cuda(
     TORCH_CHECK(do_strides[2] == 1 && o_strides[2] == 1,
                 "dO and O feature dim (D) must be contiguous (stride(2) == 1)");
 
-    dim3 blocks_D(N, H);
-    dim3 threads_D(kWarpSize);
-
-    dim3 blocks_bwd(N, H);
-    dim3 threads_bwd(kWarpSize);
-
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256,
                 "GT backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    std::visit([&](auto idxInfo, auto typeInfo, auto d_c) {
-        using index_t = typename decltype(idxInfo)::Type;
-        using torch_t = typename decltype(typeInfo)::TorchType;
-        using cuda_t = typename decltype(typeInfo)::CudaType;
-        constexpr int DC = decltype(d_c)::value;
+    // Launch compute_D for ALL nodes (always 1 warp, no bucketing)
+    {
+        dim3 blocks_D(N, H);
+        dim3 threads_D(kWarpSize);
+        std::visit([&](auto typeInfo, auto d_c) {
+            using torch_t = typename decltype(typeInfo)::TorchType;
+            using cuda_t = typename decltype(typeInfo)::CudaType;
+            constexpr int DC = decltype(d_c)::value;
 
-        auto cuda_stream = at::cuda::getDefaultCUDAStream();
+            auto cuda_stream = at::cuda::getDefaultCUDAStream();
+            auto* dO_ptr = reinterpret_cast<const cuda_t*>(dO.data_ptr<torch_t>());
+            auto* O_ptr  = reinterpret_cast<const cuda_t*>(O.data_ptr<torch_t>());
 
-        auto* dO_ptr = reinterpret_cast<const cuda_t*>(dO.data_ptr<torch_t>());
-        auto* O_ptr  = reinterpret_cast<const cuda_t*>(O.data_ptr<torch_t>());
-        auto* Q_ptr  = reinterpret_cast<const cuda_t*>(Q.data_ptr<torch_t>());
-        auto* K_ptr  = reinterpret_cast<const cuda_t*>(K.data_ptr<torch_t>());
-        auto* V_ptr  = reinterpret_cast<const cuda_t*>(V.data_ptr<torch_t>());
-        auto* dQ_ptr = reinterpret_cast<cuda_t*>(dQ.data_ptr<torch_t>());
-        auto* dV_ptr = reinterpret_cast<cuda_t*>(dV.data_ptr<torch_t>());
+            compute_D_mh_kernel_D<DC, cuda_t><<<blocks_D, threads_D, 0, cuda_stream>>>(
+                dO_ptr, O_ptr, Delta.data_ptr<float>(),
+                N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
+            );
+        }, MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
+           MakeIntVariant<32, 64, 128, 256>((int)D));
+    }
 
-        compute_D_mh_kernel_D<DC, cuda_t><<<blocks_D, threads_D, 0, cuda_stream>>>(
-            dO_ptr, O_ptr, Delta.data_ptr<float>(),
-            N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
-        );
+    // Lambda to launch backward kernel for a bucket with given warp count
+    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+        if (num_nodes_bucket == 0) return;
 
-        // qj + vj as cuda_t, gq + gv as float
-        size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + 2 * DC * sizeof(float);
+        std::visit([&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+            using index_t = typename decltype(idxInfo)::Type;
+            using torch_t = typename decltype(typeInfo)::TorchType;
+            using cuda_t = typename decltype(typeInfo)::CudaType;
+            constexpr int DC = decltype(d_c)::value;
+            constexpr int W = decltype(warp_c)::value;
 
-        auto* dK_ptr = dK_f32.data_ptr<float>();
+            auto cuda_stream = at::cuda::getDefaultCUDAStream();
 
-        graph_attn_backward_csrT_kernel_D<DC, cuda_t, index_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
-            N, H,
-            index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
-            Q_ptr, K_ptr, V_ptr,
-            q_strides[0], q_strides[1],
-            k_strides[0], k_strides[1],
-            v_strides[0], v_strides[1],
-            dO_ptr,
-            logsumexp.data_ptr<float>(),
-            Delta.data_ptr<float>(),
-            scale,
-            dQ_ptr, dK_ptr, dV_ptr
-        );
-    }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-       MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-       MakeIntVariant<32, 64, 128, 256>((int)D));
+            auto* Q_ptr  = reinterpret_cast<const cuda_t*>(Q.data_ptr<torch_t>());
+            auto* K_ptr  = reinterpret_cast<const cuda_t*>(K.data_ptr<torch_t>());
+            auto* V_ptr  = reinterpret_cast<const cuda_t*>(V.data_ptr<torch_t>());
+            auto* dO_ptr = reinterpret_cast<const cuda_t*>(dO.data_ptr<torch_t>());
+            auto* dQ_ptr = reinterpret_cast<cuda_t*>(dQ.data_ptr<torch_t>());
+            auto* dV_ptr = reinterpret_cast<cuda_t*>(dV.data_ptr<torch_t>());
+            auto* dK_ptr = dK_f32.data_ptr<float>();
+
+            // qj + vj (read-only) + W * (gq + gv) per-warp accumulators
+            size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
+
+            dim3 blocks(num_nodes_bucket, H);
+            dim3 threads(W * kWarpSize);
+
+            graph_attn_backward_csrT_kernel_D<W, DC, cuda_t, index_t><<<blocks, threads, shmem_bwd, cuda_stream>>>(
+                N, H,
+                index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
+                index_ptr<index_t>(node_indices),
+                Q_ptr, K_ptr, V_ptr,
+                q_strides[0], q_strides[1],
+                k_strides[0], k_strides[1],
+                v_strides[0], v_strides[1],
+                dO_ptr,
+                logsumexp.data_ptr<float>(),
+                Delta.data_ptr<float>(),
+                scale,
+                dQ_ptr, dK_ptr, dV_ptr
+            );
+        }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
+           MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
+           MakeIntVariant<32, 64, 128, 256>((int)D),
+           warp_variant);
+    };
+
+    // Light nodes
+    launch_bucket(light_nodes, light_nodes.numel(),
+                  MakeIntVariant<1, 2, 4>(light_warps_per_block));
+
+    // Heavy nodes
+    launch_bucket(heavy_nodes, heavy_nodes.numel(),
+                  MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
 
     CUDA_KERNEL_CHECK();
 
