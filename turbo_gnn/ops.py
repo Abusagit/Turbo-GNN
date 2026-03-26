@@ -66,6 +66,7 @@ def gatv2_aggr(
         attention_weights,
         negative_slope,
         grad_A_reduce_row_chunk_size,
+        graph.is_directed,
     )
 
 
@@ -87,6 +88,7 @@ def graph_transformer_aggr(
         K,
         V,
         scale,
+        graph.is_directed,
     )
 
 

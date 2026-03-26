@@ -54,7 +54,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor attn_vec,
     torch::Tensor logsumexp,
     float negative_slope,
-    int grad_A_reduce_row_chunk_size
+    int grad_A_reduce_row_chunk_size,
+    bool is_directed = true
 );
 
 // ============================================================================
@@ -73,15 +74,18 @@ graph_attention_forward_csr_mh_cuda(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 graph_attention_backward_csr_mh_cuda(
-    torch::Tensor row_ptr_T,
-    torch::Tensor col_idx_T,
+    torch::Tensor row_ptr,       // forward CSR [N+1]
+    torch::Tensor col_idx,       // forward CSR [E]
+    torch::Tensor row_ptr_T,     // backward CSR^T [N+1]
+    torch::Tensor col_idx_T,     // backward CSR^T [E]
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
     torch::Tensor dO,
     torch::Tensor logsumexp,
-    float scale
+    float scale,
+    bool is_directed = true
 );
 
 // ============================================================================

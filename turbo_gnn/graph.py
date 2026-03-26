@@ -80,6 +80,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
 
     max_degree: int = -1
     _device: torch.device = torch.device("cpu")
+    is_directed: bool | None = None  # None = auto-detect, True/False = explicit
 
     def __post_init__(self):
         self._device = self.forward_indptr.device
@@ -100,6 +101,18 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         degrees = indptr[1:] - indptr[:-1]
         self.max_degree = degrees.max().item()
         assert self.max_degree != -1
+
+        # Auto-detect directedness if not explicitly set
+        if self.is_directed is None:
+            self.is_directed = not (
+                torch.equal(self.forward_indptr, self.backward_indptr)
+                and torch.equal(self.forward_indices, self.backward_indices)
+            )
+
+        # Alias backward CSR to forward CSR for undirected graphs (saves memory)
+        if not self.is_directed:
+            self.backward_indptr = self.forward_indptr
+            self.backward_indices = self.forward_indices
 
     @staticmethod
     def _to_signed_view(t: torch.Tensor) -> torch.Tensor:
@@ -148,13 +161,19 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             forward_heavy_nodes=fwd_heavy,
             backward_light_nodes=bwd_light,
             backward_heavy_nodes=bwd_heavy,
+            is_directed=self.is_directed,
         )
 
     def to(self, device) -> AdjacencyForwardBackwardWithNodeBuckets:
         self.forward_indptr = self.forward_indptr.to(device)
         self.forward_indices = self.forward_indices.to(device)
-        self.backward_indptr = self.backward_indptr.to(device)
-        self.backward_indices = self.backward_indices.to(device)
+        if self.is_directed:
+            self.backward_indptr = self.backward_indptr.to(device)
+            self.backward_indices = self.backward_indices.to(device)
+        else:
+            # Preserve aliasing: backward CSR shares tensors with forward CSR
+            self.backward_indptr = self.forward_indptr
+            self.backward_indices = self.forward_indices
         self.forward_light_nodes = self.forward_light_nodes.to(device)
         self.forward_heavy_nodes = self.forward_heavy_nodes.to(device)
         self.backward_light_nodes = self.backward_light_nodes.to(device)
@@ -169,20 +188,39 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         num_nodes: int,
         quantile: float = 0.99,
         index_dtype: torch.dtype | None = None,
+        is_directed: bool | None = None,
     ) -> AdjacencyForwardBackwardWithNodeBuckets:
-        """Build from COO edge_index [2, E]. Constructs forward + backward CSR."""
+        """Build from COO edge_index [2, E]. Constructs forward + backward CSR.
+
+        Args:
+            is_directed: None = auto-detect, True = always directed,
+                         False = skip backward CSR (alias to forward).
+        """
         fwd_indptr, fwd_indices, _, fwd_counts = build_csr_as_is(edge_index, None, num_nodes, do_transpose=True)
-        bwd_indptr, bwd_indices, _, bwd_counts = build_csr_as_is(edge_index, None, num_nodes, do_transpose=False)
+
+        if is_directed is not False:
+            bwd_indptr, bwd_indices, _, bwd_counts = build_csr_as_is(edge_index, None, num_nodes, do_transpose=False)
+        else:
+            bwd_counts = fwd_counts
 
         if index_dtype is not None:
             fwd_indptr = fwd_indptr.to(index_dtype)
             fwd_indices = fwd_indices.to(index_dtype)
-            bwd_indptr = bwd_indptr.to(index_dtype)
-            bwd_indices = bwd_indices.to(index_dtype)
+            if is_directed is not False:
+                bwd_indptr = bwd_indptr.to(index_dtype)
+                bwd_indices = bwd_indices.to(index_dtype)
+
+        # For explicitly undirected, alias after dtype conversion
+        if is_directed is False:
+            bwd_indptr = fwd_indptr
+            bwd_indices = fwd_indices
 
         idx_dt = index_dtype or fwd_indptr.dtype
         fwd_light, fwd_heavy = _bucket_nodes_by_degree(fwd_counts, quantile, index_dtype=idx_dt)
-        bwd_light, bwd_heavy = _bucket_nodes_by_degree(bwd_counts, quantile, index_dtype=idx_dt)
+        if is_directed is False:
+            bwd_light, bwd_heavy = fwd_light, fwd_heavy
+        else:
+            bwd_light, bwd_heavy = _bucket_nodes_by_degree(bwd_counts, quantile, index_dtype=idx_dt)
 
         return cls(
             forward_indptr=fwd_indptr,
@@ -193,6 +231,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             forward_heavy_nodes=fwd_heavy,
             backward_light_nodes=bwd_light,
             backward_heavy_nodes=bwd_heavy,
+            is_directed=is_directed,
         )
 
     @classmethod
@@ -204,23 +243,38 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         bwd_indices: torch.Tensor,
         quantile: float = 0.99,
         index_dtype: torch.dtype | None = None,
+        is_directed: bool | None = None,
     ) -> AdjacencyForwardBackwardWithNodeBuckets:
-        """Build from pre-computed forward and backward CSR arrays."""
+        """Build from pre-computed forward and backward CSR arrays.
+
+        Args:
+            is_directed: None = auto-detect, True = always directed,
+                         False = alias backward CSR to forward.
+        """
         if index_dtype is not None:
             fwd_indptr = fwd_indptr.to(index_dtype)
             fwd_indices = fwd_indices.to(index_dtype)
-            bwd_indptr = bwd_indptr.to(index_dtype)
-            bwd_indices = bwd_indices.to(index_dtype)
+            if is_directed is not False:
+                bwd_indptr = bwd_indptr.to(index_dtype)
+                bwd_indices = bwd_indices.to(index_dtype)
+
+        if is_directed is False:
+            bwd_indptr = fwd_indptr
+            bwd_indices = fwd_indices
 
         idx_dt = index_dtype or fwd_indptr.dtype
 
         signed_fwd = cls._to_signed_view(fwd_indptr)
         fwd_counts = signed_fwd[1:] - signed_fwd[:-1]
-        signed_bwd = cls._to_signed_view(bwd_indptr)
-        bwd_counts = signed_bwd[1:] - signed_bwd[:-1]
 
         fwd_light, fwd_heavy = _bucket_nodes_by_degree(fwd_counts, quantile, index_dtype=idx_dt)
-        bwd_light, bwd_heavy = _bucket_nodes_by_degree(bwd_counts, quantile, index_dtype=idx_dt)
+
+        if is_directed is False:
+            bwd_light, bwd_heavy = fwd_light, fwd_heavy
+        else:
+            signed_bwd = cls._to_signed_view(bwd_indptr)
+            bwd_counts = signed_bwd[1:] - signed_bwd[:-1]
+            bwd_light, bwd_heavy = _bucket_nodes_by_degree(bwd_counts, quantile, index_dtype=idx_dt)
 
         return cls(
             forward_indptr=fwd_indptr,
@@ -231,6 +285,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             forward_heavy_nodes=fwd_heavy,
             backward_light_nodes=bwd_light,
             backward_heavy_nodes=bwd_heavy,
+            is_directed=is_directed,
         )
 
     @classmethod
@@ -239,9 +294,12 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         dgl_graph,
         quantile: float = 0.99,
         index_dtype: torch.dtype | None = None,
+        is_directed: bool | None = None,
     ) -> AdjacencyForwardBackwardWithNodeBuckets:
         """Build from DGL graph (optional dep). Delegates to from_edge_list."""
         src, dst = dgl_graph.edges()
         edge_index = torch.stack([src, dst], dim=0)
         num_nodes = dgl_graph.num_nodes()
-        return cls.from_edge_list(edge_index, num_nodes, quantile=quantile, index_dtype=index_dtype)
+        return cls.from_edge_list(
+            edge_index, num_nodes, quantile=quantile, index_dtype=index_dtype, is_directed=is_directed
+        )
