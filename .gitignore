@@ -34,3 +34,5 @@ out/*
 *.tex
 
 *.pdf
+
+results*
