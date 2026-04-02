@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 
 os.environ["CUDA_HOME"] = "/usr/local/cuda"
@@ -8,8 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
 
-import dgl
-import dgl.sparse as dglsp
 import numpy as np
 import torch
 from torch.utils.cpp_extension import load
@@ -92,6 +92,8 @@ def reorder_graph(
     node_permute_algo="metis",
     partition_size=1024,
 ):
+    import dgl
+
     graph = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
     if edge_weights is not None:
         graph.edata["w"] = edge_weights
@@ -254,13 +256,17 @@ def to_tcgnn_data(
 
 
 def g_to_SPmatrix(g):
+    import dgl.sparse as dglsp
+
     indices = torch.stack(g.edges())
     N = g.num_nodes()
     A = dglsp.spmatrix(indices, shape=(N, N))
     return A, 128
 
 
-def to_dfgnn_data(g: dgl.DGLGraph):
+def to_dfgnn_data(g):
+    import dgl.sparse as dglsp
+
     WARP_SIZE = 32
 
     A, max_neigh = g_to_SPmatrix(g)
