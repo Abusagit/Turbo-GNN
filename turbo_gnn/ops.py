@@ -83,7 +83,7 @@ def gatv2_aggr(
     x: torch.Tensor,
     x_neighbors: torch.Tensor,
     attention_weights: torch.Tensor,
-    negative_slope: float,
+    negative_slope: float = 0.2,
     grad_A_reduce_row_chunk_size: int = 512,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
@@ -129,7 +129,7 @@ def graph_transformer_aggr(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
-    scale: float,
+    scale: float | None = None,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
