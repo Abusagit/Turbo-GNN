@@ -100,7 +100,8 @@ class CachedWheelsCommand(_bdist_wheel):
             impl_tag, abi_tag, plat_tag = self.get_tag()
             archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
             wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
-            os.rename(wheel_filename, wheel_path)
+            import shutil
+            shutil.move(wheel_filename, wheel_path)
         except (urllib.error.HTTPError, urllib.error.URLError):
             print("Precompiled wheel not found. Building from source...")
             super().run()
