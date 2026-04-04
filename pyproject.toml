@@ -74,13 +74,13 @@ dev = [
 ]
 
 # ---------------------------------------------------------------------------
-# Bench: dev + DGL + viz + cugraph (requires torch==2.4.1 for DGL 2.4.0)
+# Bench: dev + DGL + viz + cugraph (requires torch==2.4.0 for DGL 2.4.0)
 # Usage: pip install -e ".[bench]"
 # ---------------------------------------------------------------------------
 bench = [
     "turbo-gnn[dev]",
-    # DGL (requires torch==2.4.1)
-    "torch==2.4.1",
+    # DGL (requires torch==2.4.0)
+    "torch==2.4.0",
     "dgl==2.4.0",
     # viz
     "matplotlib>=3.5.0",

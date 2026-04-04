@@ -117,7 +117,7 @@ install-dev: venv _install-torch-dev _install-dev setup-hooks test
 
 # Bench: dev + DGL + viz + cugraph (torch==2.4.1 for DGL compat)
 _install-torch-bench: venv
-	$(PIP) install "torch==2.4.1+$(CUDA_VERSION)" --index-url $(TORCH_INDEX)
+	$(PIP) install "torch==2.4.0+$(CUDA_VERSION)" --index-url $(TORCH_INDEX)
 	$(PIP) install wheel numpy ninja packaging psutil "setuptools>=77.0"
 
 _install-bench:
