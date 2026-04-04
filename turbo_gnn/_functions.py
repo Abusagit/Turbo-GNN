@@ -217,6 +217,7 @@ class _FusedGraphAttention(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale):
+        scale = scale or 1 / (Q.shape[-1] ** 0.5)
         out, logsumexp = _C.gt_forward_csr_mh(edge_ptr, edge_idx, Q, K, V, scale)
 
         ctx.scale = scale
