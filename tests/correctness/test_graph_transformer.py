@@ -1,7 +1,6 @@
 import pytest
 import torch
 import torch.nn as nn
-from dgl import DGLGraph
 from fixtures import (
     create_conv_layer,
     create_graph_sample,
@@ -16,10 +15,10 @@ from src.backends.registry import BackendRegistry
 
 
 class TestGraphTransformer:
-    "Test Graph Transformer correctness"
+    "Test Graph Transformer correctness against manual computation"
 
-    def test_correctness_dgl(self):
-        backend = BackendRegistry.get_backend("dgl")
+    def test_correctness_torch_native(self):
+        backend = BackendRegistry.get_backend("torch_native")
 
         hidden_dim = 16
         num_heads = 4
@@ -30,32 +29,28 @@ class TestGraphTransformer:
         # create test graph
         num_nodes = 6
         node_features = torch.randn(num_nodes, hidden_dim)
-        edges = [(1, 0), (2, 0), (3, 0), (1, 4), (2, 5), (1, 5)]
-        edges = torch.tensor(edges)
+        edges = torch.tensor([(1, 0), (2, 0), (3, 0), (1, 4), (2, 5), (1, 5)])
         num_edges = len(edges)
 
-        graph = DGLGraph()
-        graph.add_nodes(num_nodes)
+        # Build COO graph: (edge_index [2, E], edge_weight, num_nodes)
+        edge_index = edges.T.long()  # [2, E]
+        graph = (edge_index, None, num_nodes)
 
-        for src, dst in edges:
-            graph.add_edges(src, dst)
-
-        out_dgl = conv(node_features, graph)
+        out_ref = conv(node_features, graph)
 
         # dummy loss to trigger backward pass
-        dummy_loss = (out_dgl**2).sum()
+        dummy_loss = (out_ref**2).sum()
         dummy_loss.backward()
 
         # save gradients for correctness checking
-
-        dgl_grads_qkv = conv.qkv_proj.weight.grad.clone()
-        dgl_grads_qkv_bias = conv.qkv_proj.bias.grad.clone()
+        ref_grads_qkv = conv.qkv_proj.weight.grad.clone()
+        ref_grads_qkv_bias = conv.qkv_proj.bias.grad.clone()
 
         # zero current gradients
         conv.qkv_proj.weight.grad.zero_()
         conv.qkv_proj.bias.grad.zero_()
 
-        assert out_dgl.shape == (num_nodes, hidden_dim)
+        assert out_ref.shape == (num_nodes, hidden_dim)
 
         # calculate output manually
         qkv = conv.qkv_proj(nn.functional.layer_norm(node_features, (node_features.shape[-1],)))
@@ -79,27 +74,28 @@ class TestGraphTransformer:
 
         out = torch.zeros(num_nodes, hidden_dim)
 
-        # calculate softmax on edges
-
+        # calculate softmax on edges -- find incoming edges per node via edge_index
+        src_nodes, dst_nodes = edge_index[0], edge_index[1]
         for i in range(num_nodes):
-            in_edges_indexes = graph.in_edges(i, form="eid")
-            if len(in_edges_indexes) == 0:
+            in_edge_mask = dst_nodes == i
+            in_edge_indices = torch.nonzero(in_edge_mask, as_tuple=True)[0]
+            if len(in_edge_indices) == 0:
                 continue
-            exp_scores = torch.exp(attn_scores[in_edges_indexes])
+            exp_scores = torch.exp(attn_scores[in_edge_indices])
             exp_scores = exp_scores / exp_scores.sum(dim=0)
 
-            source_node_values = v[edges[in_edges_indexes, 0]]
+            source_node_values = v[edges[in_edge_indices, 0]]
             out[i] += torch.einsum("ehd,eh->hd", source_node_values, exp_scores).reshape(-1)
 
-        assert torch.allclose(out, out_dgl, atol=1e-6), "Output mismatch"
+        assert torch.allclose(out, out_ref, atol=1e-6), "Output mismatch"
 
         dummy_loss = (out**2).sum()
         dummy_loss.backward()
 
-        # check gradient correctess
+        # check gradient correctness
         assert torch.allclose(
-            conv.qkv_proj.weight.grad, dgl_grads_qkv, atol=1e-6
+            conv.qkv_proj.weight.grad, ref_grads_qkv, atol=1e-6
         ), "Gradient mismatch for qkv_proj.weight"
         assert torch.allclose(
-            conv.qkv_proj.bias.grad, dgl_grads_qkv_bias, atol=1e-6
+            conv.qkv_proj.bias.grad, ref_grads_qkv_bias, atol=1e-6
         ), "Gradient mismatch for qkv_proj.bias"

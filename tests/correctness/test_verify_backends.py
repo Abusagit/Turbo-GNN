@@ -24,7 +24,6 @@ def test_backend_registration():
 
     # Import backend modules to trigger registration
     try:
-        import src.backends.dgl_backend  # noqa: F401
         import src.backends.pyg_backend  # noqa: F401
         import src.backends.torch_native_backend  # noqa: F401
 
@@ -36,34 +35,10 @@ def test_backend_registration():
     backends = BackendRegistry.list_backends()
     print(f"Registered backends: {backends}")
 
-    expected = {"pyg", "dgl", "torch_native_gcn"}
+    expected = {"pyg", "torch_native", "torch_native_gcn"}
     missing = expected - set(backends)
     if missing:
         pytest.fail(f"Missing backends: {missing}")
-
-
-def test_dataset_loading():
-    """Test dataset loading from different sources."""
-    print("\n" + "=" * 60)
-    print("Testing Dataset Loading")
-    print("=" * 60)
-
-    test_configs = [
-        DatasetConfig(source="pyg", name="cora", root="data", conv_backend="pyg"),
-        DatasetConfig(source="dgl", name="cora", root="data", conv_backend="pyg"),
-        DatasetConfig(source="ogbn", name="ogbn-arxiv", root="data", conv_backend="pyg"),  # Large dataset
-    ]
-
-    for cfg in test_configs:
-        try:
-            print(f"\nLoading {cfg.source}/{cfg.name}...")
-            sample = load_single_graph(cfg)
-            print(f"  ✓ Loaded: {sample.num_nodes} nodes, {sample.num_features} features")
-            print(f"    Classes: {sample.num_classes}")
-            print(f"    Edges: {sample.edge_index.shape}")
-            print(f"    Train mask: {sample.train_mask.sum().item()} nodes")
-        except Exception as e:
-            pytest.fail(f"Failed: {e}")
 
 
 def test_backend_convolutions():
@@ -84,7 +59,7 @@ def test_backend_convolutions():
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     x = torch.randn(num_nodes, feature_dim, device=device, requires_grad=True)
 
-    backends_to_test = ["pyg", "dgl", "torch_native"]
+    backends_to_test = ["pyg", "torch_native"]
     conv_types = ["gcn", "mean_aggr", "sum_aggr"]
 
     results = {}

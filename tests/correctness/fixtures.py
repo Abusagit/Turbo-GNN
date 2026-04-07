@@ -5,7 +5,6 @@ import pytest
 import torch
 from torch_geometric.utils import add_self_loops
 
-import src.backends.dgl_backend  # noqa: F401
 import src.backends.pyg_backend  # noqa: F401
 import src.backends.torch_native_backend  # noqa: F401
 from src.backends.registry import BackendRegistry
@@ -379,7 +378,7 @@ def karate_like_club_graph(device):
     }
 
 
-@pytest.fixture(params=["torch_native_mean_aggr", "pyg", "dgl"])
+@pytest.fixture(params=["torch_native_mean_aggr", "pyg", "torch_native"])
 def graph_backend(request):
     """Parametrized fixture for different graph backends."""
     return request.param
@@ -466,14 +465,3 @@ def identity_weight_conv(create_conv_layer, set_default_device):
         return conv
 
     return _create
-
-
-@pytest.fixture(scope="session")
-def dgl_available():
-    """Check if DGL is available for comparison tests."""
-    try:
-        import dgl  # noqa: F401
-
-        return True
-    except ImportError:
-        return False

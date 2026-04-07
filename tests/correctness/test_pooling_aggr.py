@@ -12,7 +12,6 @@ from fixtures import (
     create_conv_layer,
     create_graph_sample,
     device,
-    dgl_available,
     fully_connected_on_3_vertices_data,
     karate_like_club_graph,
     random_graph_data,
@@ -29,7 +28,7 @@ class TestBackendRegistration:
 
     @pytest.mark.parametrize(
         "backend_type",
-        ["dgl", "torch_native_adj_mat"],
+        ["torch_native", "torch_native_adj_mat"],
     )
     def test_backend_is_registered(self, backend_type):
         """Verify the backends necessary are registered."""
@@ -39,7 +38,7 @@ class TestBackendRegistration:
     @pytest.mark.parametrize(
         "backend_type, graph_repr",
         [
-            ("dgl", "dgl"),
+            ("torch_native", "coo"),
             ("torch_native_adj_mat", "adj_mat"),
         ],
     )
@@ -50,7 +49,7 @@ class TestBackendRegistration:
 
     @pytest.mark.parametrize(
         "backend_type",
-        ["dgl", "torch_native_adj_mat"],
+        ["torch_native", "torch_native_adj_mat"],
     )
     def test_backend_instantiation(self, backend_type):
         """Verify the backends necessary can be instantiated."""
@@ -61,8 +60,8 @@ class TestBackendRegistration:
     @pytest.mark.parametrize(
         "backend_type, aggr_type",
         [
-            ("dgl", "min_aggr"),
-            ("dgl", "max_aggr"),
+            ("torch_native", "min_aggr"),
+            ("torch_native", "max_aggr"),
             ("torch_native_adj_mat", "min_aggr"),
             ("torch_native_adj_mat", "max_aggr"),
         ],
@@ -82,8 +81,8 @@ class TestAggregationCorrectness:
     @pytest.mark.parametrize(
         "backend_type, gt_key, aggr_type",
         [
-            ("dgl", "expected_min", "min_aggr"),
-            ("dgl", "expected_max", "max_aggr"),
+            ("torch_native", "expected_min", "min_aggr"),
+            ("torch_native", "expected_max", "max_aggr"),
             ("torch_native_adj_mat", "expected_min", "min_aggr"),
             ("torch_native_adj_mat", "expected_max", "max_aggr"),
         ],
@@ -94,44 +93,24 @@ class TestAggregationCorrectness:
         """
         star graph - all nodes except center pass messages to the center; no other messages are passed
         """
-        try:
-            import dgl
-            import dgl.ops as dgl_ops
-        except ImportError:
-            pytest.skip("DGL not installed - cannot verify correctness")
-
         data = small_graph_data
         features = data["features"]
-        out_channels = features.shape[1]
 
         # ===== gt =====
-
         gt = data[gt_key]
 
         # =====  Our Implementation =====
+        graph_sample = create_graph_sample(
+            edge_index=data["edge_index"],
+            features=features,
+            backend=backend_type,
+            num_nodes=data["num_nodes"],
+            add_self_loops=False,
+        )
 
-        if backend_type == "dgl":
-            our_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-                data["device"]
-            )
+        conv = create_conv_layer(backend_type, aggr_type, feature_dim=data["in_channels"], bias=False)
 
-            conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-            our_output = conv(features, our_graph)
-        elif backend_type == "torch_native_adj_mat":
-            graph_sample = create_graph_sample(
-                edge_index=data["edge_index"],
-                features=features,
-                backend="torch_native_adj_mat",
-                num_nodes=data["num_nodes"],
-                add_self_loops=False,
-            )
-
-            conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-            our_output = conv(features, graph_sample.graph_repr)
-        else:
-            raise ValueError("Incorrect backend passed; check parametrize for correctness")
+        our_output = conv(features, graph_sample.graph_repr)
 
         # ===== Compare Outputs =====
         max_abs_diff = (gt - our_output).abs().max().item()
@@ -153,8 +132,8 @@ class TestAggregationCorrectness:
     @pytest.mark.parametrize(
         "backend_type, gt_key, aggr_type",
         [
-            ("dgl", "expected_min", "min_aggr"),
-            ("dgl", "expected_max", "max_aggr"),
+            ("torch_native", "expected_min", "min_aggr"),
+            ("torch_native", "expected_max", "max_aggr"),
             ("torch_native_adj_mat", "expected_min", "min_aggr"),
             ("torch_native_adj_mat", "expected_max", "max_aggr"),
         ],
@@ -171,43 +150,24 @@ class TestAggregationCorrectness:
         """
         fully connected graph - all nodes pass messages to all the other nodes
         """
-        try:
-            import dgl
-            import dgl.ops as dgl_ops
-        except ImportError:
-            pytest.skip("DGL not installed - cannot verify correctness")
-
         data = fully_connected_on_3_vertices_data
         features = data["features"]
 
         # ===== gt =====
-
         gt = data[gt_key]
 
         # =====  Our Implementation =====
+        graph_sample = create_graph_sample(
+            edge_index=data["edge_index"],
+            features=features,
+            backend=backend_type,
+            num_nodes=data["num_nodes"],
+            add_self_loops=False,
+        )
 
-        if backend_type == "dgl":
-            our_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-                data["device"]
-            )
+        conv = create_conv_layer(backend_type, aggr_type, feature_dim=data["in_channels"], bias=False)
 
-            conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-            our_output = conv(features, our_graph)
-        elif backend_type == "torch_native_adj_mat":
-            graph_sample = create_graph_sample(
-                edge_index=data["edge_index"],
-                features=features,
-                backend="torch_native_adj_mat",
-                num_nodes=data["num_nodes"],
-                add_self_loops=False,
-            )
-
-            conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-            our_output = conv(features, graph_sample.graph_repr)
-        else:
-            raise ValueError("Incorrect backend passed; check parametrize for correctness")
+        our_output = conv(features, graph_sample.graph_repr)
 
         # ===== Compare Outputs =====
         max_abs_diff = (gt - our_output).abs().max().item()
@@ -229,8 +189,8 @@ class TestAggregationCorrectness:
     @pytest.mark.parametrize(
         "backend_type, gt_key, aggr_type",
         [
-            ("dgl", "expected_min", "min_aggr"),
-            ("dgl", "expected_max", "max_aggr"),
+            ("torch_native", "expected_min", "min_aggr"),
+            ("torch_native", "expected_max", "max_aggr"),
             ("torch_native_adj_mat", "expected_min", "min_aggr"),
             ("torch_native_adj_mat", "expected_max", "max_aggr"),
         ],
@@ -247,43 +207,24 @@ class TestAggregationCorrectness:
         """
         graph with 3 vertices and edges 0->1 1->0 to test isolation layer result
         """
-        try:
-            import dgl
-            import dgl.ops as dgl_ops
-        except ImportError:
-            pytest.skip("DGL not installed - cannot verify correctness")
-
         data = connectivity_component_and_isolated_vertice_data
         features = data["features"]
 
         # ===== gt =====
-
         gt = data[gt_key]
 
         # =====  Our Implementation =====
+        graph_sample = create_graph_sample(
+            edge_index=data["edge_index"],
+            features=features,
+            backend=backend_type,
+            num_nodes=data["num_nodes"],
+            add_self_loops=False,
+        )
 
-        if backend_type == "dgl":
-            our_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-                data["device"]
-            )
+        conv = create_conv_layer(backend_type, aggr_type, feature_dim=data["in_channels"], bias=False)
 
-            conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-            our_output = conv(features, our_graph)
-        elif backend_type == "torch_native_adj_mat":
-            graph_sample = create_graph_sample(
-                edge_index=data["edge_index"],
-                features=features,
-                backend="torch_native_adj_mat",
-                num_nodes=data["num_nodes"],
-                add_self_loops=False,
-            )
-
-            conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-            our_output = conv(features, graph_sample.graph_repr)
-        else:
-            raise ValueError("Incorrect backend passed; check parametrize for correctness")
+        our_output = conv(features, graph_sample.graph_repr)
 
         # ===== Compare Outputs =====
         max_abs_diff = (gt - our_output).abs().max().item()
@@ -309,7 +250,8 @@ class TestAggregationCorrectness:
 
 class TestAggregationEquivalence:
     """
-    Test equivalence of implementation outputs on hard graph samples
+    Test equivalence of implementation outputs on hard graph samples.
+    Compares scatter-based torch_native vs sparse-COO torch_native_adj_mat.
     """
 
     @pytest.mark.parametrize(
@@ -322,26 +264,21 @@ class TestAggregationEquivalence:
         """
         Test equivalence of output of our implementations on Karate Club graph.
         """
-
-        try:
-            import dgl
-            import dgl.ops as dgl_ops
-        except ImportError:
-            pytest.skip("DGL not installed - cannot verify correctness")
-
         data = karate_like_club_graph
         features = data["features"]
 
-        # ===== two outputs =====
-
-        our_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-            data["device"]
+        # ===== scatter-based output =====
+        scatter_graph = create_graph_sample(
+            edge_index=data["edge_index"],
+            features=features,
+            backend="torch_native",
+            num_nodes=data["num_nodes"],
+            add_self_loops=False,
         )
+        conv_scatter = create_conv_layer("torch_native", aggr_type, feature_dim=data["in_channels"], bias=False)
+        scatter_output = conv_scatter(features, scatter_graph.graph_repr)
 
-        conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-        dgl_output = conv(features, our_graph)
-
+        # ===== sparse COO output =====
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
@@ -349,27 +286,25 @@ class TestAggregationEquivalence:
             num_nodes=data["num_nodes"],
             add_self_loops=False,
         )
-
         conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
-
         native_output = conv(features, graph_sample.graph_repr)
 
         # ===== Compare Outputs =====
-        max_abs_diff = (dgl_output - native_output).abs().max().item()
-        mean_abs_diff = (dgl_output - native_output).abs().mean().item()
+        max_abs_diff = (scatter_output - native_output).abs().max().item()
+        mean_abs_diff = (scatter_output - native_output).abs().mean().item()
 
         # Relative error (avoid division by zero*)
-        relative_error = ((dgl_output - native_output).abs() / (dgl_output.abs() + 1e-8)).mean().item()
+        relative_error = ((scatter_output - native_output).abs() / (scatter_output.abs() + 1e-8)).mean().item()
 
-        print("\nComparison with ground truth:")
+        print("\nComparison scatter vs sparse COO:")
         print(f"  Max absolute difference:  {max_abs_diff:.8e}")
         print(f"  Mean absolute difference: {mean_abs_diff:.8e}")
         print(f"  Mean relative error:      {relative_error:.8e}")
 
         # Assert numerical equivalence
         assert torch.allclose(
-            dgl_output, native_output, atol=1e-6, rtol=1e-5
-        ), f"Output doesn't match ground truth: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
+            scatter_output, native_output, atol=1e-6, rtol=1e-5
+        ), f"Output doesn't match: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
 
     @pytest.mark.parametrize(
         "gt_key, aggr_type",
@@ -381,26 +316,21 @@ class TestAggregationEquivalence:
         """
         Test equivalence of output of our implementations on random graph fixture.
         """
-
-        try:
-            import dgl
-            import dgl.ops as dgl_ops
-        except ImportError:
-            pytest.skip("DGL not installed - cannot verify correctness")
-
         data = random_graph_data
         features = data["features"]
 
-        # ===== two outputs =====
-
-        our_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-            data["device"]
+        # ===== scatter-based output =====
+        scatter_graph = create_graph_sample(
+            edge_index=data["edge_index"],
+            features=features,
+            backend="torch_native",
+            num_nodes=data["num_nodes"],
+            add_self_loops=False,
         )
+        conv_scatter = create_conv_layer("torch_native", aggr_type, feature_dim=data["in_channels"], bias=False)
+        scatter_output = conv_scatter(features, scatter_graph.graph_repr)
 
-        conv = create_conv_layer("dgl", aggr_type, feature_dim=data["in_channels"], bias=False)
-
-        dgl_output = conv(features, our_graph)
-
+        # ===== sparse COO output =====
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
@@ -408,27 +338,25 @@ class TestAggregationEquivalence:
             num_nodes=data["num_nodes"],
             add_self_loops=False,
         )
-
         conv = create_conv_layer("torch_native_adj_mat", aggr_type, feature_dim=data["in_channels"], bias=False)
-
         native_output = conv(features, graph_sample.graph_repr)
 
         # ===== Compare Outputs =====
-        max_abs_diff = (dgl_output - native_output).abs().max().item()
-        mean_abs_diff = (dgl_output - native_output).abs().mean().item()
+        max_abs_diff = (scatter_output - native_output).abs().max().item()
+        mean_abs_diff = (scatter_output - native_output).abs().mean().item()
 
         # Relative error (avoid division by zero*)
-        relative_error = ((dgl_output - native_output).abs() / (dgl_output.abs() + 1e-8)).mean().item()
+        relative_error = ((scatter_output - native_output).abs() / (scatter_output.abs() + 1e-8)).mean().item()
 
-        print("\nComparison with ground truth:")
+        print("\nComparison scatter vs sparse COO:")
         print(f"  Max absolute difference:  {max_abs_diff:.8e}")
         print(f"  Mean absolute difference: {mean_abs_diff:.8e}")
         print(f"  Mean relative error:      {relative_error:.8e}")
 
         # Assert numerical equivalence
         assert torch.allclose(
-            dgl_output, native_output, atol=1e-6, rtol=1e-5
-        ), f"Output doesn't match ground truth: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
+            scatter_output, native_output, atol=1e-6, rtol=1e-5
+        ), f"Output doesn't match: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
 
 
 if __name__ == "__main__":

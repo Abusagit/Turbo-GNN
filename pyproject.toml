@@ -1,15 +1,13 @@
 [build-system]
-requires = ["setuptools>=65.0", "wheel", "torch>=2.0.0", "ninja", "packaging", "psutil"]
+requires = ["setuptools", "wheel", "ninja", "packaging", "psutil"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "turbo-gnn"
-version = "0.1.0rc2"
+version = "0.1.0rc4"
 description = "High-performance CUDA kernels for GNN aggregation, with a comprehensive benchmarking framework"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "BSD-3-Clause"
-license-files = ["LICENSE*"]
 
 authors = []
 keywords = [
@@ -34,12 +32,19 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-dependencies = ["torch>=2.0.0", "numpy<2.0"]
+dependencies = ["torch>=2.0.0", "numpy"]
 
 [project.optional-dependencies]
-research = [
-    "torch>=2.4.0",
-    "numpy<2.0",
+# ---------------------------------------------------------------------------
+# Dev: research + testing + linting (no DGL, works with torch>=2.9)
+# Usage: pip install -e ".[dev]"
+# ---------------------------------------------------------------------------
+dev = [
+    # torch version is NOT pinned here; the Makefile bootstrap step
+    # pre-installs the right torch before `pip install -e ".[dev]"` runs.
+    # Base constraint (torch>=2.0.0) comes from [project].dependencies.
+    "numpy",
+    # research deps
     "scipy>=1.7.0",
     "pandas>=1.5.0",
     "scikit-learn>=1.0.0",
@@ -48,45 +53,11 @@ research = [
     "tensorboard>=2.10.0",
     "psutil>=5.9.0",
     "ogb>=1.3.0",
-    "torchdata==0.9.0",
     "python-dotenv",
     "tabulate",
-]
-
-pyg = [
+    # pyg (core only; C++ extensions like torch-scatter not needed)
     "torch-geometric",
-    "torch-scatter",
-    "torch-sparse",
-    "torch-cluster",
-    "torch-spline-conv",
-]
-
-cugraph = [
-    "pylibcugraphops-cu12",
-]
-
-dgl = [
-    "dgl==2.4.0",
-]
-
-viz = [
-    "matplotlib>=3.5.0",
-    "seaborn>=0.12.0",
-    "plotly>=5.0.0",
-]
-
-notebook = [
-    "jupyterlab>=3.0.0",
-    "ipywidgets>=7.6.0",
-    "ipython>=8.0.0",
-]
-
-tracking = [
-    "comet_ml>=3.53.2",
-    "python-dotenv",
-]
-
-lint = [
+    # lint
     "ruff==0.14.0",
     "pre-commit>=3.0.0",
     "mypy>=0.990",
@@ -94,22 +65,41 @@ lint = [
     "isort>=5.11.0",
     "types-PyYAML>=6.0.0",
     "types-tqdm>=4.65.0",
-]
-
-test = [
-    "turbo-gnn[research,pyg,dgl,lint]",
+    # test
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
-]
-
-dev = [
-    "turbo-gnn[test]",
+    # triton / cutlass
     "nvidia-cutlass-dsl==4.3.0.dev0",
 ]
 
+# ---------------------------------------------------------------------------
+# Bench: dev + DGL + viz + cugraph (requires torch==2.4.0 for DGL 2.4.0)
+# Usage: pip install -e ".[bench]"
+# ---------------------------------------------------------------------------
+bench = [
+    "turbo-gnn[dev]",
+    # DGL (requires torch==2.4.0)
+    "torch==2.4.0",
+    "dgl==2.4.0",
+    # viz
+    "matplotlib>=3.5.0",
+    "seaborn>=0.12.0",
+    "plotly>=5.0.0",
+    # cugraph
+    "pylibcugraphops-cu12",
+]
+
+# ---------------------------------------------------------------------------
+# Full: bench + notebook + experiment tracking
+# Usage: pip install -e ".[full]"
+# ---------------------------------------------------------------------------
 full = [
-    "turbo-gnn[test,viz,notebook,tracking,cugraph]",
+    "turbo-gnn[bench]",
+    "jupyterlab>=3.0.0",
+    "ipywidgets>=7.6.0",
+    "ipython>=8.0.0",
+    "comet_ml>=3.53.2",
 ]
 
 [project.scripts]

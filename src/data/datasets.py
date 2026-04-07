@@ -2,11 +2,8 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Dict, Literal, Mapping, Optional, Tuple
 
-import dgl.data as dgl_data
 import torch
 import torch_geometric.datasets as pyg_datasets
-from dgl import add_self_loop
-from dgl import graph as dgl_graph
 from ogb.nodeproppred import NodePropPredDataset
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
@@ -64,6 +61,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     "cusparse": "csr",
     "cusparse_precomputed_bwd": "csr_and_csr_T_for_cusparse",
     "fusegnn": "coo",
+    "torch_native": "coo",
     "tcgnn": "tcgnn",
     "triton_block_sparse": "weighted_sparse_block",
     "cuda": "csr_and_csr_transposed",
@@ -191,6 +189,9 @@ class GraphSample:
                 self.edge_index, self.edge_weight = add_self_loops_pyg(self.edge_index, self.edge_weight)
             graph = (self._to_default_device(self.edge_index), self._to_default_device(self.edge_weight))
         elif self.backend == "dgl":
+            from dgl import add_self_loop
+            from dgl import graph as dgl_graph
+
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             if self.edge_weight is not None:
                 graph.edata["w"] = self.edge_weight
@@ -388,6 +389,8 @@ class GraphSample:
             # TODO add light & heavy vertices
 
         elif self.backend == "dfgnn":
+            from dgl import graph as dgl_graph
+
             graph = dgl_graph((self.edge_index[0], self.edge_index[1]), num_nodes=self.num_nodes)
             graph = to_dfgnn_data(graph)
             graph = [self._to_default_device(item) for item in graph]
@@ -816,6 +819,8 @@ def load_dgl_single_graph(
 
     @ensure_cpu_device
     def _load_dgl_cpu():
+        import dgl.data as dgl_data
+
         if name == "cora":
             dset = dgl_data.CoraGraphDataset(raw_dir=root)
         elif name == "citeseer":

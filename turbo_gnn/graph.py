@@ -69,6 +69,31 @@ def build_csr_as_is(
 
 @dataclass
 class AdjacencyForwardBackwardWithNodeBuckets:
+    """Dual-CSR graph representation with degree-based node bucketing.
+
+    Stores a graph as two CSR matrices (forward and backward/transposed) plus
+    per-direction node partitions into "light" (low-degree) and "heavy"
+    (high-degree) buckets.  This layout is consumed by all turbo_gnn CUDA
+    kernels:
+
+    - **Forward CSR** (``forward_indptr``, ``forward_indices``): rows are
+      destination nodes, columns are source nodes.  Used in the forward pass
+      to gather neighbor features into each destination.
+    - **Backward CSR** (``backward_indptr``, ``backward_indices``): the
+      transpose -- rows are source nodes, columns are destination nodes.
+      Used in the backward pass to scatter gradients back to sources.
+    - **Node buckets**: light/heavy partitions let kernels choose different
+      execution strategies per node (e.g. atomic writes for light nodes vs.
+      tiled reductions for heavy nodes).
+
+    All index tensors must share the same dtype (int32 or int64).  Unsigned
+    dtypes (uint32) are supported and converted internally via
+    ``_to_signed_view`` for arithmetic.
+
+    Construct via :meth:`from_edge_list`, :meth:`from_csr`, or
+    :meth:`from_dgl`.
+    """
+
     forward_indptr: torch.Tensor
     forward_indices: torch.Tensor
     backward_indptr: torch.Tensor
