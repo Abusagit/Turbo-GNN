@@ -202,6 +202,9 @@ class TestGTUndirectedKernel:
         except ImportError:
             pytest.skip("turbo_gnn C extension not available")
 
+        all_nodes = torch.arange(num_nodes, device=device, dtype=torch.int32)
+        empty_nodes = torch.tensor([], dtype=torch.int32, device=device)
+
         # Directed backward
         Q_d = Q.detach().clone().requires_grad_(True)
         K_d = K.detach().clone().requires_grad_(True)
@@ -215,7 +218,15 @@ class TestGTUndirectedKernel:
             K_d,
             V_d,
             scale,
-            True,
+            all_nodes,
+            empty_nodes,  # fwd light/heavy
+            all_nodes,
+            empty_nodes,  # bwd light/heavy
+            1,
+            8,
+            1,
+            8,  # light/heavy warps fwd/bwd
+            True,  # is_directed
         )
         grad_out = torch.randn_like(out_d)
         out_d.backward(grad_out)
@@ -233,7 +244,15 @@ class TestGTUndirectedKernel:
             K_u,
             V_u,
             scale,
-            False,
+            all_nodes,
+            empty_nodes,  # fwd light/heavy
+            all_nodes,
+            empty_nodes,  # bwd light/heavy
+            1,
+            8,
+            1,
+            8,  # light/heavy warps fwd/bwd
+            False,  # is_directed
         )
         out_u.backward(grad_out)
 
@@ -280,6 +299,9 @@ class TestGATv2UndirectedKernel:
         except ImportError:
             pytest.skip("turbo_gnn C extension not available")
 
+        all_nodes = torch.arange(num_nodes, device=device, dtype=torch.int32)
+        empty_nodes = torch.tensor([], dtype=torch.int32, device=device)
+
         # Directed backward
         xl_d = x_left.detach().clone().requires_grad_(True)
         xr_d = x_right.detach().clone().requires_grad_(True)
@@ -294,7 +316,15 @@ class TestGATv2UndirectedKernel:
             aw_d,
             negative_slope,
             512,
-            True,
+            all_nodes,
+            empty_nodes,  # fwd light/heavy
+            all_nodes,
+            empty_nodes,  # bwd light/heavy
+            1,
+            8,
+            1,
+            8,  # light/heavy warps fwd/bwd
+            True,  # is_directed
         )
         grad_out = torch.randn_like(out_d)
         out_d.backward(grad_out)
@@ -313,7 +343,15 @@ class TestGATv2UndirectedKernel:
             aw_u,
             negative_slope,
             512,
-            False,
+            all_nodes,
+            empty_nodes,  # fwd light/heavy
+            all_nodes,
+            empty_nodes,  # bwd light/heavy
+            1,
+            8,
+            1,
+            8,  # light/heavy warps fwd/bwd
+            False,  # is_directed
         )
         out_u.backward(grad_out)
 
