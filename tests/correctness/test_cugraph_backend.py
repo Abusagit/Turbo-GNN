@@ -12,7 +12,6 @@ from fixtures import (
     small_graph_data,
 )
 
-from src.backends.cugraph_backend import CugraphBackend
 from src.backends.registry import BackendRegistry
 
 try:
@@ -29,95 +28,43 @@ class TestCugraphBasicAggregation:
     """Test basic aggregation operations (sum/mean/min/max)."""
 
     @pytest.mark.parametrize("aggr_type", ["sum", "mean", "min", "max"])
-    def test_mean_aggregation_matches_dgl(
+    def test_aggregation_matches_torch_native(
         self, aggr_type, karate_like_club_graph, create_graph_sample, create_conv_layer
     ):
-        """Test that cugraph mean aggregation matches DGL's copy_u_mean."""
-        try:
-            import dgl
-            import dgl.ops as dgl_ops
-        except ImportError:
-            pytest.skip("DGL not installed - cannot verify correctness")
-
+        """Test that cugraph aggregation matches torch_native scatter reference."""
         data = karate_like_club_graph
         features = data["features"]
 
-        dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-            data["device"]
+        # ===== torch_native scatter reference =====
+        ref_graph_sample = create_graph_sample(
+            edge_index=data["edge_index"],
+            features=features,
+            backend="torch_native",
+            num_nodes=data["num_nodes"],
         )
-        dgl_graph = dgl.add_self_loop(dgl_graph)
+        ref_conv = create_conv_layer("torch_native", f"{aggr_type}_aggr", feature_dim=data["in_channels"], bias=False)
+        ref_output = ref_conv(features, ref_graph_sample.graph_repr)
 
+        # ===== CuGraph =====
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
             backend="cugraph",
             num_nodes=data["num_nodes"],
         )
-
-        match aggr_type:
-            case "sum":
-                dgl_op = dgl_ops.copy_u_sum
-            case "mean":
-                dgl_op = dgl_ops.copy_u_mean
-            case "min":
-                dgl_op = dgl_ops.copy_u_min
-            case "max":
-                dgl_op = dgl_ops.copy_u_max
-
-        dgl_output = dgl_op(dgl_graph, features)
         conv = create_conv_layer("cugraph", f"{aggr_type}_aggr", feature_dim=data["in_channels"], bias=False)
         cugraph_output = conv(features, graph_sample.graph_repr)
 
         assert torch.allclose(
-            cugraph_output, dgl_output, atol=1e-6, rtol=1e-5
-        ), f"CuGraph {aggr_type} aggregation doesn't match DGL"
+            cugraph_output, ref_output, atol=1e-6, rtol=1e-5
+        ), f"CuGraph {aggr_type} aggregation doesn't match torch_native reference"
 
 
 class TestCugraphGATv2:
     """Test GATv2 convolution with cugraph backend."""
 
     @pytest.mark.parametrize("heads", [1, 4])
-    def test_gatv2_matches_dgl(self, heads, karate_like_club_graph, create_graph_sample, create_conv_layer):
-        """Test that cugraph GATv2 matches DGL's GATv2Conv."""
-        try:
-            import dgl
-            from dgl.nn.pytorch.conv import GATv2Conv
-        except ImportError:
-            pytest.skip("DGL not installed")
-
-        data = karate_like_club_graph
-        features = data["features"]
-        feature_dim = data["in_channels"]
-
-        dgl_conv = GATv2Conv(
-            in_feats=feature_dim, out_feats=feature_dim, num_heads=heads, bias=False, allow_zero_in_degree=True
-        ).to(data["device"])
-
-        dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-            data["device"]
-        )
-        cugraph_conv = create_conv_layer("cugraph", "gat_v2", feature_dim=feature_dim, heads=heads, bias=False)
-
-        with torch.no_grad():
-            cugraph_conv.linear_gat_projection.weight.data = dgl_conv.fc_src.weight.data.clone()
-            cugraph_conv.attn_weights.data = dgl_conv.attn.data.flatten().clone()
-            cugraph_conv.outer_projection = torch.nn.Identity()
-
-        dgl_output = dgl_conv(dgl_graph, features, get_attention=False)
-        dgl_output = dgl_output.view(data["num_nodes"], -1)
-
-        graph_sample = create_graph_sample(
-            edge_index=data["edge_index"],
-            features=features,
-            backend="cugraph",
-            num_nodes=data["num_nodes"],
-        )
-        cugraph_output = cugraph_conv(features, graph_sample.graph_repr)
-
-        assert cugraph_output.shape == dgl_output.shape
-        assert not torch.isnan(cugraph_output).any()
-
-    def test_gatv2_forward_backward(self, karate_like_club_graph, create_graph_sample, create_conv_layer):
+    def test_gatv2_forward_backward(self, heads, karate_like_club_graph, create_graph_sample, create_conv_layer):
         """Test GATv2 forward and backward passes."""
         data = karate_like_club_graph
         features = data["features"].clone().requires_grad_(True)
@@ -129,7 +76,7 @@ class TestCugraphGATv2:
             num_nodes=data["num_nodes"],
         )
 
-        conv = create_conv_layer("cugraph", "gat_v2", feature_dim=data["in_channels"], heads=4, bias=False)
+        conv = create_conv_layer("cugraph", "gat_v2", feature_dim=data["in_channels"], heads=heads, bias=False)
 
         output = conv(features, graph_sample.graph_repr)
         assert output.shape == (data["num_nodes"], 16)

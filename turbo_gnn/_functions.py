@@ -1,4 +1,9 @@
-"""All torch.autograd.Function subclasses wrapping turbo_gnn._C kernels."""
+"""torch.autograd.Function subclasses wrapping turbo_gnn._C CUDA kernels.
+
+Each class bridges the Python API (:mod:`turbo_gnn.ops`) to the C++/CUDA
+extension module (``turbo_gnn._C``), implementing custom forward/backward
+passes with AMP support (``custom_fwd`` / ``custom_bwd``).
+"""
 
 from __future__ import annotations
 
@@ -25,6 +30,16 @@ def _next_power_of_two(x):
 
 
 class ReductionAggrFunction(torch.autograd.Function):
+    """Min/max reduction aggregation over CSR neighbors.
+
+    Forward: calls ``_C.reduction_aggr_forward_partitioned`` which splits nodes
+    into light (atomic kernel) and heavy (tiled reduction kernel) buckets.
+    Saves argmin/argmax indices for the backward pass.
+
+    Backward: scatters ``grad_out`` to source nodes using the saved arg indices
+    via ``_C.reduction_aggr_backward`` (only the "winning" source gets gradient).
+    """
+
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(
@@ -92,6 +107,20 @@ class ReductionAggrFunction(torch.autograd.Function):
 
 
 class gatv2_function(torch.autograd.Function):
+    """GATv2 fused forward/backward pass.
+
+    Forward (``_C.gatv2_forward``): for each edge (u -> v), computes
+    ``e = attn^T * LeakyReLU(x_left[v] + x_right[u])``, applies numerically
+    stable edge softmax (returns log-sum-exp for backward), and aggregates
+    ``out[v] = sum alpha_{uv} * x_right[u]``.
+
+    Backward (``_C.gatv2_backward``): computes gradients for x_left, x_right,
+    and attention weights. The backward kernel walks the *transposed* CSR
+    (backward adjacency) to scatter gradients to source nodes. The
+    ``grad_A_reduce_row_chunk_size`` parameter controls shared-memory usage
+    in the attention-gradient reduction kernel.
+    """
+
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(
@@ -177,9 +206,22 @@ class gatv2_function(torch.autograd.Function):
 
 
 class _FusedGraphAttention(torch.autograd.Function):
+    """Fused multi-head graph transformer attention (forward + backward).
+
+    Forward (``_C.gt_forward_csr_mh``): computes per-edge dot-product attention
+    scores ``Q[src] . K[dst] * scale``, edge softmax via log-sum-exp, and
+    weighted value aggregation -- all in a single kernel over the forward CSR.
+
+    Backward (``_C.gt_backward_csr_mh``): computes dQ, dK, dV using the
+    transposed CSR (backward adjacency) and the saved logsumexp + output
+    tensors for the softmax Jacobian.
+    """
+
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
+
     def forward(ctx, edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale, is_directed):
+        scale = scale or 1 / (Q.shape[-1] ** 0.5)
         out, logsumexp = _C.gt_forward_csr_mh(edge_ptr, edge_idx, Q, K, V, scale)
 
         ctx.scale = scale
@@ -265,7 +307,26 @@ def csr_SPMM_normalized(
     do_transpose_a=False,
     block_dim=256,
 ):
-    """Normalized SpMM operation supporting different GCN normalization schemes."""
+    """Normalized SpMM: ``out = norm(A) @ features`` via cuSPARSE.
+
+    Wraps ``_C.csr_SPMM_normalized`` which computes degree-based normalization
+    weights on the fly and calls ``cusparseSpMM``.
+
+    Args:
+        indptr: CSR row pointers, shape ``[N+1]``.
+        indices: CSR column indices, shape ``[E]``.
+        features: Node feature matrix, shape ``[N, F]``.
+        edge_weights: Optional per-edge weights, shape ``[E]``. None = all ones.
+        norm: Normalization mode -- ``"none"`` (sum), ``"right"`` (mean),
+            ``"left"`` (random-walk), ``"both"`` (symmetric GCN).
+        algorithm: cuSPARSE algorithm id (-1 = auto select).
+        use_cache: Cache the cuSPARSE descriptor across calls.
+        do_transpose_a: If True, multiply by A^T instead of A (used in backward).
+        block_dim: CUDA block size for the normalization pre-pass kernel.
+
+    Returns:
+        Result tensor, shape ``[N, F]``.
+    """
     if edge_weights is None:
         edge_weights_gpu = torch.empty(0, device=features.device, dtype=torch.float32)
     else:

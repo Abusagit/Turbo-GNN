@@ -9,7 +9,26 @@ from turbo_gnn._functions import ReductionAggrFunction, _FusedGraphAttention, ga
 
 
 class ReductionAggrKernel(TunableKernel):
-    """Tunable kernel callable for reduction aggregation (min/max)."""
+    """Tunable kernel for min/max neighbor aggregation.
+
+    Tunable forward parameters (grid-searched during autotuning):
+
+    - ``forward_warps_per_block``: warps per CUDA block for the light-node
+      atomic kernel. More warps = higher occupancy but diminishing returns
+      when feature dim is small.
+    - ``forward_edges_per_block_heavy_nodes``: edges processed per block in
+      the heavy-node tiled kernel. Larger values amortize launch overhead
+      but increase register pressure.
+    - ``forward_use_2d_kernel``: whether to use the 2-D tiled kernel variant
+      for heavy nodes (tiles over both edges and features).
+    - ``forward_features_per_block``, ``forward_tiles_y``: tile dimensions
+      for the 2-D kernel.
+
+    Tunable graph parameter:
+
+    - ``forward_huge_degree_threshold_quantile``: degree quantile for the
+      light/heavy partition (-1 disables bucketing, all nodes go to light).
+    """
 
     def __init__(self, reduce: str = "min", **kwargs):
         super().__init__()
@@ -52,7 +71,21 @@ class ReductionAggrKernel(TunableKernel):
 
 
 class GATv2AggrKernel(TunableKernel):
-    """Tunable kernel callable for GATv2 aggregation."""
+    """Tunable kernel for GATv2 attention aggregation.
+
+    Tunable backward parameter:
+
+    - ``backward_grad_A_reduce_row_chunk_size``: number of destination-node
+      rows reduced per shared-memory pass when computing attention gradients.
+      Larger chunks reduce kernel launches but increase shared memory usage.
+
+    Tunable graph parameters (forward and backward):
+
+    - ``forward_huge_degree_threshold_quantile``: light/heavy partition for
+      the forward adjacency.
+    - ``backward_huge_degree_threshold_quantile``: light/heavy partition for
+      the backward (transposed) adjacency used in the gradient kernel.
+    """
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -105,7 +138,16 @@ class GATv2AggrKernel(TunableKernel):
 
 
 class GraphTransformerAggrKernel(TunableKernel):
-    """Tunable kernel callable for fused graph transformer attention."""
+    """Tunable kernel for fused multi-head graph transformer attention.
+
+    No tunable kernel parameters (the kernel is fully fused).  Only graph
+    partitioning can be tuned:
+
+    - ``forward_huge_degree_threshold_quantile``: light/heavy partition for
+      the forward CSR.
+    - ``backward_huge_degree_threshold_quantile``: light/heavy partition for
+      the backward CSR.
+    """
 
     def __init__(self):
         super().__init__()
