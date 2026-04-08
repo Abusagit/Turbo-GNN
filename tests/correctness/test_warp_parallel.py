@@ -15,12 +15,11 @@ _project_root = str(Path(__file__).resolve().parent.parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from turbo_gnn._functions import _FusedGraphAttention, gatv2_function  # noqa: E402
 from turbo_gnn.graph import (  # noqa: E402
     AdjacencyForwardBackwardWithNodeBuckets,
     build_csr_as_is,
 )
-from turbo_gnn._functions import _FusedGraphAttention, gatv2_function  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,7 +42,10 @@ def make_graph(N, E_approx, device="cuda", seed=42):
 def build_graph_with_buckets(edge_index, num_nodes, quantile=-1):
     """Build graph with node bucketing. quantile=-1 puts all nodes in light."""
     return AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
-        edge_index, num_nodes, quantile=quantile, index_dtype=torch.int32,
+        edge_index,
+        num_nodes,
+        quantile=quantile,
+        index_dtype=torch.int32,
     )
 
 
@@ -53,15 +55,26 @@ def run_gt_forward_backward(graph, N, H, D, light_w, heavy_w, seed=42):
     Q = torch.randn(N, H, D, device="cuda", requires_grad=True)
     K = torch.randn(N, H, D, device="cuda", requires_grad=True)
     V = torch.randn(N, H, D, device="cuda", requires_grad=True)
-    scale = D ** -0.5
+    scale = D**-0.5
 
     out = _FusedGraphAttention.apply(
-        graph.forward_indptr, graph.forward_indices,
-        graph.backward_indptr, graph.backward_indices,
-        Q, K, V, scale,
-        graph.forward_light_nodes, graph.forward_heavy_nodes,
-        graph.backward_light_nodes, graph.backward_heavy_nodes,
-        light_w, heavy_w, light_w, heavy_w,
+        graph.forward_indptr,
+        graph.forward_indices,
+        graph.backward_indptr,
+        graph.backward_indices,
+        Q,
+        K,
+        V,
+        scale,
+        graph.forward_light_nodes,
+        graph.forward_heavy_nodes,
+        graph.backward_light_nodes,
+        graph.backward_heavy_nodes,
+        light_w,
+        heavy_w,
+        light_w,
+        heavy_w,
+        True,  # is_directed
     )
 
     torch.manual_seed(seed + 1000)
@@ -79,12 +92,24 @@ def run_gatv2_forward_backward(graph, N, H, D, light_w, heavy_w, seed=42):
     aw = torch.randn(H, D, device="cuda", requires_grad=True)
 
     out = gatv2_function.apply(
-        graph.forward_indptr, graph.forward_indices,
-        graph.backward_indptr, graph.backward_indices,
-        xl, xr, aw, 0.2, 512,
-        graph.forward_light_nodes, graph.forward_heavy_nodes,
-        graph.backward_light_nodes, graph.backward_heavy_nodes,
-        light_w, heavy_w, light_w, heavy_w,
+        graph.forward_indptr,
+        graph.forward_indices,
+        graph.backward_indptr,
+        graph.backward_indices,
+        xl,
+        xr,
+        aw,
+        0.2,
+        512,
+        graph.forward_light_nodes,
+        graph.forward_heavy_nodes,
+        graph.backward_light_nodes,
+        graph.backward_heavy_nodes,
+        light_w,
+        heavy_w,
+        light_w,
+        heavy_w,
+        True,  # is_directed
     )
 
     torch.manual_seed(seed + 1000)
@@ -113,13 +138,13 @@ class TestGTWarpSweep:
         out_test, dQ_test, dK_test, dV_test = run_gt_forward_backward(graph, N, H, D, warps, 8)
 
         atol_fwd, atol_bwd = 1e-4, 1e-3
-        assert torch.allclose(out_ref, out_test, atol=atol_fwd, rtol=atol_fwd), (
-            f"GT fwd W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
-        )
+        assert torch.allclose(
+            out_ref, out_test, atol=atol_fwd, rtol=atol_fwd
+        ), f"GT fwd W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
         for name, ref, test in [("dQ", dQ_ref, dQ_test), ("dK", dK_ref, dK_test), ("dV", dV_ref, dV_test)]:
-            assert torch.allclose(ref, test, atol=atol_bwd, rtol=atol_bwd), (
-                f"GT {name} W={warps}: max diff {(ref - test).abs().max():.3e}"
-            )
+            assert torch.allclose(
+                ref, test, atol=atol_bwd, rtol=atol_bwd
+            ), f"GT {name} W={warps}: max diff {(ref - test).abs().max():.3e}"
 
     @pytest.mark.parametrize("warps", [8, 16, 32])
     def test_gt_forward_heavy_warp_sweep(self, warps):
@@ -133,23 +158,27 @@ class TestGTWarpSweep:
         all_nodes = torch.arange(N, device="cuda", dtype=torch.int32)
 
         graph = AdjacencyForwardBackwardWithNodeBuckets(
-            forward_indptr=fwd_indptr.int(), forward_indices=fwd_indices.int(),
-            backward_indptr=bwd_indptr.int(), backward_indices=bwd_indices.int(),
-            forward_light_nodes=empty, forward_heavy_nodes=all_nodes,
-            backward_light_nodes=empty, backward_heavy_nodes=all_nodes,
+            forward_indptr=fwd_indptr.int(),
+            forward_indices=fwd_indices.int(),
+            backward_indptr=bwd_indptr.int(),
+            backward_indices=bwd_indices.int(),
+            forward_light_nodes=empty,
+            forward_heavy_nodes=all_nodes,
+            backward_light_nodes=empty,
+            backward_heavy_nodes=all_nodes,
         )
 
         out_ref, dQ_ref, dK_ref, dV_ref = run_gt_forward_backward(graph, N, H, D, 1, 8)
         out_test, dQ_test, dK_test, dV_test = run_gt_forward_backward(graph, N, H, D, 1, warps)
 
         atol_fwd, atol_bwd = 1e-4, 1e-3
-        assert torch.allclose(out_ref, out_test, atol=atol_fwd, rtol=atol_fwd), (
-            f"GT fwd heavy W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
-        )
+        assert torch.allclose(
+            out_ref, out_test, atol=atol_fwd, rtol=atol_fwd
+        ), f"GT fwd heavy W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
         for name, ref, test in [("dQ", dQ_ref, dQ_test), ("dK", dK_ref, dK_test), ("dV", dV_ref, dV_test)]:
-            assert torch.allclose(ref, test, atol=atol_bwd, rtol=atol_bwd), (
-                f"GT {name} heavy W={warps}: max diff {(ref - test).abs().max():.3e}"
-            )
+            assert torch.allclose(
+                ref, test, atol=atol_bwd, rtol=atol_bwd
+            ), f"GT {name} heavy W={warps}: max diff {(ref - test).abs().max():.3e}"
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +200,13 @@ class TestGATv2WarpSweep:
         out_test, gl_test, gr_test, ga_test = run_gatv2_forward_backward(graph, N, H, D, warps, 8)
 
         atol_fwd, atol_bwd = 1e-4, 1e-3
-        assert torch.allclose(out_ref, out_test, atol=atol_fwd, rtol=atol_fwd), (
-            f"GATv2 fwd W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
-        )
+        assert torch.allclose(
+            out_ref, out_test, atol=atol_fwd, rtol=atol_fwd
+        ), f"GATv2 fwd W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
         for name, ref, test in [("grad_l", gl_ref, gl_test), ("grad_r", gr_ref, gr_test), ("grad_a", ga_ref, ga_test)]:
-            assert torch.allclose(ref, test, atol=atol_bwd, rtol=atol_bwd), (
-                f"GATv2 {name} W={warps}: max diff {(ref - test).abs().max():.3e}"
-            )
+            assert torch.allclose(
+                ref, test, atol=atol_bwd, rtol=atol_bwd
+            ), f"GATv2 {name} W={warps}: max diff {(ref - test).abs().max():.3e}"
 
     @pytest.mark.parametrize("warps", [8, 16, 32])
     def test_gatv2_heavy_warp_sweep(self, warps):
@@ -189,23 +218,27 @@ class TestGATv2WarpSweep:
         all_nodes = torch.arange(N, device="cuda", dtype=torch.int32)
 
         graph = AdjacencyForwardBackwardWithNodeBuckets(
-            forward_indptr=fwd_indptr.int(), forward_indices=fwd_indices.int(),
-            backward_indptr=bwd_indptr.int(), backward_indices=bwd_indices.int(),
-            forward_light_nodes=empty, forward_heavy_nodes=all_nodes,
-            backward_light_nodes=empty, backward_heavy_nodes=all_nodes,
+            forward_indptr=fwd_indptr.int(),
+            forward_indices=fwd_indices.int(),
+            backward_indptr=bwd_indptr.int(),
+            backward_indices=bwd_indices.int(),
+            forward_light_nodes=empty,
+            forward_heavy_nodes=all_nodes,
+            backward_light_nodes=empty,
+            backward_heavy_nodes=all_nodes,
         )
 
         out_ref, gl_ref, gr_ref, ga_ref = run_gatv2_forward_backward(graph, N, H, D, 1, 8)
         out_test, gl_test, gr_test, ga_test = run_gatv2_forward_backward(graph, N, H, D, 1, warps)
 
         atol_fwd, atol_bwd = 1e-4, 1e-3
-        assert torch.allclose(out_ref, out_test, atol=atol_fwd, rtol=atol_fwd), (
-            f"GATv2 fwd heavy W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
-        )
+        assert torch.allclose(
+            out_ref, out_test, atol=atol_fwd, rtol=atol_fwd
+        ), f"GATv2 fwd heavy W={warps}: max diff {(out_ref - out_test).abs().max():.3e}"
         for name, ref, test in [("grad_l", gl_ref, gl_test), ("grad_r", gr_ref, gr_test), ("grad_a", ga_ref, ga_test)]:
-            assert torch.allclose(ref, test, atol=atol_bwd, rtol=atol_bwd), (
-                f"GATv2 {name} heavy W={warps}: max diff {(ref - test).abs().max():.3e}"
-            )
+            assert torch.allclose(
+                ref, test, atol=atol_bwd, rtol=atol_bwd
+            ), f"GATv2 {name} heavy W={warps}: max diff {(ref - test).abs().max():.3e}"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +257,13 @@ class TestLightHeavySplit:
         # Baseline: all nodes in light (W=1)
         graph_all_light = build_graph_with_buckets(edge_index, N, quantile=-1)
         out_ref, dQ_ref, dK_ref, dV_ref = run_gt_forward_backward(
-            graph_all_light, N, H, D, light_w=1, heavy_w=8, seed=99,
+            graph_all_light,
+            N,
+            H,
+            D,
+            light_w=1,
+            heavy_w=8,
+            seed=99,
         )
 
         # Split: quantile=0.9 separates light from heavy
@@ -234,17 +273,23 @@ class TestLightHeavySplit:
         assert n_light > 0 and n_heavy > 0, "Need both buckets non-empty for this test"
 
         out_test, dQ_test, dK_test, dV_test = run_gt_forward_backward(
-            graph_split, N, H, D, light_w=1, heavy_w=8, seed=99,
+            graph_split,
+            N,
+            H,
+            D,
+            light_w=1,
+            heavy_w=8,
+            seed=99,
         )
 
         atol_fwd, atol_bwd = 1e-4, 1e-3
-        assert torch.allclose(out_ref, out_test, atol=atol_fwd, rtol=atol_fwd), (
-            f"GT fwd split: max diff {(out_ref - out_test).abs().max():.3e}"
-        )
+        assert torch.allclose(
+            out_ref, out_test, atol=atol_fwd, rtol=atol_fwd
+        ), f"GT fwd split: max diff {(out_ref - out_test).abs().max():.3e}"
         for name, ref, test in [("dQ", dQ_ref, dQ_test), ("dK", dK_ref, dK_test), ("dV", dV_ref, dV_test)]:
-            assert torch.allclose(ref, test, atol=atol_bwd, rtol=atol_bwd), (
-                f"GT {name} split: max diff {(ref - test).abs().max():.3e}"
-            )
+            assert torch.allclose(
+                ref, test, atol=atol_bwd, rtol=atol_bwd
+            ), f"GT {name} split: max diff {(ref - test).abs().max():.3e}"
 
     def test_gatv2_light_heavy_split(self):
         N, H, D = 64, 2, 64
@@ -252,7 +297,13 @@ class TestLightHeavySplit:
 
         graph_all_light = build_graph_with_buckets(edge_index, N, quantile=-1)
         out_ref, gl_ref, gr_ref, ga_ref = run_gatv2_forward_backward(
-            graph_all_light, N, H, D, light_w=1, heavy_w=8, seed=99,
+            graph_all_light,
+            N,
+            H,
+            D,
+            light_w=1,
+            heavy_w=8,
+            seed=99,
         )
 
         graph_split = build_graph_with_buckets(edge_index, N, quantile=0.9)
@@ -261,17 +312,23 @@ class TestLightHeavySplit:
         assert n_light > 0 and n_heavy > 0, "Need both buckets non-empty for this test"
 
         out_test, gl_test, gr_test, ga_test = run_gatv2_forward_backward(
-            graph_split, N, H, D, light_w=1, heavy_w=8, seed=99,
+            graph_split,
+            N,
+            H,
+            D,
+            light_w=1,
+            heavy_w=8,
+            seed=99,
         )
 
         atol_fwd, atol_bwd = 1e-4, 1e-3
-        assert torch.allclose(out_ref, out_test, atol=atol_fwd, rtol=atol_fwd), (
-            f"GATv2 fwd split: max diff {(out_ref - out_test).abs().max():.3e}"
-        )
+        assert torch.allclose(
+            out_ref, out_test, atol=atol_fwd, rtol=atol_fwd
+        ), f"GATv2 fwd split: max diff {(out_ref - out_test).abs().max():.3e}"
         for name, ref, test in [("grad_l", gl_ref, gl_test), ("grad_r", gr_ref, gr_test), ("grad_a", ga_ref, ga_test)]:
-            assert torch.allclose(ref, test, atol=atol_bwd, rtol=atol_bwd), (
-                f"GATv2 {name} split: max diff {(ref - test).abs().max():.3e}"
-            )
+            assert torch.allclose(
+                ref, test, atol=atol_bwd, rtol=atol_bwd
+            ), f"GATv2 {name} split: max diff {(ref - test).abs().max():.3e}"
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +349,14 @@ class TestEdgeCases:
         all_nodes = torch.arange(N, device="cuda", dtype=torch.int32)
 
         graph = AdjacencyForwardBackwardWithNodeBuckets(
-            forward_indptr=fwd_indptr.int(), forward_indices=fwd_indices.int(),
-            backward_indptr=bwd_indptr.int(), backward_indices=bwd_indices.int(),
-            forward_light_nodes=empty, forward_heavy_nodes=all_nodes,
-            backward_light_nodes=empty, backward_heavy_nodes=all_nodes,
+            forward_indptr=fwd_indptr.int(),
+            forward_indices=fwd_indices.int(),
+            backward_indptr=bwd_indptr.int(),
+            backward_indices=bwd_indices.int(),
+            forward_light_nodes=empty,
+            forward_heavy_nodes=all_nodes,
+            backward_light_nodes=empty,
+            backward_heavy_nodes=all_nodes,
         )
         out, dQ, dK, dV = run_gt_forward_backward(graph, N, H, D, 1, 8)
         assert not out.isnan().any(), "NaN in output"

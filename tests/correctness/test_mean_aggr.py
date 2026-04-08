@@ -7,7 +7,6 @@ from fixtures import (
     create_conv_layer,
     create_graph_sample,
     device,
-    dgl_available,
     karate_like_club_graph,
     set_default_device,
 )
@@ -45,34 +44,26 @@ class TestBackendRegistration:
 
 
 class TestAggregationCorrectness:
-    """Test mean aggregation mathematical correctness against DGL."""
+    """Test mean aggregation mathematical correctness against scatter-based torch reference."""
 
-    def test_matches_dgl_copy_u_mean(self, karate_like_club_graph, create_graph_sample, create_conv_layer):
+    def test_matches_scatter_mean(self, karate_like_club_graph, create_graph_sample, create_conv_layer):
         """
-        Test that our mean aggregation matches DGL's copy_u_mean exactly.
-
-        This is the core correctness test: we compare our implementation with
-        DGL's reference implementation on the Karate Club graph.
+        Test that our sparse-matmul mean aggregation matches the scatter-based reference.
         """
-        try:
-            import dgl
-            import dgl.ops as dgl_ops
-        except ImportError:
-            pytest.skip("DGL not installed - cannot verify correctness")
-
         data = karate_like_club_graph
         features = data["features"]
-        out_channels = features.shape[1]
 
-        # ===== DGL Implementation =====
-        dgl_graph = dgl.graph((data["edge_index"][0], data["edge_index"][1]), num_nodes=data["num_nodes"]).to(
-            data["device"]
+        # ===== Scatter-based reference =====
+        ref_graph_sample = create_graph_sample(
+            edge_index=data["edge_index"],
+            features=features,
+            backend="torch_native",
+            num_nodes=data["num_nodes"],
         )
-        dgl_graph = dgl.add_self_loop(dgl_graph)
+        ref_conv = create_conv_layer("torch_native", "mean_aggr", feature_dim=data["in_channels"], bias=False)
+        ref_output = ref_conv(features, ref_graph_sample.graph_repr)
 
-        dgl_output = dgl_ops.copy_u_mean(dgl_graph, features)
-
-        # ===== Our Implementation =====
+        # ===== Our sparse-matmul Implementation =====
         graph_sample = create_graph_sample(
             edge_index=data["edge_index"],
             features=features,
@@ -85,21 +76,21 @@ class TestAggregationCorrectness:
         our_output = conv(features, graph_sample.graph_repr)
 
         # ===== Compare Outputs =====
-        max_abs_diff = (dgl_output - our_output).abs().max().item()
-        mean_abs_diff = (dgl_output - our_output).abs().mean().item()
+        max_abs_diff = (ref_output - our_output).abs().max().item()
+        mean_abs_diff = (ref_output - our_output).abs().mean().item()
 
         # Relative error (avoid division by zero)
-        relative_error = ((dgl_output - our_output).abs() / (dgl_output.abs() + 1e-8)).mean().item()
+        relative_error = ((ref_output - our_output).abs() / (ref_output.abs() + 1e-8)).mean().item()
 
-        print("\nComparison with DGL copy_u_mean:")
+        print("\nComparison with scatter-based mean reference:")
         print(f"  Max absolute difference:  {max_abs_diff:.8e}")
         print(f"  Mean absolute difference: {mean_abs_diff:.8e}")
         print(f"  Mean relative error:      {relative_error:.8e}")
 
         # Assert numerical equivalence
         assert torch.allclose(
-            our_output, dgl_output, atol=1e-6, rtol=1e-5
-        ), f"Output doesn't match DGL: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
+            our_output, ref_output, atol=1e-6, rtol=1e-5
+        ), f"Output doesn't match reference: max_diff={max_abs_diff:.8e}, mean_diff={mean_abs_diff:.8e}"
 
     def test_isolated_nodes_produce_zero(self, create_graph_sample, create_conv_layer, device):
         """
