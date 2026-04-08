@@ -141,6 +141,22 @@ std::variant<std::integral_constant<int, Values>...> MakeIntVariant(int value) {
     return result;
 }
 
+template <bool... Values>
+std::variant<std::integral_constant<bool, Values>...> MakeBoolVariant(bool value) {
+    std::variant<std::integral_constant<bool, Values>...> result;
+    bool found = false;
+    ([&] {
+        if (value == Values) {
+            result.template emplace<std::integral_constant<bool, Values>>();
+            found = true;
+        }
+    }(), ...);
+    if (!found) {
+        throw std::runtime_error("Wrong bool value");
+    }
+    return result;
+}
+
 template <typename T>
 struct TTypeInfo {
     using Traits = TTypeTraits<T>;

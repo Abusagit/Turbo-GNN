@@ -680,11 +680,15 @@ def wsb_flashattn_tc_backward_kernel(
     COMPUTE_DTYPE: tl.constexpr,
     LOOP_NUM_STAGES: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
+    IS_UNDIRECTED: tl.constexpr = False,
 ):
     """Backward kernel with K at rows (aggregation target) and Q, V at cols (neighbors).
 
     Forward was: O[row] = softmax(K[row] @ Q[col].T * scale) @ V[col]
     Backward computes: dK[row] (local accum), dQ[col] and dV[col] (atomic scatter).
+
+    When IS_UNDIRECTED=True, also computes reverse direction locally:
+    dQ[row] and dV[row] are accumulated without atomics by exploiting symmetric adjacency.
     """
     rw_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -715,6 +719,19 @@ def wsb_flashattn_tc_backward_kernel(
 
     # dK accumulator [16, D] — accumulated locally at rows
     dK_acc = tl.zeros((ROW_WINDOW_SIZE, D), dtype=tl.float32)
+
+    # Undirected: additional row loads and accumulators for reverse direction
+    if IS_UNDIRECTED:
+        # Q, V at row positions (for reverse direction attention)
+        q_row_ptrs = Q_ptr + rows[:, None] * stride_qn + head_id * stride_qh + d_offs[None, :] * stride_qd
+        Q_rows = tl.load(q_row_ptrs, mask=row_mask[:, None], other=0.0).to(COMPUTE_DTYPE)
+
+        v_row_ptrs = V_ptr + rows[:, None] * stride_vn + head_id * stride_vh + d_offs[None, :] * stride_vd
+        V_rows = tl.load(v_row_ptrs, mask=row_mask[:, None], other=0.0).to(COMPUTE_DTYPE)
+
+        # Local accumulators for dQ and dV (no atomics needed)
+        dQ_acc = tl.zeros((ROW_WINDOW_SIZE, D), dtype=tl.float32)
+        dV_acc = tl.zeros((ROW_WINDOW_SIZE, D), dtype=tl.float32)
 
     # TCB range for this row-window
     tcb_start = tl.load(tcb_row_offset_ptr + rw_id)
@@ -790,13 +807,12 @@ def wsb_flashattn_tc_backward_kernel(
         P_block = tl.where(full_mask, P_block, 0.0)
 
         # dV = P^T @ dO  [16, D]
-        dV_block = tl.dot(tl.trans(P_block).to(COMPUTE_DTYPE), dO_block.to(COMPUTE_DTYPE)).to(tl.float32)
-
-        # atomically add dV
-        dv_ptrs = dV_ptr + cols[:, None] * stride_dvn + head_id * stride_dvh + d_offs[None, :] * stride_dvd
-
-        atomic_mask_dv = col_valid[:, None]  # [16,1] broadcast with D
-        tl.atomic_add(dv_ptrs, dV_block, mask=atomic_mask_dv)
+        if not IS_UNDIRECTED:
+            # Directed path: scatter dV to column nodes via atomics
+            dV_block = tl.dot(tl.trans(P_block).to(COMPUTE_DTYPE), dO_block.to(COMPUTE_DTYPE)).to(tl.float32)
+            dv_ptrs = dV_ptr + cols[:, None] * stride_dvn + head_id * stride_dvh + d_offs[None, :] * stride_dvd
+            atomic_mask_dv = col_valid[:, None]
+            tl.atomic_add(dv_ptrs, dV_block, mask=atomic_mask_dv)
 
         # dP = dO @ V^T [16, 16]
         dP_block = tl.dot(dO_block.to(COMPUTE_DTYPE), tl.trans(V_block)).to(tl.float32)
@@ -811,33 +827,79 @@ def wsb_flashattn_tc_backward_kernel(
         # dK[row] += dS_scaled @ Q[col] [16, D] — local accumulation at rows
         dK_acc = tl.dot(dS_scaled.to(COMPUTE_DTYPE), Q_block, acc=dK_acc)
 
-        # dQ[col] = dS_scaled^T @ K[row] [16, D] — scattered to cols
-        dQ_block = tl.dot(tl.trans(dS_scaled).to(COMPUTE_DTYPE), K_block).to(tl.float32)
+        if not IS_UNDIRECTED:
+            # Directed path: scatter dQ to column nodes via atomics
+            dQ_block = tl.dot(tl.trans(dS_scaled).to(COMPUTE_DTYPE), K_block).to(tl.float32)
+            dq_ptrs = dQ_ptr + cols[:, None] * stride_dqn + head_id * stride_dqh + d_offs[None, :] * stride_dqd
+            atomic_mask_dq = col_valid[:, None]
+            tl.atomic_add(dq_ptrs, dQ_block, mask=atomic_mask_dq)
 
-        # atomically add dQ to column nodes
-        dq_ptrs = dQ_ptr + cols[:, None] * stride_dqn + head_id * stride_dqh + d_offs[None, :] * stride_dqd
+        if IS_UNDIRECTED:
+            # ── Reverse direction: dQ[row], dV[row] accumulated locally ──
+            # For undirected graphs, edge (row, col) implies edge (col, row).
+            # P_rev[row, col] = exp(Q[row] @ K[col]^T * scale - L[col])
 
-        atomic_mask_dq = col_valid[:, None]
-        tl.atomic_add(dq_ptrs, dQ_block, mask=atomic_mask_dq)
+            # Load additional column data for reverse direction
+            k_col_ptrs = K_ptr + cols[:, None] * stride_kn + head_id * stride_kh + d_offs[None, :] * stride_kd
+            K_cols = tl.load(k_col_ptrs).to(COMPUTE_DTYPE)
+
+            do_col_ptrs = dO_ptr + cols[:, None] * stride_don + head_id * stride_doh + d_offs[None, :] * stride_dod
+            dO_cols = tl.load(do_col_ptrs)
+
+            o_col_ptrs = O_ptr + cols[:, None] * stride_on + head_id * stride_oh + d_offs[None, :] * stride_od
+            O_cols = tl.load(o_col_ptrs)
+
+            l_col_ptrs = L_ptr + cols * stride_ln + head_id * stride_lh
+            L_cols = tl.load(l_col_ptrs)
+
+            D_cols = tl.sum(dO_cols * O_cols, axis=1)  # [16]
+
+            # S_rev = Q[rows] @ K[cols]^T * scale  [16, 16]
+            S_rev = tl.dot(Q_rows, tl.trans(K_cols)) * scale
+            S_rev = tl.where(full_mask, S_rev, -float("inf"))
+
+            # P_rev = exp(S_rev - L_cols)  -- L at COLUMNS, broadcast across rows
+            P_rev = tl.exp(S_rev - L_cols[None, :])
+            P_rev = tl.where(full_mask, P_rev, 0.0)
+
+            # dV[rows] += P_rev @ dO_cols  [16, D]
+            dV_acc = tl.dot(P_rev.to(COMPUTE_DTYPE), dO_cols.to(COMPUTE_DTYPE), acc=dV_acc)
+
+            # dP_rev = V[rows] @ dO_cols^T  [16, 16]
+            dP_rev = tl.dot(V_rows, tl.trans(dO_cols.to(COMPUTE_DTYPE))).to(tl.float32)
+
+            # dS_rev = P_rev * (dP_rev - D_cols)
+            dS_rev = P_rev * (dP_rev - D_cols[None, :])
+            dS_rev = tl.where(full_mask, dS_rev, 0.0)
+            dS_rev_scaled = dS_rev * scale
+
+            # dQ[rows] += dS_rev_scaled @ K_cols  [16, D]
+            dQ_acc = tl.dot(dS_rev_scaled.to(COMPUTE_DTYPE), K_cols, acc=dQ_acc)
 
     # write dK at rows (no atomics needed, each row window owns its rows)
     dk_ptrs = dK_ptr + rows[:, None] * stride_dkn + head_id * stride_dkh + d_offs[None, :] * stride_dkd
-
     tl.store(dk_ptrs, dK_acc, mask=row_mask[:, None])
 
+    if IS_UNDIRECTED:
+        # write dQ, dV at rows (no atomics — accumulated locally)
+        dq_row_ptrs = dQ_ptr + rows[:, None] * stride_dqn + head_id * stride_dqh + d_offs[None, :] * stride_dqd
+        tl.store(dq_row_ptrs, dQ_acc, mask=row_mask[:, None])
 
-def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
+        dv_row_ptrs = dV_ptr + rows[:, None] * stride_dvn + head_id * stride_dvh + d_offs[None, :] * stride_dvd
+        tl.store(dv_row_ptrs, dV_acc, mask=row_mask[:, None])
+
+
+def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale, is_undirected=False):
     """
     Backward pass computing dQ, dK, dV for multi-head case.
 
     All tensors Q, K, V, output, dO are [N, H, D].
-
-        L is [N, H].
-
+    L is [N, H].
 
     Args:
         L: Logsumexp from forward pass
         dO: Gradient of output
+        is_undirected: If True, use atomic-free reverse direction computation.
 
     Returns:
         dQ, dK, dV: Gradients
@@ -853,11 +915,17 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
     assert L.shape == (N, H), f"L must be [N, H], got {L.shape}"
     assert D in {16, 32, 64, 128, 256, 512}, f"HEAD_DIM must be power-of-2 ≤ 512, got {D}"
 
-    # dQ/dV are scattered with atomics -> must be zero-initialized
-    dQ = torch.zeros_like(Q, dtype=torch.float32)
-    # dK is accumulated locally at rows -> no atomics
+    if is_undirected:
+        # Undirected: all gradients accumulated locally, no atomics needed
+        dQ = torch.empty_like(Q, dtype=torch.float32)
+        dV = torch.empty_like(V, dtype=torch.float32)
+    else:
+        # Directed: dQ/dV scattered with atomics -> must be zero-initialized
+        dQ = torch.zeros_like(Q, dtype=torch.float32)
+        dV = torch.zeros_like(V, dtype=torch.float32)
+
+    # dK is accumulated locally at rows -> no atomics in either mode
     dK = torch.empty_like(K, dtype=torch.float32)
-    dV = torch.zeros_like(V, dtype=torch.float32)
 
     grid = (wsb.num_row_windows, H)
 
@@ -917,6 +985,7 @@ def wsb_flashattn_tc_backward(wsb, Q, K, V, output, L, dO, scale):
         TCB_WIDTH=TCB_WIDTH,
         TILE_K=16,
         COMPUTE_DTYPE=_triton_dtype(Q),
+        IS_UNDIRECTED=is_undirected,
     )
 
     return dQ, dK, dV
@@ -926,13 +995,22 @@ class WSBGraphTransformer(torch.autograd.Function):
     """Autograd function for WSB Graph Transformer"""
 
     @staticmethod
-    def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, wsb: WSBFormat, scale: float) -> torch.Tensor:
+    def forward(
+        ctx,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        wsb: WSBFormat,
+        scale: float,
+        is_undirected: bool = False,
+    ) -> torch.Tensor:
         Q = _low_precision(Q)
         K = K.to(Q.dtype)
         V = V.to(Q.dtype)
 
         ctx.wsb = wsb
         ctx.scale = scale
+        ctx.is_undirected = is_undirected
 
         output, logsumexp = wsb_flashattn_tc_forward(wsb, Q, K, V, scale=ctx.scale)
         ctx.save_for_backward(Q, K, V, logsumexp, output)
@@ -946,5 +1024,15 @@ class WSBGraphTransformer(torch.autograd.Function):
         num_heads = Q.shape[1]
         grad_output = grad_output.view(-1, num_heads, head_dim)
 
-        dQ, dK, dV = wsb_flashattn_tc_backward(ctx.wsb, Q, K, V, output, logsumexp, grad_output, scale=ctx.scale)
-        return dQ, dK, dV, None, None
+        dQ, dK, dV = wsb_flashattn_tc_backward(
+            ctx.wsb,
+            Q,
+            K,
+            V,
+            output,
+            logsumexp,
+            grad_output,
+            scale=ctx.scale,
+            is_undirected=ctx.is_undirected,
+        )
+        return dQ, dK, dV, None, None, None

@@ -409,6 +409,216 @@ graph_attn_backward_csrT_kernel_D(
 }
 
 
+// =============================================================================
+// Undirected backward kernel: uses forward CSR, zero atomics.
+// For each dst node d, iterates over src neighbors s. Computes:
+//   Forward direction: dK[d] (local)
+//   Reverse direction: dQ[d], dV[d] (local, exploiting symmetric adjacency)
+// =============================================================================
+template<int D_CONST, typename cuda_t, typename index_t>
+__global__ void __launch_bounds__(kWarpSize)
+graph_attn_backward_fwd_csr_undirected_kernel_D(
+    int64_t N,
+    int64_t H,
+    const index_t* __restrict__ row_ptr,     // [N+1], forward CSR row pointers
+    const index_t* __restrict__ col_idx,     // [E],   forward CSR col indices
+    const cuda_t* __restrict__ Q,            // [N, H, D]
+    const cuda_t* __restrict__ K,            // [N, H, D]
+    const cuda_t* __restrict__ V,            // [N, H, D]
+    int64_t stride_q_n, int64_t stride_q_h,
+    int64_t stride_k_n, int64_t stride_k_h,
+    int64_t stride_v_n, int64_t stride_v_h,
+    const cuda_t* __restrict__ dO,           // [N, H, D] (contiguous)
+    const float* __restrict__ logsumexp,     // [N, H]
+    const float* __restrict__ Delta,         // [N, H]
+    float scale,
+    cuda_t* __restrict__ dQ,                 // [N, H, D] (contiguous)
+    cuda_t* __restrict__ dK,                 // [N, H, D] (contiguous, cuda_t — no atomics)
+    cuda_t* __restrict__ dV                  // [N, H, D] (contiguous)
+) {
+    static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
+
+    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
+    using Tile = TileOps<VW, cuda_t>;
+    constexpr int EPV = Tile::ELEM_PER_VEC;
+    constexpr int D_VEC = D_CONST / EPV;
+
+    int node_d = blockIdx.x;
+    int head_h = blockIdx.y;
+    int lane   = threadIdx.x; // 0..31
+
+    if (node_d >= N || head_h >= H) {
+        return;
+    }
+
+    index_t edge_start = row_ptr[node_d];
+    index_t edge_end   = row_ptr[node_d + 1];
+    int num_neighbors  = static_cast<int>(edge_end - edge_start);
+
+    const size_t out_dh = (node_d * H + head_h) * D_CONST;
+
+    // Handle isolated nodes: write zeros
+    if (num_neighbors == 0) {
+        for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
+            Tile::write_zero(dQ + out_dh, fv);
+            Tile::write_zero(dK + out_dh, fv);
+            Tile::write_zero(dV + out_dh, fv);
+        }
+        return;
+    }
+
+    // Shared memory layout:
+    //   kd_shared:  D_CONST * sizeof(cuda_t)   -- K[d]
+    //   qd_shared:  D_CONST * sizeof(cuda_t)   -- Q[d]
+    //   vd_shared:  D_CONST * sizeof(cuda_t)   -- V[d]
+    //   gk_shared:  D_CONST * sizeof(float)    -- float32 accumulator for dK[d]
+    //   gq_shared:  D_CONST * sizeof(float)    -- float32 accumulator for dQ[d]
+    //   gv_shared:  D_CONST * sizeof(float)    -- float32 accumulator for dV[d]
+    extern __shared__ char sh_raw[];
+    cuda_t* kd_shared = reinterpret_cast<cuda_t*>(sh_raw);
+    cuda_t* qd_shared = kd_shared + D_CONST;
+    cuda_t* vd_shared = qd_shared + D_CONST;
+    float*  gk_shared = reinterpret_cast<float*>(sh_raw + 3 * D_CONST * sizeof(cuda_t));
+    float*  gq_shared = gk_shared + D_CONST;
+    float*  gv_shared = gq_shared + D_CONST;
+
+    // Load K[d], Q[d], V[d] via 128-bit transactions
+    {
+        constexpr int ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);
+        constexpr int NUM_LOADS = D_CONST / ELEMS_PER_F4;
+        const float4* kd_src = reinterpret_cast<const float4*>(K + node_d * stride_k_n + head_h * stride_k_h);
+        const float4* qd_src = reinterpret_cast<const float4*>(Q + node_d * stride_q_n + head_h * stride_q_h);
+        const float4* vd_src = reinterpret_cast<const float4*>(V + node_d * stride_v_n + head_h * stride_v_h);
+        float4* kd_sh_f4 = reinterpret_cast<float4*>(kd_shared);
+        float4* qd_sh_f4 = reinterpret_cast<float4*>(qd_shared);
+        float4* vd_sh_f4 = reinterpret_cast<float4*>(vd_shared);
+        for (int i = lane; i < NUM_LOADS; i += kWarpSize) {
+            kd_sh_f4[i] = kd_src[i];
+            qd_sh_f4[i] = qd_src[i];
+            vd_sh_f4[i] = vd_src[i];
+        }
+    }
+
+    // Zero float32 gradient accumulators
+    {
+        constexpr int NUM_F4 = D_CONST / 4;
+        float4* gk_f4 = reinterpret_cast<float4*>(gk_shared);
+        float4* gq_f4 = reinterpret_cast<float4*>(gq_shared);
+        float4* gv_f4 = reinterpret_cast<float4*>(gv_shared);
+        for (int i = lane; i < NUM_F4; i += kWarpSize) {
+            gk_f4[i] = {0.f, 0.f, 0.f, 0.f};
+            gq_f4[i] = {0.f, 0.f, 0.f, 0.f};
+            gv_f4[i] = {0.f, 0.f, 0.f, 0.f};
+        }
+    }
+    __syncwarp(FULL_WARP_MASK);
+
+    // Row scalars
+    float L_d = 0.0f, Delta_d = 0.0f;
+    if (lane == 0) {
+        const size_t idx_dh = static_cast<size_t>(node_d) * static_cast<size_t>(H) + static_cast<size_t>(head_h);
+        L_d     = __ldg(&logsumexp[idx_dh]);
+        Delta_d = __ldg(&Delta[idx_dh]);
+    }
+    L_d     = __shfl_sync(FULL_WARP_MASK, L_d, 0);
+    Delta_d = __shfl_sync(FULL_WARP_MASK, Delta_d, 0);
+
+    // dO[d] base pointer (contiguous)
+    const cuda_t* dOd_base = dO + out_dh;
+
+    for (int e = 0; e < num_neighbors; ++e) {
+        index_t node_s = 0;
+        if (lane == 0) {
+            node_s = __ldg(&col_idx[edge_start + e]);
+        }
+        node_s = __shfl_sync(FULL_WARP_MASK, node_s, 0);
+
+        if (node_s >= N) continue;
+
+        // Column node pointers (strided)
+        const cuda_t* qs_base  = Q  + node_s * stride_q_n + head_h * stride_q_h;
+        const cuda_t* ks_base  = K  + node_s * stride_k_n + head_h * stride_k_h;
+        const cuda_t* vs_base  = V  + node_s * stride_v_n + head_h * stride_v_h;
+        // dO[s] is contiguous
+        const size_t out_sh = static_cast<size_t>(node_s) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
+        const cuda_t* dOs_base = dO + out_sh;
+
+        // 1) Compute dot products for both directions
+        float dot_kd_qs = 0.0f;  // K[d] . Q[s]  -> forward score
+        float dP_fwd    = 0.0f;  // dO[d] . V[s]  -> forward dP
+        float dot_qd_ks = 0.0f;  // Q[d] . K[s]  -> reverse score
+        float dP_rev    = 0.0f;  // V[d] . dO[s]  -> reverse dP
+
+        for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
+            auto kd  = Tile::load(kd_shared, fv);
+            auto qd  = Tile::load(qd_shared, fv);
+            auto vd  = Tile::load(vd_shared, fv);
+            auto dOd = Tile::load(dOd_base, fv);
+            auto qs  = Tile::load(qs_base, fv);
+            auto ks  = Tile::load(ks_base, fv);
+            auto vs  = Tile::load(vs_base, fv);
+            auto dOs = Tile::load(dOs_base, fv);
+
+            dot_kd_qs += Tile::dot_product(kd, qs);
+            dP_fwd    += Tile::dot_product(dOd, vs);
+            dot_qd_ks += Tile::dot_product(qd, ks);
+            dP_rev    += Tile::dot_product(vd, dOs);
+        }
+
+        dot_kd_qs = warp_reduce_sum(dot_kd_qs);
+        dP_fwd    = warp_reduce_sum(dP_fwd);
+        dot_qd_ks = warp_reduce_sum(dot_qd_ks);
+        dP_rev    = warp_reduce_sum(dP_rev);
+
+        // 2) Load L[s] and Delta[s] for reverse direction
+        float L_s = 0.0f, Delta_s = 0.0f;
+        if (lane == 0) {
+            const size_t idx_sh = static_cast<size_t>(node_s) * static_cast<size_t>(H) + static_cast<size_t>(head_h);
+            L_s     = __ldg(&logsumexp[idx_sh]);
+            Delta_s = __ldg(&Delta[idx_sh]);
+        }
+        L_s     = __shfl_sync(FULL_WARP_MASK, L_s, 0);
+        Delta_s = __shfl_sync(FULL_WARP_MASK, Delta_s, 0);
+
+        // 3) Forward direction: dK[d] += dS_fwd * Q[s]
+        const float score_fwd    = dot_kd_qs * scale;
+        const float alpha_fwd    = __expf(score_fwd - L_d);
+        const float dS_fwd       = alpha_fwd * (dP_fwd - Delta_d);
+        const float dS_fwd_scaled = dS_fwd * scale;
+
+        // 4) Reverse direction: dQ[d] += dS_rev * K[s], dV[d] += alpha_rev * dO[s]
+        const float score_rev    = dot_qd_ks * scale;
+        const float alpha_rev    = __expf(score_rev - L_s);
+        const float dS_rev       = alpha_rev * (dP_rev - Delta_s);
+        const float dS_rev_scaled = dS_rev * scale;
+
+        // 5) Accumulate all three gradients in shared float32
+        for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
+            int base_f = fv * EPV;
+            auto qs  = Tile::load(qs_base, fv);
+            auto ks  = Tile::load(ks_base, fv);
+            auto dOs = Tile::load(dOs_base, fv);
+
+            Tile::weighted_accum(&gk_shared[base_f], dS_fwd_scaled, qs);   // dK[d] += dS_fwd * Q[s]
+            Tile::weighted_accum(&gq_shared[base_f], dS_rev_scaled, ks);   // dQ[d] += dS_rev * K[s]
+            Tile::weighted_accum(&gv_shared[base_f], alpha_rev, dOs);      // dV[d] += P_rev * dO[s]
+        }
+    }
+
+    // Write all three gradients: convert float32 accumulators to cuda_t
+    cuda_t* dK_base = dK + out_dh;
+    cuda_t* dQ_base = dQ + out_dh;
+    cuda_t* dV_base = dV + out_dh;
+
+    for (int fv = lane; fv < D_VEC; fv += kWarpSize) {
+        int base_f = fv * EPV;
+        Tile::write_typed(dK_base, fv, &gk_shared[base_f]);
+        Tile::write_typed(dQ_base, fv, &gq_shared[base_f]);
+        Tile::write_typed(dV_base, fv, &gv_shared[base_f]);
+    }
+}
+
+
 std::tuple<torch::Tensor, torch::Tensor>
 graph_attention_forward_csr_mh_cuda(
     torch::Tensor row_ptr,
@@ -506,16 +716,21 @@ graph_attention_forward_csr_mh_cuda(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 graph_attention_backward_csr_mh_cuda(
-    torch::Tensor row_ptr_T,   // [N+1], int32, CSR^T
-    torch::Tensor col_idx_T,   // [E],   int32, CSR^T
+    torch::Tensor row_ptr,     // [N+1], forward CSR
+    torch::Tensor col_idx,     // [E],   forward CSR
+    torch::Tensor row_ptr_T,   // [N+1], CSR^T (backward)
+    torch::Tensor col_idx_T,   // [E],   CSR^T (backward)
     torch::Tensor Q,           // [N, H, D]
     torch::Tensor K,           // [N, H, D]
     torch::Tensor V,           // [N, H, D]
     torch::Tensor O,           // [N, H, D] (forward output)
     torch::Tensor dO,          // [N, H, D]
     torch::Tensor logsumexp,   // [N, H],   float32
-    float scale
+    float scale,
+    bool is_directed
 ) {
+    TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(),
+                "Forward CSR indices must be CUDA");
     TORCH_CHECK(row_ptr_T.is_cuda() && col_idx_T.is_cuda(),
                 "CSR^T indices must be CUDA");
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda() &&
@@ -556,6 +771,10 @@ graph_attention_backward_csr_mh_cuda(
                 "row_ptr_T must be [N+1]");
     TORCH_CHECK(col_idx_T.dim() == 1,
                 "col_idx_T must be [E]");
+    TORCH_CHECK(row_ptr.dim() == 1 && row_ptr.size(0) == N + 1,
+                "row_ptr must be [N+1]");
+    TORCH_CHECK(col_idx.dim() == 1,
+                "col_idx must be [E]");
 
     TORCH_CHECK(logsumexp.size(0) == N && logsumexp.size(1) == H,
                 "logsumexp must be [N, H]");
@@ -582,15 +801,12 @@ graph_attention_backward_csr_mh_cuda(
                 "logsumexp must be contiguous [N, H]");
     TORCH_CHECK(row_ptr_T.is_contiguous() && col_idx_T.is_contiguous(),
                 "CSR^T arrays must be contiguous");
+    TORCH_CHECK(row_ptr.is_contiguous() && col_idx.is_contiguous(),
+                "Forward CSR arrays must be contiguous");
 
     auto input_dtype = Q.dtype();
     auto f32_options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
     auto typed_options = torch::TensorOptions().dtype(input_dtype).device(Q.device());
-
-    // dQ, dV match input dtype; dK accumulates in float32 to avoid bf16/fp16 atomicAdd contention
-    torch::Tensor dQ = torch::empty({N, H, D}, typed_options);
-    torch::Tensor dV = torch::empty({N, H, D}, typed_options);
-    torch::Tensor dK_f32 = torch::zeros({N, H, D}, f32_options);
 
     // Delta[i,h] = <O[i,h,:], dO[i,h,:]>
     torch::Tensor Delta = torch::empty({N, H}, f32_options);
@@ -613,11 +829,23 @@ graph_attention_backward_csr_mh_cuda(
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256,
                 "GT backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    std::visit([&](auto idxInfo, auto typeInfo, auto d_c) {
+    torch::Tensor dQ = torch::empty({N, H, D}, typed_options);
+    torch::Tensor dV = torch::empty({N, H, D}, typed_options);
+    // Directed: dK in float32 for atomicAdd; undirected: dK in input dtype (no atomics)
+    torch::Tensor dK_f32;
+    torch::Tensor dK_typed;
+    if (is_directed) {
+        dK_f32 = torch::zeros({N, H, D}, f32_options);
+    } else {
+        dK_typed = torch::empty({N, H, D}, typed_options);
+    }
+
+    std::visit([&](auto idxInfo, auto typeInfo, auto d_c, auto directed_c) {
         using index_t = typename decltype(idxInfo)::Type;
         using torch_t = typename decltype(typeInfo)::TorchType;
         using cuda_t = typename decltype(typeInfo)::CudaType;
         constexpr int DC = decltype(d_c)::value;
+        constexpr bool IS_DIRECTED = decltype(directed_c)::value;
 
         auto cuda_stream = at::cuda::getDefaultCUDAStream();
 
@@ -634,32 +862,51 @@ graph_attention_backward_csr_mh_cuda(
             N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
         );
 
-        // qj + vj as cuda_t, gq + gv as float
-        size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + 2 * DC * sizeof(float);
+        if constexpr (IS_DIRECTED) {
+            size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + 2 * DC * sizeof(float);
+            auto* dK_ptr = dK_f32.data_ptr<float>();
 
-        auto* dK_ptr = dK_f32.data_ptr<float>();
+            graph_attn_backward_csrT_kernel_D<DC, cuda_t, index_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
+                N, H,
+                index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
+                Q_ptr, K_ptr, V_ptr,
+                q_strides[0], q_strides[1],
+                k_strides[0], k_strides[1],
+                v_strides[0], v_strides[1],
+                dO_ptr,
+                logsumexp.data_ptr<float>(),
+                Delta.data_ptr<float>(),
+                scale,
+                dQ_ptr, dK_ptr, dV_ptr
+            );
+        } else {
+            // 3 cuda_t vectors (K,Q,V) + 3 float accumulators (dK,dQ,dV)
+            size_t shmem_bwd = 3 * DC * sizeof(cuda_t) + 3 * DC * sizeof(float);
+            auto* dK_ptr = reinterpret_cast<cuda_t*>(dK_typed.data_ptr<torch_t>());
 
-        graph_attn_backward_csrT_kernel_D<DC, cuda_t, index_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
-            N, H,
-            index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
-            Q_ptr, K_ptr, V_ptr,
-            q_strides[0], q_strides[1],
-            k_strides[0], k_strides[1],
-            v_strides[0], v_strides[1],
-            dO_ptr,
-            logsumexp.data_ptr<float>(),
-            Delta.data_ptr<float>(),
-            scale,
-            dQ_ptr, dK_ptr, dV_ptr
-        );
+            graph_attn_backward_fwd_csr_undirected_kernel_D<DC, cuda_t, index_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
+                N, H,
+                index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
+                Q_ptr, K_ptr, V_ptr,
+                q_strides[0], q_strides[1],
+                k_strides[0], k_strides[1],
+                v_strides[0], v_strides[1],
+                dO_ptr,
+                logsumexp.data_ptr<float>(),
+                Delta.data_ptr<float>(),
+                scale,
+                dQ_ptr, dK_ptr, dV_ptr
+            );
+        }
     }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
        MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-       MakeIntVariant<32, 64, 128, 256>((int)D));
+       MakeIntVariant<32, 64, 128, 256>((int)D),
+       MakeBoolVariant<true, false>(is_directed));
 
     CUDA_KERNEL_CHECK();
 
-    // Convert float32 dK accumulator back to input dtype
-    torch::Tensor dK = dK_f32.to(input_dtype);
+    // Convert float32 dK accumulator back to input dtype for directed path
+    torch::Tensor dK = is_directed ? dK_f32.to(input_dtype) : dK_typed;
 
     return std::make_tuple(dQ, dK, dV);
 }

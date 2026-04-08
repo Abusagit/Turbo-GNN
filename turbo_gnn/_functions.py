@@ -134,6 +134,7 @@ class gatv2_function(torch.autograd.Function):
         attention_weights,
         negative_slope,
         grad_A_reduce_row_chunk_size,
+        is_directed,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -148,6 +149,7 @@ class gatv2_function(torch.autograd.Function):
         )
         ctx.negative_slope = negative_slope
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
+        ctx.is_directed = is_directed
         ctx.heads = x_left.shape[1]
         ctx.head_dim = x_left.shape[2]
 
@@ -197,9 +199,10 @@ class gatv2_function(torch.autograd.Function):
             logsumexp,
             negative_slope,
             grad_A_reduce_row_chunk_size,
+            is_directed=ctx.is_directed,
         )
 
-        return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None, None
+        return None, None, None, None, grad_x_left, grad_x_right, grad_attention, None, None, None
 
 
 class _FusedGraphAttention(torch.autograd.Function):
@@ -216,27 +219,42 @@ class _FusedGraphAttention(torch.autograd.Function):
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
-    def forward(ctx, edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale):
+
+    def forward(ctx, edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, scale, is_directed):
         scale = scale or 1 / (Q.shape[-1] ** 0.5)
         out, logsumexp = _C.gt_forward_csr_mh(edge_ptr, edge_idx, Q, K, V, scale)
 
         ctx.scale = scale
+        ctx.is_directed = is_directed
         ctx.num_heads = Q.shape[1]
         ctx.head_dim = Q.shape[2]
-        ctx.save_for_backward(edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp)
+        ctx.save_for_backward(edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp)
         return out
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
-        edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp = ctx.saved_tensors
+        edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp = ctx.saved_tensors
         scale = ctx.scale
         num_heads = ctx.num_heads
         head_dim = ctx.head_dim
         grad_output = grad_output.view(-1, num_heads, head_dim)
 
-        dQ, dK, dV = _C.gt_backward_csr_mh(edge_ptr_T, edge_idx_T, Q, K, V, out, grad_output, logsumexp, scale)
-        return None, None, None, None, dQ, dK, dV, None
+        dQ, dK, dV = _C.gt_backward_csr_mh(
+            edge_ptr,
+            edge_idx,
+            edge_ptr_T,
+            edge_idx_T,
+            Q,
+            K,
+            V,
+            out,
+            grad_output,
+            logsumexp,
+            scale,
+            is_directed=ctx.is_directed,
+        )
+        return None, None, None, None, dQ, dK, dV, None, None
 
 
 class _CudaSpMMConvFn(torch.autograd.Function):
