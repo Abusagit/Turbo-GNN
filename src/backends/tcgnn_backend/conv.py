@@ -146,3 +146,11 @@ class TcgnnBackend(BaseBackend):
                 return _AGNNConv(feature_dim, feature_dim)
             case _:
                 raise ValueError(f"Unsupported convolution type: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any):
+        from ..base import ConvAsAggr
+
+        feature_dim = kwargs.pop("feature_dim", None)
+        if conv_type == "gcn":
+            return ConvAsAggr(_GCNConv(feature_dim, feature_dim))
+        raise KeyError(f"Unsupported conv_type for TCGNN aggr: {conv_type}")

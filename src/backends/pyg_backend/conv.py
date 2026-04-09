@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch_geometric.nn import GATConv, GATv2Conv
 from torch_geometric.nn import GCNConv as _GCN
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution, ConvAsAggr
 from ..registry import BackendRegistry
 
 doc = """
@@ -171,3 +171,21 @@ class PygBackend(BaseBackend):
                 heads = kwargs.pop("heads")
                 return _PygGATv2Conv(feature_dim, heads=heads, **kwargs)
         raise KeyError(f"Unsupported conv_type for PyG backend: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        # PyG convolutions for GCN/aggregations are already projection-free.
+        # For GAT/GATv2 projections are fused inside PyG — not separable.
+        # Wrap the projection-free convs as BaseAggr.
+        feature_dim = kwargs.pop("feature_dim", None)
+        ct = conv_type.lower()
+        match ct:
+            case "gcn":
+                conv = _PygGCNConv(feature_dim)
+            case "mean_aggr":
+                conv = _PygGCNConv(feature_dim, aggr="mean", normalize=False)
+            case "sum_aggr":
+                conv = _PygGCNConv(feature_dim, normalize=False)
+            case _:
+                raise KeyError(f"Unsupported conv_type for PyG aggr (projections not separable): {conv_type}")
+        # _PygGCNConv is already projection-free, wrap it as BaseAggr
+        return ConvAsAggr(conv)

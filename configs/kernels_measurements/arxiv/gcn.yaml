@@ -4,6 +4,8 @@ params_grid:
   all:
     feature_dim: [64, 128, 256, 512]
 kernel_related_kwargs:
+  cuda:
+    huge_degree_threshold_quantile: [0.99, 0.999, -1]
   all:
     graph_reordering_partition_size: [-1]
 datasets:

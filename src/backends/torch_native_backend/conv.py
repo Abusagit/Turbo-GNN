@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F_torch
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 
 doc = """
@@ -469,6 +469,89 @@ class _ScatterGraphTransformer(BaseConvolution):
 # ---------------------------------------------------------------------------
 
 
+class _ScatterSimpleAggOnly(BaseAggr):
+    """Aggregation-only scatter min/max/sum/mean."""
+
+    def __init__(self, reduce: str, **kwargs: Any) -> None:
+        super().__init__(conv_type=f"{reduce}_aggr")
+        self.reduce = reduce
+
+    def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        edge_index, _ew, num_nodes = graph
+        src, dst = edge_index
+        messages = x[src]
+        F_dim = x.size(1)
+        idx = dst.unsqueeze(1).expand(-1, F_dim)
+
+        if self.reduce == "min":
+            out = torch.full((num_nodes, F_dim), float("inf"), device=x.device, dtype=x.dtype)
+            out.scatter_reduce_(0, idx, messages, reduce="amin", include_self=False)
+            out[out.isinf()] = 0.0
+        elif self.reduce == "max":
+            out = torch.full((num_nodes, F_dim), float("-inf"), device=x.device, dtype=x.dtype)
+            out.scatter_reduce_(0, idx, messages, reduce="amax", include_self=False)
+            out[out.isinf()] = 0.0
+        elif self.reduce == "sum":
+            out = _scatter_add(messages, dst, num_nodes)
+        elif self.reduce == "mean":
+            out = _scatter_add(messages, dst, num_nodes)
+            counts = torch.zeros(num_nodes, 1, device=x.device, dtype=x.dtype)
+            counts.scatter_add_(0, dst.unsqueeze(1), torch.ones(dst.size(0), 1, device=x.device, dtype=x.dtype))
+            out = out / counts.clamp(min=1)
+        else:
+            raise ValueError(f"Unknown reduce: {self.reduce}")
+        return out
+
+
+class _ScatterGATv2AggOnly(BaseAggr):
+    """Aggregation-only scatter GATv2: takes pre-projected x_left, x_right."""
+
+    def __init__(self, heads: int, head_dim: int, negative_slope: float = 0.2, **kwargs: Any) -> None:
+        super().__init__(conv_type="gat_v2")
+        self.heads = heads
+        self.head_dim = head_dim
+        self.negative_slope = negative_slope
+        self.attn = nn.Parameter(torch.empty(1, heads, head_dim))
+        nn.init.xavier_normal_(self.attn)
+
+    def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        edge_index, _ew, num_nodes = graph
+        src, dst = edge_index
+
+        e = F_torch.leaky_relu(x_left[dst] + x_right[src], negative_slope=self.negative_slope)
+        attn_scores = (e * self.attn).sum(-1)
+        attn_probs = _edge_softmax(attn_scores, dst, num_nodes)
+
+        messages = x_right[src] * attn_probs.unsqueeze(-1)
+        out = torch.zeros(num_nodes, self.heads, self.head_dim, device=x_left.device, dtype=x_left.dtype)
+        dst_exp = dst.unsqueeze(1).unsqueeze(2).expand_as(messages)
+        out.scatter_add_(0, dst_exp, messages)
+        return out.reshape(num_nodes, -1)
+
+
+class _ScatterGTAggOnly(BaseAggr):
+    """Aggregation-only scatter Graph Transformer: takes pre-projected Q, K, V."""
+
+    def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
+        super().__init__(conv_type="gt")
+        self.heads = heads
+        self.head_dim = head_dim
+        self.scale = head_dim**-0.5
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        edge_index, _ew, num_nodes = graph
+        src, dst = edge_index
+
+        attn_scores = (Q[src] * K[dst]).sum(-1) * self.scale
+        attn_probs = _edge_softmax(attn_scores, dst, num_nodes)
+
+        messages = V[src] * attn_probs.unsqueeze(-1)
+        out = torch.zeros(num_nodes, *V.shape[1:], device=V.device, dtype=V.dtype)
+        dst_exp = dst.view(-1, *([1] * (V.ndim - 1))).expand_as(messages)
+        out.scatter_add_(0, dst_exp, messages)
+        return out.reshape(num_nodes, -1)
+
+
 @BackendRegistry.register_backend("torch_native")
 class TorchNativeBackend(BaseBackend):
     """Unified pure-torch backend using scatter ops on COO edge lists.
@@ -503,3 +586,25 @@ class TorchNativeBackend(BaseBackend):
                 heads = kwargs.pop("heads", 8)
                 return _ScatterGraphTransformer(feature_dim=feature_dim, heads=heads, **kwargs)
         raise KeyError(f"Unsupported conv_type for torch_native backend: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        feature_dim = kwargs.pop("feature_dim", None)
+        ct = conv_type.lower()
+        match ct:
+            case "min_aggr":
+                return _ScatterSimpleAggOnly(reduce="min")
+            case "max_aggr":
+                return _ScatterSimpleAggOnly(reduce="max")
+            case "sum_aggr":
+                return _ScatterSimpleAggOnly(reduce="sum")
+            case "mean_aggr":
+                return _ScatterSimpleAggOnly(reduce="mean")
+            case "gat_v2":
+                heads = kwargs.pop("heads", 1)
+                return _ScatterGATv2AggOnly(heads=heads, head_dim=feature_dim)
+            case "gt":
+                heads = kwargs.pop("heads", 8)
+                head_dim = feature_dim // heads
+                return _ScatterGTAggOnly(heads=heads, head_dim=head_dim)
+            case _:
+                raise KeyError(f"Unsupported conv_type for torch_native aggr: {conv_type}")

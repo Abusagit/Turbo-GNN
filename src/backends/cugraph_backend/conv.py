@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from pylibcugraphops.pytorch import operators
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution, ConvAsAggr
 from ..registry import BackendRegistry
 
 doc = """
@@ -219,4 +219,11 @@ class CugraphBackend(BaseBackend):
             return _CugraphGATv2Conv(feature_dim)
         if conv_type == "graph_transformer":
             raise NotImplementedError("mha_simple_n2n is broken and doesn't work with correct inputs")
-            # return _CugraphGraphTransfomerConv(in_channels, out_channels, **kwargs)
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        feature_dim = kwargs.pop("feature_dim", None)
+        ct = conv_type.lower()
+        # Simple aggregations are already projection-free
+        if ct in ("sum_aggr", "mean_aggr", "min_aggr", "max_aggr", "gcn"):
+            return ConvAsAggr(self.create_conv(ct, feature_dim=feature_dim, **kwargs))
+        raise KeyError(f"Unsupported conv_type for CuGraph aggr (projections not separable): {conv_type}")

@@ -112,6 +112,50 @@ class BaseBackend(ABC):
     ) -> BaseConvolution:
         pass
 
+    def create_aggr(
+        self,
+        conv_type: str,
+        **kwargs: Any,
+    ) -> BaseAggr:
+        """Create an aggregation-only callable (no linear projections).
+
+        Override in subclasses that support aggregation-only benchmarking.
+        """
+        raise NotImplementedError(f"create_aggr not implemented for {type(self).__name__}")
+
+
+class BaseAggr(nn.Module):
+    """Aggregation-only callable (no linear projections).
+
+    Subclasses implement ``forward()`` which takes pre-projected tensors
+    and a graph, returning aggregated features.  The exact signature
+    depends on the conv type (simple aggr vs attention-based).
+
+    """
+
+    def __init__(self, conv_type: str, **kwargs: Any) -> None:
+        super().__init__()
+        self.conv_type = conv_type
+
+    @abstractmethod
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        pass
+
+
+class ConvAsAggr(BaseAggr):
+    """Wrap a projection-free BaseConvolution as a BaseAggr.
+
+    Use this for backends where the conv module already performs
+    pure aggregation without any linear projections.
+    """
+
+    def __init__(self, conv: nn.Module) -> None:
+        super().__init__(conv_type=conv.__class__.__name__)
+        self._conv = conv
+
+    def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        return self._conv(x, graph, **kwargs)
+
 
 class BaseConvolution(nn.Module):
     """Abstract base class for graph convolution layers."""

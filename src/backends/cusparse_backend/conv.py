@@ -2,7 +2,7 @@ from typing import Any, Optional
 
 import torch
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution, ConvAsAggr
 from ..registry import BackendRegistry
 from .utils import csr_SPMM_normalized
 
@@ -193,6 +193,10 @@ class СuSparseBackend(BaseBackend):
             )
         raise KeyError(f"Unsupported conv_type for CuSparse backend: {conv_type}")
 
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        # CuSparse convs are already pure SpMM — no projections to strip.
+        return ConvAsAggr(self.create_conv(conv_type, **kwargs))
+
 
 @BackendRegistry.register_backend("cusparse_precomputed_bwd")
 class СuSparsePrecomputeBWDBackend(BaseBackend):
@@ -234,4 +238,7 @@ class СuSparsePrecomputeBWDBackend(BaseBackend):
             return _СuSparseMatMulPrecomputedBWDConv(
                 norm_type="both", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
-        raise KeyError(f"Unsupported conv_type for CuSparse backend: {conv_type}")
+        raise KeyError(f"Unsupported conv_type for CuSparse precomputed_bwd backend: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        return ConvAsAggr(self.create_conv(conv_type, **kwargs))

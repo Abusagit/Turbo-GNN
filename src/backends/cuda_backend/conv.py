@@ -5,7 +5,7 @@ from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import GATv2AggrKernel, gatv2_aggr
 from .gt_aggr.utils import GraphTransformerAggrKernel, graph_transformer_aggr
@@ -174,6 +174,64 @@ class _CudaSpMMConv(BaseConvolution):
         )
 
 
+class _CudaSimpleAggr(BaseAggr):
+    """Aggregation-only min/max via turbo_gnn."""
+
+    def __init__(self, reduce: str = "min", **kwargs: Any) -> None:
+        super().__init__(conv_type=f"{reduce}_aggr", **kwargs)
+        self.reduce = reduce
+
+    def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        return reduction_aggr(graph, x, reduce=self.reduce)
+
+
+class _CudaGATv2Aggr(BaseAggr):
+    """Aggregation-only GATv2 attention via turbo_gnn (no linear projections)."""
+
+    def __init__(self, heads: int, head_dim: int, negative_slope: float = 0.2, **kwargs: Any) -> None:
+        super().__init__(conv_type="gat_v2", **kwargs)
+        self.heads = heads
+        self.head_dim = head_dim
+        self.negative_slope = negative_slope
+        self.attn_weights = nn.Parameter(torch.empty(heads, head_dim))
+        nn.init.xavier_normal_(self.attn_weights, gain=nn.init.calculate_gain("relu"))
+
+    def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        return gatv2_aggr(graph, x_left, x_right, self.attn_weights.data, self.negative_slope)
+
+
+class _CudaGTAggr(BaseAggr):
+    """Aggregation-only graph transformer attention via turbo_gnn (no QKV projection)."""
+
+    def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
+        super().__init__(conv_type="gt", **kwargs)
+        self.heads = heads
+        self.head_dim = head_dim
+        self.scale = head_dim**-0.5
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        x_dummy = Q.view(Q.shape[0], -1)
+        return graph_transformer_aggr(graph, x_dummy, Q, K, V, self.scale)
+
+
+class _CudaSpMMAggr(BaseAggr):
+    """Aggregation-only SpMM via turbo_gnn."""
+
+    def __init__(self, norm_type: str = "none", **kwargs: Any) -> None:
+        super().__init__(conv_type=f"spmm_{norm_type}", **kwargs)
+        self.norm_type = norm_type
+
+    def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        return spmm_aggr(
+            x,
+            graph.forward_indptr.int(),
+            graph.forward_indices.int(),
+            self.norm_type,
+            -1,
+            256,
+        )
+
+
 @BackendRegistry.register_backend("cuda")
 class CUDABackend(BaseBackend):
     """Backend that instantiates CUDA-based convolutions."""
@@ -241,3 +299,27 @@ class CUDABackend(BaseBackend):
             conv.enable_autotune(config=autotune_config)
 
         return conv
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        feature_dim = kwargs.pop("feature_dim", None)
+        ct = conv_type.lower()
+        match ct:
+            case "gat_v2":
+                heads = kwargs.pop("heads", 1)
+                return _CudaGATv2Aggr(heads=heads, head_dim=feature_dim, **kwargs)
+            case "gt":
+                heads = kwargs.pop("heads", 8)
+                head_dim = feature_dim // heads
+                return _CudaGTAggr(heads=heads, head_dim=head_dim, **kwargs)
+            case "min_aggr":
+                return _CudaSimpleAggr(reduce="min")
+            case "max_aggr":
+                return _CudaSimpleAggr(reduce="max")
+            case "sum_aggr":
+                return _CudaSpMMAggr(norm_type="none")
+            case "mean_aggr":
+                return _CudaSpMMAggr(norm_type="right")
+            case "gcn":
+                return _CudaSpMMAggr(norm_type="both")
+            case _:
+                raise KeyError(f"Unsupported conv_type for CUDA aggr: {conv_type}")

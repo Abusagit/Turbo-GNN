@@ -1,3 +1,4 @@
+precisions: ["fp32", "bf16"]
 params_grid:
   all:
     feature_dim: [256, 512]

@@ -8,7 +8,7 @@ from dgl import ops
 from dgl.nn.pytorch import GraphConv
 from dgl.nn.pytorch.conv import GATConv, GATv2Conv
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 
 doc = """
@@ -261,6 +261,78 @@ class _DglGraphTransformer(BaseConvolution):
         return hidden
 
 
+class _DglMinAggr(BaseAggr):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(conv_type="min_aggr")
+
+    def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        out = dgl.ops.copy_u_min(graph, x)
+        out[out.isinf()] = 0
+        return out
+
+
+class _DglMaxAggr(BaseAggr):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(conv_type="max_aggr")
+
+    def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        out = dgl.ops.copy_u_max(graph, x)
+        out[out.isinf()] = 0
+        return out
+
+
+class _DglGraphConvAggr(BaseAggr):
+    """Aggregation-only DGL GraphConv (weight=False, no projection)."""
+
+    def __init__(self, norm: str, **kwargs: Any) -> None:
+        super().__init__(conv_type=f"spmm_{norm}")
+        self._conv = GraphConv(1, 1, norm=norm, weight=False, bias=False, allow_zero_in_degree=True)
+
+    def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        return self._conv(graph, x, edge_weight=graph.edata.get("w"))
+
+
+class _DglGATv2Aggr(BaseAggr):
+    """Aggregation-only DGL GATv2 (projections replaced with identity)."""
+
+    def __init__(self, heads: int, head_dim: int, negative_slope: float = 0.2, **kwargs: Any) -> None:
+        super().__init__(conv_type="gat_v2")
+        self.heads = heads
+        self.head_dim = head_dim
+        hd = heads * head_dim
+        self._conv = GATv2Conv(hd, head_dim, num_heads=heads, bias=False, allow_zero_in_degree=True)
+        # Replace internal linear projections with identity
+        self._conv.fc_src = nn.Identity()
+        self._conv.fc_dst = nn.Identity()
+
+    def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        # DGL GATv2Conv expects flat [N, H*D] input; fc_src/fc_dst are Identity
+        N, H, D = x_left.shape
+        feat_src = x_right.reshape(N, H * D)
+        feat_dst = x_left.reshape(N, H * D)
+        graph.srcdata["el"] = feat_src
+        graph.dstdata["er"] = feat_dst
+        out = self._conv(graph, (feat_src, feat_dst), get_attention=False)
+        return out.view(N, -1)
+
+
+class _DglGTAggr(BaseAggr):
+    """Aggregation-only DGL Graph Transformer (no QKV projection)."""
+
+    def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
+        super().__init__(conv_type="gt")
+        self.heads = heads
+        self.head_dim = head_dim
+        self.scale = torch.rsqrt(torch.tensor(float(head_dim)))
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        n = graph.num_nodes()
+        attn_scores = ops.u_dot_v(graph, Q, K)
+        attn_scores = attn_scores * self.scale
+        attn_probs = F.edge_softmax(graph, attn_scores)
+        return ops.u_mul_e_sum(graph, V, attn_probs).view(n, -1)
+
+
 @BackendRegistry.register_backend("dgl")
 class DglBackend(BaseBackend):
     """Backend that instantiates DGL-based convolutions."""
@@ -304,3 +376,27 @@ class DglBackend(BaseBackend):
                 heads = kwargs.pop("heads")
                 return _DglGraphTransformer(feature_dim=feature_dim, heads=heads)
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        feature_dim = kwargs.pop("feature_dim", None)
+        ct = conv_type.lower()
+        match ct:
+            case "min_aggr":
+                return _DglMinAggr()
+            case "max_aggr":
+                return _DglMaxAggr()
+            case "gat_v2":
+                heads = kwargs.pop("heads", 1)
+                return _DglGATv2Aggr(heads=heads, head_dim=feature_dim)
+            case "gt":
+                heads = kwargs.pop("heads", 8)
+                head_dim = feature_dim // heads
+                return _DglGTAggr(heads=heads, head_dim=head_dim)
+            case "gcn":
+                return _DglGraphConvAggr(norm="both")
+            case "mean_aggr":
+                return _DglGraphConvAggr(norm="right")
+            case "sum_aggr":
+                return _DglGraphConvAggr(norm="none")
+            case _:
+                raise KeyError(f"Unsupported conv_type for DGL aggr: {conv_type}")

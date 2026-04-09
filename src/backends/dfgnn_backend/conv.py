@@ -4,7 +4,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 from .bindings import dfgnn_ops
 
@@ -136,6 +136,32 @@ class _DFGNN_GTConv(BaseConvolution):
         return output
 
 
+class _DFGNN_GTAggr(BaseAggr):
+    """Aggregation-only DFGNN GT (no QKV projection)."""
+
+    def __init__(self, feature_dim: int, num_heads: int = 8) -> None:
+        super().__init__(conv_type="gt")
+        self.num_heads = num_heads
+        self.feature_dim = feature_dim
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs) -> torch.Tensor:
+        rows, row_ptr, col_ind, val, col_ptr, row_ind, val_idx, smem_consume = graph
+        output = GTConvFunction.apply(
+            rows,
+            row_ptr,
+            col_ind,
+            val,
+            col_ptr,
+            row_ind,
+            val_idx,
+            smem_consume,
+            Q,
+            K,
+            V,
+        )
+        return output.view(Q.shape[0], -1)
+
+
 @BackendRegistry.register_backend("dfgnn")
 class DFGNNBackend(BaseBackend):
     def create_conv(self, conv_type: str, **kwargs: Any) -> BaseConvolution:
@@ -151,3 +177,10 @@ class DFGNNBackend(BaseBackend):
         if conv_type == "gt":
             return _DFGNN_GTConv(kwargs["feature_dim"], num_heads=kwargs["heads"])
         raise ValueError(f"Unsupported conv_type for DFGNN backend: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        if conv_type == "gt":
+            heads = kwargs.get("heads", 8)
+            feature_dim = kwargs["feature_dim"]
+            return _DFGNN_GTAggr(feature_dim=feature_dim, num_heads=heads)
+        raise KeyError(f"Unsupported conv_type for DFGNN aggr: {conv_type}")

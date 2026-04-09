@@ -2,8 +2,16 @@ precisions: ["fp32", "bf16"]
 graph_modes: ["directed", "undirected_directed_kernel", "undirected"]
 params_grid:
   all:
-    feature_dim: [64, 128, 256, 512]
+    feature_dim: [32, 64, 128, 256]
+    heads: [2, 4, 8]
+  cuda:
+    forward_light_warps: [1, 2, 4]
+    forward_heavy_warps: [8, 16, 32]
+    backward_light_warps: [1, 2, 4]
+    backward_heavy_warps: [8, 16, 32]
 kernel_related_kwargs:
+  cuda:
+    huge_degree_threshold_quantile: [0.99, 0.999, -1]
   all:
     graph_reordering_partition_size: [-1]
 datasets:

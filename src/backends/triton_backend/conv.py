@@ -3,7 +3,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution, ConvAsAggr
 from ..registry import BackendRegistry
 from .kernels_impl import WSBGraphTransformer, WSBSpMM
 
@@ -85,6 +85,18 @@ class _TritonBlockSparseGraphTransformerConv(BaseConvolution):
         return out
 
 
+class _TritonGTAggr(BaseAggr):
+    """Aggregation-only Triton GT (no QKV projection)."""
+
+    def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
+        super().__init__(conv_type="gt")
+        self.scale = torch.rsqrt(torch.tensor(float(head_dim))).item()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        out = WSBGraphTransformer.apply(Q, K, V, graph, self.scale)
+        return out.view(Q.shape[0], -1)
+
+
 @BackendRegistry.register_backend("triton_block_sparse")
 class TritonBlockSparseBackend(BaseBackend):
     """Backend that instantiates DGL-based convolutions."""
@@ -117,4 +129,18 @@ class TritonBlockSparseBackend(BaseBackend):
             case "gt":
                 heads = kwargs.pop("heads")
                 return _TritonBlockSparseGraphTransformerConv(feature_dim=feature_dim, heads=heads)
-        raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
+        raise KeyError(f"Unsupported conv_type for Triton backend: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        feature_dim = kwargs.pop("feature_dim", None)
+        ct = conv_type.lower()
+        match ct:
+            case "gcn" | "mean_aggr" | "sum_aggr":
+                # SpMM convs are already projection-free
+                return ConvAsAggr(self.create_conv(ct, feature_dim=feature_dim, **kwargs))
+            case "gt":
+                heads = kwargs.pop("heads", 8)
+                head_dim = feature_dim // heads
+                return _TritonGTAggr(heads=heads, head_dim=head_dim)
+            case _:
+                raise KeyError(f"Unsupported conv_type for Triton aggr: {conv_type}")

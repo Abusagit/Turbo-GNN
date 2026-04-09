@@ -4,7 +4,7 @@ import torch
 
 from src.backends.fusegnn_backend.convs import garGATConv, garGCNConv, gasGATConv, gasGCNConv
 
-from ..base import BaseBackend, BaseConvolution
+from ..base import BaseAggr, BaseBackend, BaseConvolution, ConvAsAggr
 from ..registry import BackendRegistry
 
 
@@ -103,3 +103,9 @@ class FuseGNNBackend(BaseBackend):
             assert "heads" in kwargs, "fuse_gnn gat needs heads argument"
             return _FuseGNN_GATConv(kwargs["feature_dim"], kwargs["heads"], fusegnn_fuse_type)
         raise KeyError(f"Unsupported conv_type for FuseGNN backend: {conv_type}")
+
+    def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        fusegnn_fuse_type = kwargs.pop("fusegnn_fuse_type", "gar")
+        if conv_type.lower() == "gcn":
+            return ConvAsAggr(_FuseGNN_GCNConv(fusegnn_fuse_type))
+        raise KeyError(f"Unsupported conv_type for FuseGNN aggr (projections not separable): {conv_type}")
