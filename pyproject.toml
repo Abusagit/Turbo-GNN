@@ -86,7 +86,17 @@ bench = [
     "matplotlib>=3.5.0",
     "seaborn>=0.12.0",
     "plotly>=5.0.0",
-    # cugraph
+    # NOTE: pylibcugraphops-cu12 moved to [cugraph] extra —
+    # it only ships pre-built wheels for specific CUDA/Python combos
+    # and fails to build from sdist.  Install separately if needed:
+    #   pip install pylibcugraphops-cu12
+]
+
+# ---------------------------------------------------------------------------
+# Cugraph: optional, only if pre-built wheel is available
+# Usage: pip install -e ".[cugraph]"
+# ---------------------------------------------------------------------------
+cugraph = [
     "pylibcugraphops-cu12",
 ]
 

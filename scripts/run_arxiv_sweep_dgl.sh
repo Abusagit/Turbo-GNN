@@ -18,7 +18,7 @@ declare -A CONV_TYPES=(
     ["min_aggr"]="min_aggr"
 )
 
-BACKENDS="cuda dgl"
+BACKENDS="dgl"
 TARGET_BACKEND="cuda"
 MODE="aggr"
 
