@@ -22,6 +22,36 @@ BASE_WHEEL_URL = "https://github.com/Abusagit/Turbo-GNN/releases/download/{tag_n
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def ensure_ninja_on_path():
+    """Make the `ninja` build requirement visible to torch."""
+    import shutil
+
+    if shutil.which("ninja"):
+        return True
+
+    candidates = []
+    try:
+        import ninja
+
+        candidates.append(ninja.BIN_DIR)
+    except (ImportError, AttributeError):
+        pass
+    candidates.append(os.path.dirname(sys.executable))
+
+    for bindir in candidates:
+        if bindir and os.path.isfile(os.path.join(bindir, "ninja")):
+            os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+            return True
+
+    print(
+        "WARNING: ninja was not found. The extension will be compiled with the "
+        "serial distutils backend (MAX_JOBS is ignored) and the build will be "
+        "several times slower. Run `pip install ninja` into the build environment.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def get_platform():
     """Returns the platform name as used in wheel filenames."""
     if sys.platform.startswith("linux"):
@@ -119,6 +149,8 @@ if not SKIP_CUDA_BUILD:
         import torch
         from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
+        ensure_ninja_on_path()
+
         # NinjaBuildExtension — auto-calculates MAX_JOBS to prevent OOM
         class NinjaBuildExtension(BuildExtension):
             def __init__(self, *args, **kwargs):
@@ -136,6 +168,10 @@ if not SKIP_CUDA_BUILD:
                     )
                     os.environ["MAX_JOBS"] = str(max_jobs)
                 super().__init__(*args, **kwargs)
+                # BuildExtension flips use_ninja off with only a log warning if
+                # it cannot find the binary; surface that instead of shipping a
+                # silently serial build.
+                print(f"turbo-gnn: ninja backend {'ENABLED' if self.use_ninja else 'DISABLED (serial build!)'}")
 
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
@@ -160,6 +196,13 @@ if not SKIP_CUDA_BUILD:
         except ImportError:
             pass
 
+        # parallelise inside nvcc too:
+        # need nvcc >= 11.2; gate on CUDA 12+ so older toolchains are safe.
+        _nvcc_flags = ["-O3", "--use_fast_math", "--generate-line-info"]
+        _nvcc_threads = os.getenv("TURBO_GNN_NVCC_THREADS", "4")
+        if torch.version.cuda and parse(torch.version.cuda).major >= 12:
+            _nvcc_flags += [f"--threads={_nvcc_threads}", f"--split-compile={_nvcc_threads}"]
+
         ext_modules = [
             CUDAExtension(
                 name="turbo_gnn._C",
@@ -177,7 +220,7 @@ if not SKIP_CUDA_BUILD:
                 libraries=["cusparse"],
                 extra_compile_args={
                     "cxx": ["-O3"],
-                    "nvcc": ["-O3", "--use_fast_math", "--generate-line-info"],
+                    "nvcc": _nvcc_flags,
                 },
             ),
         ]
