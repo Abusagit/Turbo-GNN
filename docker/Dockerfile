@@ -32,7 +32,7 @@ ENV CUDA_HOME=${CUDA_HOME}
 
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
-ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9"
+ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0"
 
 
 RUN pip uninstall -y torch torchvision torchaudio || true
