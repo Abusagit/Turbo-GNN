@@ -42,13 +42,15 @@ WORKDIR /workspace/turbo-gnn
 COPY . .
 
 RUN rm -rf .venv && \
-    make venv PYTHON_BIN=$(which python3) CUDA_HOME=${CUDA_HOME} && \
-    make _install-torch-dev CUDA_HOME=${CUDA_HOME} && \
-    make _install-dev CUDA_HOME=${CUDA_HOME} && \
-    make setup-hooks CUDA_HOME=${CUDA_HOME}
+    make _install-torch-dev PYTHON_BIN=$(which python3) CUDA_HOME=${CUDA_HOME} && \
+    make _install-dev PYTHON_BIN=$(which python3) CUDA_HOME=${CUDA_HOME} && \
+    make setup-hooks PYTHON_BIN=$(which python3) CUDA_HOME=${CUDA_HOME}
 
 
 ENV DGLBACKEND="pytorch"
 ENV PYTHONPATH="/workspace/turbo-gnn:${PYTHONPATH}"
+
+ENV PATH="/workspace/turbo-gnn/.venv/bin:${PATH}"
+ENV VIRTUAL_ENV="/workspace/turbo-gnn/.venv"
 
 CMD ["bash"]
