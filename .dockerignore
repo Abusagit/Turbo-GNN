@@ -23,10 +23,6 @@ runs/
 experiments/
 results/
 
-# Git
-.git/
-.github/
-
 # Misc
 *.log
 *.tmp

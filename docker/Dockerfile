@@ -21,15 +21,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         vim \
         nano \
         make \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # --------------------------------------------------------------------------- #
 # CUDA env
 # --------------------------------------------------------------------------- #
-ENV CUDA_HOME=/usr/local/cuda
+ARG CUDA_HOME=/usr/local/cuda
+ENV CUDA_HOME=${CUDA_HOME}
+
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
-ENV TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0"
+ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9"
 
 
 RUN pip uninstall -y torch torchvision torchaudio || true
@@ -38,20 +41,11 @@ RUN pip uninstall -y torch torchvision torchaudio || true
 WORKDIR /workspace/turbo-gnn
 COPY . .
 
-
-RUN make _install-torch-dev \
-        PYTHON_BIN=$(which python3) \
-        VENV_DIR="" \
-        PIP="pip3" \
-        PYTHON="python3" \
-        CUDA_HOME=${CUDA_HOME}
-
-RUN make _install-dev \
-        PYTHON_BIN=$(which python3) \
-        VENV_DIR="" \
-        PIP="pip3" \
-        PYTHON="python3" \
-        CUDA_HOME=${CUDA_HOME}
+RUN rm -rf .venv && \
+    make venv PYTHON_BIN=$(which python3) CUDA_HOME=${CUDA_HOME} && \
+    make _install-torch-dev CUDA_HOME=${CUDA_HOME} && \
+    make _install-dev CUDA_HOME=${CUDA_HOME} && \
+    make setup-hooks CUDA_HOME=${CUDA_HOME}
 
 
 ENV DGLBACKEND="pytorch"

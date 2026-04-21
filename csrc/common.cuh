@@ -356,13 +356,7 @@ struct Vec2Ops<__half> {
     static __device__ __forceinline__ float2 to_float2(vec2_t v) { return __half22float2(v); }
     static __device__ __forceinline__ vec2_t from_float2(float2 v) { return __float22half2_rn(v); }
     static __device__ __forceinline__ vec2_t fma(vec2_t a, vec2_t b, vec2_t c) {
-        float2 af = __bfloat1622float2(a);
-        float2 bf = __bfloat1622float2(b);
-        float2 cf = __bfloat1622float2(c);
-        return __float22bfloat162_rn(make_float2(
-            fmaf(af.x, bf.x, cf.x),
-            fmaf(af.y, bf.y, cf.y)
-        ));
+        return __hfma2(a, b, c);
     }
     static __device__ __forceinline__ vec2_t leaky_relu(vec2_t x, vec2_t neg_slope) {
         vec2_t z = get_zero();
