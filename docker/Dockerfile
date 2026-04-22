@@ -8,7 +8,7 @@
 
 FROM nvcr.io/nvidia/pytorch:24.09-py3
 
-LABEL version="1.0"
+LABEL version="0.1.0rc4"
 LABEL description="Turbo-GNN research image — CUDA kernels, PyG, Triton"
 
 
@@ -27,16 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --------------------------------------------------------------------------- #
 # CUDA env
 # --------------------------------------------------------------------------- #
-ARG CUDA_HOME=/usr/local/cuda
-ENV CUDA_HOME=${CUDA_HOME}
-
+ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0"
 
-
 RUN pip uninstall -y torch torchvision torchaudio || true
-
 
 WORKDIR /workspace/turbo-gnn
 COPY . .
