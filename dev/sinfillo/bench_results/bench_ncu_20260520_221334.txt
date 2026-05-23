@@ -1,0 +1,69 @@
+===== Nsight Compute profiling =====
+Profiling baseline (D=128, fp32)...
+==PROF== Connected to process 929742 (/home/sinfillo/micromamba/envs/turbo-gnn-124/bin/python3.11)
+==WARNING== Unable to access the following 6 metrics: ctc__rx_bytes_data_user.sum, ctc__rx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__rx_bytes_data_user.sum.per_second, ctc__tx_bytes_data_user.sum, ctc__tx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__tx_bytes_data_user.sum.per_second.
+
+
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=False ...
+Done.
+==PROF== Disconnected from process 929742
+==PROF== Report: /home/sinfillo/Turbo-GNN/dev/sinfillo/bench_results/ncu_20260520_221334/baseline_D128_fp32.ncu-rep
+Profiling pipeline (D=128, fp32)...
+==PROF== Connected to process 1089244 (/home/sinfillo/micromamba/envs/turbo-gnn-124/bin/python3.11)
+==WARNING== Unable to access the following 6 metrics: ctc__rx_bytes_data_user.sum, ctc__rx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__rx_bytes_data_user.sum.per_second, ctc__tx_bytes_data_user.sum, ctc__tx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__tx_bytes_data_user.sum.per_second.
+
+
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=True ...
+Done.
+==PROF== Disconnected from process 1089244
+==PROF== Report: /home/sinfillo/Turbo-GNN/dev/sinfillo/bench_results/ncu_20260520_221334/pipeline_D128_fp32.ncu-rep
+Profiling baseline (D=128, fp16)...
+==PROF== Connected to process 1197457 (/home/sinfillo/micromamba/envs/turbo-gnn-124/bin/python3.11)
+==WARNING== Unable to access the following 6 metrics: ctc__rx_bytes_data_user.sum, ctc__rx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__rx_bytes_data_user.sum.per_second, ctc__tx_bytes_data_user.sum, ctc__tx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__tx_bytes_data_user.sum.per_second.
+
+
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 37 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 37 passes
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=float16
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=False ...
+Done.
+==PROF== Disconnected from process 1197457
+==PROF== Report: /home/sinfillo/Turbo-GNN/dev/sinfillo/bench_results/ncu_20260520_221334/baseline_D128_fp16.ncu-rep
+Profiling pipeline (D=128, fp16)...
+==PROF== Connected to process 1304884 (/home/sinfillo/micromamba/envs/turbo-gnn-124/bin/python3.11)
+==WARNING== Unable to access the following 6 metrics: ctc__rx_bytes_data_user.sum, ctc__rx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__rx_bytes_data_user.sum.per_second, ctc__tx_bytes_data_user.sum, ctc__tx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__tx_bytes_data_user.sum.per_second.
+
+
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+==PROF== Profiling "GATv2Forward_Kernel": 0%....50%....100% - 38 passes
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=float16
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=True ...
+Done.
+==PROF== Disconnected from process 1304884
+==PROF== Report: /home/sinfillo/Turbo-GNN/dev/sinfillo/bench_results/ncu_20260520_221334/pipeline_D128_fp16.ncu-rep

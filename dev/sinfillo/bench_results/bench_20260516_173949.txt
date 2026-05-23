@@ -1,0 +1,259 @@
+=================================================================
+GATv2 Forward Kernel Benchmark: baseline vs async pipeline
+Date: Sat May 16 05:39:49 PM MSK 2026
+Host: genesis-h100-klg.klg.yp-c.yandex.net
+GPU:  NVIDIA H100 80GB HBM3
+=================================================================
+
+===== Varying head_dim (fp32, N=100k, deg=16) =====
+--- D=32 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=32, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  0.6656 ms
+Pipeline:  0.6441 ms
+Speedup:   1.033x
+Max diff:  0.00e+00
+
+--- D=64 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=64, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  0.7539 ms
+Pipeline:  0.7888 ms
+Speedup:   0.956x
+Max diff:  0.00e+00
+
+--- D=128 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  1.0755 ms
+Pipeline:  1.1871 ms
+Speedup:   0.906x
+Max diff:  0.00e+00
+
+--- D=256 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=256, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  1.9193 ms
+Pipeline:  1.9045 ms
+Speedup:   1.008x
+Max diff:  0.00e+00
+
+===== Varying avg_degree (fp32, N=100k, D=128) =====
+--- deg=4 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=4, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 402212 edges, light=100000, heavy=0
+Baseline:  0.5704 ms
+Pipeline:  0.5464 ms
+Speedup:   1.044x
+Max diff:  0.00e+00
+
+--- deg=8 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=8, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 801300 edges, light=100000, heavy=0
+Baseline:  0.7622 ms
+Pipeline:  0.7037 ms
+Speedup:   1.083x
+Max diff:  0.00e+00
+
+--- deg=16 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  1.0684 ms
+Pipeline:  0.9622 ms
+Speedup:   1.110x
+Max diff:  0.00e+00
+
+--- deg=64 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=64, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 6401086 edges, light=0, heavy=100000
+Baseline:  4.9608 ms
+Pipeline:  3.7291 ms
+Speedup:   1.330x
+Max diff:  0.00e+00
+
+===== fp16 (N=100k, deg=16) =====
+--- D=64  fp16 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=64, dtype=float16
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  0.5909 ms
+Pipeline:  0.7091 ms
+Speedup:   0.833x
+Max diff:  0.00e+00
+
+--- D=128 fp16 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=float16
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  0.8463 ms
+Pipeline:  0.9072 ms
+Speedup:   0.933x
+Max diff:  0.00e+00
+
+--- D=256 fp16 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=256, dtype=float16
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  1.1048 ms
+Pipeline:  1.1173 ms
+Speedup:   0.989x
+Max diff:  0.00e+00
+
+===== bf16 (N=100k, deg=16) =====
+--- D=128 bf16 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=128, dtype=bfloat16
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  0.8802 ms
+Pipeline:  0.9385 ms
+Speedup:   0.938x
+Max diff:  0.00e+00
+
+--- D=256 bf16 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=4, D=256, dtype=bfloat16
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  1.1276 ms
+Pipeline:  1.1739 ms
+Speedup:   0.961x
+Max diff:  0.00e+00
+
+===== Larger graphs (fp32, D=128, deg=16) =====
+--- N=500k ---
+GPU: NVIDIA H100 80GB HBM3
+N=500000, avg_degree=16, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 500000 nodes, 7995239 edges, light=499946, heavy=54
+Baseline:  6.7545 ms
+Pipeline:  6.0413 ms
+Speedup:   1.118x
+Max diff:  0.00e+00
+
+--- N=1M ---
+GPU: NVIDIA H100 80GB HBM3
+N=1000000, avg_degree=16, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 1000000 nodes, 15992201 edges, light=999880, heavy=120
+Baseline:  13.9895 ms
+Pipeline:  12.5141 ms
+Speedup:   1.118x
+Max diff:  0.00e+00
+
+===== Larger graphs sparse (fp32, D=128, deg=4) =====
+--- N=500k deg=4 ---
+GPU: NVIDIA H100 80GB HBM3
+N=500000, avg_degree=4, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 500000 nodes, 2008482 edges, light=500000, heavy=0
+Baseline:  3.0138 ms
+Pipeline:  2.8465 ms
+Speedup:   1.059x
+Max diff:  0.00e+00
+
+--- N=1M   deg=4 ---
+GPU: NVIDIA H100 80GB HBM3
+N=1000000, avg_degree=4, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 1000000 nodes, 4018612 edges, light=1000000, heavy=0
+Baseline:  6.0894 ms
+Pipeline:  5.7469 ms
+Speedup:   1.060x
+Max diff:  0.00e+00
+
+===== More heads (fp32, N=100k, deg=16) =====
+--- H=8 D=64 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=8, D=64, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  1.4875 ms
+Pipeline:  1.5536 ms
+Speedup:   0.957x
+Max diff:  0.00e+00
+
+--- H=8 D=128 ---
+GPU: NVIDIA H100 80GB HBM3
+N=100000, avg_degree=16, H=8, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Baseline:  2.1387 ms
+Pipeline:  1.9226 ms
+Speedup:   1.112x
+Max diff:  0.00e+00
+
+===== Best-case combos =====
+--- N=500k D=256 fp16 deg=8 ---
+GPU: NVIDIA H100 80GB HBM3
+N=500000, avg_degree=8, H=4, D=256, dtype=float16
+light_wpb=2, heavy_wpb=8
+
+Graph: 500000 nodes, 4000004 edges, light=500000, heavy=0
+Baseline:  4.0809 ms
+Pipeline:  4.0465 ms
+Speedup:   1.009x
+Max diff:  0.00e+00
+
+--- N=1M   D=128 fp16 deg=4 ---
+GPU: NVIDIA H100 80GB HBM3
+N=1000000, avg_degree=4, H=4, D=128, dtype=float16
+light_wpb=2, heavy_wpb=8
+
+Graph: 1000000 nodes, 4018612 edges, light=1000000, heavy=0
+Baseline:  4.8061 ms
+Pipeline:  4.5037 ms
+Speedup:   1.067x
+Max diff:  0.00e+00
+
+--- N=500k D=128 fp32 deg=4 ---
+GPU: NVIDIA H100 80GB HBM3
+N=500000, avg_degree=4, H=4, D=128, dtype=float32
+light_wpb=2, heavy_wpb=8
+
+Graph: 500000 nodes, 2008482 edges, light=500000, heavy=0
+Baseline:  3.0136 ms
+Pipeline:  2.8466 ms
+Speedup:   1.059x
+Max diff:  0.00e+00
+
+=================================================================
+Done! Results saved to: dev/sinfillo/bench_results/bench_20260516_173949.txt
