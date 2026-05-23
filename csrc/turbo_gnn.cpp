@@ -25,7 +25,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("attn_vec"), py::arg("negative_slope") = 0.2f,
           py::arg("light_nodes"), py::arg("heavy_nodes"),
           py::arg("light_warps_per_block") = 1,
-          py::arg("heavy_warps_per_block") = 8);
+          py::arg("heavy_warps_per_block") = 8,
+          py::arg("use_pipeline") = false);
 
     m.def("gatv2_backward", &gatv2_backward_cuda,
           "GATv2 backward pass (CUDA)",

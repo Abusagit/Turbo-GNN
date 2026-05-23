@@ -4,7 +4,7 @@
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template<int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+template<int WARPS_PER_BLOCK, int D_CONST, bool USE_PIPELINE, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * kMaxThreadsInWarp)
 GATv2Forward_Kernel(
     size_t N,
@@ -33,6 +33,11 @@ GATv2Forward_Kernel(
     constexpr int NUM_VECS       = D_CONST / EPV;
     constexpr int VECS_PER_LANE  = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
     constexpr int ACCS_PER_LANE  = VECS_PER_LANE * EPV;
+
+    // only meaningful when USE_PIPELINE
+    constexpr int R_BYTES        = D_CONST * (int)sizeof(cuda_t);
+    constexpr int F4_PER_R       = R_BYTES / 16;
+    constexpr int NUM_STAGES     = 2;
 
     const int node_i = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h = blockIdx.y;
@@ -65,16 +70,21 @@ GATv2Forward_Kernel(
 
     // Shared memory layout:
     //   l_sh:      D_CONST * sizeof(cuda_t)                        -- read-only
+    //   r_dbuf:    WARPS_PER_BLOCK * 2 * D_CONST * sizeof(cuda_t)  -- per-warp ping-pong for async r[j]
     //   warp_out:  WARPS_PER_BLOCK * D_CONST * sizeof(float)       -- per-warp output accum
     //   warp_max:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax max
     //   warp_sum:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax sum_exp
     extern __shared__ char sh_raw[];
     cuda_t* l_sh     = reinterpret_cast<cuda_t*>(sh_raw);
-    float*  warp_out = reinterpret_cast<float*>(sh_raw + D_CONST * sizeof(cuda_t));
+    cuda_t* r_dbuf   = l_sh + D_CONST; // only meaningful when USE_PIPELINE
+    float*  warp_out = USE_PIPELINE ? reinterpret_cast<float*>(r_dbuf + WARPS_PER_BLOCK * 2 * D_CONST) : reinterpret_cast<float*>(l_sh + D_CONST);
     float*  warp_max = warp_out + WARPS_PER_BLOCK * D_CONST;
     float*  warp_sum = warp_max + WARPS_PER_BLOCK;
 
     float* my_out = warp_out + warp_id * D_CONST;
+
+    cuda_t* r0_ptr = r_dbuf + warp_id * 2 * D_CONST;
+    cuda_t* r1_ptr = r0_ptr + D_CONST;
 
     // Cooperative load of l into shared memory using all threads
     {
@@ -98,37 +108,104 @@ GATv2Forward_Kernel(
 
     OnlineSoftmaxState softmax_state;
 
-    // Warp-strided neighbor loop
-    for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
-        index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
-        const cuda_t* r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+    if constexpr (USE_PIPELINE) {
+        int loop_iters = (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
 
-        float dot_lane = 0.f;
-        #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
-                vec_t lv = Tile::load(l_sh, v);
-                vec_t rv = Tile::load(r_base, v);
-                vec_t av = Tile::load(a_base, v);
-                dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+        if (loop_iters > 0) {
+            cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
+
+            auto async_copy_r = [&](cuda_t* dst, const cuda_t* src) {
+                for (int i = lane; i < F4_PER_R; i += kMaxThreadsInWarp) {
+                    cuda::memcpy_async(reinterpret_cast<char*>(dst) + i * 16, reinterpret_cast<const char*>(src) + i * 16, cuda::aligned_size_t<16>(16), pipe);
+                }
+            };
+
+            {
+                index_t j0 = d_col_idx[edge_start + static_cast<index_t>(warp_id)];
+                const cuda_t* r0_src = d_r + j0 * stride_r_n + head_h * stride_r_h;
+                pipe.producer_acquire();
+                async_copy_r(r0_ptr, r0_src);
+                pipe.producer_commit();
+            }
+
+            for (int iter = 0; iter < loop_iters; ++iter) {
+                int k = warp_id + iter * WARPS_PER_BLOCK;
+                cuda_t* r_cur  = (iter & 1) ? r1_ptr : r0_ptr;
+                cuda_t* r_next = (iter & 1) ? r0_ptr : r1_ptr;
+
+                pipe.producer_acquire();
+                int k_next = k + WARPS_PER_BLOCK;
+                if (k_next < num_neighbors) {
+                    index_t j_next = d_col_idx[edge_start + static_cast<index_t>(k_next)];
+                    const cuda_t* r_next_src = d_r + j_next * stride_r_n + head_h * stride_r_h;
+                    async_copy_r(r_next, r_next_src);
+                }
+                pipe.producer_commit();
+
+                cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
+
+                float dot_lane = 0.f;
+                #pragma unroll
+                for (int t = 0; t < VECS_PER_LANE; ++t) {
+                    int v = lane + kMaxThreadsInWarp * t;
+                    if (v < NUM_VECS) {
+                        vec_t lv = Tile::load(l_sh, v);
+                        vec_t rv = Tile::load(r_cur, v);
+                        vec_t av = Tile::load(a_base, v);
+                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+                    }
+                }
+                float dot = warp_reduce_sum(dot_lane);
+
+                float rescale = softmax_state.update(dot);
+                #pragma unroll
+                for (int i = 0; i < ACCS_PER_LANE; ++i) h_acc[i] *= rescale;
+
+                float contrib = __expf(dot - softmax_state.max_val);
+                #pragma unroll
+                for (int t = 0; t < VECS_PER_LANE; ++t) {
+                    int v = lane + kMaxThreadsInWarp * t;
+                    if (v < NUM_VECS) {
+                        vec_t rv = Tile::load(r_cur, v);
+                        Tile::weighted_accum(&h_acc[t * EPV], contrib, rv);
+                    }
+                }
+                pipe.consumer_release();
             }
         }
-        float dot = warp_reduce_sum(dot_lane);
+    } else {
+        // Warp-strided neighbor loop
+        for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
+            index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
+            const cuda_t* r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
 
-        float rescale = softmax_state.update(dot);
-        #pragma unroll
-        for (int i = 0; i < ACCS_PER_LANE; ++i) {
-            h_acc[i] *= rescale;
-        }
+            float dot_lane = 0.f;
+            #pragma unroll
+            for (int t = 0; t < VECS_PER_LANE; ++t) {
+                int v = lane + kMaxThreadsInWarp * t;
+                if (v < NUM_VECS) {
+                    vec_t lv = Tile::load(l_sh, v);
+                    vec_t rv = Tile::load(r_base, v);
+                    vec_t av = Tile::load(a_base, v);
+                    dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+                }
+            }
+            float dot = warp_reduce_sum(dot_lane);
 
-        float contrib = __expf(dot - softmax_state.max_val);
-        #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
-                vec_t rv = Tile::load(r_base, v);
-                Tile::weighted_accum(&h_acc[t * EPV], contrib, rv);
+            float rescale = softmax_state.update(dot);
+            #pragma unroll
+            for (int i = 0; i < ACCS_PER_LANE; ++i) {
+                h_acc[i] *= rescale;
+            }
+
+            float contrib = __expf(dot - softmax_state.max_val);
+            #pragma unroll
+            for (int t = 0; t < VECS_PER_LANE; ++t) {
+                int v = lane + kMaxThreadsInWarp * t;
+                if (v < NUM_VECS) {
+                    vec_t rv = Tile::load(r_base, v);
+                    Tile::weighted_accum(&h_acc[t * EPV], contrib, rv);
+                }
             }
         }
     }
@@ -1129,7 +1206,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
-    int heavy_warps_per_block
+    int heavy_warps_per_block,
+    bool use_pipeline
 ) {
 
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
@@ -1194,25 +1272,29 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
         if (num_nodes_bucket == 0) return;
 
-        std::visit([&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+        std::visit([&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto pipe_c) {
             using index_t = typename decltype(idxInfo)::Type;
             using torch_t = typename decltype(typeInfo)::TorchType;
             using cuda_t = typename decltype(typeInfo)::CudaType;
             constexpr int DC = decltype(d_c)::value;
             constexpr int W = decltype(warp_c)::value;
+            constexpr bool PIPE = decltype(pipe_c)::value;
 
             auto* l_ptr     = reinterpret_cast<const cuda_t*>(l.data_ptr<torch_t>());
             auto* r_ptr     = reinterpret_cast<const cuda_t*>(r.data_ptr<torch_t>());
             auto* attn_ptr  = reinterpret_cast<const cuda_t*>(attn_vec.data_ptr<torch_t>());
             auto* h_out_ptr = reinterpret_cast<cuda_t*>(h_out.data_ptr<torch_t>());
 
-            // l_sh + W * D float + 2 * W float
-            size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+            // l_sh + r_dbuf (if PIPE) + W * D float + 2 * W float
+            size_t shmem = DC * sizeof(cuda_t)
+             + (PIPE ? W * 2 * DC * sizeof(cuda_t) : 0)
+             + W * DC * sizeof(float)
+             + 2 * W * sizeof(float);
 
             dim3 blocks(num_nodes_bucket, H);
             dim3 threads(W * kMaxThreadsInWarp);
 
-            GATv2Forward_Kernel<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+            GATv2Forward_Kernel<W, DC, PIPE, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                 N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
                 index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
                 index_ptr<index_t>(node_indices),
@@ -1220,7 +1302,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
         }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
            MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
            MakeIntVariant<32, 64, 128, 256>((int)D),
-           warp_variant);
+           warp_variant,
+           MakeBoolVariant<true, false>(use_pipeline));
     };
 
     launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block));
