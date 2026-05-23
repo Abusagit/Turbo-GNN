@@ -1,0 +1,31 @@
+===== Nsight Compute profiling =====
+Profiling baseline (D=128, fp32, N=100k, deg=16)...
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=False ...
+Done.
+==PROF== Disconnected from process 3284355
+
+Profiling pipeline (D=128, fp32, N=100k, deg=16)...
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=True ...
+Done.
+==PROF== Disconnected from process 3434631
+
+Profiling baseline (D=128, fp16, N=100k, deg=16)...
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=False ...
+Done.
+==PROF== Disconnected from process 3567656
+
+Profiling pipeline (D=128, fp16, N=100k, deg=16)...
+
+Graph: 100000 nodes, 1599951 edges, light=99991, heavy=9
+Running with pipeline=True ...
+Done.
+==PROF== Disconnected from process 3698788
+
+NCU reports saved to: dev/sinfillo/bench_results/ncu_20260520_213956/
+View with: ncu-ui dev/sinfillo/bench_results/ncu_20260520_213956/baseline_D128_fp32.ncu-rep dev/sinfillo/bench_results/ncu_20260520_213956/pipeline_D128_fp32.ncu-rep
