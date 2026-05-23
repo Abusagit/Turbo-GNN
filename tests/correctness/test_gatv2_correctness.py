@@ -305,3 +305,102 @@ def test_gatv2_cuda_low_precision_backward(dtype, num_nodes, feature_dim, heads)
         f"max|diff|={(x_cuda.grad.float() - x_ref.grad.float()).abs().max().item():.3e}, "
         f"mean|diff|={(x_cuda.grad.float() - x_ref.grad.float()).abs().mean().item():.3e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline correctness: USE_PIPELINE=true vs USE_PIPELINE=false
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_nodes", [64, 200, 1000])
+@pytest.mark.parametrize("feature_dim", [32, 64, 128, 256])
+@pytest.mark.parametrize("heads", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gatv2_pipeline_vs_baseline_forward(num_nodes, feature_dim, heads, dtype):
+    """Forward: USE_PIPELINE=true must match USE_PIPELINE=false exactly."""
+    device = "cuda"
+    torch.manual_seed(42)
+
+    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+    cuda_graph = build_cuda_graph(edge_index, num_nodes)
+
+    cuda_backend = BackendRegistry.get_backend("cuda")
+
+    layer = (
+        cuda_backend.create_conv(
+            "gat_v2",
+            feature_dim=feature_dim,
+            heads=heads,
+            bias=False,
+        )
+        .to(device)
+        .to(dtype)
+    )
+
+    x = torch.randn(num_nodes, feature_dim, device=device, dtype=dtype)
+
+    layer.use_pipeline = False
+    out_baseline = layer(x, cuda_graph)
+
+    layer.use_pipeline = True
+    out_pipeline = layer(x, cuda_graph)
+
+    assert not out_pipeline.isnan().any(), "Pipeline output contains NaN"
+    assert torch.equal(out_baseline, out_pipeline), (
+        f"Pipeline vs baseline forward mismatch ({dtype}): "
+        f"max|diff|={(out_baseline.float() - out_pipeline.float()).abs().max().item():.3e}"
+    )
+
+
+@pytest.mark.parametrize("num_nodes", [64, 200, 1000])
+@pytest.mark.parametrize("feature_dim", [32, 64, 128, 256])
+@pytest.mark.parametrize("heads", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gatv2_pipeline_vs_baseline_backward(num_nodes, feature_dim, heads, dtype):
+    """Backward: gradients must match between pipeline and baseline."""
+    device = "cuda"
+    torch.manual_seed(42)
+
+    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+    cuda_graph = build_cuda_graph(edge_index, num_nodes)
+
+    cuda_backend = BackendRegistry.get_backend("cuda")
+
+    layer = (
+        cuda_backend.create_conv(
+            "gat_v2",
+            feature_dim=feature_dim,
+            heads=heads,
+            bias=False,
+        )
+        .to(device)
+        .to(dtype)
+    )
+
+    x_base = torch.randn(num_nodes, feature_dim, device=device, dtype=dtype, requires_grad=True)
+    x_pipe = x_base.detach().clone().requires_grad_(True)
+
+    # Baseline forward + backward
+    layer.use_pipeline = False
+    out_base = layer(x_base, cuda_graph)
+    out_base.sum().backward()
+
+    # Pipeline forward + backward
+    layer.use_pipeline = True
+    out_pipe = layer(x_pipe, cuda_graph)
+    out_pipe.sum().backward()
+
+    assert x_base.grad is not None and x_pipe.grad is not None
+    assert not x_pipe.grad.isnan().any(), "Pipeline grad contains NaN"
+
+    # Forward match
+    assert torch.equal(out_base, out_pipe), (
+        f"Pipeline vs baseline forward mismatch in backward test ({dtype}): "
+        f"max|diff|={(out_base.float() - out_pipe.float()).abs().max().item():.3e}"
+    )
+
+    # Gradient match
+    assert torch.equal(x_base.grad, x_pipe.grad), (
+        f"Pipeline vs baseline backward mismatch ({dtype}): "
+        f"max|diff|={(x_base.grad.float() - x_pipe.grad.float()).abs().max().item():.3e}"
+    )
