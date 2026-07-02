@@ -19,6 +19,7 @@ GATv2Forward_Kernel(
     const index_t* __restrict__ d_row_ptr,
     const index_t* __restrict__ d_col_idx,
     const index_t* __restrict__ node_indices,   // node indirection
+    int num_nodes_bucket,
     const cuda_t* __restrict__ d_attn_vec,
     cuda_t* __restrict__ d_h_out,
     float* __restrict__ d_logsumexp_out,
@@ -34,31 +35,35 @@ GATv2Forward_Kernel(
     constexpr int VECS_PER_LANE  = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
     constexpr int ACCS_PER_LANE  = VECS_PER_LANE * EPV;
 
-    const int node_i = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h = blockIdx.y;
     const int warp_id = threadIdx.x / kMaxThreadsInWarp;
     const int lane    = threadIdx.x % kMaxThreadsInWarp;
 
-    if (node_i >= (int)N || head_h >= (int)H) return;
+    if (head_h >= (int)H) return;
 
-    index_t edge_start = d_row_ptr[node_i];
-    index_t edge_end   = d_row_ptr[node_i + 1];
-    int num_neighbors  = static_cast<int>(edge_end - edge_start);
+    for (int b = blockIdx.x; b < num_nodes_bucket; b += gridDim.x) {
+        const int node_i = static_cast<int>(node_indices[b]);
+        if (node_i >= (int)N) continue;
 
-    cuda_t* h_out_base = d_h_out + ((int64_t)node_i * H + head_h) * D_CONST;
+        index_t edge_start = d_row_ptr[node_i];
+        index_t edge_end   = d_row_ptr[node_i + 1];
+        int num_neighbors  = static_cast<int>(edge_end - edge_start);
 
-    // handle isolated nodes
-    if (num_neighbors == 0) {
-        if (warp_id == 0) {
-            for (int v = lane; v < NUM_VECS; v += kMaxThreadsInWarp) {
-                Tile::write_zero(h_out_base, v);
+        cuda_t* h_out_base = d_h_out + ((int64_t)node_i * H + head_h) * D_CONST;
+
+        // handle isolated nodes
+        if (num_neighbors == 0) {
+            if (warp_id == 0) {
+                for (int v = lane; v < NUM_VECS; v += kMaxThreadsInWarp) {
+                    Tile::write_zero(h_out_base, v);
+                }
+                if (lane == 0) {
+                    d_logsumexp_out[(int64_t)node_i * H + head_h] = -INFINITY;
+                }
             }
-            if (lane == 0) {
-                d_logsumexp_out[(int64_t)node_i * H + head_h] = -INFINITY;
-            }
+            __syncthreads();
+            continue;
         }
-        return;
-    }
 
     const cuda_t* l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t* a_base = d_attn_vec + head_h * D_CONST;
@@ -193,6 +198,9 @@ GATv2Forward_Kernel(
                 Tile::write_typed(h_out_base, v, combined);
             }
         }
+    }
+
+    __syncthreads();
     }
 }
 
@@ -1129,7 +1137,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
-    int heavy_warps_per_block
+    int heavy_warps_per_block,
+    int grid_size_override
 ) {
 
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
@@ -1209,13 +1218,17 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
             // l_sh + W * D float + 2 * W float
             size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
-            dim3 blocks(num_nodes_bucket, H);
+            int gx = (grid_size_override > 0)
+                       ? std::min(grid_size_override, num_nodes_bucket)
+                       : num_nodes_bucket;
+            dim3 blocks(gx, H);
             dim3 threads(W * kMaxThreadsInWarp);
 
             GATv2Forward_Kernel<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                 N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
                 index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
                 index_ptr<index_t>(node_indices),
+                num_nodes_bucket,
                 attn_ptr, h_out_ptr, d_logsumexp, negative_slope);
         }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
            MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
