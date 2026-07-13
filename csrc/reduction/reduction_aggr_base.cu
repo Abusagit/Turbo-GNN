@@ -1,12 +1,6 @@
 #include "common.cuh"
 
-
-void reduction_aggr_backward_cuda(
-    const at::Tensor& grad_out,
-    const at::Tensor& arg_idx,
-    at::Tensor& grad_x,
-    int warps_per_block = 8
-);
+void reduction_aggr_backward_cuda(const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8);
 
 void reduction_aggr_forward_partitioned_cuda(
     const at::Tensor& edge_ptr,
@@ -17,35 +11,27 @@ void reduction_aggr_forward_partitioned_cuda(
     int max_degree,
     at::Tensor& out,
     at::Tensor& arg_idx,
-    int warps_per_block = 8,
+    int warps_per_block             = 8,
     int edges_per_block_heavy_nodes = 128,
-    bool use_2d_kernel = false,
-    int features_per_block = 32,
-    int tiles_y = 8,
-    const std::string& reduce = "min"
+    bool use_2d_kernel              = false,
+    int features_per_block          = 32,
+    int tiles_y                     = 8,
+    const std::string& reduce       = "min"
 );
 
-at::Tensor reduction_aggr_backward_torch(
-    at::Tensor grad_out,
-    at::Tensor arg_idx,
-    int64_t num_src_nodes,
-    int warps_per_block = 8
-) {
+at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8) {
     TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
     TORCH_CHECK(arg_idx.is_cuda(), "arg_idx must be CUDA");
     TORCH_CHECK(
-        grad_out.scalar_type() == at::kFloat ||
-        grad_out.scalar_type() == at::kHalf ||
-        grad_out.scalar_type() == at::kBFloat16,
+        grad_out.scalar_type() == at::kFloat || grad_out.scalar_type() == at::kHalf || grad_out.scalar_type() == at::kBFloat16,
         "grad_out must be float32/float16/bfloat16"
     );
-    TORCH_CHECK(is_supported_index_type(arg_idx.scalar_type()),
-                "arg_idx must be int32, int64, uint32, or uint64");
+    TORCH_CHECK(is_supported_index_type(arg_idx.scalar_type()), "arg_idx must be int32, int64, uint32, or uint64");
 
     TORCH_CHECK(grad_out.dim() == 2, "grad_out must be 2D");
     TORCH_CHECK(arg_idx.sizes() == grad_out.sizes(), "arg_idx and grad_out shapes must match");
     const int64_t num_nodes = grad_out.size(0);
-    const int64_t d = grad_out.size(1);
+    const int64_t d         = grad_out.size(1);
 
     auto grad_x = torch::zeros({num_src_nodes, d}, grad_out.options());
 
@@ -60,24 +46,25 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     at::Tensor light_nodes,
     at::Tensor heavy_nodes,
     int max_degree,
-    int warps_per_block = 8,
+    int warps_per_block             = 8,
     int edges_per_block_heavy_nodes = 128,
-    bool use_2d_kernel = false,
-    int features_per_block = 32,
-    int tiles_y = 8,
-    std::string reduce = "min"
+    bool use_2d_kernel              = false,
+    int features_per_block          = 32,
+    int tiles_y                     = 8,
+    std::string reduce              = "min"
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
 
     auto idx_dtype = edge_ptr.scalar_type();
-    TORCH_CHECK(is_supported_index_type(idx_dtype),
-                "index tensors must be int32, int64, uint32, or uint64");
+    TORCH_CHECK(is_supported_index_type(idx_dtype), "index tensors must be int32, int64, uint32, or uint64");
     TORCH_CHECK(edge_idx.scalar_type() == idx_dtype, "edge_idx must have same dtype as edge_ptr");
     TORCH_CHECK(light_nodes.scalar_type() == idx_dtype, "light_nodes must have same dtype as edge_ptr");
     TORCH_CHECK(heavy_nodes.scalar_type() == idx_dtype, "heavy_nodes must have same dtype as edge_ptr");
 
-    TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16, "X must be float32/float16/bfloat16");
+    TORCH_CHECK(
+        X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16, "X must be float32/float16/bfloat16"
+    );
     TORCH_CHECK(X.dim() == 2, "X must be 2D");
 
     if (use_2d_kernel) {
@@ -88,12 +75,27 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     }
 
     const auto num_nodes = X.size(0);
-    const auto d = X.size(1);
+    const auto d         = X.size(1);
 
     auto out = torch::empty({num_nodes, d}, X.options());
     // arg_idx uses the same index dtype as edge_ptr
     auto arg_idx = torch::empty({num_nodes, d}, edge_ptr.options());
 
-    reduction_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y, reduce);
+    reduction_aggr_forward_partitioned_cuda(
+        edge_ptr,
+        edge_idx,
+        X,
+        light_nodes,
+        heavy_nodes,
+        max_degree,
+        out,
+        arg_idx,
+        warps_per_block,
+        edges_per_block_heavy_nodes,
+        use_2d_kernel,
+        features_per_block,
+        tiles_y,
+        reduce
+    );
     return {out, arg_idx};
 }

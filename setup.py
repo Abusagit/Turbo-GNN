@@ -76,7 +76,7 @@ def get_wheel_url():
 # ---------------------------------------------------------------------------
 # CachedWheelsCommand — downloads pre-built wheel from GitHub Releases
 # ---------------------------------------------------------------------------
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 class CachedWheelsCommand(_bdist_wheel):

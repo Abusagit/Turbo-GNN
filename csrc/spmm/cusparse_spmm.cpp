@@ -1,11 +1,10 @@
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
 #include <cusparse_v2.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <iostream>
-#include <unordered_map>
-#include <mutex>
+
 #include <cmath>
+#include <mutex>
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -24,9 +23,12 @@
 // Map torch scalar type to cuSPARSE data type
 static cudaDataType_t torch_to_cuda_dtype(c10::ScalarType dtype) {
     switch (dtype) {
-        case c10::ScalarType::Float:    return CUDA_R_32F;
-        case c10::ScalarType::Half:     return CUDA_R_16F;
-        case c10::ScalarType::BFloat16: return CUDA_R_16BF;
+        case c10::ScalarType::Float:
+            return CUDA_R_32F;
+        case c10::ScalarType::Half:
+            return CUDA_R_16F;
+        case c10::ScalarType::BFloat16:
+            return CUDA_R_16BF;
         default:
             TORCH_CHECK(false, "Unsupported dtype for cuSPARSE SpMM. Must be float32/float16/bfloat16");
     }
@@ -34,38 +36,30 @@ static cudaDataType_t torch_to_cuda_dtype(c10::ScalarType dtype) {
 
 constexpr int BLOCK_DIM = 256;
 
-enum class NormType {
-    NONE = 0,
-    RIGHT = 1,
-    LEFT = 2,
-    BOTH = 3
-};
+enum class NormType { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
 
+void launch_compute_degrees(
+    const torch::Tensor& indptr, const torch::Tensor& indices, torch::Tensor& in_degrees, torch::Tensor& out_degrees, int block_dim
+);
 
-
-void launch_compute_degrees(const torch::Tensor& indptr, const torch::Tensor& indices,
-                           torch::Tensor& in_degrees, torch::Tensor& out_degrees, int block_dim);
-
-void launch_compute_normalized_weights(const torch::Tensor& indptr, const torch::Tensor& indices,
-                                      const torch::Tensor& edge_weights, torch::Tensor& normalized_weights,
-                                      const torch::Tensor& in_degrees, const torch::Tensor& out_degrees,
-                                      NormType norm, int block_dim);
-
-
+void launch_compute_normalized_weights(
+    const torch::Tensor& indptr, const torch::Tensor& indices, const torch::Tensor& edge_weights, torch::Tensor& normalized_weights,
+    const torch::Tensor& in_degrees, const torch::Tensor& out_degrees, NormType norm, int block_dim
+);
 
 // Cache for graph structures and preprocessed data
 struct GraphCache {
     cusparseSpMatDescr_t matA = nullptr;
-    void* workspace = nullptr;
-    size_t workspace_size = 0;
+    void *workspace           = nullptr;
+    size_t workspace_size     = 0;
     torch::Tensor edge_values;  // Stores normalized edge weights
     torch::Tensor in_degrees;   // Cache in-degrees
     torch::Tensor out_degrees;  // Cache out-degrees
     int32_t m, n, nnz;
     cusparseSpMMAlg_t best_alg = CUSPARSE_SPMM_ALG_DEFAULT;
-    NormType cached_norm = NormType::NONE;
-    bool has_edge_weights = false;
-    bool is_transposed = false;
+    NormType cached_norm       = NormType::NONE;
+    bool has_edge_weights      = false;
+    bool is_transposed         = false;
 
     ~GraphCache() {
         if (matA) cusparseDestroySpMat(matA);
@@ -78,13 +72,14 @@ static std::unordered_map<size_t, std::unique_ptr<GraphCache>> graph_cache;
 static std::mutex cache_mutex;
 
 // Hash function for graph structure (including normalization type and feature dtype)
-size_t hash_graph(const torch::Tensor& indptr, const torch::Tensor& indices,
-                  NormType norm, bool has_edge_weights, bool is_transposed,
-                  c10::ScalarType feature_dtype) {
+size_t hash_graph(
+    const torch::Tensor& indptr, const torch::Tensor& indices, NormType norm, bool has_edge_weights, bool is_transposed,
+    c10::ScalarType feature_dtype
+) {
     size_t h1 = std::hash<int64_t>{}(indptr.size(0));
     size_t h2 = std::hash<int64_t>{}(indices.size(0));
-    size_t h3 = std::hash<void*>{}(indptr.data_ptr());
-    size_t h4 = std::hash<void*>{}(indices.data_ptr());
+    size_t h3 = std::hash<void *>{}(indptr.data_ptr());
+    size_t h4 = std::hash<void *>{}(indices.data_ptr());
     size_t h5 = std::hash<int>{}(static_cast<int>(norm));
     size_t h6 = std::hash<bool>{}(has_edge_weights);
     size_t h7 = std::hash<bool>{}(is_transposed);
@@ -92,34 +87,36 @@ size_t hash_graph(const torch::Tensor& indptr, const torch::Tensor& indices,
     return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7);
 }
 
-
-
-
-
-torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
-                                 const torch::Tensor &indices,
-                                 const torch::Tensor &features,
-                                 const torch::Tensor &edge_weights,
-                                 const std::string &norm_str,
-                                 int algorithm,
-                                 bool use_cache,
-                                 bool do_transpose_a,
-                                 int block_dim) {
+torch::Tensor csr_SPMM_normalized(
+    const torch::Tensor& indptr,
+    const torch::Tensor& indices,
+    const torch::Tensor& features,
+    const torch::Tensor& edge_weights,
+    const std::string& norm_str,
+    int algorithm,
+    bool use_cache,
+    bool do_transpose_a,
+    int block_dim
+) {
     CHECK_INPUT(indptr);
     CHECK_INPUT(indices);
     CHECK_INPUT(features);
 
     TORCH_CHECK(
-        features.scalar_type() == c10::ScalarType::Float ||
-        features.scalar_type() == c10::ScalarType::Half ||
-        features.scalar_type() == c10::ScalarType::BFloat16,
-        "features must be float32/float16/bfloat16");
+        features.scalar_type() == c10::ScalarType::Float || features.scalar_type() == c10::ScalarType::Half ||
+            features.scalar_type() == c10::ScalarType::BFloat16,
+        "features must be float32/float16/bfloat16"
+    );
 
     NormType norm;
-    if (norm_str == "none") norm = NormType::NONE;
-    else if (norm_str == "right") norm = NormType::RIGHT;
-    else if (norm_str == "left") norm = NormType::LEFT;
-    else if (norm_str == "both") norm = NormType::BOTH;
+    if (norm_str == "none")
+        norm = NormType::NONE;
+    else if (norm_str == "right")
+        norm = NormType::RIGHT;
+    else if (norm_str == "left")
+        norm = NormType::LEFT;
+    else if (norm_str == "both")
+        norm = NormType::BOTH;
     else {
         TORCH_CHECK(false, "Invalid normalization type. Must be one of: 'none', 'right', 'left', 'both'");
     }
@@ -130,31 +127,40 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
         TORCH_CHECK(edge_weights.size(0) == indices.size(0), "Edge weights must have same length as indices");
     }
 
-    auto handle = at::cuda::getCurrentCUDASparseHandle();
+    auto handle                = at::cuda::getCurrentCUDASparseHandle();
     cudaDataType_t dense_dtype = torch_to_cuda_dtype(features.scalar_type());
 
-    int32_t m = indptr.size(0) - 1;
-    int32_t n = features.size(1);
-    int32_t k = features.size(0);
+    int32_t m   = indptr.size(0) - 1;
+    int32_t n   = features.size(1);
+    int32_t k   = features.size(0);
     int64_t nnz = indices.size(0);
 
     TORCH_CHECK(k == m, "Feature matrix first dimension must match number of nodes");
 
     float alpha = 1.0f;
-    float beta = 0.0f;
+    float beta  = 0.0f;
 
     auto out = torch::empty({m, n}, features.options());
 
     cusparseSpMMAlg_t alg;
     switch (algorithm) {
-        case 0: alg = CUSPARSE_SPMM_ALG_DEFAULT; break;
-        case 1: alg = CUSPARSE_SPMM_CSR_ALG1; break;
-        case 2: alg = CUSPARSE_SPMM_CSR_ALG2; break;
-        case 3: alg = CUSPARSE_SPMM_CSR_ALG3; break;
-        default: alg = CUSPARSE_SPMM_ALG_DEFAULT;
+        case 0:
+            alg = CUSPARSE_SPMM_ALG_DEFAULT;
+            break;
+        case 1:
+            alg = CUSPARSE_SPMM_CSR_ALG1;
+            break;
+        case 2:
+            alg = CUSPARSE_SPMM_CSR_ALG2;
+            break;
+        case 3:
+            alg = CUSPARSE_SPMM_CSR_ALG3;
+            break;
+        default:
+            alg = CUSPARSE_SPMM_ALG_DEFAULT;
     }
 
-    GraphCache* cache = nullptr;
+    GraphCache *cache = nullptr;
     size_t graph_hash = 0;
 
     if (use_cache) {
@@ -169,38 +175,29 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
                 alg = cache->best_alg;
             }
         } else {
-
             graph_cache[graph_hash] = std::make_unique<GraphCache>();
-            cache = graph_cache[graph_hash].get();
-            cache->m = m;
-            cache->n = n;
-            cache->nnz = nnz;
-            cache->best_alg = alg;
-            cache->cached_norm = norm;
+            cache                   = graph_cache[graph_hash].get();
+            cache->m                = m;
+            cache->n                = n;
+            cache->nnz              = nnz;
+            cache->best_alg         = alg;
+            cache->cached_norm      = norm;
             cache->has_edge_weights = has_edge_weights;
 
-
-            cache->in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+            cache->in_degrees  = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
             cache->out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
-
 
             launch_compute_degrees(indptr, indices, cache->in_degrees, cache->out_degrees, block_dim);
 
-
             cache->edge_values = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
-            launch_compute_normalized_weights(indptr, indices, edge_weights, cache->edge_values,
-                                     cache->in_degrees, cache->out_degrees, norm, block_dim);
-
+            launch_compute_normalized_weights(
+                indptr, indices, edge_weights, cache->edge_values, cache->in_degrees, cache->out_degrees, norm, block_dim
+            );
 
             CHECK_CUSPARSE(cusparseCreateCsr(
-                &cache->matA, m, m, nnz,
-                indptr.data_ptr<int32_t>(),
-                indices.data_ptr<int32_t>(),
-                cache->edge_values.data_ptr<float>(),
-                CUSPARSE_INDEX_32I,
-                CUSPARSE_INDEX_32I,
-                CUSPARSE_INDEX_BASE_ZERO,
-                CUDA_R_32F));
+                &cache->matA, m, m, nnz, indptr.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), cache->edge_values.data_ptr<float>(),
+                CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F
+            ));
         }
     }
 
@@ -213,75 +210,62 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
         matA = cache->matA;
     } else {
         // Compute normalized weights on-the-fly
-        torch::Tensor in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+        torch::Tensor in_degrees  = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
         torch::Tensor out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
 
         launch_compute_degrees(indptr, indices, in_degrees, out_degrees, block_dim);
 
         normalized_weights = torch::empty({nnz}, torch::dtype(torch::kFloat32).device(features.device()));
-        launch_compute_normalized_weights(indptr, indices, edge_weights, normalized_weights,
-                                 in_degrees, out_degrees, norm, block_dim);
+        launch_compute_normalized_weights(indptr, indices, edge_weights, normalized_weights, in_degrees, out_degrees, norm, block_dim);
 
         CHECK_CUSPARSE(cusparseCreateCsr(
-            &matA, m, m, nnz,
-            indptr.data_ptr<int32_t>(),
-            indices.data_ptr<int32_t>(),
-            normalized_weights.data_ptr<float>(),
-            CUSPARSE_INDEX_32I,
-            CUSPARSE_INDEX_32I,
-            CUSPARSE_INDEX_BASE_ZERO,
-            CUDA_R_32F)
-        );
+            &matA, m, m, nnz, indptr.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), normalized_weights.data_ptr<float>(), CUSPARSE_INDEX_32I,
+            CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F
+        ));
     }
 
-    CHECK_CUSPARSE(cusparseCreateDnMat(&matB, m, n, n, features.data_ptr(),
-                                       dense_dtype, CUSPARSE_ORDER_ROW));
+    CHECK_CUSPARSE(cusparseCreateDnMat(&matB, m, n, n, features.data_ptr(), dense_dtype, CUSPARSE_ORDER_ROW));
 
-    CHECK_CUSPARSE(cusparseCreateDnMat(&matC, m, n, n, out.data_ptr(),
-                                       dense_dtype, CUSPARSE_ORDER_ROW));
+    CHECK_CUSPARSE(cusparseCreateDnMat(&matC, m, n, n, out.data_ptr(), dense_dtype, CUSPARSE_ORDER_ROW));
 
     // Handle workspace
-    void* workspace = nullptr;
-    size_t workspace_size = 0;
+    void *workspace          = nullptr;
+    size_t workspace_size    = 0;
     bool need_free_workspace = false;
 
-    cusparseOperation_t opA = do_transpose_a
-        ? CUSPARSE_OPERATION_TRANSPOSE
-        : CUSPARSE_OPERATION_NON_TRANSPOSE;
+    cusparseOperation_t opA = do_transpose_a ? CUSPARSE_OPERATION_TRANSPOSE : CUSPARSE_OPERATION_NON_TRANSPOSE;
 
     if (cache && cache->workspace) {
         // Use cached workspace
-        workspace = cache->workspace;
+        workspace      = cache->workspace;
         workspace_size = cache->workspace_size;
     } else {
         // Get required workspace size
         size_t required_size;
         CHECK_CUSPARSE(cusparseSpMM_bufferSize(
-            handle, opA, CUSPARSE_OPERATION_NON_TRANSPOSE,
-            &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg, &required_size));
+            handle, opA, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg, &required_size
+        ));
 
         if (cache && use_cache) {
             // Allocate and cache workspace
             if (required_size > 0) {
                 cudaMalloc(&cache->workspace, required_size);
                 cache->workspace_size = required_size;
-                workspace = cache->workspace;
-                workspace_size = required_size;
+                workspace             = cache->workspace;
+                workspace_size        = required_size;
             }
         } else {
             // Temporary workspace
             if (required_size > 0) {
                 cudaMalloc(&workspace, required_size);
-                workspace_size = required_size;
+                workspace_size      = required_size;
                 need_free_workspace = true;
             }
         }
     }
 
     // Perform SpMM (compute type always float32 for accuracy)
-    CHECK_CUSPARSE(cusparseSpMM(
-        handle, opA, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg, workspace));
+    CHECK_CUSPARSE(cusparseSpMM(handle, opA, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg, workspace));
 
     // Cleanup
     CHECK_CUSPARSE(cusparseDestroyDnMat(matB));
@@ -298,34 +282,38 @@ torch::Tensor csr_SPMM_normalized(const torch::Tensor &indptr,
     return out;
 }
 
-
-int find_best_algorithm_normalized(const torch::Tensor &indptr,
-                                  const torch::Tensor &indices,
-                                  const torch::Tensor &features,
-                                  const torch::Tensor &edge_weights,
-                                  const std::string &norm_str,
-                                  int block_dim) {
+int find_best_algorithm_normalized(
+    const torch::Tensor& indptr,
+    const torch::Tensor& indices,
+    const torch::Tensor& features,
+    const torch::Tensor& edge_weights,
+    const std::string& norm_str,
+    int block_dim
+) {
     auto handle = at::cuda::getCurrentCUDASparseHandle();
 
-
     NormType norm;
-    if (norm_str == "none") norm = NormType::NONE;
-    else if (norm_str == "right") norm = NormType::RIGHT;
-    else if (norm_str == "left") norm = NormType::LEFT;
-    else if (norm_str == "both") norm = NormType::BOTH;
+    if (norm_str == "none")
+        norm = NormType::NONE;
+    else if (norm_str == "right")
+        norm = NormType::RIGHT;
+    else if (norm_str == "left")
+        norm = NormType::LEFT;
+    else if (norm_str == "both")
+        norm = NormType::BOTH;
     else {
         TORCH_CHECK(false, "Invalid normalization type. Must be one of: 'none', 'right', 'left', 'both'");
     }
 
-    int32_t m = indptr.size(0) - 1;
-    int32_t n = features.size(1);
+    int32_t m   = indptr.size(0) - 1;
+    int32_t n   = features.size(1);
     int64_t nnz = indices.size(0);
 
     float alpha = 1.0f;
-    float beta = 0.0f;
+    float beta  = 0.0f;
 
     // Compute normalized weights
-    torch::Tensor in_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
+    torch::Tensor in_degrees  = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
     torch::Tensor out_degrees = torch::zeros({m}, torch::dtype(torch::kFloat32).device(features.device()));
     launch_compute_degrees(indptr, indices, in_degrees, out_degrees, block_dim);
 
@@ -338,30 +326,19 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
     cusparseDnMatDescr_t matB, matC;
 
     CHECK_CUSPARSE(cusparseCreateCsr(
-        &matA, m, m, nnz,
-        indptr.data_ptr<int32_t>(),
-        indices.data_ptr<int32_t>(),
-        normalized_weights.data_ptr<float>(),
-        CUSPARSE_INDEX_32I,
-        CUSPARSE_INDEX_32I,
-        CUSPARSE_INDEX_BASE_ZERO,
-        CUDA_R_32F));
+        &matA, m, m, nnz, indptr.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), normalized_weights.data_ptr<float>(), CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F
+    ));
 
     cudaDataType_t bench_dense_dtype = torch_to_cuda_dtype(features.scalar_type());
 
-    CHECK_CUSPARSE(cusparseCreateDnMat(&matB, m, n, n, features.data_ptr(),
-                                       bench_dense_dtype, CUSPARSE_ORDER_ROW));
+    CHECK_CUSPARSE(cusparseCreateDnMat(&matB, m, n, n, features.data_ptr(), bench_dense_dtype, CUSPARSE_ORDER_ROW));
 
-    CHECK_CUSPARSE(cusparseCreateDnMat(&matC, m, n, n, out.data_ptr(),
-                                       bench_dense_dtype, CUSPARSE_ORDER_ROW));
+    CHECK_CUSPARSE(cusparseCreateDnMat(&matC, m, n, n, out.data_ptr(), bench_dense_dtype, CUSPARSE_ORDER_ROW));
 
     // Test different algorithms
     std::vector<std::pair<int, cusparseSpMMAlg_t>> algorithms = {
-        {0, CUSPARSE_SPMM_ALG_DEFAULT},
-        {1, CUSPARSE_SPMM_CSR_ALG1},
-        {2, CUSPARSE_SPMM_CSR_ALG2},
-        {3, CUSPARSE_SPMM_CSR_ALG3}
-    };
+        {0, CUSPARSE_SPMM_ALG_DEFAULT}, {1, CUSPARSE_SPMM_CSR_ALG1}, {2, CUSPARSE_SPMM_CSR_ALG2}, {3, CUSPARSE_SPMM_CSR_ALG3}};
 
     int best_alg_id = -1;
     float best_time = std::numeric_limits<float>::max();
@@ -370,18 +347,21 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
         try {
             size_t workspace_size;
             CHECK_CUSPARSE(cusparseSpMM_bufferSize(
-                handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg, &workspace_size));
+                handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg,
+                &workspace_size
+            ));
 
-            void* workspace = nullptr;
+            void *workspace = nullptr;
             if (workspace_size > 0) {
                 cudaMalloc(&workspace, workspace_size);
             }
 
             // Warmup
             for (int i = 0; i < 3; i++) {
-                cusparseSpMM(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                            &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg, workspace);
+                cusparseSpMM(
+                    handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, CUDA_R_32F,
+                    alg, workspace
+                );
             }
 
             // Time it
@@ -391,8 +371,10 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
 
             cudaEventRecord(start);
             for (int i = 0; i < 10; i++) {
-                cusparseSpMM(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                            &alpha, matA, matB, &beta, matC, CUDA_R_32F, alg, workspace);
+                cusparseSpMM(
+                    handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, CUDA_R_32F,
+                    alg, workspace
+                );
             }
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);
@@ -401,7 +383,7 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
             cudaEventElapsedTime(&milliseconds, start, stop);
 
             if (milliseconds < best_time) {
-                best_time = milliseconds;
+                best_time   = milliseconds;
                 best_alg_id = alg_id;
             }
 
@@ -421,30 +403,26 @@ int find_best_algorithm_normalized(const torch::Tensor &indptr,
     return best_alg_id;
 }
 
-
 // ************************* BACKWARD COMPATIBILITY STARTS *************************
-int find_best_algorithm(const torch::Tensor &indptr,
-                        const torch::Tensor &indices,
-                        const torch::Tensor &features,
-                        int block_dim) {
+int find_best_algorithm(const torch::Tensor& indptr, const torch::Tensor& indices, const torch::Tensor& features, int block_dim) {
     torch::Tensor empty_weights = torch::empty({0}, features.options());
     return find_best_algorithm_normalized(indptr, indices, features, empty_weights, "none", block_dim);
 }
 
-
-torch::Tensor csr_SPMM(const torch::Tensor &indptr,
-                       const torch::Tensor &indices,
-                       const torch::Tensor &features,
-                       int algorithm,
-                       bool use_cache,
-                       bool do_transpose_a,
-                       int block_dim) {
+torch::Tensor csr_SPMM(
+    const torch::Tensor& indptr,
+    const torch::Tensor& indices,
+    const torch::Tensor& features,
+    int algorithm,
+    bool use_cache,
+    bool do_transpose_a,
+    int block_dim
+) {
     torch::Tensor empty_weights = torch::empty({0}, features.options());
     return csr_SPMM_normalized(indptr, indices, features, empty_weights, "none", algorithm, use_cache, do_transpose_a, block_dim);
 }
 
 // ************************* BACKWARD COMPATIBILITY ENDS *************************
-
 
 void clear_graph_cache() {
     std::lock_guard<std::mutex> lock(cache_mutex);

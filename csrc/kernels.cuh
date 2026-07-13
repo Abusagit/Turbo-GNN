@@ -1,8 +1,9 @@
 #pragma once
 #include <torch/extension.h>
-#include <vector>
-#include <tuple>
+
 #include <string>
+#include <tuple>
+#include <vector>
 
 // ============================================================================
 // Reduction aggregation
@@ -15,20 +16,15 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     at::Tensor light_nodes,
     at::Tensor heavy_nodes,
     int max_degree,
-    int warps_per_block = 8,
+    int warps_per_block             = 8,
     int edges_per_block_heavy_nodes = 128,
-    bool use_2d_kernel = false,
-    int features_per_block = 32,
-    int tiles_y = 8,
-    std::string reduce = "min"
+    bool use_2d_kernel              = false,
+    int features_per_block          = 32,
+    int tiles_y                     = 8,
+    std::string reduce              = "min"
 );
 
-at::Tensor reduction_aggr_backward_torch(
-    at::Tensor grad_out,
-    at::Tensor arg_idx,
-    int64_t num_src_nodes,
-    int warps_per_block = 8
-);
+at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);
 
 // ============================================================================
 // GATv2 aggregation
@@ -65,15 +61,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor bwd_heavy_nodes,
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
-    bool is_directed = true
+    bool is_directed          = true
 );
 
 // ============================================================================
 // Graph Transformer aggregation
 // ============================================================================
 
-std::tuple<torch::Tensor, torch::Tensor>
-graph_attention_forward_csr_mh_cuda(
+std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     torch::Tensor row_ptr,
     torch::Tensor col_idx,
     torch::Tensor Q,
@@ -86,12 +81,11 @@ graph_attention_forward_csr_mh_cuda(
     int heavy_warps_per_block = 8
 );
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-graph_attention_backward_csr_mh_cuda(
-    torch::Tensor row_ptr,       // forward CSR [N+1]
-    torch::Tensor col_idx,       // forward CSR [E]
-    torch::Tensor row_ptr_T,     // backward CSR^T [N+1]
-    torch::Tensor col_idx_T,     // backward CSR^T [E]
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward_csr_mh_cuda(
+    torch::Tensor row_ptr,    // forward CSR [N+1]
+    torch::Tensor col_idx,    // forward CSR [E]
+    torch::Tensor row_ptr_T,  // backward CSR^T [N+1]
+    torch::Tensor col_idx_T,  // backward CSR^T [E]
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -103,7 +97,7 @@ graph_attention_backward_csr_mh_cuda(
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
-    bool is_directed = true
+    bool is_directed          = true
 );
 
 // ============================================================================
@@ -111,9 +105,5 @@ graph_attention_backward_csr_mh_cuda(
 // ============================================================================
 
 void launch_compute_degrees(
-    const torch::Tensor& indptr,
-    const torch::Tensor& indices,
-    torch::Tensor& in_degrees,
-    torch::Tensor& out_degrees,
-    int block_dim
+    const torch::Tensor& indptr, const torch::Tensor& indices, torch::Tensor& in_degrees, torch::Tensor& out_degrees, int block_dim
 );
