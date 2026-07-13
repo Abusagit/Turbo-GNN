@@ -1,0 +1,207 @@
+# .clang-format — Google C++ style, fully expanded.
+#
+# This intentionally states every option manually instead of using
+# `BasedOnStyle: Google`, so the style is pinned regardless of which
+# clang-format default "Google" happens to ship. Values mirror Google's
+# style as emitted by `clang-format -style=google --dump-config`.
+#
+# CUDA support: clang-format has no separate CUDA language; it parses
+# `.cu` / `.cuh` files with `Language: Cpp`, so this single section covers
+# .c/.cc/.cpp/.h/.hpp/.cu/.cuh alike (kernel-launch `<<<...>>>`,
+# `__global__`/`__device__`/`__host__` qualifiers, etc. are handled).
+---
+Language: Cpp
+Standard: c++20
+
+# ---------------------------------------------------------------------------
+# Indentation & width
+# ---------------------------------------------------------------------------
+ColumnLimit: 144
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+TabWidth: 8
+UseTab: Never
+AccessModifierOffset: -1
+IndentAccessModifiers: false
+IndentCaseLabels: true
+IndentCaseBlocks: false
+IndentGotoLabels: true
+IndentExternBlock: AfterExternBlock
+IndentPPDirectives: None
+IndentRequiresClause: true
+IndentWrappedFunctionNames: false
+NamespaceIndentation: None
+LambdaBodyIndentation: Signature
+BitFieldColonSpacing: After
+
+# ---------------------------------------------------------------------------
+# Braces & blocks
+# ---------------------------------------------------------------------------
+BreakBeforeBraces: Attach
+Cpp11BracedListStyle: true
+InsertBraces: false
+RemoveBracesLLVM: false
+CompactNamespaces: false
+FixNamespaceComments: true
+ShortNamespaceLines: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+SeparateDefinitionBlocks: Leave
+EmptyLineAfterAccessModifier: Never
+EmptyLineBeforeAccessModifier: LogicalBlock
+
+# ---------------------------------------------------------------------------
+# "Short" constructs allowed on a single line
+# ---------------------------------------------------------------------------
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLambdasOnASingleLine: All
+AllowShortLoopsOnASingleLine: true
+
+# ---------------------------------------------------------------------------
+# Function / parameter / argument packing & wrapping
+# ---------------------------------------------------------------------------
+SkipMacroDefinitionBody: true
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+BinPackArguments: true
+BinPackParameters: true
+ExperimentalAutoDetectBinPacking: true
+AlignAfterOpenBracket: false
+# Dangling parenthesis for multiline function decls/defs/calls: break after
+# the open bracket (first arg on next line) and put the closing bracket on
+# its own line. In clang-format >= 21 these replace `AlignAfterOpenBracket:
+# BlockIndent`, which now only aligns args and no longer dangles the ')'.
+BreakAfterOpenBracketFunction: true
+BreakBeforeCloseBracketFunction: true
+BreakAfterReturnType: None
+BreakConstructorInitializers: BeforeColon
+PackConstructorInitializers: NextLine
+BreakInheritanceList: BeforeColon
+AlwaysBreakBeforeMultilineStrings: true
+BreakTemplateDeclarations: Yes
+RequiresClausePosition: OwnLine
+
+# ---------------------------------------------------------------------------
+# Operators, breaking & alignment
+# ---------------------------------------------------------------------------
+BreakBeforeBinaryOperators: None
+BreakBeforeConceptDeclarations: Always
+BreakBeforeTemplateCloser: true
+BreakBeforeTernaryOperators: true
+BreakStringLiterals: true
+AlignOperands: Align
+AlignEscapedNewlines: Left
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 0
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveBitFields: Consecutive
+AlignConsecutiveDeclarations: None
+AlignConsecutiveMacros: None
+AlignArrayOfStructures: None
+DerivePointerAlignment: false
+PointerAlignment: Right
+ReferenceAlignment: Left
+QualifierAlignment: Leave
+
+# ---------------------------------------------------------------------------
+# Spacing
+# ---------------------------------------------------------------------------
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceAroundPointerQualifiers: Default
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCaseColon: false
+SpaceBeforeCpp11BracedList: false
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceBeforeSquareBrackets: false
+SpaceInEmptyBlock: false
+SpacesBeforeTrailingComments: 2
+SpacesInAngles: Never
+SpacesInContainerLiterals: true
+SpacesInLineCommentPrefix:
+  Minimum: 1
+  Maximum: -1
+SpacesInParens: Never
+SpacesInSquareBrackets: false
+
+# ---------------------------------------------------------------------------
+# #include handling
+# ---------------------------------------------------------------------------
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeIsMainRegex: '([-_](test|unittest))?$'
+IncludeIsMainSourceRegex: ''
+IncludeCategories:
+  - Regex: '^<ext/.*\.h>'
+    Priority: 2
+    SortPriority: 0
+    CaseSensitive: false
+  - Regex: '^<.*\.h>'
+    Priority: 1
+    SortPriority: 0
+    CaseSensitive: false
+  - Regex: '^<.*'
+    Priority: 2
+    SortPriority: 0
+    CaseSensitive: false
+  - Regex: '.*'
+    Priority: 3
+    SortPriority: 0
+    CaseSensitive: false
+
+# ---------------------------------------------------------------------------
+# Comments, using-decls, misc.
+# ---------------------------------------------------------------------------
+ReflowComments: true
+CommentPragmas: '^ IWYU pragma:'
+SortUsingDeclarations: LexicographicNumeric
+InsertNewlineAtEOF: false
+InsertTrailingCommas: None
+RemoveSemicolon: false
+DisableFormat: false
+
+# ---------------------------------------------------------------------------
+# Macros clang-format should treat specially (helps CUDA / framework macros)
+# ---------------------------------------------------------------------------
+AttributeMacros:
+  - __capability
+ForEachMacros:
+  - foreach
+  - Q_FOREACH
+  - BOOST_FOREACH
+IfMacros:
+  - KJ_IF_MAYBE
+StatementAttributeLikeMacros:
+  - Q_EMIT
+StatementMacros:
+  - Q_UNUSED
+  - QT_REQUIRE_VERSION
+WhitespaceSensitiveMacros:
+  - STRINGIZE
+  - PP_STRINGIZE
+  - BOOST_PP_STRINGIZE
+
+# ---------------------------------------------------------------------------
+# Penalties (Google defaults — tune the cost of each kind of line break)
+# ---------------------------------------------------------------------------
+PenaltyBreakAssignment: 2
+PenaltyBreakBeforeFirstCallParameter: 1
+PenaltyBreakComment: 300
+PenaltyBreakFirstLessLess: 120
+PenaltyBreakOpenParenthesis: 0
+PenaltyBreakString: 1000
+PenaltyBreakTemplateDeclaration: 10
+PenaltyExcessCharacter: 1000000
+PenaltyIndentedWhitespace: 0
+PenaltyReturnTypeOnItsOwnLine: 200
+...
