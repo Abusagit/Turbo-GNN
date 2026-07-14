@@ -1,12 +1,18 @@
+#include <cstdint>
+
 #include "common.cuh"
 
 template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForward_CSR_MH_v2_D(
-    const int N, const int H, const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
-    const int64_t stride_q_n, const int64_t stride_q_h, const int64_t stride_k_n, const int64_t stride_k_h, const int64_t stride_v_n,
-    const int64_t stride_v_h, const index_t *__restrict__ row_ptr, const index_t *__restrict__ col_idx,
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionForward_CSR_MH_v2_D( // no-format
+    int N, int H,
+    const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
+    int64_t stride_q_n, int64_t stride_q_h,
+    int64_t stride_k_n, int64_t stride_k_h,
+    int64_t stride_v_n, int64_t stride_v_h,
+    const index_t *__restrict__ row_ptr, const index_t *__restrict__ col_idx,
     const index_t *__restrict__ node_indices,  // node indirection: node_i = node_indices[blockIdx.x]
-    cuda_t *__restrict__ O, const int64_t stride_o_n, const int64_t stride_o_h, float *__restrict__ logsumexp, const float scale
+    cuda_t *__restrict__ O, int64_t stride_o_n, int64_t stride_o_h,
+    float *__restrict__ logsumexp, float scale
 ) {
     static_assert(D_CONST % 32 == 0, "D_CONST must be multiple of 32 for this fast path");
 
@@ -22,7 +28,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
     const int warp_id = threadIdx.x / kWarpSize;
     const int lane_id = threadIdx.x % kWarpSize;
 
-    if (node_i >= N || head_h >= H) {
+    if (node_i >= N || head_h >= H) [[unlikely]] {
         return;
     }
 
@@ -35,13 +41,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
     // warp_out[WARPS_PER_BLOCK * D_CONST] as float
     // warp_max[WARPS_PER_BLOCK] as float
     // warp_sum[WARPS_PER_BLOCK] as float
-    extern __shared__ char sh_raw[];
-    cuda_t *k_shared = reinterpret_cast<cuda_t *>(sh_raw);
-    float *warp_out  = reinterpret_cast<float *>(sh_raw + D_CONST * sizeof(cuda_t));
-    float *warp_max  = warp_out + WARPS_PER_BLOCK * D_CONST;
-    float *warp_sum  = warp_max + WARPS_PER_BLOCK;
+    extern __shared__ uint8_t sh_raw[];
+    cuda_t *const k_shared = reinterpret_cast<cuda_t *>(sh_raw);
+    float *const warp_out  = reinterpret_cast<float *>(sh_raw + D_CONST * sizeof(cuda_t));
+    float *const warp_max  = warp_out + WARPS_PER_BLOCK * D_CONST;
+    float *const warp_sum  = warp_max + WARPS_PER_BLOCK;
 
-    float *my_out = warp_out + warp_id * D_CONST;
+    float *const my_out = warp_out + warp_id * D_CONST;
 
     // handle isolated nodes
     if (num_neighbors == 0) {
@@ -59,7 +65,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
 
     // cooperative load of K_i via 128-bit transactions (unchanged)
     {
-        constexpr int ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);
+        constexpr int ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);  // remainder is guaranteed to be zero
         constexpr int NUM_K_LOADS  = D_CONST / ELEMS_PER_F4;
         const cuda_t *k_base       = K + node_i * stride_k_n + head_h * stride_k_h;
         const float4 *k_src        = reinterpret_cast<const float4 *>(k_base);
@@ -72,15 +78,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
 
     OnlineSoftmaxState softmax_state;
 
-    float o_acc[ACCS_PER_LANE];
-#pragma unroll
-    for (int i = 0; i < ACCS_PER_LANE; ++i) {
-        o_acc[i] = 0.0f;
-    }
+    float o_acc[ACCS_PER_LANE] = {0};
 
     // neighbor loop
     for (int e = warp_id; e < num_neighbors; e += WARPS_PER_BLOCK) {
-        const index_t j = __ldg(&col_idx[edge_start + e]);
+        const index_t j = col_idx[edge_start + e];
 
         const cuda_t *q_base = Q + j * stride_q_n + head_h * stride_q_h;
         const cuda_t *v_base = V + j * stride_v_n + head_h * stride_v_h;
@@ -107,7 +109,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
             const int vi = lane_id + t * kWarpSize;
             if (vi < VEC_D) {
 #pragma unroll
-                for (int ep = 0; ep < EPV; ++ep) o_acc[t * EPV + ep] *= correction;
+                for (int ep = 0; ep < EPV; ++ep) {
+                    o_acc[t * EPV + ep] *= correction;
+                }
                 auto vv = Tile::load(v_base, vi);
                 Tile::weighted_accum(&o_acc[t * EPV], w, vv);
             }
@@ -149,8 +153,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
                 warp_sum[w] = __expf(warp_max[w] - global_max);  // scale_w
             }
 
-            inv_sum                        = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
-            logsumexp[node_i * H + head_h] = (global_sum > 0.0f) ? (global_max + logf(global_sum)) : -INFINITY;
+            inv_sum = fmaxf(1.0f / global_sum, 0.0f);
+            // This is correct for node that has at least 1 neighbour
+            // (global_sum > 0.0f) ? (global_max + logf(global_sum)) : -INFINITY; - always correct
+            logsumexp[node_i * H + head_h] = fmaxf(global_max + logf(global_sum), -INFINITY);
         }
 
         inv_sum = __shfl_sync(FULL_WARP_MASK, inv_sum, 0);
@@ -161,11 +167,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
         for (int t = 0; t < TILES; ++t) {
             const int vi = lane_id + t * kWarpSize;
             if (vi < VEC_D) {
-                float combined[EPV];
+                float combined[EPV] = {0};
 #pragma unroll
                 for (int ep = 0; ep < EPV; ++ep) {
-                    combined[ep] = 0.0f;
-                    int d_idx    = vi * EPV + ep;
+                    int d_idx = vi * EPV + ep;
 #pragma unroll
                     for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
                         combined[ep] = fmaf(warp_sum[w], warp_out[w * D_CONST + d_idx], combined[ep]);
@@ -185,9 +190,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GraphAttentionForw
 // D[i,h] = sum_d dO[i,h,d] * O[i,h,d]
 template <int D_CONST, typename cuda_t>
 __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
-    const cuda_t *__restrict__ dO,    // [N, H, D]
-    const cuda_t *__restrict__ O_in,  // [N, H, D]
-    float *__restrict__ D_out,        // [N, H]
+    cuda_t const *const __restrict__ dO,    // [N, H, D]
+    cuda_t const *const __restrict__ O_in,  // [N, H, D]
+    float *const __restrict__ D_out,        // [N, H]
     int64_t N,
     int64_t H,
     int64_t stride_do_n,
@@ -206,7 +211,7 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
     const int head_h = blockIdx.y;
     const int lane   = threadIdx.x;  // 0..31
 
-    if (node_i >= (int)N || head_h >= (int)H) {
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) {
         return;
     }
 
@@ -235,20 +240,20 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_kernel_D(
     int64_t N, int64_t H,
-    const index_t *__restrict__ row_ptr_T,     // [N+1], CSR^T row pointers
-    const index_t *__restrict__ col_idx_T,     // [E],   CSR^T col indices
-    const index_t *__restrict__ node_indices,  // node indirection
-    const cuda_t *__restrict__ Q,              // [N, H, D]
-    const cuda_t *__restrict__ K,              // [N, H, D]
-    const cuda_t *__restrict__ V,              // [N, H, D]
+    index_t const *const __restrict__ row_ptr_T,     // [N+1], CSR^T row pointers
+    index_t const *const __restrict__ col_idx_T,     // [E],   CSR^T col indices
+    index_t const *const __restrict__ node_indices,  // node indirection
+    cuda_t const *const __restrict__ Q,              // [N, H, D]
+    cuda_t const *const __restrict__ K,              // [N, H, D]
+    cuda_t const *const __restrict__ V,              // [N, H, D]
     int64_t stride_q_n, int64_t stride_q_h, int64_t stride_k_n, int64_t stride_k_h, int64_t stride_v_n, int64_t stride_v_h,
-    const cuda_t *__restrict__ dO,        // [N, H, D]
-    const float *__restrict__ logsumexp,  // [N, H]
-    const float *__restrict__ Delta,      // [N, H]
+    cuda_t const *const __restrict__ dO,        // [N, H, D]
+    float const *const __restrict__ logsumexp,  // [N, H]
+    float const *const __restrict__ Delta,      // [N, H]
     float scale,
-    cuda_t *__restrict__ dQ,  // [N, H, D] (contiguous)
-    float *__restrict__ dK,   // [N, H, D] (contiguous, float32 for atomicAdd)
-    cuda_t *__restrict__ dV   // [N, H, D] (contiguous)
+    cuda_t *const __restrict__ dQ,  // [N, H, D] (contiguous)
+    float *const __restrict__ dK,   // [N, H, D] (contiguous, float32 for atomicAdd)
+    cuda_t *const __restrict__ dV   // [N, H, D] (contiguous)
 ) {
     static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
 
@@ -262,7 +267,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     const int warp_id = threadIdx.x / kWarpSize;
     const int lane    = threadIdx.x % kWarpSize;
 
-    if (node_j >= N || head_h >= H) {
+    if (node_j >= N || head_h >= H) [[unlikely]] {
         return;
     }
 
@@ -289,7 +294,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     // vj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
     // warp_gq:   WARPS_PER_BLOCK * D_CONST * sizeof(float)       -- per-warp dQ accumulators
     // warp_gv:   WARPS_PER_BLOCK * D_CONST * sizeof(float)       -- per-warp dV accumulators
-    extern __shared__ char sh_raw[];
+    extern __shared__ uint8_t sh_raw[];
     cuda_t *qj_shared = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *vj_shared = qj_shared + D_CONST;
     float *warp_gq    = reinterpret_cast<float *>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
@@ -333,7 +338,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
         }
         node_i = __shfl_sync(FULL_WARP_MASK, node_i, 0);
 
-        if (node_i >= N) continue;
+        if (node_i >= N) {
+            continue;
+        }
 
         const cuda_t *ki_base  = K + node_i * stride_k_n + head_h * stride_k_h;
         const size_t out_ih    = static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
@@ -425,19 +432,19 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 template <int D_CONST, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirected_kernel_D(
     int64_t N, int64_t H,
-    const index_t *__restrict__ row_ptr,  // [N+1], forward CSR row pointers
-    const index_t *__restrict__ col_idx,  // [E],   forward CSR col indices
-    const cuda_t *__restrict__ Q,         // [N, H, D]
-    const cuda_t *__restrict__ K,         // [N, H, D]
-    const cuda_t *__restrict__ V,         // [N, H, D]
+    index_t const *const __restrict__ row_ptr,  // [N+1], forward CSR row pointers
+    index_t const *const __restrict__ col_idx,  // [E],   forward CSR col indices
+    cuda_t const *const __restrict__ Q,         // [N, H, D]
+    cuda_t const *const __restrict__ K,         // [N, H, D]
+    cuda_t const *const __restrict__ V,         // [N, H, D]
     int64_t stride_q_n, int64_t stride_q_h, int64_t stride_k_n, int64_t stride_k_h, int64_t stride_v_n, int64_t stride_v_h,
-    const cuda_t *__restrict__ dO,        // [N, H, D] (contiguous)
-    const float *__restrict__ logsumexp,  // [N, H]
-    const float *__restrict__ Delta,      // [N, H]
+    cuda_t const *const __restrict__ dO,        // [N, H, D] (contiguous)
+    float const *const __restrict__ logsumexp,  // [N, H]
+    float const *const __restrict__ Delta,      // [N, H]
     float scale,
-    cuda_t *__restrict__ dQ,  // [N, H, D] (contiguous)
-    cuda_t *__restrict__ dK,  // [N, H, D] (contiguous, cuda_t — no atomics)
-    cuda_t *__restrict__ dV   // [N, H, D] (contiguous)
+    cuda_t *const __restrict__ dQ,  // [N, H, D] (contiguous)
+    cuda_t *const __restrict__ dK,  // [N, H, D] (contiguous, cuda_t — no atomics)
+    cuda_t *const __restrict__ dV   // [N, H, D] (contiguous)
 ) {
     static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
 
@@ -477,7 +484,7 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     //   gk_shared:  D_CONST * sizeof(float)    -- float32 accumulator for dK[d]
     //   gq_shared:  D_CONST * sizeof(float)    -- float32 accumulator for dQ[d]
     //   gv_shared:  D_CONST * sizeof(float)    -- float32 accumulator for dV[d]
-    extern __shared__ char sh_raw[];
+    extern __shared__ uint8_t sh_raw[];
     cuda_t *kd_shared = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *qd_shared = kd_shared + D_CONST;
     cuda_t *vd_shared = qd_shared + D_CONST;
@@ -536,7 +543,9 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
         }
         node_s = __shfl_sync(FULL_WARP_MASK, node_s, 0);
 
-        if (node_s >= N) continue;
+        if (node_s >= N) {
+            continue;
+        }
 
         // Column node pointers (strided)
         const cuda_t *qs_base = Q + node_s * stride_q_n + head_h * stride_q_h;

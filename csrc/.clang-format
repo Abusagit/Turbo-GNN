@@ -175,6 +175,7 @@ DisableFormat: false
 # ---------------------------------------------------------------------------
 AttributeMacros:
   - __capability
+  - __launch_bounds__
 ForEachMacros:
   - foreach
   - Q_FOREACH

@@ -30,11 +30,11 @@
 #endif
 
 #ifndef kWarpSize
-constexpr int kWarpSize = 32;
+inline constexpr int kWarpSize = 32;
 #endif
 
 #ifndef kMaxThreadsInWarp
-constexpr int kMaxThreadsInWarp = 32;
+inline constexpr int kMaxThreadsInWarp = 32;
 #endif
 
 #define CUDA_CHECK(call)                                                       \
@@ -420,10 +420,8 @@ __device__ __forceinline__ T warp_reduce_max(T x) {
 }
 
 struct OnlineSoftmaxState {
-    float max_val;
-    float sum_exp;
-
-    __device__ __forceinline__ OnlineSoftmaxState() : max_val(-FLT_MAX), sum_exp(0.0f) {}
+    float max_val = -FLT_MAX;
+    float sum_exp = 0.0f;
 
     __device__ __forceinline__ float update(float logit) {
         float old_max = max_val;
@@ -432,6 +430,7 @@ struct OnlineSoftmaxState {
         // correction factor for previous sum when max changes
         float correction = __expf(old_max - max_val);
         sum_exp          = sum_exp * correction + __expf(logit - max_val);
+
         return correction;
     }
 
@@ -448,9 +447,11 @@ __device__ __forceinline__ float recompute_alpha(
 
 __device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
     float acc = a.x * b.x;
-    acc       = fmaf(a.y, b.y, acc);
-    acc       = fmaf(a.z, b.z, acc);
-    acc       = fmaf(a.w, b.w, acc);
+
+    acc = fmaf(a.y, b.y, acc);
+    acc = fmaf(a.z, b.z, acc);
+    acc = fmaf(a.w, b.w, acc);
+
     return acc;
 }
 
@@ -492,8 +493,9 @@ __device__ __forceinline__ float4 f4_mul(float4 a, float4 b) { return make_float
 // =============================================================================
 template <int D_CONST, typename cuda_t, int THREADS_PER_D = 32>
 struct SelectVW {
+    // static constexpr int THREADS_PER_D = THREADS_PER_D;
     static constexpr bool is_fp32 = (sizeof(cuda_t) == 4);
-    static constexpr int value    = is_fp32 ? ((D_CONST / 4 >= THREADS_PER_D) ? 4 : 1) : ((D_CONST / 8 >= THREADS_PER_D) ? 8 : 2);
+    static constexpr int value    = is_fp32 ? ((D_CONST >= THREADS_PER_D * 4) ? 4 : 1) : ((D_CONST >= THREADS_PER_D * 8) ? 8 : 2);
 };
 
 // =============================================================================
@@ -807,6 +809,10 @@ struct TileOps<8, cuda_t> {
     static __device__ __forceinline__ void write_float(float *out, int vec_idx, const float *acc) {
         reinterpret_cast<float4 *>(&out[vec_idx * 8])[0] = make_float4(acc[0], acc[1], acc[2], acc[3]);
         reinterpret_cast<float4 *>(&out[vec_idx * 8])[1] = make_float4(acc[4], acc[5], acc[6], acc[7]);
+
+        // TODO: Test this. It seems to be faster, not sure about correctness
+        // reinterpret_cast<float4 *>(&out[vec_idx * 8])[0] = *reinterpret_cast<float4 const *>(acc);
+        // reinterpret_cast<float4 *>(&out[vec_idx * 8])[1] = *reinterpret_cast<float4 const *>(acc + 4);
     }
     static __device__ __forceinline__ void write_zero(cuda_t *out, int vec_idx) {
         Vec8<cuda_t> zero_v;
