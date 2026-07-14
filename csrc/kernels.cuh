@@ -20,7 +20,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     bool use_2d_kernel = false,
     int features_per_block = 32,
     int tiles_y = 8,
-    std::string reduce = "min"
+    std::string reduce = "min",
+    int grid_size_override = 0
 );
 
 at::Tensor reduction_aggr_backward_torch(

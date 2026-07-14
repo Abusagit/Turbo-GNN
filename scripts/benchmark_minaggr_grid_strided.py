@@ -55,6 +55,26 @@ def build_bucketed(edge_index, N, quantile):
     )
 
 
+def _signed_indptr(indptr):
+    if indptr.dtype == torch.uint32:
+        return indptr.view(torch.int32)
+    if indptr.dtype == torch.uint64:
+        return indptr.view(torch.int64)
+    return indptr
+
+
+def degree_stats(graph):
+    deg = (_signed_indptr(graph.forward_indptr).diff()).float()
+    return {
+        "mean": deg.mean().item(),
+        "p50": deg.median().item(),
+        "p99": torch.quantile(deg, 0.99).item(),
+        "max": deg.max().item(),
+        "light_nodes": int(graph.forward_light_nodes.numel()),
+        "heavy_nodes": int(graph.forward_heavy_nodes.numel()),
+    }
+
+
 def resolve_grid_sizes(grid_sizes, grid_multipliers, sm_count):
     if grid_sizes or grid_multipliers:
         raw = list(grid_sizes or [])
@@ -68,26 +88,9 @@ def resolve_grid_sizes(grid_sizes, grid_multipliers, sm_count):
     return out
 
 
-def degree_stats(graph):
-    indptr = graph.forward_indptr
-    if indptr.dtype == torch.uint32:
-        indptr = indptr.view(torch.int32)
-    elif indptr.dtype == torch.uint64:
-        indptr = indptr.view(torch.int64)
-    deg = (indptr[1:] - indptr[:-1]).float()
-    return {
-        "mean": deg.mean().item(),
-        "p50": deg.median().item(),
-        "p99": torch.quantile(deg, 0.99).item(),
-        "max": deg.max().item(),
-        "light_nodes": int(graph.forward_light_nodes.numel()),
-        "heavy_nodes": int(graph.forward_heavy_nodes.numel()),
-    }
-
-
-def bench_one(N, avg_degree, H, D, dtype, grid_size_override, warmup, iters,
+def bench_one(N, avg_degree, d, dtype, grid_size_override, warmup, iters,
               seed=42, schedule="none", graph_type="powerlaw", exponent=2.5,
-              quantile=-1.0):
+              quantile=-1.0, reduce="min"):
     edge_index = make_graph(N, avg_degree, seed, graph_type, exponent)
     graph = build_bucketed(edge_index, N, quantile=quantile)
     if schedule == "sort":
@@ -98,22 +101,23 @@ def bench_one(N, avg_degree, H, D, dtype, grid_size_override, warmup, iters,
             graph.forward_heavy_nodes = sort_by_degree_desc(
                 graph.forward_heavy_nodes, graph.forward_indptr,
             )
-    xl = torch.randn(N, H, D, device="cuda", dtype=dtype)
-    xr = torch.randn(N, H, D, device="cuda", dtype=dtype)
-    aw = torch.randn(H, D, device="cuda", dtype=dtype)
+    max_degree = int(_signed_indptr(graph.forward_indptr).diff().max().item())
+    x = torch.randn(N, d, device="cuda", dtype=dtype)
 
     def _fn():
-        return _C.gatv2_forward(
-            xl,
-            xr,
+        return _C.reduction_aggr_forward_partitioned(
             graph.forward_indptr,
             graph.forward_indices,
-            aw,
-            0.2,
+            x,
             graph.forward_light_nodes,
             graph.forward_heavy_nodes,
-            1,
+            max_degree,
             8,
+            128,
+            False,
+            32,
+            8,
+            reduce,
             grid_size_override,
         )
 
@@ -121,12 +125,12 @@ def bench_one(N, avg_degree, H, D, dtype, grid_size_override, warmup, iters,
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="GATv2 forward: legacy vs grid-strided vs sorted.")
+    p = argparse.ArgumentParser(description="MinAggr forward: legacy vs grid-strided vs sorted.")
     p.add_argument("--sizes", type=int, nargs="+", default=[8192, 65536, 262144])
     p.add_argument("--avg-degree", type=int, default=8)
-    p.add_argument("--heads", type=int, default=4)
-    p.add_argument("--head-dim", type=int, default=64)
+    p.add_argument("--dim", type=int, default=64)
     p.add_argument("--dtype", choices=["fp32", "fp16"], default="fp32")
+    p.add_argument("--reduce", choices=["min", "max"], default="min")
     p.add_argument("--graph", choices=["er", "powerlaw"], default="powerlaw")
     p.add_argument("--exponent", type=float, default=2.5)
     p.add_argument("--quantile", type=float, default=-1.0)
@@ -158,8 +162,7 @@ def main():
         res = bench_one(
             N=N,
             avg_degree=args.avg_degree,
-            H=args.heads,
-            D=args.head_dim,
+            d=args.dim,
             dtype=dtype,
             grid_size_override=gs,
             warmup=args.warmup,
@@ -168,18 +171,18 @@ def main():
             graph_type=args.graph,
             exponent=args.exponent,
             quantile=args.quantile,
+            reduce=args.reduce,
         )
         return {
             "N": N,
             "avg_degree": args.avg_degree,
-            "heads": args.heads,
-            "head_dim": args.head_dim,
+            "dim": args.dim,
             "dtype": args.dtype,
+            "reduce": args.reduce,
             "graph": args.graph,
             "exponent": args.exponent,
             "quantile": args.quantile,
             "grid_size": gs,
-            "blocks": gs * args.heads if gs > 0 else None,
             "schedule": sched,
             "ms_per_iter": res.ms_per_iter,
         }
@@ -202,7 +205,7 @@ def main():
     print()
     print(f"GPU: {gpu_info.get('device_name', '?')}  (SMs={sm_count})")
     print(f"graph={args.graph} exponent={args.exponent} quantile={args.quantile} "
-          f"heads={args.heads} head_dim={args.head_dim} dtype={args.dtype} "
+          f"reduce={args.reduce} dim={args.dim} dtype={args.dtype} "
           f"avg_degree={args.avg_degree}")
     print()
     print("degree distribution (per N):")
@@ -213,7 +216,7 @@ def main():
               f"light={s['light_nodes']}  heavy={s['heavy_nodes']}")
     print()
 
-    header = (f"{'N':>10} | {'grid_x':>8} | {'blocks':>8} | {'sched':>6} | "
+    header = (f"{'N':>10} | {'grid_x':>8} | {'sched':>6} | "
               f"{'ms/iter':>10} | {'vs_legacy':>9}")
     print(header)
     print("-" * len(header))
@@ -226,9 +229,8 @@ def main():
         for r in by_N[N]:
             gs = r["grid_size"]
             gx_s = "legacy" if gs == 0 else str(gs)
-            blocks_s = "-" if gs == 0 else str(r["blocks"])
             speed = legacy_ms / r["ms_per_iter"]
-            print(f"{N:>10} | {gx_s:>8} | {blocks_s:>8} | {r['schedule']:>6} | "
+            print(f"{N:>10} | {gx_s:>8} | {r['schedule']:>6} | "
                   f"{r['ms_per_iter']:>10.4f} | {speed:>8.2f}x")
         print("-" * len(header))
 
