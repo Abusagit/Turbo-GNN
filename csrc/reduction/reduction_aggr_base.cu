@@ -22,7 +22,9 @@ void reduction_aggr_forward_partitioned_cuda(
     bool use_2d_kernel = false,
     int features_per_block = 32,
     int tiles_y = 8,
-    const std::string& reduce = "min"
+    const std::string& reduce = "min",
+    int grid_size_override = 0,
+    const at::Tensor& block_offsets = at::Tensor()
 );
 
 at::Tensor reduction_aggr_backward_torch(
@@ -65,7 +67,9 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     bool use_2d_kernel = false,
     int features_per_block = 32,
     int tiles_y = 8,
-    std::string reduce = "min"
+    std::string reduce = "min",
+    int grid_size_override = 0,
+    at::Tensor block_offsets = at::Tensor()
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
@@ -79,6 +83,12 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
 
     TORCH_CHECK(X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16, "X must be float32/float16/bfloat16");
     TORCH_CHECK(X.dim() == 2, "X must be 2D");
+
+    if (block_offsets.defined() && block_offsets.numel() > 0) {
+        TORCH_CHECK(block_offsets.is_cuda(), "block_offsets must be CUDA");
+        TORCH_CHECK(block_offsets.scalar_type() == at::kInt, "block_offsets must be int32");
+        TORCH_CHECK(block_offsets.is_contiguous(), "block_offsets must be contiguous");
+    }
 
     if (use_2d_kernel) {
         TORCH_CHECK(tiles_y > 0 && tiles_y <= 32, "tiles_y must be in range [1, 32]");
@@ -94,6 +104,7 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     // arg_idx uses the same index dtype as edge_ptr
     auto arg_idx = torch::empty({num_nodes, d}, edge_ptr.options());
 
-    reduction_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y, reduce);
+    at::Tensor offsets_arg = (block_offsets.defined()) ? block_offsets : at::Tensor();
+    reduction_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y, reduce, grid_size_override, offsets_arg);
     return {out, arg_idx};
 }
