@@ -5,7 +5,7 @@
 // =============================================================================
 
 template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forward_Kernel(
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
     size_t N,
     size_t H,
     size_t D,
@@ -23,22 +23,26 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
     float *__restrict__ d_logsumexp_out,
     float negative_slope
 ) {
-    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
-    using Tile       = TileOps<VW, cuda_t>;
-    using vec_t      = typename Tile::vec_t;
-    using ns_t       = typename Tile::ns_t;
+    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int EPV           = Tile::ELEM_PER_VEC;
-    constexpr int NUM_VECS      = D_CONST / EPV;
-    constexpr int VECS_PER_LANE = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
-    constexpr int ACCS_PER_LANE = VECS_PER_LANE * EPV;
+    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
+    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
+    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                                                  // Accumulatores used by one thread
+
+    using Tile = TileOps<TW, cuda_t>;
+
+    using vec_t = typename Tile::vec_t;
+    using ns_t  = typename Tile::ns_t;
 
     const int node_i  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
-    const int warp_id = threadIdx.x / kMaxThreadsInWarp;
-    const int lane    = threadIdx.x % kMaxThreadsInWarp;
+    const int warp_id = threadIdx.x / kWarpSize;
+    const int lane    = threadIdx.x % kWarpSize;
 
-    if (node_i >= (int)N || head_h >= (int)H) return;
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) [[unlikely]] {
+        return;
+    }
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -49,7 +53,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
     // handle isolated nodes
     if (num_neighbors == 0) {
         if (warp_id == 0) {
-            for (int v = lane; v < NUM_VECS; v += kMaxThreadsInWarp) {
+            for (int v = lane; v < TILES; v += kWarpSize) {
                 Tile::write_zero(h_out_base, v);
             }
             if (lane == 0) {
@@ -67,7 +71,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
     //   warp_out:  WARPS_PER_BLOCK * D_CONST * sizeof(float)       -- per-warp output accum
     //   warp_max:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax max
     //   warp_sum:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax sum_exp
-    extern __shared__ char sh_raw[];
+    extern __shared__ uint8_t sh_raw[];
     cuda_t *l_sh    = reinterpret_cast<cuda_t *>(sh_raw);
     float *warp_out = reinterpret_cast<float *>(sh_raw + D_CONST * sizeof(cuda_t));
     float *warp_max = warp_out + WARPS_PER_BLOCK * D_CONST;
@@ -80,7 +84,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
         constexpr int f4_count = (D_CONST * (int)sizeof(cuda_t)) / 16;
         const float4 *l_src4   = reinterpret_cast<const float4 *>(l_base);
         float4 *l_sh4          = reinterpret_cast<float4 *>(l_sh);
-        for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kMaxThreadsInWarp) {
+        for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kWarpSize) {
             l_sh4[i] = l_src4[i];
         }
     }
@@ -89,9 +93,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
     ns_t ns = Tile::make_ns(negative_slope);
 
     // Per-warp register accumulators
-    float h_acc[ACCS_PER_LANE];
+    float h_acc[ACCS_PER_THREAD];
 #pragma unroll
-    for (int i = 0; i < ACCS_PER_LANE; ++i) {
+    for (int i = 0; i < ACCS_PER_THREAD; ++i) {
         h_acc[i] = 0.f;
     }
 
@@ -104,9 +108,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
 
         float dot_lane = 0.f;
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv = Tile::load(l_sh, v);
                 vec_t rv = Tile::load(r_base, v);
                 vec_t av = Tile::load(a_base, v);
@@ -117,27 +121,27 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
 
         float rescale = softmax_state.update(dot);
 #pragma unroll
-        for (int i = 0; i < ACCS_PER_LANE; ++i) {
+        for (int i = 0; i < ACCS_PER_THREAD; ++i) {
             h_acc[i] *= rescale;
         }
 
         float contrib = __expf(dot - softmax_state.max_val);
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t rv = Tile::load(r_base, v);
-                Tile::weighted_accum(&h_acc[t * EPV], contrib, rv);
+                Tile::weighted_accum(&h_acc[t * TW], contrib, rv);
             }
         }
     }
 
 // Write per-warp results to shared memory
 #pragma unroll
-    for (int t = 0; t < VECS_PER_LANE; ++t) {
-        int v = lane + kMaxThreadsInWarp * t;
-        if (v < NUM_VECS) {
-            Tile::write_float(my_out, v, &h_acc[t * EPV]);
+    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+        int v = lane + kWarpSize * t;
+        if (v < TILES) {
+            Tile::write_float(my_out, v, &h_acc[t * TW]);
         }
     }
 
@@ -174,14 +178,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
 
 // Combine all warps' outputs with proper rescaling
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
-                float combined[EPV];
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                float combined[TW];
 #pragma unroll
-                for (int ep = 0; ep < EPV; ++ep) {
+                for (int ep = 0; ep < TW; ++ep) {
                     combined[ep] = 0.0f;
-                    int d_idx    = v * EPV + ep;
+                    int d_idx    = v * TW + ep;
 #pragma unroll
                     for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
                         combined[ep] = fmaf(warp_sum[w], warp_out[w * D_CONST + d_idx], combined[ep]);
@@ -198,7 +202,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
 // Unified GATv2 Backward AL kernel (computes grad_a, grad_l, G)
 // =============================================================================
 template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backward_AL(
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
@@ -210,21 +214,22 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
     cuda_t *__restrict__ grad_l,  // [N, H, D]
     float *__restrict__ d_G       // [N, H]
 ) {
-    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
-    using Tile       = TileOps<VW, cuda_t>;
-    using vec_t      = typename Tile::vec_t;
-    using ns_t       = typename Tile::ns_t;
+    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int EPV           = Tile::ELEM_PER_VEC;
-    constexpr int NUM_VECS      = D_CONST / EPV;
-    constexpr int VECS_PER_LANE = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
+    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
+    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+
+    using Tile  = TileOps<TW, cuda_t>;
+    using vec_t = typename Tile::vec_t;
+    using ns_t  = typename Tile::ns_t;
 
     const int node_i  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
-    const int warp_id = threadIdx.x / kMaxThreadsInWarp;
-    const int lane    = threadIdx.x % kMaxThreadsInWarp;
+    const int warp_id = threadIdx.x / kWarpSize;
+    const int lane    = threadIdx.x % kWarpSize;
 
-    if (node_i >= (int)N || head_h >= (int)H) return;
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -237,7 +242,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
     //   warp_gradl: WARPS_PER_BLOCK * D_CONST * sizeof(float)      -- per-warp
     //   warp_G:     WARPS_PER_BLOCK * sizeof(float)                -- per-warp G partial
     //   G_broadcast: sizeof(float)                                  -- broadcast slot
-    extern __shared__ char sh_raw[];
+    extern __shared__ uint8_t sh_raw[];
     cuda_t *li_sh      = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *ghi_sh     = li_sh + D_CONST;
     float *warp_grada  = reinterpret_cast<float *>(ghi_sh + D_CONST);
@@ -254,12 +259,12 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
     // handle isolated nodes
     if (num_neighbors == 0) {
         if (warp_id == 0) {
-            for (int v = lane; v < NUM_VECS; v += kMaxThreadsInWarp) {
+            for (int v = lane; v < TILES; v += kWarpSize) {
                 Tile::write_zero(grad_l_base, v);
             }
             constexpr int f4_count_f = D_CONST / 4;
             float4 *ga_f4            = reinterpret_cast<float4 *>(grad_a_base);
-            for (int i = lane; i < f4_count_f; i += kMaxThreadsInWarp) {
+            for (int i = lane; i < f4_count_f; i += kWarpSize) {
                 ga_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
             }
             if (lane == 0) {
@@ -280,7 +285,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
         constexpr int f4_count_f = D_CONST / 4;
         float4 *my_grada_f4      = reinterpret_cast<float4 *>(my_grada);
         float4 *my_gradl_f4      = reinterpret_cast<float4 *>(my_gradl);
-        for (int i = lane; i < f4_count_f; i += kMaxThreadsInWarp) {
+        for (int i = lane; i < f4_count_f; i += kWarpSize) {
             my_grada_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
             my_gradl_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
@@ -290,7 +295,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
         const float4 *ghi_src_f4 = reinterpret_cast<const float4 *>(ghi_base);
         float4 *li_sh_f4         = reinterpret_cast<float4 *>(li_sh);
         float4 *ghi_sh_f4        = reinterpret_cast<float4 *>(ghi_sh);
-        for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kMaxThreadsInWarp) {
+        for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kWarpSize) {
             li_sh_f4[i]  = li_src_f4[i];
             ghi_sh_f4[i] = ghi_src_f4[i];
         }
@@ -309,9 +314,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
         float e_lane = 0.f;
         float p_lane = 0.f;
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv  = Tile::load(li_sh, v);
                 vec_t rv  = Tile::load(rj_base, v);
                 vec_t av  = Tile::load(a_base, v);
@@ -348,9 +353,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
         float e_lane = 0.f;
         float p_lane = 0.f;
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv  = Tile::load(li_sh, v);
                 vec_t rv  = Tile::load(rj_base, v);
                 vec_t av  = Tile::load(a_base, v);
@@ -366,13 +371,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
         float grad_e_ij = alpha_ij * (p_ij - G_i_h);
 
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv   = Tile::load(li_sh, v);
                 vec_t rv   = Tile::load(rj_base, v);
                 vec_t av   = Tile::load(a_base, v);
-                int base_f = v * EPV;
+                int base_f = v * TW;
                 Tile::gatv2_accum_grad_al(&my_grada[base_f], &my_gradl[base_f], grad_e_ij, lv, rv, av, negative_slope);
             }
         }
@@ -383,21 +388,21 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
 
     if (warp_id == 0) {
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
-                int base_f = v * EPV;
-                float ga_sum[EPV];
-                float gl_sum[EPV];
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                int base_f = v * TW;
+                float ga_sum[TW];
+                float gl_sum[TW];
 #pragma unroll
-                for (int ep = 0; ep < EPV; ++ep) {
+                for (int ep = 0; ep < TW; ++ep) {
                     ga_sum[ep] = 0.f;
                     gl_sum[ep] = 0.f;
                 }
 #pragma unroll
                 for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
 #pragma unroll
-                    for (int ep = 0; ep < EPV; ++ep) {
+                    for (int ep = 0; ep < TW; ++ep) {
                         ga_sum[ep] += warp_grada[w * D_CONST + base_f + ep];
                         gl_sum[ep] += warp_gradl[w * D_CONST + base_f + ep];
                     }
@@ -413,7 +418,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
 // Unified GATv2 Backward R kernel (computes grad_r)
 // =============================================================================
 template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backward_R(
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr_T, const index_t *__restrict__ d_col_idx_T,
@@ -424,21 +429,22 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
     float negative_slope,
     cuda_t *__restrict__ grad_r  // [N, H, D]
 ) {
-    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
-    using Tile       = TileOps<VW, cuda_t>;
-    using vec_t      = typename Tile::vec_t;
-    using ns_t       = typename Tile::ns_t;
+    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int EPV           = Tile::ELEM_PER_VEC;
-    constexpr int NUM_VECS      = D_CONST / EPV;
-    constexpr int VECS_PER_LANE = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
+    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
+    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+
+    using Tile  = TileOps<TW, cuda_t>;
+    using vec_t = typename Tile::vec_t;
+    using ns_t  = typename Tile::ns_t;
 
     const int node_j  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
-    const int warp_id = threadIdx.x / kMaxThreadsInWarp;
-    const int lane    = threadIdx.x % kMaxThreadsInWarp;
+    const int warp_id = threadIdx.x / kWarpSize;
+    const int lane    = threadIdx.x % kWarpSize;
 
-    if (node_j >= (int)N || head_h >= (int)H) return;
+    if (node_j >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
 
     index_t edge_start = d_row_ptr_T[node_j];
     index_t edge_end   = d_row_ptr_T[node_j + 1];
@@ -447,7 +453,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
     // Shared memory layout:
     //   rj_sh:       D_CONST * sizeof(cuda_t)                      -- read-only
     //   warp_gradr:  WARPS_PER_BLOCK * D_CONST * sizeof(float)     -- per-warp
-    extern __shared__ char sh_raw[];
+    extern __shared__ uint8_t sh_raw[];
     cuda_t *rj_sh     = reinterpret_cast<cuda_t *>(sh_raw);
     float *warp_gradr = reinterpret_cast<float *>(rj_sh + D_CONST);
 
@@ -458,7 +464,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
     // Handle isolated nodes
     if (num_incoming == 0) {
         if (warp_id == 0) {
-            for (int v = lane; v < NUM_VECS; v += kMaxThreadsInWarp) {
+            for (int v = lane; v < TILES; v += kWarpSize) {
                 Tile::write_zero(grad_r_base, v);
             }
         }
@@ -472,14 +478,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
     {
         constexpr int f4_count_f = D_CONST / 4;
         float4 *my_gradr_f4      = reinterpret_cast<float4 *>(my_gradr);
-        for (int i = lane; i < f4_count_f; i += kMaxThreadsInWarp) {
+        for (int i = lane; i < f4_count_f; i += kWarpSize) {
             my_gradr_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
 
         constexpr int f4_count  = (D_CONST * (int)sizeof(cuda_t)) / 16;
         const float4 *rj_src_f4 = reinterpret_cast<const float4 *>(rj_base);
         float4 *rj_sh_f4        = reinterpret_cast<float4 *>(rj_sh);
-        for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kMaxThreadsInWarp) {
+        for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kWarpSize) {
             rj_sh_f4[i] = rj_src_f4[i];
         }
     }
@@ -499,9 +505,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
         float e_lane = 0.f;
         float p_lane = 0.f;
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv  = Tile::load(li_base, v);
                 vec_t rv  = Tile::load(rj_sh, v);
                 vec_t av  = Tile::load(a_base, v);
@@ -517,14 +523,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
         float grad_e_ij = alpha_ij * (p_ij - G_i_h);
 
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv   = Tile::load(li_base, v);
                 vec_t rv   = Tile::load(rj_sh, v);
                 vec_t av   = Tile::load(a_base, v);
                 vec_t ghv  = Tile::load(ghi_base, v);
-                int base_f = v * EPV;
+                int base_f = v * TW;
                 Tile::gatv2_accum_grad_r(&my_gradr[base_f], alpha_ij, ghv, grad_e_ij, lv, rv, av, negative_slope);
             }
         }
@@ -535,17 +541,17 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
 
     if (warp_id == 0) {
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
-                int base_f = v * EPV;
-                float gr_sum[EPV];
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                int base_f = v * TW;
+                float gr_sum[TW];
 #pragma unroll
-                for (int ep = 0; ep < EPV; ++ep) gr_sum[ep] = 0.f;
+                for (int ep = 0; ep < TW; ++ep) gr_sum[ep] = 0.f;
 #pragma unroll
                 for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
 #pragma unroll
-                    for (int ep = 0; ep < EPV; ++ep) gr_sum[ep] += warp_gradr[w * D_CONST + base_f + ep];
+                    for (int ep = 0; ep < TW; ++ep) gr_sum[ep] += warp_gradr[w * D_CONST + base_f + ep];
                 }
                 Tile::write_typed(grad_r_base, v, gr_sum);
             }
@@ -554,7 +560,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Backw
 }
 
 template <int grad_A_reduce_row_chunk_size, typename cuda_t>
-__global__ void __launch_bounds__(kMaxThreadsInWarp *kMaxThreadsInWarp) ReduceGradAKernel(
+__global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
     size_t N, size_t H, size_t D,
 
     const float *__restrict__ grad_a,         // [N, H, D] always float32
@@ -573,16 +579,16 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp *kMaxThreadsInWarp) ReduceGr
     int fx = feature_chunk_start + tx;
 
     // define shared memory chunk and accumulatur
-    __shared__ float tile_reduce[kMaxThreadsInWarp][kMaxThreadsInWarp + 1];
-    __shared__ float result_accum[kMaxThreadsInWarp];
+    __shared__ float tile_reduce[kWarpSize][kWarpSize + 1];
+    __shared__ float result_accum[kWarpSize];
 
     float accum = 0.0f;
 
     // looped logic across row chunks:
-    const int row_chunk_end = min((int)N, (int)(row_chunk_start + grad_A_reduce_row_chunk_size));
+    const int row_chunk_end = min(static_cast<int>(N), (int)(row_chunk_start + grad_A_reduce_row_chunk_size));
     for (int base_row_offset = row_chunk_start; base_row_offset < row_chunk_end; base_row_offset += blockDim.y) {
         int row_to_load = base_row_offset + ty;  // node index
-        if (row_to_load < (int)N && fx < (int)D && head_h < (int)H) {
+        if (row_to_load < static_cast<int>(N) && fx < (int)D && head_h < static_cast<int>(H)) {
             // grad_a layout: [N, H, D] contiguous
             // idx = (n * H + h) * D + d
             size_t idx = ((size_t)row_to_load * H + (size_t)head_h) * D + (size_t)fx;
@@ -608,7 +614,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp *kMaxThreadsInWarp) ReduceGr
     // now  threads with ty==0 and tx selecting feature within chunk
     // write out the final reduced result
 
-    if (ty == 0 && fx < (int)D && head_h < (int)H) {
+    if (ty == 0 && fx < (int)D && head_h < static_cast<int>(H)) {
         // output layout: [H, D] contiguous
         size_t out_idx = (size_t)head_h * D + (size_t)fx;
         atomicAdd(d_grad_a_reduced_out + out_idx, result_accum[tx]);
@@ -619,7 +625,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp *kMaxThreadsInWarp) ReduceGr
 // Undirected GATv2 backward: G computation kernel (extracts pass 1 of AL)
 // =============================================================================
 template <int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_G_Kernel(
+__global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
@@ -628,19 +634,21 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_G_Kernel(
     float negative_slope,
     float *__restrict__ d_G  // [N, H] output
 ) {
-    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
-    using Tile       = TileOps<VW, cuda_t>;
-    using vec_t      = typename Tile::vec_t;
-    using ns_t       = typename Tile::ns_t;
+    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int NUM_VECS      = D_CONST / Tile::ELEM_PER_VEC;
-    constexpr int VECS_PER_LANE = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
+    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
+    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+
+    using Tile  = TileOps<TW, cuda_t>;
+    using vec_t = typename Tile::vec_t;
+    using ns_t  = typename Tile::ns_t;
 
     int node_i = blockIdx.x;
     int head_h = blockIdx.y;
-    int lane   = threadIdx.x % kMaxThreadsInWarp;
+    int lane   = threadIdx.x % kWarpSize;
 
-    if (node_i >= (int)N || head_h >= (int)H) return;
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -654,7 +662,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_G_Kernel(
     float L_i = d_logsumexp[node_i * H + head_h];
 
     // Shared memory: li_sh + ghi_sh
-    extern __shared__ char sh_raw[];
+    extern __shared__ uint8_t sh_raw[];
     cuda_t *li_sh  = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *ghi_sh = li_sh + D_CONST;
 
@@ -669,7 +677,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_G_Kernel(
         const float4 *ghi_src_f4 = reinterpret_cast<const float4 *>(ghi_base);
         float4 *li_sh_f4         = reinterpret_cast<float4 *>(li_sh);
         float4 *ghi_sh_f4        = reinterpret_cast<float4 *>(ghi_sh);
-        for (int i = lane; i < f4_count; i += kMaxThreadsInWarp) {
+        for (int i = lane; i < f4_count; i += kWarpSize) {
             li_sh_f4[i]  = li_src_f4[i];
             ghi_sh_f4[i] = ghi_src_f4[i];
         }
@@ -686,9 +694,9 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_G_Kernel(
         float e_lane = 0.f;
         float p_lane = 0.f;
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv  = Tile::load(li_sh, v);
                 vec_t rv  = Tile::load(rj_base, v);
                 vec_t av  = Tile::load(a_base, v);
@@ -716,7 +724,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_G_Kernel(
 // Requires G[j] to be pre-computed globally.
 // =============================================================================
 template <int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirected(
+__global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
@@ -728,19 +736,21 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
     cuda_t *__restrict__ grad_l,  // [N, H, D]
     cuda_t *__restrict__ grad_r   // [N, H, D]
 ) {
-    constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
-    using Tile       = TileOps<VW, cuda_t>;
-    using vec_t      = typename Tile::vec_t;
-    using ns_t       = typename Tile::ns_t;
+    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int NUM_VECS      = D_CONST / Tile::ELEM_PER_VEC;
-    constexpr int VECS_PER_LANE = (NUM_VECS + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
+    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
+    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+
+    using Tile  = TileOps<TW, cuda_t>;
+    using vec_t = typename Tile::vec_t;
+    using ns_t  = typename Tile::ns_t;
 
     int node_i = blockIdx.x;
     int head_h = blockIdx.y;
-    int lane   = threadIdx.x % kMaxThreadsInWarp;
+    int lane   = threadIdx.x % kWarpSize;
 
-    if (node_i >= (int)N || head_h >= (int)H) return;
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -753,7 +763,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
     //   grada_sh:   D_CONST * sizeof(float)    -- accumulator for grad_a[i]
     //   gradli_sh:  D_CONST * sizeof(float)    -- accumulator for grad_l[i]
     //   gradri_sh:  D_CONST * sizeof(float)    -- accumulator for grad_r[i]
-    extern __shared__ char sh_raw[];
+    extern __shared__ uint8_t sh_raw[];
     cuda_t *li_sh    = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *ri_sh    = li_sh + D_CONST;
     cuda_t *ghi_sh   = ri_sh + D_CONST;
@@ -767,13 +777,13 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
 
     // Handle isolated nodes: write zeros
     if (num_neighbors == 0) {
-        for (int v = lane; v < NUM_VECS; v += kMaxThreadsInWarp) {
+        for (int v = lane; v < TILES; v += kWarpSize) {
             Tile::write_zero(grad_l_base, v);
             Tile::write_zero(grad_r_base, v);
         }
         constexpr int f4_count_f = D_CONST / 4;
         float4 *ga_f4            = reinterpret_cast<float4 *>(grad_a_base);
-        for (int i = lane; i < f4_count_f; i += kMaxThreadsInWarp) {
+        for (int i = lane; i < f4_count_f; i += kWarpSize) {
             ga_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
         return;
@@ -793,7 +803,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
         float4 *grada_f4         = reinterpret_cast<float4 *>(grada_sh);
         float4 *gradli_f4        = reinterpret_cast<float4 *>(gradli_sh);
         float4 *gradri_f4        = reinterpret_cast<float4 *>(gradri_sh);
-        for (int i = lane; i < f4_count_f; i += kMaxThreadsInWarp) {
+        for (int i = lane; i < f4_count_f; i += kWarpSize) {
             grada_f4[i]  = make_float4(0.f, 0.f, 0.f, 0.f);
             gradli_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
             gradri_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -806,7 +816,7 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
         float4 *li_sh_f4         = reinterpret_cast<float4 *>(li_sh);
         float4 *ri_sh_f4         = reinterpret_cast<float4 *>(ri_sh);
         float4 *ghi_sh_f4        = reinterpret_cast<float4 *>(ghi_sh);
-        for (int i = lane; i < f4_count; i += kMaxThreadsInWarp) {
+        for (int i = lane; i < f4_count; i += kWarpSize) {
             li_sh_f4[i]  = li_src_f4[i];
             ri_sh_f4[i]  = ri_src_f4[i];
             ghi_sh_f4[i] = ghi_src_f4[i];
@@ -831,9 +841,9 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
         float p_rev_lane = 0.f;
 
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv  = Tile::load(li_sh, v);    // l[i]
                 vec_t rv  = Tile::load(rj_base, v);  // r[j]
                 vec_t av  = Tile::load(a_base, v);
@@ -870,13 +880,13 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
 
 // Accumulate gradients
 #pragma unroll
-        for (int t = 0; t < VECS_PER_LANE; ++t) {
-            int v = lane + kMaxThreadsInWarp * t;
-            if (v < NUM_VECS) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
                 vec_t lv   = Tile::load(li_sh, v);
                 vec_t rv   = Tile::load(rj_base, v);
                 vec_t av   = Tile::load(a_base, v);
-                int base_f = v * Tile::ELEM_PER_VEC;
+                int base_f = v * Tile::TW;
 
                 // Forward: grad_a[i], grad_l[i] from score(i,j)
                 Tile::gatv2_accum_grad_al(&grada_sh[base_f], &gradli_sh[base_f], grad_e_fwd, lv, rv, av, negative_slope);
@@ -894,10 +904,10 @@ __global__ void __launch_bounds__(kMaxThreadsInWarp) GATv2Backward_ALR_Undirecte
 
 // Write grad_l (cuda_t), grad_a (float32), grad_r (cuda_t)
 #pragma unroll
-    for (int t = 0; t < VECS_PER_LANE; ++t) {
-        int v = lane + kMaxThreadsInWarp * t;
-        if (v < NUM_VECS) {
-            int base_f = v * Tile::ELEM_PER_VEC;
+    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+        int v = lane + kWarpSize * t;
+        if (v < TILES) {
+            int base_f = v * Tile::TW;
             Tile::write_typed(grad_l_base, v, &gradli_sh[base_f]);
             Tile::write_float(grad_a_base, v, &grada_sh[base_f]);
             Tile::write_typed(grad_r_base, v, &gradri_sh[base_f]);
@@ -915,7 +925,7 @@ void GATv2Backward_CSR_Undirected_Impl(
     const cuda_t *d_attn_vec, const float *d_logsumexp, float negative_slope, int grad_A_reduce_row_chunk_size, cudaStream_t stream,
     cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced
 ) {
-    dim3 nThreads(kMaxThreadsInWarp);
+    dim3 nThreads(kWarpSize);
     dim3 nBlocks(N, H);
 
     // 1) Compute G[i,h] for all nodes
@@ -940,13 +950,13 @@ void GATv2Backward_CSR_Undirected_Impl(
     );
 
     // 3) Reduce grad_a [N, H, D] -> [H, D]
-    size_t shmem_gradA_reduce_size = (kMaxThreadsInWarp * (kMaxThreadsInWarp + 2)) * sizeof(float);
-    dim3 grad_A_reduce_blockDim(kMaxThreadsInWarp, kMaxThreadsInWarp);
+    size_t shmem_gradA_reduce_size = (kWarpSize * (kWarpSize + 2)) * sizeof(float);
+    dim3 grad_A_reduce_blockDim(kWarpSize, kWarpSize);
 
     std::visit(
         [&](auto chunk_c) {
             constexpr int CHUNK = decltype(chunk_c)::value;
-            dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp, H);
+            dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kWarpSize - 1) / kWarpSize, H);
             ReduceGradAKernel<CHUNK, cuda_t>
                 <<<grad_A_reduce_gridDim, grad_A_reduce_blockDim, shmem_gradA_reduce_size>>>(N, H, D, grad_a, d_grad_a_reduced);
         },
@@ -982,7 +992,7 @@ void GATv2Backward_CSR_Impl_UNUSED(
     float *grad_a,           // [N, H, D] always float32
     float *d_grad_a_reduced  // [H, D] output in float32
 ) {
-    dim3 nThreads(kMaxThreadsInWarp);
+    dim3 nThreads(kWarpSize);
     dim3 nBlocks(N, H);
 
     // G has shape [N, H]
@@ -1008,13 +1018,13 @@ void GATv2Backward_CSR_Impl_UNUSED(
     );
 
     // 3: sum-reduce grad_a [N, H, D] over N into [H, D] (always float32)
-    size_t shmem_gradA_reduce_size = (kMaxThreadsInWarp * (kMaxThreadsInWarp + 2)) * sizeof(float);
-    dim3 grad_A_reduce_blockDim(kMaxThreadsInWarp, kMaxThreadsInWarp);
+    size_t shmem_gradA_reduce_size = (kWarpSize * (kWarpSize + 2)) * sizeof(float);
+    dim3 grad_A_reduce_blockDim(kWarpSize, kWarpSize);
 
     std::visit(
         [&](auto chunk_c) {
             constexpr int CHUNK = decltype(chunk_c)::value;
-            dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp, H);
+            dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kWarpSize - 1) / kWarpSize, H);
             ReduceGradAKernel<CHUNK, cuda_t>
                 <<<grad_A_reduce_gridDim, grad_A_reduce_blockDim, shmem_gradA_reduce_size>>>(N, H, D, grad_a, d_grad_a_reduced);
         },
@@ -1113,7 +1123,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
                 dim3 blocks(num_nodes_bucket, H);
-                dim3 threads(W * kMaxThreadsInWarp);
+                dim3 threads(W * kWarpSize);
 
                 GATv2Forward_Kernel<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h, index_ptr<index_t>(row_ptr),
@@ -1262,7 +1272,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     size_t sh_al = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
 
                     dim3 blocks(num_nodes_bucket, H);
-                    dim3 threads(W * kMaxThreadsInWarp);
+                    dim3 threads(W * kWarpSize);
 
                     GATv2Backward_AL<W, DC, cuda_t, index_t><<<blocks, threads, sh_al, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
@@ -1295,7 +1305,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     size_t sh_r = DC * sizeof(cuda_t) + W * DC * sizeof(float);
 
                     dim3 blocks(num_nodes_bucket, H);
-                    dim3 threads(W * kMaxThreadsInWarp);
+                    dim3 threads(W * kWarpSize);
 
                     GATv2Backward_R<W, DC, cuda_t, index_t><<<blocks, threads, sh_r, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
@@ -1318,14 +1328,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
         // 3: ReduceGradA
         {
-            size_t shmem_gradA_reduce_size = (kMaxThreadsInWarp * (kMaxThreadsInWarp + 2)) * sizeof(float);
-            dim3 grad_A_reduce_blockDim(kMaxThreadsInWarp, kMaxThreadsInWarp);
+            size_t shmem_gradA_reduce_size = (kWarpSize * (kWarpSize + 2)) * sizeof(float);
+            dim3 grad_A_reduce_blockDim(kWarpSize, kWarpSize);
 
             std::visit(
                 [&](auto typeInfo, auto chunk_c) {
                     using cuda_t        = typename decltype(typeInfo)::CudaType;
                     constexpr int CHUNK = decltype(chunk_c)::value;
-                    dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp, H);
+                    dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kWarpSize - 1) / kWarpSize, H);
                     ReduceGradAKernel<CHUNK, cuda_t><<<grad_A_reduce_gridDim, grad_A_reduce_blockDim, shmem_gradA_reduce_size>>>(
                         N, H, D, d_grad_a, grad_a_reduced_f32.data_ptr<float>()
                     );
