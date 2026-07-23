@@ -20,7 +20,7 @@
 
 
 #define FULL_WARP_MASK 0xffffffff
-constexpr int kMaxThreadsInWarp = 32;
+constexpr int kWarpSize = 32;
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
@@ -33,7 +33,7 @@ __device__ __forceinline__ float leaky_relu_elementwise(float x, float negative_
 
 __device__ __forceinline__ float warp_reduce_sum(float x) {
     #pragma unroll
-    for (int offset = kMaxThreadsInWarp / 2; offset > 0; offset >>= 1) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(FULL_WARP_MASK, x, offset);
     }
     return x;
@@ -41,7 +41,7 @@ __device__ __forceinline__ float warp_reduce_sum(float x) {
 
 __device__ __forceinline__ float warp_reduce_max(float x) {
     #pragma unroll
-    for (int offset = kMaxThreadsInWarp / 2; offset > 0; offset >>= 1) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(FULL_WARP_MASK, x, offset));
     }
     return x;
@@ -89,7 +89,7 @@ __global__ void GATv2Kernel_CSR(
     float* l_shared = shared;
 
     int node_i = blockIdx.x;
-    int lane_id = threadIdx.x % kMaxThreadsInWarp;
+    int lane_id = threadIdx.x % kWarpSize;
 
     if (node_i >= N) {
         return;
@@ -115,7 +115,7 @@ __global__ void GATv2Kernel_CSR(
         const float4* l_ptr = reinterpret_cast<const float4*>(d_l + node_i * z);
         float4* l_shared_f4 = reinterpret_cast<float4*>(l_shared);
 
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             l_shared_f4[i] = l_ptr[i];
         }
     }
@@ -137,7 +137,7 @@ __global__ void GATv2Kernel_CSR(
     // ==========================================
 
     // register accumulators for output
-    int float4_per_thread = (num_float4 + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;  // Ceiling division
+    int float4_per_thread = (num_float4 + kWarpSize - 1) / kWarpSize;  // Ceiling division
     float4 h_acc[8];  // Support up to z=1024 NOTE TODO THIS IS A WORKAROUND!!!!!!!
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -150,7 +150,7 @@ __global__ void GATv2Kernel_CSR(
         const float4* r_ptr = reinterpret_cast<const float4*>(d_r + neighbor_j * z);
 
         float dot = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 l_val = l_f4[i];
             float4 r_val = r_ptr[i];
             float4 a_val = attn_ptr[i];
@@ -189,7 +189,7 @@ __global__ void GATv2Kernel_CSR(
 
         // add weighted contribution from this neighbor
         for (int i = 0; i < float4_per_thread; ++i) {
-            int idx = lane_id + i * kMaxThreadsInWarp;
+            int idx = lane_id + i * kWarpSize;
             if (idx < num_float4) {
                 float4 r_val = r_ptr[idx];
 
@@ -210,7 +210,7 @@ __global__ void GATv2Kernel_CSR(
     float4* h_out_ptr = reinterpret_cast<float4*>(d_h_out + node_i * z);
 
     for (int i = 0; i < float4_per_thread; ++i) {
-        int idx = lane_id + i * kMaxThreadsInWarp;
+        int idx = lane_id + i * kWarpSize;
         if (idx < num_float4) {
             h_out_ptr[idx] = h_acc[i];
         }
@@ -236,7 +236,7 @@ void GATv2Forward_CSR(
     int max_neighbors,
     cudaStream_t stream = 0
 ) {
-    dim3 nThreads(kMaxThreadsInWarp);
+    dim3 nThreads(kWarpSize);
     dim3 nBlocks(N);
 
     // shared memory: z floats for l_i + max_neighbors floats for logits
@@ -275,7 +275,7 @@ __global__ void PrecomputeG(
     float* grad_h_shared = l_shared + z;
 
     int node_i = blockIdx.x;
-    int lane_id = threadIdx.x % kMaxThreadsInWarp;
+    int lane_id = threadIdx.x % kWarpSize;
 
     if (node_i >= N) return;
 
@@ -298,7 +298,7 @@ __global__ void PrecomputeG(
         float4* l_shared_f4 = reinterpret_cast<float4*>(l_shared);
         float4* gh_shared_f4 = reinterpret_cast<float4*>(grad_h_shared);
 
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             l_shared_f4[i] = l_ptr[i];
             gh_shared_f4[i] = gh_ptr[i];
         }
@@ -318,7 +318,7 @@ __global__ void PrecomputeG(
 
         // recompute e_ij = a^T @ LeakyReLU(l_i + r_j) :((((
         float e_ij = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 l_val = l_f4[i];
             float4 r_val = r_ptr[i];
             float4 a_val = attn_ptr[i];
@@ -335,7 +335,7 @@ __global__ void PrecomputeG(
 
         // compute grad_h_i * r_j
         float dot = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 gh = grad_h_f4[i];
             float4 r = r_ptr[i];
             dot += gh.x * r.x + gh.y * r.y + gh.z * r.z + gh.w * r.w;
@@ -390,7 +390,7 @@ __global__ void GATv2Backward_L(
         float4* l_shared_f4 = reinterpret_cast<float4*>(l_shared);
         float4* gh_shared_f4 = reinterpret_cast<float4*>(grad_h_shared);
 
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             l_shared_f4[i] = l_ptr[i];
             gh_shared_f4[i] = gh_ptr[i];
         }
@@ -402,7 +402,7 @@ __global__ void GATv2Backward_L(
     float L_i = d_logsumexp[node_i];
     float G_i = d_G[node_i];
 
-    int float4_per_thread = (num_float4 + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+    int float4_per_thread = (num_float4 + kWarpSize - 1) / kWarpSize;
     float4 grad_acc[8];
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -414,7 +414,7 @@ __global__ void GATv2Backward_L(
         const float4* r_ptr = reinterpret_cast<const float4*>(d_r + neighbor_j * z);
 
         float e_ij = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 l_val = l_f4[i];
             float4 r_val = r_ptr[i];
             float4 a_val = attn_ptr[i];
@@ -438,7 +438,7 @@ __global__ void GATv2Backward_L(
 
         // grad_h_i * r_j
         float dot = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 gh = grad_h_f4[i];
             float4 r = r_ptr[i];
             dot += gh.x * r.x + gh.y * r.y + gh.z * r.z + gh.w * r.w;
@@ -449,7 +449,7 @@ __global__ void GATv2Backward_L(
         float grad_e_ij = alpha_ij * (dot - G_i);
 
         for (int i = 0; i < float4_per_thread; ++i) {
-            int idx = lane_id + i * kMaxThreadsInWarp;
+            int idx = lane_id + i * kWarpSize;
             if (idx < num_float4) {
                 float4 l_val = l_f4[idx];
                 float4 r_val = r_ptr[idx];
@@ -477,7 +477,7 @@ __global__ void GATv2Backward_L(
 
     float4* grad_l_ptr = reinterpret_cast<float4*>(grad_l + node_i * z);
     for (int i = 0; i < float4_per_thread; ++i) {
-        int idx = lane_id + i * kMaxThreadsInWarp;
+        int idx = lane_id + i * kWarpSize;
         if (idx < num_float4) {
             grad_l_ptr[idx] = grad_acc[i];
         }
@@ -518,7 +518,7 @@ __global__ void GATv2Backward_R(
         const float4* r_ptr = reinterpret_cast<const float4*>(d_r + node_j * z);
         float4* r_shared_f4 = reinterpret_cast<float4*>(r_shared);
 
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             r_shared_f4[i] = r_ptr[i];
         }
     }
@@ -527,7 +527,7 @@ __global__ void GATv2Backward_R(
     const float4* r_f4 = reinterpret_cast<const float4*>(r_shared);
 
     // init gradient accumulator
-    int float4_per_thread = (num_float4 + kMaxThreadsInWarp - 1) / kMaxThreadsInWarp;
+    int float4_per_thread = (num_float4 + kWarpSize - 1) / kWarpSize;
     float4 grad_acc[8];
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -546,7 +546,7 @@ __global__ void GATv2Backward_R(
 
         // recompute e_ij = a^T @ LeakyReLU(l_i + r_j)
         float e_ij = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 l_val = l_ptr[i];
             float4 r_val = r_f4[i];
             float4 a_val = attn_ptr[i];
@@ -571,7 +571,7 @@ __global__ void GATv2Backward_R(
 
         // compute grad_h_i * r_j
         float dot = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 gh = grad_h_ptr[i];
             float4 r = r_f4[i];
             dot += gh.x * r.x + gh.y * r.y + gh.z * r.z + gh.w * r.w;
@@ -583,7 +583,7 @@ __global__ void GATv2Backward_R(
 
         // Accumulate both gradient paths
         for (int i = 0; i < float4_per_thread; ++i) {
-            int idx = lane_id + i * kMaxThreadsInWarp;
+            int idx = lane_id + i * kWarpSize;
             if (idx < num_float4) {
                 float4 l_val = l_ptr[idx];
                 float4 r_val = r_f4[idx];
@@ -626,7 +626,7 @@ __global__ void GATv2Backward_R(
 
     float4* grad_r_ptr = reinterpret_cast<float4*>(grad_r + node_j * z);
     for (int i = 0; i < float4_per_thread; ++i) {
-        int idx = lane_id + i * kMaxThreadsInWarp;
+        int idx = lane_id + i * kWarpSize;
         if (idx < num_float4) {
             grad_r_ptr[idx] = grad_acc[i];
         }
@@ -657,7 +657,7 @@ __global__ void GATv2Backward_A(
     int num_float4 = z / 4;
 
     // Initialize local grad_a accumulator
-    for (int i = lane_id; i < z; i += kMaxThreadsInWarp) {
+    for (int i = lane_id; i < z; i += kWarpSize) {
         grad_a_local[i] = 0.0f;
     }
     __syncthreads();
@@ -677,7 +677,7 @@ __global__ void GATv2Backward_A(
         float4* l_shared_f4 = reinterpret_cast<float4*>(l_shared);
         float4* gh_shared_f4 = reinterpret_cast<float4*>(grad_h_shared);
 
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             l_shared_f4[i] = l_ptr[i];
             gh_shared_f4[i] = gh_ptr[i];
         }
@@ -700,7 +700,7 @@ __global__ void GATv2Backward_A(
         float e_ij = 0.0f;
 
         // First pass: compute e_ij
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 l_val = l_f4[i];
             float4 r_val = r_ptr[i];
             float4 a_val = attn_ptr[i];
@@ -726,7 +726,7 @@ __global__ void GATv2Backward_A(
 
         // Compute grad_h_i * r_j
         float dot = 0.0f;
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 gh = grad_h_f4[i];
             float4 r = r_ptr[i];
             dot += gh.x * r.x + gh.y * r.y + gh.z * r.z + gh.w * r.w;
@@ -737,7 +737,7 @@ __global__ void GATv2Backward_A(
         float grad_e_ij = alpha_ij * (dot - G_i);
 
         // Second pass: accumulate grad_e_ij · s_ij to grad_a_local
-        for (int i = lane_id; i < num_float4; i += kMaxThreadsInWarp) {
+        for (int i = lane_id; i < num_float4; i += kWarpSize) {
             float4 l_val = l_f4[i];
             float4 r_val = r_ptr[i];
 
@@ -764,7 +764,7 @@ __global__ void GATv2Backward_A(
 
     __syncthreads();
 
-    for (int i = lane_id; i < z; i += kMaxThreadsInWarp) {
+    for (int i = lane_id; i < z; i += kWarpSize) {
         atomicAdd(&grad_a[i], grad_a_local[i]);
     }
 }
@@ -791,7 +791,7 @@ void GATv2Backward_CSR(
     float negative_slope,
     cudaStream_t stream = 0
 ) {
-    dim3 nThreads(kMaxThreadsInWarp);
+    dim3 nThreads(kWarpSize);
     dim3 nBlocks(N);
 
     // Step 1: Precompute G_i
