@@ -4,7 +4,7 @@
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template<int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+template<int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t, bool USE_OFFSETS>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * kMaxThreadsInWarp)
 GATv2Forward_Kernel(
     size_t N,
@@ -18,12 +18,13 @@ GATv2Forward_Kernel(
     int64_t stride_r_h,
     const index_t* __restrict__ d_row_ptr,
     const index_t* __restrict__ d_col_idx,
-    const index_t* __restrict__ node_indices,   // node indirection
+    const index_t* __restrict__ node_indices,
     int num_nodes_bucket,
     const cuda_t* __restrict__ d_attn_vec,
     cuda_t* __restrict__ d_h_out,
     float* __restrict__ d_logsumexp_out,
-    float negative_slope
+    float negative_slope,
+    const int* __restrict__ block_offsets
 ) {
     constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
@@ -41,7 +42,18 @@ GATv2Forward_Kernel(
 
     if (head_h >= (int)H) return;
 
-    for (int b = blockIdx.x; b < num_nodes_bucket; b += gridDim.x) {
+    int loop_start, loop_end, loop_stride;
+    if constexpr (USE_OFFSETS) {
+        loop_start  = block_offsets[blockIdx.x];
+        loop_end    = block_offsets[blockIdx.x + 1];
+        loop_stride = 1;
+    } else {
+        loop_start  = blockIdx.x;
+        loop_end    = num_nodes_bucket;
+        loop_stride = gridDim.x;
+    }
+
+    for (int b = loop_start; b < loop_end; b += loop_stride) {
         const int node_i = static_cast<int>(node_indices[b]);
         if (node_i >= (int)N) continue;
 
@@ -1138,7 +1150,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
     int heavy_warps_per_block,
-    int grid_size_override
+    int grid_size_override,
+    torch::Tensor block_offsets
 ) {
 
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
@@ -1200,7 +1213,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256,
                 "GATv2 forward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket,
+                             bool use_balanced, auto warp_variant) {
         if (num_nodes_bucket == 0) return;
 
         std::visit([&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
@@ -1218,26 +1232,40 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
             // l_sh + W * D float + 2 * W float
             size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
-            int gx = (grid_size_override > 0)
-                       ? std::min(grid_size_override, num_nodes_bucket)
-                       : num_nodes_bucket;
-            dim3 blocks(gx, H);
-            dim3 threads(W * kMaxThreadsInWarp);
-
-            GATv2Forward_Kernel<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
-                N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
-                index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
-                index_ptr<index_t>(node_indices),
-                num_nodes_bucket,
-                attn_ptr, h_out_ptr, d_logsumexp, negative_slope);
+            if (use_balanced) {
+                int gx = static_cast<int>(block_offsets.numel()) - 1;
+                dim3 blocks(gx, H);
+                dim3 threads(W * kMaxThreadsInWarp);
+                GATv2Forward_Kernel<W, DC, cuda_t, index_t, true><<<blocks, threads, shmem, stream>>>(
+                    N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
+                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
+                    index_ptr<index_t>(node_indices),
+                    num_nodes_bucket,
+                    attn_ptr, h_out_ptr, d_logsumexp, negative_slope,
+                    block_offsets.data_ptr<int>());
+            } else {
+                int gx = (grid_size_override > 0)
+                           ? std::min(grid_size_override, num_nodes_bucket)
+                           : num_nodes_bucket;
+                dim3 blocks(gx, H);
+                dim3 threads(W * kMaxThreadsInWarp);
+                GATv2Forward_Kernel<W, DC, cuda_t, index_t, false><<<blocks, threads, shmem, stream>>>(
+                    N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
+                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
+                    index_ptr<index_t>(node_indices),
+                    num_nodes_bucket,
+                    attn_ptr, h_out_ptr, d_logsumexp, negative_slope,
+                    nullptr);
+            }
         }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
            MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
            MakeIntVariant<32, 64, 128, 256>((int)D),
            warp_variant);
     };
 
-    launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block));
-    launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
+    const bool use_balanced = block_offsets.defined() && block_offsets.numel() > 0;
+    launch_bucket(light_nodes, light_nodes.numel(), use_balanced, MakeIntVariant<1, 2, 4>(light_warps_per_block));
+    launch_bucket(heavy_nodes, heavy_nodes.numel(), false, MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
 
     CUDA_KERNEL_CHECK();
 

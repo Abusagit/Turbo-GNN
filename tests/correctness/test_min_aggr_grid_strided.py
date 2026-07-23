@@ -10,6 +10,7 @@ if _project_root not in sys.path:
 
 import turbo_gnn._C as _C  # noqa: E402
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
+from turbo_gnn.scheduling import edge_balanced_partition  # noqa: E402
 
 
 def make_graph(N, avg_degree=6, seed=42, device="cuda"):
@@ -116,3 +117,106 @@ class TestMinAggrGridStrided:
         out_big, arg_big = run_forward(graph, x, "min", grid_size_override=100_000)
         assert torch.equal(out_ref, out_big)
         assert torch.equal(arg_ref, arg_big)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestMinAggrBalancedPartition:
+    @pytest.mark.parametrize("reduce", ["min", "max"])
+    @pytest.mark.parametrize("d", [32, 64, 128])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    @pytest.mark.parametrize("num_blocks", [16, 64, 132])
+    def test_balanced_matches_legacy(self, reduce, d, dtype, num_blocks):
+        N = 512
+        torch.manual_seed(0)
+        edge_index = make_graph(N, avg_degree=6)
+        graph = build_bucketed(edge_index, N, quantile=-1)
+
+        x = torch.randn(N, d, device="cuda", dtype=dtype)
+
+        out_ref, arg_ref = run_forward(graph, x, reduce, grid_size_override=0)
+
+        sorted_nodes, offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, num_blocks
+        )
+        graph.forward_light_nodes = sorted_nodes
+        out_bal, arg_bal = _C.reduction_aggr_forward_partitioned(
+            graph.forward_indptr,
+            graph.forward_indices,
+            x,
+            graph.forward_light_nodes,
+            graph.forward_heavy_nodes,
+            max_degree_of(graph.forward_indptr),
+            8, 128, False, 32, 8,
+            reduce, 0,
+            offsets,
+        )
+
+        assert torch.equal(out_ref, out_bal), (
+            f"reduce={reduce} d={d} dtype={dtype} num_blocks={num_blocks}: "
+            f"max|Δ|={(out_ref.float() - out_bal.float()).abs().max().item():.3e}"
+        )
+        assert torch.equal(arg_ref, arg_bal)
+
+    @pytest.mark.parametrize("num_blocks", [16, 64])
+    def test_balanced_mixed_light_heavy_matches_legacy(self, num_blocks):
+        N, d = 1024, 64
+        torch.manual_seed(3)
+        edge_index = make_graph(N, avg_degree=8)
+        graph = build_bucketed(edge_index, N, quantile=0.9)
+
+        assert graph.forward_light_nodes.numel() > 0
+        assert graph.forward_heavy_nodes.numel() > 0
+
+        x = torch.randn(N, d, device="cuda", dtype=torch.float32)
+        out_ref, arg_ref = run_forward(graph, x, "min", grid_size_override=0)
+
+        sorted_nodes, offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, num_blocks
+        )
+        graph.forward_light_nodes = sorted_nodes
+        out_bal, arg_bal = _C.reduction_aggr_forward_partitioned(
+            graph.forward_indptr,
+            graph.forward_indices,
+            x,
+            graph.forward_light_nodes,
+            graph.forward_heavy_nodes,
+            max_degree_of(graph.forward_indptr),
+            8, 128, False, 32, 8,
+            "min", 0,
+            offsets,
+        )
+
+        assert torch.equal(out_ref, out_bal), (
+            f"max|Δ|={(out_ref - out_bal).abs().max().item():.3e}"
+        )
+        assert torch.equal(arg_ref, arg_bal)
+
+    @pytest.mark.parametrize("num_blocks", [8, 32, 128])
+    def test_partition_edge_balance(self, num_blocks):
+        N = 2048
+        torch.manual_seed(4)
+        edge_index = make_graph(N, avg_degree=16)
+        graph = build_bucketed(edge_index, N, quantile=-1)
+
+        _, offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, num_blocks
+        )
+
+        indptr = graph.forward_indptr
+        if indptr.dtype == torch.uint32:
+            indptr = indptr.view(torch.int32)
+        degrees = (indptr[1:] - indptr[:-1]).float()
+        sorted_nodes, _ = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, num_blocks
+        )
+        block_degrees = degrees[sorted_nodes.long()]
+
+        offsets_cpu = offsets.cpu().tolist()
+        loads = [
+            block_degrees[offsets_cpu[b]:offsets_cpu[b + 1]].sum().item()
+            for b in range(num_blocks)
+            if offsets_cpu[b + 1] > offsets_cpu[b]
+        ]
+        if len(loads) > 1:
+            imbalance = (max(loads) - min(loads)) / (sum(loads) / len(loads))
+            assert imbalance < 1.0, f"Block loads too imbalanced: {imbalance:.2f}"

@@ -10,7 +10,7 @@ if _project_root not in sys.path:
 
 import turbo_gnn._C as _C  # noqa: E402
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
-from turbo_gnn.scheduling import sort_by_degree_desc  # noqa: E402
+from turbo_gnn.scheduling import edge_balanced_partition, sort_by_degree_desc  # noqa: E402
 
 
 def make_graph(N, avg_degree=8, seed=42, device="cuda"):
@@ -92,3 +92,76 @@ class TestSchedulingPreservesOutput:
             "sort_by_degree_desc did not produce descending degrees"
         assert not torch.equal(original, sorted_nodes), \
             "sort was a no-op — the input was already sorted, pick another seed"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestGATv2BalancedPartition:
+    @pytest.mark.parametrize("num_blocks", [16, 64, 132])
+    @pytest.mark.parametrize("D", [32, 64])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_balanced_matches_original(self, num_blocks, D, dtype):
+        N, H = 2048, 4
+        torch.manual_seed(5)
+        edge_index = make_graph(N, avg_degree=8)
+        graph = build_bucketed(edge_index, N, quantile=-1)
+
+        xl = torch.randn(N, H, D, device="cuda", dtype=dtype)
+        xr = torch.randn(N, H, D, device="cuda", dtype=dtype)
+        aw = torch.randn(H, D, device="cuda", dtype=dtype)
+
+        out_ref, lse_ref = run_forward(graph, xl, xr, aw, grid_size_override=0)
+
+        sorted_nodes, offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, num_blocks
+        )
+        graph.forward_light_nodes = sorted_nodes
+        out_bal, lse_bal = _C.gatv2_forward(
+            xl, xr,
+            graph.forward_indptr,
+            graph.forward_indices,
+            aw, 0.2,
+            graph.forward_light_nodes,
+            graph.forward_heavy_nodes,
+            1, 8, 0,
+            offsets,
+        )
+
+        assert torch.allclose(out_ref.float(), out_bal.float(), atol=1e-4, rtol=1e-4), (
+            f"num_blocks={num_blocks} D={D} dtype={dtype}: "
+            f"max|Δ|={(out_ref.float() - out_bal.float()).abs().max().item():.3e}"
+        )
+        assert torch.allclose(lse_ref, lse_bal, atol=1e-4, rtol=1e-4)
+
+    def test_balanced_mixed_light_heavy_matches_original(self):
+        N, H, D = 1024, 4, 64
+        torch.manual_seed(6)
+        edge_index = make_graph(N, avg_degree=8)
+        graph = build_bucketed(edge_index, N, quantile=0.9)
+
+        assert graph.forward_light_nodes.numel() > 0
+        assert graph.forward_heavy_nodes.numel() > 0
+
+        xl = torch.randn(N, H, D, device="cuda", dtype=torch.float32)
+        xr = torch.randn(N, H, D, device="cuda", dtype=torch.float32)
+        aw = torch.randn(H, D, device="cuda", dtype=torch.float32)
+
+        out_ref, lse_ref = run_forward(graph, xl, xr, aw, grid_size_override=0)
+
+        sorted_nodes, offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, 64
+        )
+        graph.forward_light_nodes = sorted_nodes
+        out_bal, lse_bal = _C.gatv2_forward(
+            xl, xr,
+            graph.forward_indptr,
+            graph.forward_indices,
+            aw, 0.2,
+            graph.forward_light_nodes,
+            graph.forward_heavy_nodes,
+            1, 8, 0,
+            offsets,
+        )
+
+        assert torch.allclose(out_ref.float(), out_bal.float(), atol=1e-4, rtol=1e-4), (
+            f"max|Δ|={(out_ref.float() - out_bal.float()).abs().max().item():.3e}"
+        )

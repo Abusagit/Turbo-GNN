@@ -10,7 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import turbo_gnn._C as _C  # noqa: E402
 from src.benchmarking.microbench import get_gpu_info, time_callable  # noqa: E402
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
-from turbo_gnn.scheduling import sort_by_degree_desc  # noqa: E402
+from turbo_gnn.scheduling import edge_balanced_partition, sort_by_degree_desc  # noqa: E402
 
 
 def _finalize(src, dst, N, device):
@@ -90,6 +90,8 @@ def bench_one(N, avg_degree, H, D, dtype, grid_size_override, warmup, iters,
               quantile=-1.0):
     edge_index = make_graph(N, avg_degree, seed, graph_type, exponent)
     graph = build_bucketed(edge_index, N, quantile=quantile)
+
+    block_offsets = None
     if schedule == "sort":
         graph.forward_light_nodes = sort_by_degree_desc(
             graph.forward_light_nodes, graph.forward_indptr,
@@ -98,6 +100,11 @@ def bench_one(N, avg_degree, H, D, dtype, grid_size_override, warmup, iters,
             graph.forward_heavy_nodes = sort_by_degree_desc(
                 graph.forward_heavy_nodes, graph.forward_indptr,
             )
+    elif schedule == "balanced" and grid_size_override > 0:
+        graph.forward_light_nodes, block_offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, grid_size_override,
+        )
+
     xl = torch.randn(N, H, D, device="cuda", dtype=dtype)
     xr = torch.randn(N, H, D, device="cuda", dtype=dtype)
     aw = torch.randn(H, D, device="cuda", dtype=dtype)
@@ -114,7 +121,8 @@ def bench_one(N, avg_degree, H, D, dtype, grid_size_override, warmup, iters,
             graph.forward_heavy_nodes,
             1,
             8,
-            grid_size_override,
+            0 if block_offsets is not None else grid_size_override,
+            block_offsets if block_offsets is not None else torch.empty(0, dtype=torch.int32, device="cuda"),
         )
 
     return time_callable(_fn, warmup=warmup, iters=iters, do_memory_profile=False)
@@ -132,7 +140,7 @@ def parse_args():
     p.add_argument("--quantile", type=float, default=-1.0)
     p.add_argument("--grid-sizes", type=int, nargs="+", default=None)
     p.add_argument("--grid-multipliers", type=float, nargs="+", default=None)
-    p.add_argument("--schedules", nargs="+", choices=["none", "sort"], default=["none", "sort"])
+    p.add_argument("--schedules", nargs="+", choices=["none", "sort", "balanced"], default=["none", "sort", "balanced"])
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--json-out", type=str, default=None)
