@@ -2,19 +2,21 @@ __examples
 
 **/__pycache__
 
-dataset/*
+dataset
 
-.vscode/
+.vscode
 
-/data/
+CLAUDE.md
 
-/build/
+/data
 
-dist/
+/build
 
-runs/
+dist
 
-.venv*/*
+runs
+
+.venv*
 
 *.egg-info
 
@@ -27,9 +29,11 @@ cutlass
 
 *.cubin
 
-thirdparty/*
+*.so
 
-out/*
+thirdparty
+
+out
 
 *.tex
 
