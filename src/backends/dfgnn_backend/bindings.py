@@ -4,6 +4,8 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load
 
+from src._ninja import ensure_ninja_on_path
+
 path = Path(__file__).parent
 build_path = path.parent.parent.parent / "build/dfgnn"
 
@@ -11,6 +13,8 @@ if os.environ.get("CUDA_HOME") is None:
     os.environ["CUDA_HOME"] = "/usr/local/cuda"
     os.environ["CUDA_PATH"] = "/usr/local/cuda"
     os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
+
+ensure_ninja_on_path()
 
 cuda_path = os.environ["CUDA_PATH"]
 
