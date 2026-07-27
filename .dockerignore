@@ -1,0 +1,29 @@
+# Virtual environments
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Dev/test noise
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data & runs (can be large)
+data/
+runs/
+experiments/
+results/
+
+# Misc
+*.log
+*.tmp
+thirdparty/

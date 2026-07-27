@@ -731,6 +731,8 @@ struct TileOps<2, cuda_t> {
     static __device__ __forceinline__ vec_t build_from_float(float const *const __restrict__ arr) {
         return Ops::from_float2(make_float2(arr[0], arr[1]));
     }
+    static __device__ __forceinline__ vec_t build(const cuda_t *arr) { return *reinterpret_cast<const vec2_t *>(arr); }
+    static __device__ __forceinline__ vec_t build_from_float(const float *arr) { return Ops::from_float2(make_float2(arr[0], arr[1])); }
 
     // --- GT backward: float32 atomic add of scalar * vec ---
     static __device__ __forceinline__ void atomic_add_scaled_f32(float *const __restrict__ ptr, int base_f, float scalar, vec_t v) {

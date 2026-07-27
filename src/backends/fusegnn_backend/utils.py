@@ -4,9 +4,13 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load
 
+from src._ninja import ensure_ninja_on_path
+
 os.environ["CUDA_HOME"] = "/usr/local/cuda"
 os.environ["CUDA_PATH"] = "/usr/local/cuda"
 os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ['PATH']}"
+
+ensure_ninja_on_path()
 
 path = Path(__file__).parent
 
