@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import torch
 import yaml
 
-sys.path.append("./")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.backends.registry import BackendRegistry
 from src.benchmarking.microbench import MicrobenchResult, get_gpu_info, time_callable
@@ -65,6 +65,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--amp", type=str, default="none", choices=["none", "bf16", "fp16"])
+    p.add_argument(
+        "--exact-iters",
+        action="store_true",
+        help="Issue exactly --warmup + --iters calls instead of using triton.testing.do_bench "
+        "(whose warmup/rep are milliseconds and which adds 6 calibration calls). Use this under "
+        "a kernel profiler such as ncu to keep the launch count small and deterministic.",
+    )
     p.add_argument("--json-out", type=str, default=None, help="Optional path to write JSON result.")
     return p.parse_args()
 
@@ -130,15 +137,24 @@ def main() -> int:
             _ = conv(x, graph)
         return _
 
-    Y = _fn_forward().requires_grad_(True)
-    grad_output = torch.randn_like(x)
+    Y = None
+    grad_output = None
+    if args.mode == "backward" or not args.exact_iters:
+        Y = _fn_forward().requires_grad_(True)
+        grad_output = torch.randn_like(x)
 
     def _fn_backward() -> None:
         nonlocal grad_output, Y
-        Y.backward(grad_output, retain_graph=True)
+        Y.backward(grad_output, retain_graph=True)  # type: ignore[union-attr]
 
     fn = _fn_forward if args.mode == "forward" else _fn_backward
-    res: MicrobenchResult = time_callable(fn, warmup=args.warmup, iters=args.iters, do_memory_profile=False)
+    res: MicrobenchResult = time_callable(
+        fn,
+        warmup=args.warmup,
+        iters=args.iters,
+        do_memory_profile=False,
+        exact_iters=args.exact_iters,
+    )
 
     base_dict = {
         "backend": args.backend,
