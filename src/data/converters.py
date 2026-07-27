@@ -17,6 +17,7 @@ from torch_geometric.data import Data
 from torch_geometric.edge_index import EdgeIndex
 from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
+from src._ninja import ensure_ninja_on_path
 from src.utils.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
 from turbo_gnn.graph import (  # noqa: E402
     AdjacencyForwardBackwardWithNodeBuckets,
@@ -43,6 +44,8 @@ if os.environ.get("CUDA_HOME") is None:
     os.environ["CUDA_HOME"] = "/usr/local/cuda"
     os.environ["CUDA_PATH"] = "/usr/local/cuda"
     os.environ["PATH"] = f"/usr/local/cuda/bin:{os.environ.get('PATH', '')}"
+
+ensure_ninja_on_path()
 
 # Set up build directory to avoid file locking issues
 path = Path(__file__).parent
