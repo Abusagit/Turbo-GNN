@@ -2,19 +2,18 @@
 
 template <int WARPS_PER_BLOCK, typename cuda_t, ReductionOp Op, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
-    const index_t *__restrict__ light_nodes_indices,
-    const index_t *__restrict__ edge_ptr,
-    const index_t *__restrict__ edge_idx,
-    const cuda_t *__restrict__ X,
-    cuda_t *__restrict__ out,
-    index_t *__restrict__ arg_idx,
+    index_t const *const __restrict__ light_nodes_indices,
+    index_t const *const __restrict__ edge_ptr,
+    index_t const *const __restrict__ edge_idx,
+    cuda_t const *const __restrict__ X,
+    cuda_t *const __restrict__ out,
+    index_t *const __restrict__ arg_idx,
     int d
 ) {
     using ROps        = ReductionOps<Op>;
     using Sentinel    = IndexSentinel<index_t>;
-    constexpr int VW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    using Tile        = TileOps<VW, cuda_t>;
-    constexpr int EPV = Tile::ELEM_PER_VEC;
+    constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    using Tile        = TileOps<TW, cuda_t>;
 
     int i     = blockIdx.x;
     index_t v = light_nodes_indices[i];
@@ -30,15 +29,15 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     cuda_t identity_val = make_cuda_value<cuda_t>(ROps::IDENTITY);
     cuda_t zero_val     = make_cuda_value<cuda_t>(0.0f);
 
-    const int d_vec = d / EPV;
+    const int d_vec = d / TW;
 
     for (int fv = tid; fv < d_vec; fv += BLOCK_DIM) {
-        const int base_f = fv * EPV;
+        const int base_f = fv * TW;
 
-        cuda_t best_vals[EPV];
-        index_t best_srcs[EPV];
+        cuda_t best_vals[TW];
+        index_t best_srcs[TW];
 #pragma unroll
-        for (int e = 0; e < EPV; ++e) {
+        for (int e = 0; e < TW; ++e) {
             best_vals[e] = identity_val;
             best_srcs[e] = Sentinel::INVALID;
         }
@@ -47,7 +46,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             index_t src = edge_idx[eid];
             auto val    = Tile::load(&X[static_cast<int>(src) * d], fv);
 #pragma unroll
-            for (int e = 0; e < EPV; ++e) {
+            for (int e = 0; e < TW; ++e) {
                 cuda_t v_e = Tile::extract(val, e);
                 if (ROps::is_better(v_e, best_vals[e])) {
                     best_vals[e] = v_e;
@@ -56,18 +55,18 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             }
         }
 
-        cuda_t result[EPV];
+        cuda_t result[TW];
 #pragma unroll
-        for (int e = 0; e < EPV; ++e) {
+        for (int e = 0; e < TW; ++e) {
             result[e]                         = Sentinel::is_valid(best_srcs[e]) ? best_vals[e] : zero_val;
             arg_idx[node_stride + base_f + e] = best_srcs[e];
         }
         Tile::store_vec(&out[node_stride], fv, Tile::build(result));
     }
 
-    // Scalar tail for d % EPV != 0 (compiles away for EPV=1)
-    if (d % EPV != 0 && tid == 0) {
-        for (int f = d_vec * EPV; f < d; ++f) {
+    // Scalar tail for d % TW != 0 (compiles away for TW=1)
+    if (d % TW != 0 && tid == 0) {
+        for (int f = d_vec * TW; f < d; ++f) {
             cuda_t best_val  = identity_val;
             index_t best_src = Sentinel::INVALID;
             for (index_t eid = row_start; eid < row_end; ++eid) {
@@ -108,13 +107,13 @@ __device__ __forceinline__ float ordered_uint_to_float(unsigned int key) {
 }
 
 // pack float and int into uint64 for atomic updates (32-bit indices only)
-__device__ __forceinline__ unsigned long long pack_val_idx(float val, int idx) {
+__device__ __forceinline__ uint64_t pack_val_idx(float val, int idx) {
     unsigned int key = float_to_ordered_uint(val);
-    return (static_cast<unsigned long long>(key) << 32) | static_cast<unsigned int>(idx);
+    return (static_cast<uint64_t>(key) << 32) | static_cast<unsigned int>(idx);
 }
 
 // unpack float and int from uint64
-__device__ __forceinline__ void unpack_val_idx(unsigned long long packed, float& val, int& idx) {
+__device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int& idx) {
     unsigned int key  = static_cast<unsigned int>(packed >> 32);
     unsigned int idxu = static_cast<unsigned int>(packed & 0xFFFFFFFFu);
 
@@ -126,19 +125,18 @@ __device__ __forceinline__ void unpack_val_idx(unsigned long long packed, float&
 // Only for 32-bit index types (packs float32 + int32 into uint64)
 template <int EDGES_PER_BLOCK, int WARPS_PER_BLOCK, typename cuda_t, ReductionOp Op, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
-    const index_t *__restrict__ heavy_nodes_indices,
-    const index_t *__restrict__ edge_ptr,
-    const index_t *__restrict__ edge_idx,
-    const cuda_t *__restrict__ X,
-    unsigned long long *__restrict__ packed,
+    index_t const *const __restrict__ heavy_nodes_indices,
+    index_t const *const __restrict__ edge_ptr,
+    index_t const *const __restrict__ edge_idx,
+    cuda_t const *const __restrict__ X,
+    uint64_t *const __restrict__ packed,
     int d
 ) {
     static_assert(sizeof(index_t) <= 4, "Packed heavy kernel only supports 32-bit index types");
     using ROps        = ReductionOps<Op>;
     using Sentinel    = IndexSentinel<index_t>;
-    constexpr int VW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    using Tile        = TileOps<VW, cuda_t>;
-    constexpr int EPV = Tile::ELEM_PER_VEC;
+    constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    using Tile        = TileOps<TW, cuda_t>;
 
     int node_idx  = blockIdx.x;
     int chunk_idx = blockIdx.y;
@@ -160,15 +158,15 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     constexpr int BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
     cuda_t identity_val     = make_cuda_value<cuda_t>(ROps::IDENTITY);
 
-    const int d_vec = d / EPV;
+    const int d_vec = d / TW;
 
     for (int fv = tid; fv < d_vec; fv += BLOCK_DIM) {
-        const int base_f = fv * EPV;
+        const int base_f = fv * TW;
 
-        cuda_t best_vals[EPV];
-        index_t best_srcs[EPV];
+        cuda_t best_vals[TW];
+        index_t best_srcs[TW];
 #pragma unroll
-        for (int e = 0; e < EPV; ++e) {
+        for (int e = 0; e < TW; ++e) {
             best_vals[e] = identity_val;
             best_srcs[e] = Sentinel::INVALID;
         }
@@ -177,7 +175,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             index_t src = edge_idx[eid];
             auto val    = Tile::load(&X[static_cast<int>(src) * d], fv);
 #pragma unroll
-            for (int e = 0; e < EPV; ++e) {
+            for (int e = 0; e < TW; ++e) {
                 cuda_t v_e = Tile::extract(val, e);
                 if (ROps::is_better(v_e, best_vals[e])) {
                     best_vals[e] = v_e;
@@ -187,17 +185,17 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
         }
 
 #pragma unroll
-        for (int e = 0; e < EPV; ++e) {
+        for (int e = 0; e < TW; ++e) {
             if (Sentinel::is_valid(best_srcs[e])) {
-                unsigned long long new_val = pack_val_idx(cuda_to_float(best_vals[e]), static_cast<int>(best_srcs[e]));
+                uint64_t new_val = pack_val_idx(cuda_to_float(best_vals[e]), static_cast<int>(best_srcs[e]));
                 ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
             }
         }
     }
 
-    // scalar tail for d % EPV != 0
-    if (d % EPV != 0 && tid == 0) {
-        for (int f = d_vec * EPV; f < d; ++f) {
+    // scalar tail for d % TW != 0
+    if (d % TW != 0 && tid == 0) {
+        for (int f = d_vec * TW; f < d; ++f) {
             cuda_t local_best = identity_val;
             index_t local_arg = Sentinel::INVALID;
 
@@ -211,7 +209,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             }
 
             if (Sentinel::is_valid(local_arg)) {
-                unsigned long long new_val = pack_val_idx(cuda_to_float(local_best), static_cast<int>(local_arg));
+                uint64_t new_val = pack_val_idx(cuda_to_float(local_best), static_cast<int>(local_arg));
                 ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
             }
         }
@@ -221,10 +219,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 // unpack results back to separate arrays (32-bit indices only, pairs with heavy kernel)
 template <int WARPS_PER_BLOCK, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_kernel(
-    const unsigned long long *__restrict__ packed,
-    const index_t *__restrict__ nodes,
-    cuda_t *__restrict__ out,
-    index_t *__restrict__ arg_idx,
+    uint64_t const *const __restrict__ packed,
+    index_t const *const __restrict__ nodes,
+    cuda_t *const __restrict__ out,
+    index_t *const __restrict__ arg_idx,
     int num_nodes,
     int d
 ) {
@@ -261,9 +259,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 ) {
     using ROps        = ReductionOps<Op>;
     using Sentinel    = IndexSentinel<index_t>;
-    constexpr int VW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    using Tile        = TileOps<VW, cuda_t>;
-    constexpr int EPV = Tile::ELEM_PER_VEC;
+    constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
+    using Tile        = TileOps<TW, cuda_t>;
 
     int i     = blockIdx.x;
     index_t v = nodes[i];
@@ -277,7 +274,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 
     const int F_BLOCK      = blockDim.x;
     const int TILES_Y      = blockDim.y;
-    const int SHMEM_STRIDE = F_BLOCK * EPV;
+    const int SHMEM_STRIDE = F_BLOCK * TW;
 
     extern __shared__ unsigned char shared_mem[];
     float *shmem_val = reinterpret_cast<float *>(shared_mem);
@@ -293,15 +290,15 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     index_t end           = (end_candidate < row_end) ? end_candidate : row_end;
 
     int node_stride = static_cast<int>(v) * d;
-    const int d_vec = d / EPV;
+    const int d_vec = d / TW;
 
     for (int fv = fid; fv < d_vec; fv += F_BLOCK) {
-        const int base_f = fv * EPV;
+        const int base_f = fv * TW;
 
-        cuda_t best_vals[EPV];
-        index_t best_srcs[EPV];
+        cuda_t best_vals[TW];
+        index_t best_srcs[TW];
 #pragma unroll
-        for (int e = 0; e < EPV; ++e) {
+        for (int e = 0; e < TW; ++e) {
             best_vals[e] = identity_val;
             best_srcs[e] = Sentinel::INVALID;
         }
@@ -310,7 +307,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
             index_t src = edge_idx[eid];
             auto val    = Tile::load(&X[static_cast<int>(src) * d], fv);
 #pragma unroll
-            for (int e = 0; e < EPV; ++e) {
+            for (int e = 0; e < TW; ++e) {
                 cuda_t v_e = Tile::extract(val, e);
                 if (ROps::is_better(v_e, best_vals[e])) {
                     best_vals[e] = v_e;
@@ -321,9 +318,9 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 
 // Write to shmem (convert to float for cross-tile reduction)
 #pragma unroll
-        for (int e = 0; e < EPV; ++e) {
-            shmem_val[tid * SHMEM_STRIDE + fid * EPV + e] = cuda_to_float(best_vals[e]);
-            shmem_idx[tid * SHMEM_STRIDE + fid * EPV + e] = best_srcs[e];
+        for (int e = 0; e < TW; ++e) {
+            shmem_val[tid * SHMEM_STRIDE + fid * TW + e] = cuda_to_float(best_vals[e]);
+            shmem_idx[tid * SHMEM_STRIDE + fid * TW + e] = best_srcs[e];
         }
 
         __syncthreads();
@@ -332,9 +329,9 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
         for (int offset = TILES_Y / 2; offset > 0; offset /= 2) {
             if (tid < offset) {
 #pragma unroll
-                for (int e = 0; e < EPV; ++e) {
-                    const int a = tid * SHMEM_STRIDE + fid * EPV + e;
-                    const int b = (tid + offset) * SHMEM_STRIDE + fid * EPV + e;
+                for (int e = 0; e < TW; ++e) {
+                    const int a = tid * SHMEM_STRIDE + fid * TW + e;
+                    const int b = (tid + offset) * SHMEM_STRIDE + fid * TW + e;
 
                     const float val_a   = shmem_val[a];
                     const index_t idx_a = shmem_idx[a];
@@ -353,11 +350,11 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 
         // Vectorized final write
         if (tid == 0) {
-            cuda_t result[EPV];
+            cuda_t result[TW];
 #pragma unroll
-            for (int e = 0; e < EPV; ++e) {
-                index_t best_idx                  = shmem_idx[fid * EPV + e];
-                result[e]                         = Sentinel::is_valid(best_idx) ? make_cuda_value<cuda_t>(shmem_val[fid * EPV + e]) : zero_val;
+            for (int e = 0; e < TW; ++e) {
+                index_t best_idx                  = shmem_idx[fid * TW + e];
+                result[e]                         = Sentinel::is_valid(best_idx) ? make_cuda_value<cuda_t>(shmem_val[fid * TW + e]) : zero_val;
                 arg_idx[node_stride + base_f + e] = best_idx;
             }
             Tile::store_vec(&out[node_stride], fv, Tile::build(result));
@@ -366,9 +363,9 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
         __syncthreads();
     }
 
-    // scalar tail for d % EPV != 0 (compiles away for EPV=1)
-    if (d % EPV != 0) {
-        const int tail_f = d_vec * EPV;
+    // scalar tail for d % TW != 0 (compiles away for TW=1)
+    if (d % TW != 0) {
+        const int tail_f = d_vec * TW;
 
         // only fid==0 does actual edge scanning; others contribute identity/INVALID.
         float local_best  = ROps::IDENTITY;
@@ -523,13 +520,12 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 if constexpr (sizeof(index_t) <= 4) {
                     // 32-bit: user can choose packed atomics or 2D
                     if (use_2d_kernel) {
-                        constexpr int VW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-                        constexpr int EPV = TileOps<VW, cuda_t>::ELEM_PER_VEC;
+                        constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
 
                         dim3 grid(num_heavy);
                         dim3 block(features_per_block, tiles_y);
 
-                        size_t shmem_size = (size_t)tiles_y * (size_t)features_per_block * EPV * (sizeof(float) + sizeof(index_t));
+                        size_t shmem_size = (size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t));
 
                         reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                             index_ptr<index_t>(heavy_nodes),
@@ -541,7 +537,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             d
                         );
                     } else {
-                        constexpr unsigned long long PACKED_INIT = ROps::PACKED_IDENTITY;
+                        constexpr uint64_t PACKED_INIT = ROps::PACKED_IDENTITY;
 
                         auto packed = at::full(
                             {num_heavy, d}, static_cast<int64_t>(PACKED_INIT), at::TensorOptions().dtype(torch::kInt64).device(X.device())
@@ -561,7 +557,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                         index_ptr<index_t>(edge_ptr),
                                         index_ptr<index_t>(edge_idx),
                                         X_ptr,
-                                        reinterpret_cast<unsigned long long *>(packed.template data_ptr<int64_t>()),
+                                        reinterpret_cast<uint64_t *>(packed.template data_ptr<int64_t>()),
                                         d
                                     );
                             },
@@ -576,7 +572,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
 
                                 int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
                                 unpack_results_kernel<WARPS_PER_BLOCK, cuda_t, index_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
-                                    reinterpret_cast<unsigned long long *>(packed.template data_ptr<int64_t>()),
+                                    reinterpret_cast<uint64_t *>(packed.template data_ptr<int64_t>()),
                                     index_ptr<index_t>(heavy_nodes),
                                     out_ptr,
                                     index_ptr_mut<index_t>(arg_idx),
@@ -589,13 +585,12 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     }
                 } else {
                     // 64-bit: must use 2D (packing doesn't fit)
-                    constexpr int VW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-                    constexpr int EPV = TileOps<VW, cuda_t>::ELEM_PER_VEC;
+                    constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
 
                     dim3 grid(num_heavy);
                     dim3 block(features_per_block, tiles_y);
 
-                    size_t shmem_size = (size_t)tiles_y * (size_t)features_per_block * EPV * (sizeof(float) + sizeof(index_t));
+                    size_t shmem_size = (size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t));
 
                     reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                         index_ptr<index_t>(heavy_nodes),
