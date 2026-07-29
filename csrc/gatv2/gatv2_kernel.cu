@@ -4,7 +4,7 @@
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template <int WARPS_PER_BLOCK, int D_CONST, bool USE_PIPELINE, typename cuda_t, typename index_t>
+template <int WARPS_PER_BLOCK, int D_CONST, bool USE_PIPELINE, int NUM_STAGES, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forward_Kernel(
     size_t N,
     size_t H,
@@ -39,9 +39,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
     const int lane    = threadIdx.x % kMaxThreadsInWarp;
 
     // only meaningful when USE_PIPELINE
-    constexpr int R_BYTES        = D_CONST * (int)sizeof(cuda_t);
+    constexpr int R_BYTES        = D_CONST * static_cast<int>(sizeof(cuda_t));
     constexpr int F4_PER_R       = R_BYTES / 16;
-    constexpr int NUM_STAGES     = 2;
+    static_assert(!USE_PIPELINE || NUM_STAGES >= 2, "pipeline needs >= 2 stages");
 
     if (node_i >= (int)N || head_h >= (int)H) return;
 
@@ -74,25 +74,20 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
     //   warp_max:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax max
     //   warp_sum:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax sum_exp
     extern __shared__ char sh_raw[];
-    cuda_t *l_sh     = reinterpret_cast<cuda_t *>(sh_raw);
-    char *after_l    = sh_raw + D_CONST * sizeof(cuda_t);   // only meaningful when USE_PIPELINE
-    cuda_t *r_dbuf   = reinterpret_cast<cuda_t *>(after_l); // only meaningful when USE_PIPELINE
-    char *after_r    = after_l;
-    if constexpr (USE_PIPELINE) {
-        after_r      += WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t);
-    }
-    float *warp_out  = reinterpret_cast<float *>(after_r);
-    float *warp_max  = warp_out + WARPS_PER_BLOCK * D_CONST;
-    float *warp_sum  = warp_max + WARPS_PER_BLOCK;
+    cuda_t *const l_sh     = reinterpret_cast<cuda_t *>(sh_raw);
+    char *const after_l    = sh_raw + D_CONST * sizeof(cuda_t);   // only meaningful when USE_PIPELINE
+    cuda_t *const r_dbuf   = reinterpret_cast<cuda_t *>(after_l); // only meaningful when USE_PIPELINE
+    char *const after_r    = after_l + (USE_PIPELINE ? WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0);
 
-    float *my_out = warp_out + warp_id * D_CONST;
+    float *const warp_out  = reinterpret_cast<float *>(after_r);
+    float *const warp_max  = warp_out + WARPS_PER_BLOCK * D_CONST;
+    float *const warp_sum  = warp_max + WARPS_PER_BLOCK;
 
-    cuda_t* r0_ptr = r_dbuf + warp_id * 2 * D_CONST;
-    cuda_t* r1_ptr = r0_ptr + D_CONST;
+    float *const my_out = warp_out + warp_id * D_CONST;
 
     // Cooperative load of l into shared memory using all threads
     {
-        constexpr int f4_count = (D_CONST * (int)sizeof(cuda_t)) / 16;
+        constexpr int f4_count = (D_CONST * static_cast<int>(sizeof(cuda_t))) / 16;
         const float4 *l_src4   = reinterpret_cast<const float4 *>(l_base);
         float4 *l_sh4          = reinterpret_cast<float4 *>(l_sh);
         for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kMaxThreadsInWarp) {
@@ -116,6 +111,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
         int loop_iters = (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
 
         if (loop_iters > 0) {
+            cuda_t *rows[NUM_STAGES];
+#pragma unroll
+            for (int s = 0; s < NUM_STAGES; ++s)
+                rows[s] = r_dbuf + (warp_id * NUM_STAGES + s) * D_CONST;
+
             cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
             auto async_copy_r = [&](cuda_t* dst, const cuda_t* src) {
@@ -124,32 +124,28 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
                 }
             };
 
-            {
-                index_t j0 = d_col_idx[edge_start + static_cast<index_t>(warp_id)];
-                const cuda_t* r0_src = d_r + j0 * stride_r_n + head_h * stride_r_h;
+            auto prefetch = [&](int it) {
                 pipe.producer_acquire();
-                async_copy_r(r0_ptr, r0_src);
-                pipe.producer_commit();
-            }
-
-            for (int iter = 0; iter < loop_iters; ++iter) {
-                int k = warp_id + iter * WARPS_PER_BLOCK;
-                cuda_t* r_cur  = (iter & 1) ? r1_ptr : r0_ptr;
-                cuda_t* r_next = (iter & 1) ? r0_ptr : r1_ptr;
-
-                pipe.producer_acquire();
-                int k_next = k + WARPS_PER_BLOCK;
-                if (k_next < num_neighbors) {
-                    index_t j_next = d_col_idx[edge_start + static_cast<index_t>(k_next)];
-                    const cuda_t* r_next_src = d_r + j_next * stride_r_n + head_h * stride_r_h;
-                    async_copy_r(r_next, r_next_src);
+                if (it < loop_iters) {
+                    int k = warp_id + it * WARPS_PER_BLOCK;
+                    index_t j = d_col_idx[edge_start + static_cast<index_t>(k)];
+                    const cuda_t *r_src = d_r + j * stride_r_n + head_h * stride_r_h;
+                    async_copy_r(rows[it % NUM_STAGES], r_src);
                 }
                 pipe.producer_commit();
+            };
+
+#pragma unroll
+            for (int s = 0; s < NUM_STAGES - 1; ++s) prefetch(s);
+
+            for (int iter = 0; iter < loop_iters; ++iter) {
+                prefetch(iter + NUM_STAGES - 1);
 
                 cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
+                cuda_t *r_cur = rows[iter % NUM_STAGES];
 
                 float dot_lane = 0.f;
-                #pragma unroll
+#pragma unroll
                 for (int t = 0; t < VECS_PER_LANE; ++t) {
                     int v = lane + kMaxThreadsInWarp * t;
                     if (v < NUM_VECS) {
@@ -162,11 +158,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
                 float dot = warp_reduce_sum(dot_lane);
 
                 float rescale = softmax_state.update(dot);
-                #pragma unroll
+#pragma unroll
                 for (int i = 0; i < ACCS_PER_LANE; ++i) h_acc[i] *= rescale;
 
                 float contrib = __expf(dot - softmax_state.max_val);
-                #pragma unroll
+#pragma unroll
                 for (int t = 0; t < VECS_PER_LANE; ++t) {
                     int v = lane + kMaxThreadsInWarp * t;
                     if (v < NUM_VECS) {
@@ -1193,13 +1189,14 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 auto *attn_ptr  = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                 auto *h_out_ptr = reinterpret_cast<cuda_t *>(h_out.data_ptr<torch_t>());
 
+                constexpr int STAGES = 2;
                 // l_sh + r_dbuf (if PIPE) + W * D float + 2 * W float
-                size_t shmem = DC * sizeof(cuda_t) + (PIPE ? W * 2 * DC * sizeof(cuda_t) : 0) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+                size_t shmem = DC * sizeof(cuda_t) + (PIPE ? W * STAGES * DC * sizeof(cuda_t) : 0) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
                 dim3 blocks(num_nodes_bucket, H);
                 dim3 threads(W * kMaxThreadsInWarp);
 
-                GATv2Forward_Kernel<W, DC, PIPE, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                GATv2Forward_Kernel<W, DC, PIPE, STAGES, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h, index_ptr<index_t>(row_ptr),
                     index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), attn_ptr, h_out_ptr, d_logsumexp, negative_slope
                 );
