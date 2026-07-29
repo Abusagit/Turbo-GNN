@@ -1,13 +1,8 @@
 #include <cstdint>
 
 #include "common.cuh"
-
-#include "gt/gt_forward.cu"
 #include "gt/gt_backward.cu"
-
-// ===================================================
-// ================== BACKWARD =======================
-// ===================================================
+#include "gt/gt_forward.cu"
 
 std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     torch::Tensor row_ptr,
@@ -76,13 +71,18 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
                 auto *V_ptr = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
                 auto *O_ptr = reinterpret_cast<cuda_t *>(O.data_ptr<torch_t>());
 
-                size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
-
                 dim3 blocks(num_nodes_bucket, H);
-                dim3 threads(W * kWarpSize);
-                // dim3 threads(kWarpSize, d_c / kWarpSize, W);
 
-                GraphAttentionForward_CSR_MH_v2_D<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                static_assert(DC % kWarpSize == 0, "D size should be a whole number of kWarpSize");
+                constexpr int x_dim = kWarpSize;
+                constexpr int y_dim = std::max(std::min(DC / SelectTW<DC, cuda_t>::value, 1024) / x_dim, 1);
+                // constexpr int y_dim = 1;
+                constexpr int z_dim = std::max(std::min(W, 1024 / (x_dim * y_dim)), 1);
+                dim3 threads(x_dim, y_dim, z_dim);
+
+                size_t shmem = DC * sizeof(cuda_t) + z_dim * DC * sizeof(float) + 2 * z_dim * sizeof(float) + y_dim * z_dim * sizeof(float) * 2;
+
+                GraphAttentionForward_CSR_MH_v2_D<y_dim, z_dim, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1],
                     index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), O_ptr, o_strides[0],
                     o_strides[1], lse.data_ptr<float>(), scale

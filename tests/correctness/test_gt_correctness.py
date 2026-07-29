@@ -109,7 +109,7 @@ def share_gt_weights(target_layer, ref_layer):
 
 
 @pytest.mark.parametrize("num_nodes", [64, 200])
-@pytest.mark.parametrize("feature_dim", [256, 512])
+@pytest.mark.parametrize("feature_dim", [256, 1024])
 @pytest.mark.parametrize("heads", [4, 8])
 def test_gt_cuda_vs_torch_native_forward(num_nodes, feature_dim, heads):
     """fp32 forward: CUDA GT vs torch_native GT."""
@@ -144,7 +144,7 @@ def test_gt_cuda_vs_torch_native_forward(num_nodes, feature_dim, heads):
 
 
 @pytest.mark.parametrize("num_nodes", [64, 200])
-@pytest.mark.parametrize("feature_dim", [256, 512])
+@pytest.mark.parametrize("feature_dim", [256, 1024])
 @pytest.mark.parametrize("heads", [4, 8])
 def test_gt_cuda_vs_torch_native_backward(num_nodes, feature_dim, heads):
     """fp32 backward: compare input gradients CUDA GT vs torch_native GT."""
@@ -191,7 +191,7 @@ def test_gt_cuda_vs_torch_native_backward(num_nodes, feature_dim, heads):
 
 
 @pytest.mark.parametrize("num_nodes", [48, 128])
-@pytest.mark.parametrize("feature_dim", [256, 512])
+@pytest.mark.parametrize("feature_dim", [256, 1024])
 @pytest.mark.parametrize("heads", [4, 8])
 def test_gt_triton_vs_torch_native_forward(num_nodes, feature_dim, heads):
     """fp32 forward: Triton GT vs torch_native GT.
@@ -233,7 +233,7 @@ def test_gt_triton_vs_torch_native_forward(num_nodes, feature_dim, heads):
 
 
 @pytest.mark.parametrize("num_nodes", [48, 128])
-@pytest.mark.parametrize("feature_dim", [256, 512])
+@pytest.mark.parametrize("feature_dim", [256, 1024])
 @pytest.mark.parametrize("heads", [4, 8])
 def test_gt_triton_vs_torch_native_backward(num_nodes, feature_dim, heads):
     """fp32 backward: compare input gradients Triton GT vs torch_native GT."""
