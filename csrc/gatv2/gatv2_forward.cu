@@ -71,25 +71,28 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     const cuda_t *l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *a_base = d_attn_vec + head_h * D_CONST;
 
+    // Number of ping-pong stages for the USE_PIPELINE async r[j] double buffer.
+    constexpr int NUM_STAGES = 2;
+
     // Shared memory layout:
-    //   l_sh:      D_CONST * sizeof(cuda_t)                          -- read-only
-    //   r_dbuf:    WARPS_PER_BLOCK * 2 * D_CONST * sizeof(cuda_t)     -- per-warp ping-pong for async r[j], only when USE_PIPELINE
-    //   warp_out:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)       -- per-warp output accum
-    //   warp_max:  WARPS_PER_BLOCK * sizeof(accum_t)                 -- per-warp softmax max
-    //   warp_sum:  WARPS_PER_BLOCK * sizeof(accum_t)                 -- per-warp softmax sum_exp
+    //   l_sh:      D_CONST * sizeof(cuda_t)                              -- read-only
+    //   r_dbuf:    WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) -- per-warp ping-pong for async r[j], only when USE_PIPELINE
+    //   warp_out:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)           -- per-warp output accum
+    //   warp_max:  WARPS_PER_BLOCK * sizeof(accum_t)                     -- per-warp softmax max
+    //   warp_sum:  WARPS_PER_BLOCK * sizeof(accum_t)                     -- per-warp softmax sum_exp
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *l_sh   = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *r_dbuf = l_sh + D_CONST;  // only meaningful when USE_PIPELINE
 
-    constexpr size_t r_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * 2 * D_CONST * sizeof(cuda_t) : 0;
+    constexpr size_t r_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
     accum_t *warp_out             = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t) + r_dbuf_bytes);
     accum_t *warp_max             = warp_out + WARPS_PER_BLOCK * D_CONST;
     accum_t *warp_sum             = warp_max + WARPS_PER_BLOCK;
 
     accum_t *my_out = warp_out + warp_id * D_CONST;
 
-    cuda_t *r0_ptr = r_dbuf + warp_id * 2 * D_CONST;  // only meaningful when USE_PIPELINE
-    cuda_t *r1_ptr = r0_ptr + D_CONST;                // only meaningful when USE_PIPELINE
+    cuda_t *r0_ptr = r_dbuf + warp_id * NUM_STAGES * D_CONST;  // only meaningful when USE_PIPELINE
+    cuda_t *r1_ptr = r0_ptr + D_CONST;                         // only meaningful when USE_PIPELINE
 
     // Cooperative load of l into shared memory using all threads
     {
@@ -112,9 +115,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     OnlineSoftmaxState softmax_state;
 
     if constexpr (USE_PIPELINE) {
-        constexpr int R_BYTES    = D_CONST * (int)sizeof(cuda_t);
-        constexpr int F4_PER_R   = R_BYTES / 16;
-        constexpr int NUM_STAGES = 2;
+        constexpr int R_BYTES  = D_CONST * (int)sizeof(cuda_t);
+        constexpr int F4_PER_R = R_BYTES / 16;
 
         const int loop_iters =
             (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
