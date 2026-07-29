@@ -4,7 +4,7 @@
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+template <int WARPS_PER_BLOCK, int D_CONST, bool USE_PIPELINE, typename cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forward_Kernel(
     size_t N,
     size_t H,
@@ -75,8 +75,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kMaxThreadsInWarp) GATv2Forwa
     //   warp_sum:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax sum_exp
     extern __shared__ char sh_raw[];
     cuda_t *l_sh     = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t* r_dbuf   = l_sh + D_CONST; // only meaningful when USE_PIPELINE
-    float *warp_out  = reinterpret_cast<float *>(sh_raw + D_CONST * sizeof(cuda_t));
+    char *after_l    = sh_raw + D_CONST * sizeof(cuda_t);   // only meaningful when USE_PIPELINE
+    cuda_t *r_dbuf   = reinterpret_cast<cuda_t *>(after_l); // only meaningful when USE_PIPELINE
+    char *after_r    = after_l;
+    if constexpr (USE_PIPELINE) {
+        after_r      += WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t);
+    }
+    float *warp_out  = reinterpret_cast<float *>(after_r);
     float *warp_max  = warp_out + WARPS_PER_BLOCK * D_CONST;
     float *warp_sum  = warp_max + WARPS_PER_BLOCK;
 
@@ -1175,7 +1180,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
         if (num_nodes_bucket == 0) return;
 
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto pipe_c) {
                 using index_t       = typename decltype(idxInfo)::Type;
                 using torch_t       = typename decltype(typeInfo)::TorchType;
                 using cuda_t        = typename decltype(typeInfo)::CudaType;
@@ -1194,7 +1199,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 dim3 blocks(num_nodes_bucket, H);
                 dim3 threads(W * kMaxThreadsInWarp);
 
-                GATv2Forward_Kernel<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                GATv2Forward_Kernel<W, DC, PIPE, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h, index_ptr<index_t>(row_ptr),
                     index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), attn_ptr, h_out_ptr, d_logsumexp, negative_slope
                 );
