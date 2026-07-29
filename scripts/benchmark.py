@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         "a kernel profiler such as ncu to keep the launch count small and deterministic.",
     )
     p.add_argument("--json-out", type=str, default=None, help="Optional path to write JSON result.")
+    p.add_argument(
+        "--use-pipeline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable async-copy pipeline for CUDA GATv2.",
+    )
     return p.parse_args()
 
 
@@ -88,30 +94,62 @@ def main() -> int:
 
     # graph + features
     if args.dataset is None:
-        edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
-        x = torch.randn(args.num_nodes, args.feature_dim, requires_grad=True).to(device)
+        edge_index, edge_weight = _make_random_graph(
+            args.num_nodes,
+            args.avg_degree,
+            device=device,
+        )
 
-        graph = GraphSample(
+        x = torch.randn(
+            args.num_nodes,
+            args.feature_dim,
+            device=device,
+            requires_grad=True,
+        )
+
+        sample = GraphSample(
             backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
             x=x,
-            y=torch.zeros(len(x)),
+            y=torch.zeros(args.num_nodes, device=device),
             edge_index=edge_index,
             edge_weight=edge_weight,
         )
+
+        dataset_name = "random"
+
     else:
         with open(args.dataset, encoding="utf-8") as f:
             dataset_cfg_top_level = yaml.safe_load(f)
-            dataset_cfg = dataset_cfg_top_level["dataset"]
-            graph = load_single_graph(
-                DatasetConfig(
-                    source=dataset_cfg["source"],
-                    name=dataset_cfg["name"],
-                    root=dataset_cfg["root"],
-                    conv_backend=args.backend,
-                )
+
+        dataset_cfg = dataset_cfg_top_level["dataset"]
+
+        sample = load_single_graph(
+            DatasetConfig(
+                source=dataset_cfg["source"],
+                name=dataset_cfg["name"],
+                root=dataset_cfg.get("root", "data"),
+                conv_backend=args.backend,
+                allow_random_split=dataset_cfg.get("allow_random_split", False),
+                kernel_related_kwargs=dataset_cfg.get(
+                    "kernel_related_kwargs",
+                    {},
+                ),
             )
-        x = torch.randn(graph.num_nodes, args.feature_dim, requires_grad=True).to(device)
-    graph = graph.graph_repr
+        )
+
+        x = torch.randn(
+            sample.num_nodes,
+            args.feature_dim,
+            device=device,
+            requires_grad=True,
+        )
+
+        dataset_name = dataset_cfg["name"]
+
+    graph = sample.graph_repr
+    num_nodes = sample.num_nodes
+    num_edges = sample.num_edges
+    head_dim = args.feature_dim
 
     # conv
     backend = BackendRegistry.get_backend(args.backend)
@@ -121,6 +159,11 @@ def main() -> int:
         conv = backend.create_conv(args.layer, feature_dim=args.feature_dim, heads=args.heads)
 
     conv = conv.to(device)
+    if args.layer == "gat_v2" and args.backend == "cuda":
+        if not hasattr(conv, "use_pipeline"):
+            raise AttributeError(f"{type(conv).__name__} has no use_pipeline attribute")
+
+        conv.use_pipeline = args.use_pipeline
 
     # measure function
     amp_dtype = None
@@ -159,14 +202,21 @@ def main() -> int:
     base_dict = {
         "backend": args.backend,
         "conv_type": args.layer,
+        "dataset": dataset_name,
+        "dataset_config": args.dataset,
+        "num_nodes": num_nodes,
+        "num_edges": num_edges,
         "feature_dim": args.feature_dim,
         "heads": args.heads,
-        # "dataset": args.dataset,
+        "head_dim": head_dim,
+        "amp": args.amp,
+        "mode": args.mode,
+        "use_pipeline": args.use_pipeline,
         "iters": res.iters,
         "ms_per_iter": res.ms_per_iter,
         "device": res.device,
         "memory": res.memory_allocated,
-    } | get_gpu_info(device)  # NOTE added GPU info to the dump
+    } | get_gpu_info(device)
 
     print(json.dumps(base_dict, indent=4))
 
