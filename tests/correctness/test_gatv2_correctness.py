@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.testing import assert_close
 
 from src.backends.registry import BackendRegistry
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets, build_csr_as_is
@@ -102,6 +103,11 @@ def share_gatv2_weights(cuda_layer, ref_layer):
             cuda_layer._outer_proj.bias.data.copy_(ref_layer._outer_proj.bias.data)
 
 
+def _max_mean_diff(a: torch.Tensor, b: torch.Tensor):
+    d = (a.float() - b.float()).abs()
+    return f"max|diff|={d.max().item():.3e}, mean|diff|={d.mean().item():.3e}"
+
+
 # ---------------------------------------------------------------------------
 # fp32: CUDA vs torch_native
 # ---------------------------------------------------------------------------
@@ -144,10 +150,12 @@ def test_gatv2_cuda_vs_torch_native_forward(num_nodes, feature_dim, heads):
 
     assert not cuda_out.isnan().any(), "CUDA output contains NaN"
     assert not ref_out.isnan().any(), "Reference output contains NaN"
-    assert torch.allclose(cuda_out, ref_out, atol=1e-4, rtol=1e-4), (
-        f"CUDA vs torch_native forward mismatch: "
-        f"max|diff|={(cuda_out - ref_out).abs().max().item():.3e}, "
-        f"mean|diff|={(cuda_out - ref_out).abs().mean().item():.3e}"
+    assert_close(
+        cuda_out,
+        ref_out,
+        rtol=1e-4,
+        atol=1e-4,
+        msg=lambda m: f"CUDA vs torch_native forward mismatch: {_max_mean_diff(cuda_out, ref_out)}\n{m}",
     )
 
 
@@ -193,10 +201,12 @@ def test_gatv2_cuda_vs_torch_native_backward(num_nodes, feature_dim, heads):
     assert x_cuda.grad is not None, "No CUDA gradient"
     assert x_ref.grad is not None, "No reference gradient"
     assert not x_cuda.grad.isnan().any(), "CUDA grad contains NaN"
-    assert torch.allclose(x_cuda.grad, x_ref.grad, atol=1e-4, rtol=1e-4), (
-        f"CUDA vs torch_native backward mismatch: "
-        f"max|diff|={(x_cuda.grad - x_ref.grad).abs().max().item():.3e}, "
-        f"mean|diff|={(x_cuda.grad - x_ref.grad).abs().mean().item():.3e}"
+    assert_close(
+        x_cuda.grad,
+        x_ref.grad,
+        rtol=1e-4,
+        atol=1e-4,
+        msg=lambda m: f"CUDA vs torch_native backward mismatch: {_max_mean_diff(x_cuda.grad, x_ref.grad)}\n{m}",
     )
 
 
@@ -248,10 +258,12 @@ def test_gatv2_cuda_low_precision_forward(dtype, num_nodes, feature_dim, heads):
     ref_f32 = ref_out.float()
 
     assert not cuda_f32.isnan().any(), "CUDA output contains NaN"
-    assert torch.allclose(cuda_f32, ref_f32, atol=5e-2, rtol=5e-2), (
-        f"Low-precision forward mismatch ({dtype}): "
-        f"max|diff|={(cuda_f32 - ref_f32).abs().max().item():.3e}, "
-        f"mean|diff|={(cuda_f32 - ref_f32).abs().mean().item():.3e}"
+    assert_close(
+        cuda_f32,
+        ref_f32,
+        rtol=5e-2,
+        atol=5e-2,
+        msg=lambda m: f"Low-precision forward mismatch ({dtype}): {_max_mean_diff(cuda_f32, ref_f32)}\n{m}",
     )
 
 
@@ -300,10 +312,15 @@ def test_gatv2_cuda_low_precision_backward(dtype, num_nodes, feature_dim, heads)
     assert x_cuda.grad is not None, "No CUDA gradient"
     assert x_ref.grad is not None, "No reference gradient"
     assert not x_cuda.grad.isnan().any(), "CUDA grad contains NaN"
-    assert torch.allclose(x_cuda.grad.float(), x_ref.grad.float(), atol=2e-1), (
-        f"Low-precision backward mismatch ({dtype}): "
-        f"max|diff|={(x_cuda.grad.float() - x_ref.grad.float()).abs().max().item():.3e}, "
-        f"mean|diff|={(x_cuda.grad.float() - x_ref.grad.float()).abs().mean().item():.3e}"
+
+    g_cuda = x_cuda.grad.float()
+    g_ref = x_ref.grad.float()
+    assert_close(
+        g_cuda,
+        g_ref,
+        rtol=1e-5,
+        atol=2e-1,
+        msg=lambda m: f"Low-precision backward mismatch ({dtype}): {_max_mean_diff(g_cuda, g_ref)}\n{m}",
     )
 
 
@@ -346,9 +363,14 @@ def test_gatv2_pipeline_vs_baseline_forward(num_nodes, feature_dim, heads, dtype
     out_pipeline = layer(x, cuda_graph)
 
     assert not out_pipeline.isnan().any(), "Pipeline output contains NaN"
-    assert torch.equal(out_baseline, out_pipeline), (
-        f"Pipeline vs baseline forward mismatch ({dtype}): "
-        f"max|diff|={(out_baseline.float() - out_pipeline.float()).abs().max().item():.3e}"
+    assert_close(
+        out_pipeline,
+        out_baseline,
+        rtol=0,
+        atol=0,
+        msg=lambda m: (
+            f"Pipeline vs baseline forward mismatch ({dtype}): " f"{_max_mean_diff(out_baseline, out_pipeline)}\n{m}"
+        ),
     )
 
 
@@ -393,14 +415,23 @@ def test_gatv2_pipeline_vs_baseline_backward(num_nodes, feature_dim, heads, dtyp
     assert x_base.grad is not None and x_pipe.grad is not None
     assert not x_pipe.grad.isnan().any(), "Pipeline grad contains NaN"
 
-    # Forward match
-    assert torch.equal(out_base, out_pipe), (
-        f"Pipeline vs baseline forward mismatch in backward test ({dtype}): "
-        f"max|diff|={(out_base.float() - out_pipe.float()).abs().max().item():.3e}"
+    assert_close(
+        out_pipe,
+        out_base,
+        rtol=0,
+        atol=0,
+        msg=lambda m: (
+            f"Pipeline vs baseline forward mismatch in backward test ({dtype}): "
+            f"{_max_mean_diff(out_base, out_pipe)}\n{m}"
+        ),
     )
 
-    # Gradient match
-    assert torch.equal(x_base.grad, x_pipe.grad), (
-        f"Pipeline vs baseline backward mismatch ({dtype}): "
-        f"max|diff|={(x_base.grad.float() - x_pipe.grad.float()).abs().max().item():.3e}"
+    assert_close(
+        x_pipe.grad,
+        x_base.grad,
+        rtol=0,
+        atol=0,
+        msg=lambda m: (
+            f"Pipeline vs baseline backward mismatch ({dtype}): " f"{_max_mean_diff(x_base.grad, x_pipe.grad)}\n{m}"
+        ),
     )
