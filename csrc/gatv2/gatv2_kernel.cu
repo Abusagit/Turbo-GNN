@@ -208,13 +208,14 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 auto *attn_ptr  = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                 auto *h_out_ptr = reinterpret_cast<cuda_t *>(h_out.data_ptr<torch_t>());
 
+                constexpr int STAGES = 2;
                 // l_sh + r_dbuf (if PIPE) + W * D float + 2 * W float
-                size_t shmem = DC * sizeof(cuda_t) + (PIPE ? W * 2 * DC * sizeof(cuda_t) : 0) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+                size_t shmem = DC * sizeof(cuda_t) + (PIPE ? W * STAGES * DC * sizeof(cuda_t) : 0) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
                 dim3 blocks(num_nodes_bucket, H);
                 dim3 threads(W * kWarpSize);
 
-                GATv2Forward_Kernel<W, DC, cuda_t, index_t, float, PIPE><<<blocks, threads, shmem, stream>>>(
+                GATv2Forward_Kernel<W, DC, cuda_t, index_t, float, PIPE, STAGES><<<blocks, threads, shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h, index_ptr<index_t>(row_ptr),
                     index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), attn_ptr, h_out_ptr, d_logsumexp, negative_slope
                 );

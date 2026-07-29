@@ -9,7 +9,9 @@
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, bool USE_PIPELINE = false>
+template <
+    int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, bool USE_PIPELINE = false,
+    int NUM_STAGES = 2>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
     size_t N,
     size_t H,
@@ -71,8 +73,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     const cuda_t *l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *a_base = d_attn_vec + head_h * D_CONST;
 
-    // Number of ping-pong stages for the USE_PIPELINE async r[j] double buffer.
-    constexpr int NUM_STAGES = 2;
+    static_assert(!USE_PIPELINE || NUM_STAGES >= 2, "pipeline needs >= 2 stages");
 
     // Shared memory layout:
     //   l_sh:      D_CONST * sizeof(cuda_t)                              -- read-only
@@ -90,9 +91,6 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     accum_t *warp_sum             = warp_max + WARPS_PER_BLOCK;
 
     accum_t *my_out = warp_out + warp_id * D_CONST;
-
-    cuda_t *r0_ptr = r_dbuf + warp_id * NUM_STAGES * D_CONST;  // only meaningful when USE_PIPELINE
-    cuda_t *r1_ptr = r0_ptr + D_CONST;                         // only meaningful when USE_PIPELINE
 
     // Cooperative load of l into shared memory using all threads
     {
@@ -122,6 +120,12 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
             (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
 
         if (loop_iters > 0) {
+            cuda_t *rows[NUM_STAGES];
+#pragma unroll
+            for (int s = 0; s < NUM_STAGES; ++s) {
+                rows[s] = r_dbuf + (warp_id * NUM_STAGES + s) * D_CONST;
+            }
+
             cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
             auto async_copy_r = [&](cuda_t *dst, const cuda_t *src) {
@@ -132,29 +136,27 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
                 }
             };
 
-            {
-                const index_t j0     = d_col_idx[edge_start + static_cast<index_t>(warp_id)];
-                const cuda_t *r0_src = d_r + j0 * stride_r_n + head_h * stride_r_h;
+            auto prefetch = [&](int it) {
                 pipe.producer_acquire();
-                async_copy_r(r0_ptr, r0_src);
+                if (it < loop_iters) {
+                    const int k         = warp_id + it * WARPS_PER_BLOCK;
+                    const index_t j     = d_col_idx[edge_start + static_cast<index_t>(k)];
+                    const cuda_t *r_src = d_r + j * stride_r_n + head_h * stride_r_h;
+                    async_copy_r(rows[it % NUM_STAGES], r_src);
+                }
                 pipe.producer_commit();
+            };
+
+#pragma unroll
+            for (int s = 0; s < NUM_STAGES - 1; ++s) {
+                prefetch(s);
             }
 
             for (int iter = 0; iter < loop_iters; ++iter) {
-                const int k    = warp_id + iter * WARPS_PER_BLOCK;
-                cuda_t *r_cur  = (iter & 1) ? r1_ptr : r0_ptr;
-                cuda_t *r_next = (iter & 1) ? r0_ptr : r1_ptr;
-
-                pipe.producer_acquire();
-                const int k_next = k + WARPS_PER_BLOCK;
-                if (k_next < num_neighbors) {
-                    const index_t j_next     = d_col_idx[edge_start + static_cast<index_t>(k_next)];
-                    const cuda_t *r_next_src = d_r + j_next * stride_r_n + head_h * stride_r_h;
-                    async_copy_r(r_next, r_next_src);
-                }
-                pipe.producer_commit();
+                prefetch(iter + NUM_STAGES - 1);
 
                 cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
+                cuda_t *r_cur = rows[iter % NUM_STAGES];
 
                 accum_t dot_lane{};
 #pragma unroll
