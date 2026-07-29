@@ -2,8 +2,8 @@
 
 #include "common.cuh"
 
-template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionForward_CSR_MH_v2_D( // no-format
+template <int WARPS_PER_N, int N_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+__global__ void __launch_bounds__(WARPS_PER_N * N_PER_BLOCK * kWarpSize) GraphAttentionForward_CSR_MH_v2_D( // no-format
     int N, int H,
     const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
     int64_t stride_q_n, int64_t stride_q_h,
@@ -18,18 +18,27 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionFor
 
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
-    constexpr int ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                                                  // Accumulatores used by one thread
+    constexpr int TW = TW_SELECTOR::value;  // Tile width
+    static_assert(D_CONST % TW == 0, "Per-head features dim should be divisible by Tile width");
+    constexpr int TILES = D_CONST / TW;  // Total tiles count
+    constexpr int TILES_PER_THREAD =
+        (TILES + (TW_SELECTOR::threads_per_d * WARPS_PER_N) - 1) / (TW_SELECTOR::threads_per_d * WARPS_PER_N);  // Tiles per thread
+    constexpr int ACCS_PER_THREAD = TW * TILES_PER_THREAD;  // Accumulatores used by one thread
 
     using Tile = TileOps<TW, cuda_t>;
 
     const int node_i = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h = blockIdx.y;
 
-    const int lane_id = threadIdx.x % kWarpSize;
-    const int warp_id = threadIdx.x / kWarpSize;
+    __builtin_assume(threadIdx.y < static_cast<unsigned>(WARPS_PER_N));
+    __builtin_assume(threadIdx.z < static_cast<unsigned>(N_PER_BLOCK));
+    const int lane_id = threadIdx.x;
+    __builtin_assume(lane_id < static_cast<int>(kWarpSize));
+    constexpr int lane_cnt            = kWarpSize;
+    const int warp_id                 = threadIdx.y;
+    constexpr int neighbor_warp_cnt   = WARPS_PER_N;
+    const int block_neighbor_id       = threadIdx.z;
+    constexpr int neighbor_block_size = N_PER_BLOCK;
 
     if (node_i >= N || head_h >= H) [[unlikely]] {
         return;
@@ -41,25 +50,27 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionFor
 
     // Shared memory layout (unchanged):
     // k_shared[D_CONST] as cuda_t
-    // warp_out[WARPS_PER_BLOCK * D_CONST] as float
-    // warp_max[WARPS_PER_BLOCK] as float
-    // warp_sum[WARPS_PER_BLOCK] as float
+    // neighbor_out[neighbor_block_size * D_CONST] as float
+    // neighbor_max[neighbor_block_size] as float
+    // neighbor_sum[neighbor_block_size] as float
+    // warp_sum_storage[neighbor_block_size * neighbor_warp_cnt] as float
     extern __shared__ uint8_t sh_raw[];
-    cuda_t *const k_shared = reinterpret_cast<cuda_t *>(sh_raw);
-    float *const warp_out  = reinterpret_cast<float *>(sh_raw + D_CONST * sizeof(cuda_t));
-    float *const warp_max  = warp_out + WARPS_PER_BLOCK * D_CONST;
-    float *const warp_sum  = warp_max + WARPS_PER_BLOCK;
+    cuda_t *const k_shared        = reinterpret_cast<cuda_t *>(sh_raw);  // Loading K_i into shared memory, because it's the same in one block
+    float *const neighbor_out     = reinterpret_cast<float *>(sh_raw + D_CONST * sizeof(cuda_t));  // Outs for each neighbor in one block
+    float *const neighbor_max     = neighbor_out + neighbor_block_size * D_CONST;  // Space to store local neighbor maximums of scores
+    float *const neighbor_sum     = neighbor_max + neighbor_block_size;            // Space to store local neighbor sums of score
+    float *const warp_sum_storage = neighbor_sum + neighbor_block_size;            // Space to store warp sums to agregate them later
 
-    float *const my_out = warp_out + warp_id * D_CONST;
+    float *const my_out = neighbor_out + block_neighbor_id * D_CONST;
 
     // handle isolated nodes
-    if (num_neighbors == 0) {
-        if (warp_id == 0) {
+    if (num_neighbors == 0) [[unlikely]] {
+        if (block_neighbor_id == 0) {
             cuda_t *out_base = O + node_i * stride_o_n + head_h * stride_o_h;
-            for (int vi = lane_id; vi < TILES; vi += kWarpSize) {
+            for (int vi = warp_id * lane_cnt + lane_id; vi < TILES; vi += lane_cnt * neighbor_warp_cnt) {
                 Tile::write_zero(out_base, vi);
             }
-            if (lane_id == 0) {
+            if (warp_id == 0 && lane_id == 0) {
                 logsumexp[node_i * H + head_h] = -INFINITY;
             }
         }
@@ -67,13 +78,15 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionFor
     }
 
     // cooperative load of K_i via 128-bit transactions (unchanged)
-    {
+    // TODO: make separate function
+    if (block_neighbor_id == 0) {
         constexpr int ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);  // remainder is guaranteed to be zero
+        static_assert(D_CONST % ELEMS_PER_F4 == 0, "Per-head feature dim should be divisible by 8");
         constexpr int NUM_K_LOADS  = D_CONST / ELEMS_PER_F4;
-        const cuda_t *k_base       = K + node_i * stride_k_n + head_h * stride_k_h;
-        const float4 *k_src        = reinterpret_cast<const float4 *>(k_base);
-        float4 *k_sh               = reinterpret_cast<float4 *>(k_shared);
-        for (int i = threadIdx.x; i < NUM_K_LOADS; i += WARPS_PER_BLOCK * kWarpSize) {
+        cuda_t const *const k_base = K + node_i * stride_k_n + head_h * stride_k_h;
+        float4 const *const k_src  = reinterpret_cast<float4 const *>(k_base);
+        float4 *const k_sh         = reinterpret_cast<float4 *>(k_shared);
+        for (int i = warp_id * lane_cnt + lane_id; i < NUM_K_LOADS; i += neighbor_warp_cnt * lane_cnt) {
             k_sh[i] = k_src[i];
         }
     }
@@ -84,38 +97,68 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionFor
     float o_acc[ACCS_PER_THREAD] = {0};
 
     // neighbor loop
-    for (int e = warp_id; e < num_neighbors; e += WARPS_PER_BLOCK) {
-        const index_t j = col_idx[edge_start + e];
+    const int rounds = (num_neighbors + neighbor_block_size - 1) / neighbor_block_size;
+    for (int r = 0; r < rounds; ++r) {
+        const int neighbor_id = r * neighbor_block_size + block_neighbor_id;
+        const bool active = neighbor_id < num_neighbors;
+        const index_t j   = active ? col_idx[edge_start + neighbor_id] : index_t{0};
 
         const cuda_t *q_base = Q + j * stride_q_n + head_h * stride_q_h;
         const cuda_t *v_base = V + j * stride_v_n + head_h * stride_v_h;
 
-        // Q·K dot product (uses improved dot_product with native mul)
         float s_partial = 0.0f;
+
+        // Q*K dot product (uses improved dot_product with native mul)
+        if (active) {
 #pragma unroll
-        for (int t = 0; t < TILES; ++t) {
-            const int vi = lane_id + t * kWarpSize;
-            if (vi < TILES) {
-                auto kv = Tile::load(k_shared, vi);
-                auto qv = Tile::load(q_base, vi);
+            for (int tile_id = warp_id * lane_cnt + lane_id; tile_id < TILES; tile_id += lane_cnt * neighbor_warp_cnt) {
+                const typename Tile::vec_t kv = Tile::load(k_shared, tile_id);
+                const typename Tile::vec_t qv = Tile::load(q_base, tile_id);
                 s_partial += Tile::dot_product(kv, qv);
             }
         }
 
-        const float score      = warp_reduce_sum(s_partial) * scale;
+        float score;
+        if constexpr (neighbor_warp_cnt > 1) {
+            if (active) {
+                auto local_score = warp_reduce_sum(s_partial);
+                if (lane_id == 0) {
+                    warp_sum_storage[(r & 1) * neighbor_warp_cnt * neighbor_block_size + block_neighbor_id * neighbor_warp_cnt + warp_id] = local_score;
+                }
+            }
+            __syncthreads();
+
+            if (active) {
+                float score_ = 0;
+#pragma unroll
+                for (int i = block_neighbor_id * neighbor_warp_cnt; i < (block_neighbor_id + 1) * neighbor_warp_cnt; ++i) {
+                    score_ += warp_sum_storage[(r & 1) * neighbor_warp_cnt * neighbor_block_size + i];
+                }
+                score = score_ * scale;
+            }
+        } else {
+            if (active) {
+                score = warp_reduce_sum(s_partial) * scale;
+            }
+        }
+
+        if (!active) {
+            break;
+        }
+
         const float correction = softmax_state.update(score);
         const float w          = __expf(score - softmax_state.max_val);
 
-// V accumulation (keeps fmaf via weighted_accum)
+        // V accumulation (keeps fmaf via weighted_accum)
 #pragma unroll
-        for (int t = 0; t < TILES; ++t) {
-            const int vi = lane_id + t * kWarpSize;
-            if (vi < TILES) {
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            const int vi = warp_id * lane_cnt + lane_id + lane_cnt * neighbor_warp_cnt * t;
+            if (vi < TILES) [[likely]] {
 #pragma unroll
                 for (int ep = 0; ep < TW; ++ep) {
                     o_acc[t * TW + ep] *= correction;
                 }
-                auto vv = Tile::load(v_base, vi);
+                const typename Tile::vec_t vv = Tile::load(v_base, vi);
                 Tile::weighted_accum(&o_acc[t * TW], w, vv);
             }
         }
@@ -123,37 +166,37 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionFor
 
 // write per-warp results to float32 shared
 #pragma unroll
-    for (int t = 0; t < TILES; ++t) {
-        const int vi = lane_id + t * kWarpSize;
-        if (vi < TILES) {
+    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+        const int vi = warp_id * lane_cnt + lane_id + lane_cnt * neighbor_warp_cnt * t;
+        if (vi < TILES) [[likely]] {
             Tile::write_float(my_out, vi, &o_acc[t * TW]);
         }
     }
 
-    if (lane_id == 0) {
-        warp_max[warp_id] = softmax_state.max_val;
-        warp_sum[warp_id] = softmax_state.sum_exp;
+    if (lane_id == 0 && warp_id == 0) {
+        neighbor_max[block_neighbor_id] = softmax_state.max_val;
+        neighbor_sum[block_neighbor_id] = softmax_state.sum_exp;
     }
     __syncthreads();
 
     // cross-warp reduction (warp 0 only)
-    if (warp_id == 0) {
+    if (warp_id == 0 && block_neighbor_id == 0) {
         float global_max = -FLT_MAX;
         float global_sum = 0.0f;
         float inv_sum    = 0.0f;
 
         if (lane_id == 0) {
-#pragma unroll
-            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                global_max = fmaxf(global_max, warp_max[w]);
+            // #pragma unroll
+            for (int w = 0; w < neighbor_block_size; ++w) {
+                global_max = fmaxf(global_max, neighbor_max[w]);
             }
-#pragma unroll
-            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                global_sum = fmaf(warp_sum[w], __expf(warp_max[w] - global_max), global_sum);
+            // #pragma unroll
+            for (int w = 0; w < neighbor_block_size; ++w) {
+                global_sum = fmaf(neighbor_sum[w], __expf(neighbor_max[w] - global_max), global_sum);
             }
-#pragma unroll
-            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                warp_sum[w] = __expf(warp_max[w] - global_max);  // scale_w
+            // #pragma unroll
+            for (int w = 0; w < neighbor_block_size; ++w) {
+                neighbor_sum[w] = __expf(neighbor_max[w] - global_max);  // scale_w
             }
 
             inv_sum = fmaxf(1.0f / global_sum, 0.0f);
@@ -164,19 +207,19 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize) GraphAttentionFor
 
         inv_sum = __shfl_sync(FULL_WARP_MASK, inv_sum, 0);
 
-        // cross-warp output write (uses write_typed for vec2 stores)
-        cuda_t *out_base = O + node_i * stride_o_n + head_h * stride_o_h;
+        // cross-neighbor output write (uses write_typed for vec2 stores)
+        cuda_t *const out_base = O + node_i * stride_o_n + head_h * stride_o_h;
 #pragma unroll
-        for (int t = 0; t < TILES; ++t) {
+        for (int t = 0; t < (TILES + lane_cnt - 1) / lane_cnt; ++t) {
             const int vi = lane_id + t * kWarpSize;
-            if (vi < TILES) {
+            if (vi < TILES) [[likely]] {
                 float combined[TW] = {0};
 #pragma unroll
                 for (int ep = 0; ep < TW; ++ep) {
                     int d_idx = vi * TW + ep;
 #pragma unroll
-                    for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                        combined[ep] = fmaf(warp_sum[w], warp_out[w * D_CONST + d_idx], combined[ep]);
+                    for (int w = 0; w < neighbor_block_size; ++w) {
+                        combined[ep] = fmaf(neighbor_sum[w], neighbor_out[w * D_CONST + d_idx], combined[ep]);
                     }
                     combined[ep] *= inv_sum;
                 }

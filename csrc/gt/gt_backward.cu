@@ -2,6 +2,10 @@
 
 #include "common.cuh"
 
+// ===================================================
+// ================== BACKWARD =======================
+// ===================================================
+
 // D[i,h] = sum_d dO[i,h,d] * O[i,h,d]
 template <int D_CONST, typename cuda_t>
 __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
