@@ -378,7 +378,7 @@ __device__ __forceinline__ void f4_fma_vec(float4& acc, float4 s, float4 v) {
 // Falls back to narrowest TW if no width satisfies the constraint.
 // Available: fp32 → {4, 1}, 16-bit → {8, 2}.
 // =============================================================================
-template <int D_CONST, typename cuda_t, int THREADS_PER_D = 32>
+template <int D_CONST, typename cuda_t, int THREADS_PER_D = kWarpSize>
 struct SelectTW {
     // static constexpr int THREADS_PER_D = THREADS_PER_D;
     static constexpr bool is_fp32      = (sizeof(cuda_t) == 4);
@@ -427,12 +427,12 @@ struct Vec2 {
 
 template <typename num_type>
 __device__ __forceinline__ Vec2<num_type> load_vec2(num_type const *const __restrict__ ptr) {
-    return *reinterpret_cast<Vec2<num_type> const *const>(ptr);
+    return *reinterpret_cast<Vec2<num_type> const *>(ptr);
 }
 
 template <typename num_type>
 __device__ __forceinline__ void store_vec2(num_type *const __restrict__ ptr, Vec2<num_type> val) {
-    *reinterpret_cast<Vec2<num_type> *const>(ptr) = val;
+    *reinterpret_cast<Vec2<num_type> *>(ptr) = val;
 }
 
 // Vec2Ops: type-generic packed operations for 16-bit types
@@ -511,7 +511,7 @@ template <typename cuda_t>
 requires(sizeof(cuda_t) == 1)
 struct alignas(8) Vec8<cuda_t> {
     using vec2_t = typename Vec2Ops<cuda_t>::vec2_t;
-    vec2_t v[4];
+    vec2_t v[2];
 };
 
 template <typename cuda_t>
@@ -552,23 +552,23 @@ struct TileOps<1, T> {
         return s * a;
     }
     static __device__ __forceinline__ float dot_product(vec_t a, vec_t b) { return a * b; }
-    static __device__ __forceinline__ void weighted_accum(float *const __restrict__ acc, float w, vec_t r) { acc[0] = fmaf(w, r, acc[0]); }
+    static __device__ __forceinline__ void weighted_accum(float *const __restrict__ acc, float w, vec_t r) { acc[0] = cuda::std::fma(w, r, acc[0]); }
     static __device__ __forceinline__ void gatv2_accum_grad_al(
         float *const __restrict__ ga, float *const __restrict__ gl, float ge, vec_t l, vec_t r, vec_t a, float ns
     ) {
-        float edge = l + r;
+        T edge = l + r;
         float tder = leaky_relu_der_elementwise(edge, ns);
         float t_ij = tder * edge;
-        ga[0]      = fmaf(ge, t_ij, ga[0]);
-        gl[0]      = fmaf(ge * tder, a, gl[0]);
+        ga[0]      = cuda::std::fma(ge, t_ij, ga[0]);
+        gl[0]      = cuda::std::fma(ge * tder, a, gl[0]);
     }
     static __device__ __forceinline__ void gatv2_accum_grad_r(
         float *const __restrict__ gr, float alpha, vec_t gh, float ge, vec_t l, vec_t r, vec_t a, float ns
     ) {
-        float edge = l + r;
+        T edge = l + r;
         float tder = leaky_relu_der_elementwise(edge, ns);
-        gr[0]      = fmaf(alpha, gh, gr[0]);
-        gr[0]      = fmaf(ge * tder, a, gr[0]);
+        gr[0]      = cuda::std::fma(alpha, gh, gr[0]);
+        gr[0]      = cuda::std::fma(ge * tder, a, gr[0]);
     }
     static __device__ __forceinline__ void write(
         float *const __restrict__ out, int vec_idx, float const *const __restrict__ acc, float inv_sum
@@ -939,7 +939,7 @@ struct ReductionOps;
 template <>
 struct ReductionOps<ReductionOp::MIN> {
     static constexpr float IDENTITY                     = INFINITY;  // +inf
-    static constexpr unsigned long long PACKED_IDENTITY = 0xff800000ffffffffULL;
+    static constexpr uint64_t PACKED_IDENTITY = 0xff800000ffffffffULL;
 
     template <typename cuda_t>
     static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) {
@@ -948,15 +948,15 @@ struct ReductionOps<ReductionOp::MIN> {
 
     static __device__ __forceinline__ bool is_better_f(float a, float b) { return a < b; }
 
-    static __device__ __forceinline__ unsigned long long atomic_reduce(unsigned long long *addr, unsigned long long val) {
-        return atomicMin(addr, val);
+    static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
+        return atomicMin(reinterpret_cast<unsigned long long *>(addr), val);
     }
 };
 
 template <>
 struct ReductionOps<ReductionOp::MAX> {
     static constexpr float IDENTITY                     = -INFINITY;  // -inf
-    static constexpr unsigned long long PACKED_IDENTITY = 0x007fffffffffffffULL;
+    static constexpr uint64_t PACKED_IDENTITY = 0x007fffffffffffffULL;
 
     template <typename cuda_t>
     static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) {
@@ -965,7 +965,7 @@ struct ReductionOps<ReductionOp::MAX> {
 
     static __device__ __forceinline__ bool is_better_f(float a, float b) { return a > b; }
 
-    static __device__ __forceinline__ unsigned long long atomic_reduce(unsigned long long *addr, unsigned long long val) {
-        return atomicMax(addr, val);
+    static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
+        return atomicMax(reinterpret_cast<unsigned long long *>(addr), val);
     }
 };
