@@ -1,42 +1,28 @@
-__examples
-
-**/__pycache__
-
-dataset
-
 .vscode
-
 CLAUDE.md
 
-/data
-
-/build
-
-dist
-
-runs
-
-.venv*
-
-*.egg-info
-
+.venv
 .env
 
+__examples
+thirdparty
+results*
 
+dataset
+/data
+
+dist
+runs
+
+**/__pycache__
+*.egg-info
+/build
 cutlass
-
 *.ptx
-
 *.cubin
-
 *.so
 
-thirdparty
-
 out
-
 *.tex
-
 *.pdf
-
-results*
+*.ncu-rep

@@ -13,3 +13,7 @@ if constexpr (DC <= 64) -- we need to check not only that but also the data type
 
 
 fuse r kernel for gatv2 backward for undirected graphs
+
+
+TODO:
+ - Разобраться с флотами в 8-клеточных тайлах.
