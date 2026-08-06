@@ -201,24 +201,3 @@ concept FloatingNum = is_floating_point_cuda_v<T>;
 
 template <typename T>
 inline constexpr bool is_half_fp_v = std::is_same_v<std::remove_cv_t<T>, half> || std::is_same_v<std::remove_cv_t<T>, nv_bfloat16>;
-
-template <FloatingNum L, FloatingNum S>
-static constexpr __host__ __device__ auto broadcast_scalar_to_packed(L val) {
-    if constexpr (sizeof(L) == 2) {
-        if constexpr (std::is_same_v<std::remove_cvref_t<S>, half>) {
-            return half2{val, val};
-        } else if constexpr (std::is_same_v<std::remove_cvref_t<S>, nv_bfloat16>) {
-            return nv_bfloat162{val, val};
-        } else {
-            __builtin_unreachable();
-        }
-    } else {
-        if constexpr (std::is_same_v<std::remove_cvref_t<S>, half>) {
-            return __float2half2_rn(static_cast<float>(val));
-        } else if constexpr (std::is_same_v<std::remove_cvref_t<S>, nv_bfloat16>) {
-            return __float2bfloat162_rn(static_cast<float>(val));
-        } else {
-            __builtin_unreachable();
-        }
-    }
-}

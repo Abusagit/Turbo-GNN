@@ -16,7 +16,8 @@
 #define FULL_WARP_MASK 0xffffffff
 #endif
 
-inline constexpr int kWarpSize = 32;
+inline constexpr size_t kWarpSize = 32;
+inline constexpr size_t kMaxThreadsInBlock = 1024;
 
 #if defined(__CUDA_ARCH__)
 inline constexpr bool is_device_pass = true;
