@@ -22,7 +22,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int tiles_y = 8,
     std::string reduce = "min",
     int grid_size_override = 0,
-    at::Tensor block_offsets = at::Tensor()
+    at::Tensor block_offsets = at::Tensor(),
+    bool use_dynamic_schedule = false
 );
 
 at::Tensor reduction_aggr_backward_torch(
@@ -48,7 +49,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
     int grid_size_override = 0,
-    torch::Tensor block_offsets = torch::Tensor()
+    torch::Tensor block_offsets = torch::Tensor(),
+    bool use_dynamic_schedule = false
 );
 
 

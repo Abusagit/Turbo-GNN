@@ -24,7 +24,8 @@ void reduction_aggr_forward_partitioned_cuda(
     int tiles_y = 8,
     const std::string& reduce = "min",
     int grid_size_override = 0,
-    const at::Tensor& block_offsets = at::Tensor()
+    const at::Tensor& block_offsets = at::Tensor(),
+    bool use_dynamic_schedule = false
 );
 
 at::Tensor reduction_aggr_backward_torch(
@@ -69,7 +70,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int tiles_y = 8,
     std::string reduce = "min",
     int grid_size_override = 0,
-    at::Tensor block_offsets = at::Tensor()
+    at::Tensor block_offsets = at::Tensor(),
+    bool use_dynamic_schedule = false
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
@@ -105,6 +107,6 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     auto arg_idx = torch::empty({num_nodes, d}, edge_ptr.options());
 
     at::Tensor offsets_arg = (block_offsets.defined()) ? block_offsets : at::Tensor();
-    reduction_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y, reduce, grid_size_override, offsets_arg);
+    reduction_aggr_forward_partitioned_cuda(edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y, reduce, grid_size_override, offsets_arg, use_dynamic_schedule);
     return {out, arg_idx};
 }

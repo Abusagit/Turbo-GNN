@@ -165,3 +165,113 @@ class TestGATv2BalancedPartition:
         assert torch.allclose(out_ref.float(), out_bal.float(), atol=1e-4, rtol=1e-4), (
             f"max|Δ|={(out_ref.float() - out_bal.float()).abs().max().item():.3e}"
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestGATv2DynamicSchedule:
+    """Runtime-assigned block index via atomicAdd (heaviest-first)."""
+
+    @pytest.mark.parametrize("num_blocks", [16, 64, 132])
+    @pytest.mark.parametrize("D", [32, 64])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_balanced_dynamic_matches_reference(self, num_blocks, D, dtype):
+        N, H = 2048, 4
+        torch.manual_seed(21)
+        edge_index = make_graph(N, avg_degree=8)
+        graph = build_bucketed(edge_index, N, quantile=-1)
+
+        xl = torch.randn(N, H, D, device="cuda", dtype=dtype)
+        xr = torch.randn(N, H, D, device="cuda", dtype=dtype)
+        aw = torch.randn(H, D, device="cuda", dtype=dtype)
+
+        out_ref, lse_ref = run_forward(graph, xl, xr, aw, grid_size_override=0)
+
+        sorted_nodes, offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, num_blocks
+        )
+        graph.forward_light_nodes = sorted_nodes
+
+        out_dyn, lse_dyn = _C.gatv2_forward(
+            xl, xr,
+            graph.forward_indptr,
+            graph.forward_indices,
+            aw, 0.2,
+            graph.forward_light_nodes,
+            graph.forward_heavy_nodes,
+            1, 8, 0,
+            offsets,
+            True,
+        )
+
+        assert torch.allclose(out_ref.float(), out_dyn.float(), atol=1e-4, rtol=1e-4), (
+            f"num_blocks={num_blocks} D={D} dtype={dtype}: "
+            f"max|Δ|={(out_ref.float() - out_dyn.float()).abs().max().item():.3e}"
+        )
+        assert torch.allclose(lse_ref, lse_dyn, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("grid_size", [32, 132, 264])
+    @pytest.mark.parametrize("D", [32, 64])
+    def test_gsl_dynamic_matches_reference(self, grid_size, D):
+        N, H = 2048, 4
+        torch.manual_seed(22)
+        edge_index = make_graph(N, avg_degree=8)
+        graph = build_bucketed(edge_index, N, quantile=-1)
+
+        xl = torch.randn(N, H, D, device="cuda", dtype=torch.float32)
+        xr = torch.randn(N, H, D, device="cuda", dtype=torch.float32)
+        aw = torch.randn(H, D, device="cuda", dtype=torch.float32)
+
+        out_ref, lse_ref = run_forward(graph, xl, xr, aw, grid_size_override=0)
+
+        empty_offsets = torch.empty(0, dtype=torch.int32, device="cuda")
+        out_dyn, lse_dyn = _C.gatv2_forward(
+            xl, xr,
+            graph.forward_indptr,
+            graph.forward_indices,
+            aw, 0.2,
+            graph.forward_light_nodes,
+            graph.forward_heavy_nodes,
+            1, 8, grid_size,
+            empty_offsets,
+            True,
+        )
+
+        assert torch.allclose(out_ref.float(), out_dyn.float(), atol=1e-4, rtol=1e-4), (
+            f"grid_size={grid_size} D={D}: "
+            f"max|Δ|={(out_ref.float() - out_dyn.float()).abs().max().item():.3e}"
+        )
+        assert torch.allclose(lse_ref, lse_dyn, atol=1e-4, rtol=1e-4)
+
+    def test_balanced_dynamic_mixed_light_heavy(self):
+        N, H, D = 1024, 4, 64
+        torch.manual_seed(23)
+        edge_index = make_graph(N, avg_degree=8)
+        graph = build_bucketed(edge_index, N, quantile=0.9)
+
+        assert graph.forward_light_nodes.numel() > 0
+        assert graph.forward_heavy_nodes.numel() > 0
+
+        xl = torch.randn(N, H, D, device="cuda", dtype=torch.float32)
+        xr = torch.randn(N, H, D, device="cuda", dtype=torch.float32)
+        aw = torch.randn(H, D, device="cuda", dtype=torch.float32)
+
+        out_ref, lse_ref = run_forward(graph, xl, xr, aw, grid_size_override=0)
+
+        sorted_nodes, offsets = edge_balanced_partition(
+            graph.forward_light_nodes, graph.forward_indptr, 64
+        )
+        graph.forward_light_nodes = sorted_nodes
+        out_dyn, lse_dyn = _C.gatv2_forward(
+            xl, xr,
+            graph.forward_indptr,
+            graph.forward_indices,
+            aw, 0.2,
+            graph.forward_light_nodes,
+            graph.forward_heavy_nodes,
+            1, 8, 0,
+            offsets,
+            True,
+        )
+
+        assert torch.allclose(out_ref.float(), out_dyn.float(), atol=1e-4, rtol=1e-4)
+        assert torch.allclose(lse_ref, lse_dyn, atol=1e-4, rtol=1e-4)

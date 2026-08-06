@@ -1,6 +1,6 @@
 #include "common.cuh"
 
-template <int WARPS_PER_BLOCK, typename cuda_t, ReductionOp Op, typename index_t, bool USE_OFFSETS>
+template <int WARPS_PER_BLOCK, typename cuda_t, ReductionOp Op, typename index_t, bool USE_OFFSETS, bool USE_ATOMIC_SCHED>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * kWarpSize)
 reduction_aggr_forward_light_kernel_1d(
     const index_t* __restrict__ light_nodes_indices,
@@ -11,7 +11,8 @@ reduction_aggr_forward_light_kernel_1d(
     index_t* __restrict__ arg_idx,
     int num_light,
     int d,
-    const int* __restrict__ block_offsets
+    const int* __restrict__ block_offsets,
+    unsigned int* __restrict__ block_counter
 ) {
     using ROps = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
@@ -27,13 +28,25 @@ reduction_aggr_forward_light_kernel_1d(
 
     const int d_vec = d / EPV;
 
+    int bid_x;
+    if constexpr (USE_ATOMIC_SCHED) {
+        __shared__ unsigned int bid_s;
+        if (tid == 0) {
+            bid_s = atomicAdd(block_counter, 1u);
+        }
+        __syncthreads();
+        bid_x = static_cast<int>(bid_s);
+    } else {
+        bid_x = blockIdx.x;
+    }
+
     int loop_start, loop_end, loop_stride;
     if constexpr (USE_OFFSETS) {
-        loop_start  = block_offsets[blockIdx.x];
-        loop_end    = block_offsets[blockIdx.x + 1];
+        loop_start  = block_offsets[bid_x];
+        loop_end    = block_offsets[bid_x + 1];
         loop_stride = 1;
     } else {
-        loop_start  = blockIdx.x;
+        loop_start  = bid_x;
         loop_end    = num_light;
         loop_stride = gridDim.x;
     }
@@ -465,7 +478,8 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     int features_per_block,
     int tiles_y,
     int grid_size_override,
-    const at::Tensor& block_offsets
+    const at::Tensor& block_offsets,
+    bool use_dynamic_schedule
 ) {
     using ROps = ReductionOps<Op>;
 
@@ -490,6 +504,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     const int num_light = light_nodes.numel();
     if (num_light > 0) {
         const bool use_balanced = block_offsets.defined() && block_offsets.numel() > 0;
+        const bool use_atomic_sched = use_dynamic_schedule;
         std::visit([&](auto idxInfo, auto typeInfo, auto warps_const) {
             using index_t = typename decltype(idxInfo)::Type;
             using torch_t = typename decltype(typeInfo)::TorchType;
@@ -501,32 +516,48 @@ void reduction_aggr_forward_partitioned_cuda_impl(
             auto* X_ptr = reinterpret_cast<const cuda_t*>(X.data_ptr<torch_t>());
             auto* out_ptr = reinterpret_cast<cuda_t*>(out.data_ptr<torch_t>());
 
-            if (use_balanced) {
-                int gx = static_cast<int>(block_offsets.numel()) - 1;
-                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, true><<<gx, THREADS_PER_BLOCK>>>(
+            int gx = use_balanced
+                       ? (static_cast<int>(block_offsets.numel()) - 1)
+                       : ((grid_size_override > 0) ? std::min(grid_size_override, num_light) : num_light);
+
+            torch::Tensor block_counter_t;
+            unsigned int* block_counter_ptr = nullptr;
+            if (use_atomic_sched) {
+                block_counter_t = torch::zeros({1},
+                    torch::TensorOptions().dtype(torch::kInt32).device(X.device()));
+                block_counter_ptr = reinterpret_cast<unsigned int*>(
+                    block_counter_t.data_ptr<int32_t>());
+            }
+            const int* offsets_ptr = use_balanced ? block_offsets.data_ptr<int>() : nullptr;
+
+            if (use_balanced && use_atomic_sched) {
+                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, true, true><<<gx, THREADS_PER_BLOCK>>>(
                     index_ptr<index_t>(light_nodes),
                     index_ptr<index_t>(edge_ptr),
                     index_ptr<index_t>(edge_idx),
-                    X_ptr,
-                    out_ptr,
-                    index_ptr_mut<index_t>(arg_idx),
-                    num_light,
-                    d,
-                    block_offsets.data_ptr<int>()
-                );
+                    X_ptr, out_ptr, index_ptr_mut<index_t>(arg_idx),
+                    num_light, d, offsets_ptr, block_counter_ptr);
+            } else if (use_balanced && !use_atomic_sched) {
+                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, true, false><<<gx, THREADS_PER_BLOCK>>>(
+                    index_ptr<index_t>(light_nodes),
+                    index_ptr<index_t>(edge_ptr),
+                    index_ptr<index_t>(edge_idx),
+                    X_ptr, out_ptr, index_ptr_mut<index_t>(arg_idx),
+                    num_light, d, offsets_ptr, nullptr);
+            } else if (!use_balanced && use_atomic_sched) {
+                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, false, true><<<gx, THREADS_PER_BLOCK>>>(
+                    index_ptr<index_t>(light_nodes),
+                    index_ptr<index_t>(edge_ptr),
+                    index_ptr<index_t>(edge_idx),
+                    X_ptr, out_ptr, index_ptr_mut<index_t>(arg_idx),
+                    num_light, d, nullptr, block_counter_ptr);
             } else {
-                int gx = (grid_size_override > 0) ? std::min(grid_size_override, num_light) : num_light;
-                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, false><<<gx, THREADS_PER_BLOCK>>>(
+                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, false, false><<<gx, THREADS_PER_BLOCK>>>(
                     index_ptr<index_t>(light_nodes),
                     index_ptr<index_t>(edge_ptr),
                     index_ptr<index_t>(edge_idx),
-                    X_ptr,
-                    out_ptr,
-                    index_ptr_mut<index_t>(arg_idx),
-                    num_light,
-                    d,
-                    nullptr
-                );
+                    X_ptr, out_ptr, index_ptr_mut<index_t>(arg_idx),
+                    num_light, d, nullptr, nullptr);
             }
         },
         MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
@@ -656,18 +687,21 @@ void reduction_aggr_forward_partitioned_cuda(
     int tiles_y,
     const std::string& reduce,
     int grid_size_override,
-    const at::Tensor& block_offsets
+    const at::Tensor& block_offsets,
+    bool use_dynamic_schedule
 ) {
     if (reduce == "min") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MIN>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree,
             out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y, grid_size_override, block_offsets);
+            use_2d_kernel, features_per_block, tiles_y, grid_size_override, block_offsets,
+            use_dynamic_schedule);
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree,
             out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y, grid_size_override, block_offsets);
+            use_2d_kernel, features_per_block, tiles_y, grid_size_override, block_offsets,
+            use_dynamic_schedule);
     } else {
         TORCH_CHECK(false, "Unsupported reduce: " + reduce);
     }

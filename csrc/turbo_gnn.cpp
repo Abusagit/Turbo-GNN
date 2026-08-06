@@ -13,7 +13,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("use_2d_kernel") = false, py::arg("features_per_block") = 32,
           py::arg("tiles_y") = 8, py::arg("reduce") = "min",
           py::arg("grid_size_override") = 0,
-          py::arg("block_offsets") = torch::empty({0}, torch::dtype(torch::kInt32)));
+          py::arg("block_offsets") = torch::empty({0}, torch::dtype(torch::kInt32)),
+          py::arg("use_dynamic_schedule") = false);
 
     m.def("reduction_aggr_backward", &reduction_aggr_backward_torch,
           "Reduction aggregation backward",
@@ -29,7 +30,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("light_warps_per_block") = 1,
           py::arg("heavy_warps_per_block") = 8,
           py::arg("grid_size_override") = 0,
-          py::arg("block_offsets") = torch::empty({0}, torch::dtype(torch::kInt32)));
+          py::arg("block_offsets") = torch::empty({0}, torch::dtype(torch::kInt32)),
+          py::arg("use_dynamic_schedule") = false);
 
     m.def("gatv2_backward", &gatv2_backward_cuda,
           "GATv2 backward pass (CUDA)",

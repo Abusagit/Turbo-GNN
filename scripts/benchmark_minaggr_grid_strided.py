@@ -95,6 +95,7 @@ def bench_one(N, avg_degree, d, dtype, grid_size_override, warmup, iters,
     graph = build_bucketed(edge_index, N, quantile=quantile)
 
     block_offsets = None
+    use_dynamic = False
     if schedule == "sort":
         graph.forward_light_nodes = sort_by_degree_desc(
             graph.forward_light_nodes, graph.forward_indptr,
@@ -103,10 +104,11 @@ def bench_one(N, avg_degree, d, dtype, grid_size_override, warmup, iters,
             graph.forward_heavy_nodes = sort_by_degree_desc(
                 graph.forward_heavy_nodes, graph.forward_indptr,
             )
-    elif schedule == "balanced" and grid_size_override > 0:
+    elif schedule in ("balanced", "balanced_atomic") and grid_size_override > 0:
         graph.forward_light_nodes, block_offsets = edge_balanced_partition(
             graph.forward_light_nodes, graph.forward_indptr, grid_size_override,
         )
+        use_dynamic = (schedule == "balanced_atomic")
 
     max_degree = int(_signed_indptr(graph.forward_indptr).diff().max().item())
     x = torch.randn(N, d, device="cuda", dtype=dtype)
@@ -127,6 +129,7 @@ def bench_one(N, avg_degree, d, dtype, grid_size_override, warmup, iters,
             reduce,
             0 if block_offsets is not None else grid_size_override,
             block_offsets if block_offsets is not None else torch.empty(0, dtype=torch.int32, device="cuda"),
+            use_dynamic,
         )
 
     return time_callable(_fn, warmup=warmup, iters=iters, do_memory_profile=False)
@@ -144,7 +147,9 @@ def parse_args():
     p.add_argument("--quantile", type=float, default=-1.0)
     p.add_argument("--grid-sizes", type=int, nargs="+", default=None)
     p.add_argument("--grid-multipliers", type=float, nargs="+", default=None)
-    p.add_argument("--schedules", nargs="+", choices=["none", "sort", "balanced"], default=["none", "sort", "balanced"])
+    p.add_argument("--schedules", nargs="+",
+                   choices=["none", "sort", "balanced", "balanced_atomic"],
+                   default=["none", "sort", "balanced", "balanced_atomic"])
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--json-out", type=str, default=None)
@@ -224,7 +229,7 @@ def main():
               f"light={s['light_nodes']}  heavy={s['heavy_nodes']}")
     print()
 
-    header = (f"{'N':>10} | {'grid_x':>8} | {'sched':>6} | "
+    header = (f"{'N':>10} | {'grid_x':>8} | {'sched':>16} | "
               f"{'ms/iter':>10} | {'vs_legacy':>9}")
     print(header)
     print("-" * len(header))
@@ -238,7 +243,7 @@ def main():
             gs = r["grid_size"]
             gx_s = "legacy" if gs == 0 else str(gs)
             speed = legacy_ms / r["ms_per_iter"]
-            print(f"{N:>10} | {gx_s:>8} | {r['schedule']:>6} | "
+            print(f"{N:>10} | {gx_s:>8} | {r['schedule']:>16} | "
                   f"{r['ms_per_iter']:>10.4f} | {speed:>8.2f}x")
         print("-" * len(header))
 
