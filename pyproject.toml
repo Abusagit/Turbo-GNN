@@ -179,6 +179,7 @@ markers = [
     "cuda: marks tests that require CUDA",
     "integration: marks integration tests",
     "unit: marks unit tests",
+    "csrc: marks tests that JIT-compile and exercise csrc/ CUDA headers",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

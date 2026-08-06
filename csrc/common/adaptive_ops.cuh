@@ -158,7 +158,9 @@ template <
 >
 constexpr __device__ __forceinline__ packed_dst_type packed_convert(packed_src_type a) {
     if constexpr (std::is_same_v<std::remove_cvref_t<src_type>, float>) {
-        if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, nv_bfloat16>) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, float>) {
+            return a;
+        } else if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, nv_bfloat16>) {
             return __float22bfloat162_rn(a);
         } else if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, half>) {
             return __float22half2_rn(a);
@@ -168,16 +170,20 @@ constexpr __device__ __forceinline__ packed_dst_type packed_convert(packed_src_t
     } else if constexpr (std::is_same_v<std::remove_cvref_t<src_type>, nv_bfloat16>) {
         if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, float>) {
             return __bfloat1622float2(a);
+        } else if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, nv_bfloat16>) {
+            return a;
         } else if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, half>) {
             return __float22half2_rn(__bfloat1622float2(a));
         } else {
             __builtin_unreachable();
         }
-    } else if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, half>) {
+    } else if constexpr (std::is_same_v<std::remove_cvref_t<src_type>, half>) {
         if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, float>) {
             return __half22float2(a);
         } else if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, nv_bfloat16>) {
             return __float22bfloat162_rn(__half22float2(a));
+        } else if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, half>) {
+            return a;
         } else {
             __builtin_unreachable();
         }
@@ -190,9 +196,9 @@ template <FloatingNum L, FloatingNum S>
 constexpr __device__ auto broadcast_scalar_to_packed(L val) {
     if constexpr (is_half_fp_v<L>) {
         if constexpr (std::is_same_v<std::remove_cvref_t<S>, half>) {
-            return half2{val, val};
+            return make_half2(val, val);
         } else if constexpr (std::is_same_v<std::remove_cvref_t<S>, nv_bfloat16>) {
-            return nv_bfloat162{val, val};
+            return make_bfloat162(val, val);
         } else {
             __builtin_unreachable();
         }

@@ -416,10 +416,9 @@ union alignas(16) Packed128bit {
     uint4 _b128;
 };
 
-
 // Vec2 instructions
 
-template<typename num_type>
+template <typename num_type>
 struct Vec2 {
     static_assert(sizeof(num_type) <= 8, "Vec2 is for types, that are no larger than 64 bit.");
     num_type x, y;
@@ -495,20 +494,20 @@ struct Vec2Ops<__nv_bfloat16> {
 
 // Vec8: 128-bit load/store for 16-bit types = 8 scalars = 4 vec2 pairs
 
-template<typename cuda_t>
+template <typename cuda_t>
 struct Vec8 {
     static_assert(sizeof(cuda_t) <= 2, "Vec8 only for 16-bit types or smaller");
 };
 
 template <typename cuda_t>
-requires(sizeof(cuda_t) <= 2)
+    requires(sizeof(cuda_t) <= 2)
 struct alignas(16) Vec8<cuda_t> {
     using vec2_t = typename Vec2Ops<cuda_t>::vec2_t;
     vec2_t v[4];
 };
 
 template <typename cuda_t>
-requires(sizeof(cuda_t) == 1)
+    requires(sizeof(cuda_t) == 1)
 struct alignas(8) Vec8<cuda_t> {
     using vec2_t = typename Vec2Ops<cuda_t>::vec2_t;
     vec2_t v[2];
@@ -540,8 +539,8 @@ struct TileOps;
 template <typename T>
 struct TileOps<1, T> {
     static_assert(sizeof(T) <= 16);
-    using vec_t                       = T;
-    using ns_t                        = T;
+    using vec_t             = T;
+    using ns_t              = T;
     static constexpr int TW = 1;
 
     static __device__ __forceinline__ vec_t load(float const *const __restrict__ ptr, int vec_idx) { return ptr[vec_idx]; }
@@ -552,11 +551,13 @@ struct TileOps<1, T> {
         return s * a;
     }
     static __device__ __forceinline__ float dot_product(vec_t a, vec_t b) { return a * b; }
-    static __device__ __forceinline__ void weighted_accum(float *const __restrict__ acc, float w, vec_t r) { acc[0] = cuda::std::fma(w, r, acc[0]); }
+    static __device__ __forceinline__ void weighted_accum(float *const __restrict__ acc, float w, vec_t r) {
+        acc[0] = cuda::std::fma(w, r, acc[0]);
+    }
     static __device__ __forceinline__ void gatv2_accum_grad_al(
         float *const __restrict__ ga, float *const __restrict__ gl, float ge, vec_t l, vec_t r, vec_t a, float ns
     ) {
-        T edge = l + r;
+        T edge     = l + r;
         float tder = leaky_relu_der_elementwise(edge, ns);
         float t_ij = tder * edge;
         ga[0]      = cuda::std::fma(ge, t_ij, ga[0]);
@@ -565,7 +566,7 @@ struct TileOps<1, T> {
     static __device__ __forceinline__ void gatv2_accum_grad_r(
         float *const __restrict__ gr, float alpha, vec_t gh, float ge, vec_t l, vec_t r, vec_t a, float ns
     ) {
-        T edge = l + r;
+        T edge     = l + r;
         float tder = leaky_relu_der_elementwise(edge, ns);
         gr[0]      = cuda::std::fma(alpha, gh, gr[0]);
         gr[0]      = cuda::std::fma(ge * tder, a, gr[0]);
@@ -599,8 +600,8 @@ struct TileOps<1, T> {
 // --- VW=4, float: float4 loads ---
 template <>
 struct TileOps<4, float> {
-    using vec_t                       = float4;
-    using ns_t                        = float;
+    using vec_t             = float4;
+    using ns_t              = float;
     static constexpr int TW = 4;
 
     static __device__ __forceinline__ vec_t load(float const *const __restrict__ ptr, int vec_idx) {
@@ -677,10 +678,10 @@ struct TileOps<4, float> {
 // --- VW=2, half/bf16: vec2 loads ---
 template <typename cuda_t>
 struct TileOps<2, cuda_t> {
-    using Ops                         = Vec2Ops<cuda_t>;
-    using vec2_t                      = typename Ops::vec2_t;
-    using vec_t                       = vec2_t;
-    using ns_t                        = vec2_t;
+    using Ops               = Vec2Ops<cuda_t>;
+    using vec2_t            = typename Ops::vec2_t;
+    using vec_t             = vec2_t;
+    using ns_t              = vec2_t;
     static constexpr int TW = 2;
 
     static __device__ __forceinline__ vec2_t get_zero() { return Ops::from_float(0.0f); }
@@ -778,17 +779,15 @@ struct TileOps<2, cuda_t> {
 // --- VW=8, half/bf16: Vec8 (128-bit) loads ---
 template <typename cuda_t>
 struct TileOps<8, cuda_t> {
-    using Ops                         = Vec2Ops<cuda_t>;
-    using vec2_t                      = typename Ops::vec2_t;
-    using vec_t                       = Vec8<cuda_t>;
-    using ns_t                        = vec2_t;
+    using Ops    = Vec2Ops<cuda_t>;
+    using vec2_t = typename Ops::vec2_t;
+    using vec_t  = Vec8<cuda_t>;
+    using ns_t   = vec2_t;
 
-    static constexpr int TW = 8;
+    static constexpr int TW           = 8;
     static constexpr float4 zero_bits = {0.f, 0.f, 0.f, 0.f};
 
-    static __device__ __forceinline__ vec_t load(cuda_t const *const __restrict__ ptr, int vec_idx) {
-        return load_vec8(&ptr[vec_idx * TW]);
-    }
+    static __device__ __forceinline__ vec_t load(cuda_t const *const __restrict__ ptr, int vec_idx) { return load_vec8(&ptr[vec_idx * TW]); }
     static __device__ __forceinline__ ns_t make_ns(float ns) { return Ops::from_float(ns); }
 
     static __device__ __forceinline__ float gatv2_dot_leaky_relu(vec_t l, vec_t r, vec_t a, ns_t ns) {
@@ -938,7 +937,7 @@ struct ReductionOps;
 
 template <>
 struct ReductionOps<ReductionOp::MIN> {
-    static constexpr float IDENTITY                     = INFINITY;  // +inf
+    static constexpr float IDENTITY           = INFINITY;  // +inf
     static constexpr uint64_t PACKED_IDENTITY = 0xff800000ffffffffULL;
 
     template <typename cuda_t>
@@ -955,7 +954,7 @@ struct ReductionOps<ReductionOp::MIN> {
 
 template <>
 struct ReductionOps<ReductionOp::MAX> {
-    static constexpr float IDENTITY                     = -INFINITY;  // -inf
+    static constexpr float IDENTITY           = -INFINITY;  // -inf
     static constexpr uint64_t PACKED_IDENTITY = 0x007fffffffffffffULL;
 
     template <typename cuda_t>
