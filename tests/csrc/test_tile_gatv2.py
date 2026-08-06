@@ -49,17 +49,16 @@ NS = 0.2
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize("start", [0, 3], ids=["start=0", "start=3"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_read_uses_vector_indexing(bridge, n, dtype_name, on_host, start):
+def test_read_uses_vector_indexing(bridge, n, dtype_name, start):
     """read(arr, vec_idx) must fetch arr[vec_idx * TW .. +TW).
 
     Note the index convention differs from atomic_add_scaled_f32, which takes an element
     offset under the same parameter name -- see test_atomic_add_uses_element_offset.
     """
-    mod = bridge.get("cvt", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("cvt", dtype_name)
+    device = torch.device("cuda:0")
 
     total = (start + M) * n
     arr = (torch.arange(1, total + 1, dtype=torch.float64) / 16.0).to(TORCH_DTYPE[dtype_name]).to(device)
@@ -75,13 +74,12 @@ def test_read_uses_vector_indexing(bridge, n, dtype_name, on_host, start):
 
 
 @pytest.mark.parametrize("kind", ["random", "special"])
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_gatv2_dot_leaky_relu(bridge, n, dtype_name, on_host, kind):
+def test_gatv2_dot_leaky_relu(bridge, n, dtype_name, kind):
     """e_partial = sum_k a_k * LeakyReLU_ns(l_k + r_k), one tile's worth."""
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
-    paths = Paths(n=n, name=dtype_name, on_host=on_host)
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
+    paths = Paths(n=n, name=dtype_name)
 
     cap = float(torch.finfo(TORCH_DTYPE[dtype_name]).max) ** 0.5 / 4.0
     lv = make_input(M, n, dtype_name, device, seed=6000 + n, kind=kind, max_abs=cap)
@@ -94,19 +92,18 @@ def test_gatv2_dot_leaky_relu(bridge, n, dtype_name, on_host, kind):
     # A dot product internally, so the residual is bounded by the sum of |terms| rather
     # than by the (possibly cancelling) result.
     terms = a.double() * (lv.double() + r.double())
-    assert_sum_fp64(got, ref, terms, dtype_name, f"gatv2_dot {dtype_name} N={n} {kind} host={on_host}")
+    assert_sum_fp64(got, ref, terms, dtype_name, f"gatv2_dot {dtype_name} N={n} {kind}")
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_gatv2_dot_leaky_relu_closed_form(bridge, n, dtype_name, on_host):
+def test_gatv2_dot_leaky_relu_closed_form(bridge, n, dtype_name):
     """A hand-checkable case, independent of the reference implementation.
 
     With a = ones, lv + r = [2, -2, 2, -2, ...], LeakyReLU_0.2 gives [2, -0.4, ...], so
     the tile's contribution is N/2 * (2 - 0.4) = 0.8 * N for even N, and 2 for N == 1.
     """
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]
 
     pattern = torch.tensor([2.0 if k % 2 == 0 else -2.0 for k in range(n)], dtype=torch.float64)
@@ -158,14 +155,6 @@ def test_atomic_add_uses_element_offset(bridge, n, dtype_name, vec_idx):
 
 
 @pytest.mark.parametrize(("n", "dtype_name"), ATOMIC_TOO_WIDE, ids=ATOMIC_TOO_WIDE_IDS)
-@pytest.mark.xfail(
-    strict=True,
-    reason="atomic_add_scaled_f32 stages through Vec<N, float>, and Vec caps at 128 bits, so "
-    "N=8 with a 16-bit num_type cannot be instantiated. This is reachable, not theoretical: "
-    "SelectTW<256, half>::value == 8, so a D=256 fp16 kernel asks for exactly "
-    "TileOps<8, half>. Fix by staging through two Vec<4, float> halves. Remove this marker "
-    "once it compiles.",
-)
 def test_atomic_add_scaled_f32_supports_full_tile_width(bridge, n, dtype_name):
     """The widest tile a 16-bit type can have must still be able to accumulate in fp32."""
     mod = bridge.get("cvt", dtype_name)

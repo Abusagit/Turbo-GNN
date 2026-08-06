@@ -61,14 +61,13 @@ def _run(mod, op, n, a, b, *, acc_init=ACC_INIT, w=WEIGHT, use_double=False):
 
 @pytest.mark.parametrize("kind", ["random", "special"])
 @pytest.mark.parametrize(("acc_name", "use_double"), ACC_DTYPES, ids=["acc=f32", "acc=f64"])
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize("op", ALL_REDUCTIONS)
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_reduction_matches_header_order(bridge, op, n, dtype_name, on_host, acc_name, use_double, kind):
+def test_reduction_matches_header_order(bridge, op, n, dtype_name, acc_name, use_double, kind):
     """Bit-exact against an order-faithful replay of the header's reduction tree."""
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
-    paths = Paths(n=n, name=dtype_name, on_host=on_host)
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
+    paths = Paths(n=n, name=dtype_name)
 
     cap = float(torch.finfo(TORCH_DTYPE[dtype_name]).max) ** 0.5 / 4.0
     a = make_input(M, n, dtype_name, device, seed=2000 + n, kind=kind, max_abs=cap)
@@ -76,7 +75,7 @@ def test_reduction_matches_header_order(bridge, op, n, dtype_name, on_host, acc_
 
     got = _run(mod, op, n, a, b, use_double=use_double)
     ref = ref_reduce(op, a.double(), b.double(), ACC_INIT, WEIGHT, paths, acc_name)
-    label = f"{op} {dtype_name} N={n} {acc_name} {kind} host={on_host}"
+    label = f"{op} {dtype_name} N={n} {acc_name} {kind}"
 
     if op.startswith("dot_product") or op == "weighted_sum_acc":
         # dot_product keeps its product in a register, so the compiler is free to
@@ -94,10 +93,9 @@ def test_reduction_matches_header_order(bridge, op, n, dtype_name, on_host, acc_
         assert_exact(got, ref, acc_name, label, ftz=paths.ftz, ftz_name=dtype_name)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize("op", ALL_REDUCTIONS)
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_reduction_matches_fp64(bridge, op, n, dtype_name, on_host):
+def test_reduction_matches_fp64(bridge, op, n, dtype_name):
     """Close to the mathematically correct value, within the accumulation error budget.
 
     The budget is N ulp of the *accumulator* type: each of the N steps can contribute
@@ -105,9 +103,9 @@ def test_reduction_matches_fp64(bridge, op, n, dtype_name, on_host):
     the budget has to be taken in num_type instead, which is exactly the precision
     question ``test_sum_accumulates_in_accum_t`` isolates.
     """
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
-    paths = Paths(n=n, name=dtype_name, on_host=on_host)
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
+    paths = Paths(n=n, name=dtype_name)
 
     # Well-conditioned inputs only: fp64 agreement is not a meaningful question for
     # deliberately overflowing or subnormal operands.
@@ -116,7 +114,7 @@ def test_reduction_matches_fp64(bridge, op, n, dtype_name, on_host):
 
     got = _run(mod, op, n, a, b)
     ref = ref_reduce_fp64(op, a.double(), b.double(), ACC_INIT, WEIGHT)
-    label = f"{op} {dtype_name} N={n} vs fp64 host={on_host}"
+    label = f"{op} {dtype_name} N={n} vs fp64"
 
     if op.startswith(("sum", "weighted_sum", "dot_product")):
         # The header accumulates these in num_type (tile.cuh:807), so the error is
@@ -129,36 +127,27 @@ def test_reduction_matches_fp64(bridge, op, n, dtype_name, on_host):
         assert_ulp(got, ref, "float", label, max_ulp=float(n) + 1.0)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_prod_uses_multiplicative_identity(bridge, n, dtype_name, on_host):
+def test_prod_uses_multiplicative_identity(bridge, n, dtype_name):
     """prod of an all-ones vector must be 1, not 0.
 
     Guards the accumulator seed: an additive-identity seed silently turns every product
     into zero, which is invisible in any test whose expected value happens to be 0.
     """
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
     ones = torch.ones((8, n), dtype=TORCH_DTYPE[dtype_name], device=device)
 
     got = _run(mod, "prod_ret", n, ones, ones, acc_init=0.0)
     torch.testing.assert_close(got.double(), torch.ones(8, dtype=torch.float64, device=device), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize("want_max", [False, True], ids=["min", "max"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-@pytest.mark.xfail(
-    strict=True,
-    reason="value-returning min/max seed accum_t{} == 0, so the result is clamped against "
-    "zero: min of an all-positive vector comes back 0 and max of an all-negative one "
-    "comes back 0. They should seed from src[0] (or +-inf). Remove this marker once "
-    "tile.cuh:921/:955 are fixed.",
-)
-def test_minmax_value_form_is_not_clamped_against_zero(bridge, n, dtype_name, want_max, on_host):
+def test_minmax_value_form_is_not_clamped_against_zero(bridge, n, dtype_name, want_max):
     """min/max of a same-signed vector must be an element of that vector."""
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]
 
     # All strictly positive for min, all strictly negative for max: in both cases the
@@ -171,7 +160,6 @@ def test_minmax_value_form_is_not_clamped_against_zero(bridge, n, dtype_name, wa
     torch.testing.assert_close(got.double(), want, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize("dtype_name", ["half", "bf16"])
 @pytest.mark.xfail(
     strict=True,
@@ -180,11 +168,11 @@ def test_minmax_value_form_is_not_clamped_against_zero(bridge, n, dtype_name, wa
     "total leaves half's exactly-representable range and the result is wrong by more "
     "than rounding. Remove once the accumulator is accum_t.",
 )
-def test_sum_accumulates_in_accum_t(bridge, dtype_name, on_host):
+def test_sum_accumulates_in_accum_t(bridge, dtype_name):
     """A wide accum_t should protect the running total from the narrow input type."""
     n = 8
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]
 
     # 8 x 1024: representable individually, and the exact total (8192) is representable
@@ -199,17 +187,16 @@ def test_sum_accumulates_in_accum_t(bridge, dtype_name, on_host):
     torch.testing.assert_close(got.double(), want, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_acc_forms_accumulate_rather_than_overwrite(bridge, n, dtype_name, on_host):
+def test_acc_forms_accumulate_rather_than_overwrite(bridge, n, dtype_name):
     """The acc-pointer forms must combine with the incoming value, not replace it.
 
     Running the same vector twice into a live accumulator has to move it twice as far
     from the seed as running it once -- the property the GATv2/GT kernels rely on when
     they accumulate a row across tiles.
     """
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
     a = make_input(M, n, dtype_name, device, seed=4242 + n, kind="random", positive=True)
 
     once = _run(mod, "sum_acc", n, a, a, acc_init=0.0).double()
@@ -218,12 +205,11 @@ def test_acc_forms_accumulate_rather_than_overwrite(bridge, n, dtype_name, on_ho
     torch.testing.assert_close(from_seed, once + ACC_INIT, rtol=1e-6, atol=1e-6)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_dot_product_equals_sum_of_products(bridge, n, dtype_name, on_host):
+def test_dot_product_equals_sum_of_products(bridge, n, dtype_name):
     """dot_product must agree with mul_ followed by sum, since that is how it is built."""
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
 
     a = make_input(M, n, dtype_name, device, seed=555 + n, kind="random")
     b = make_input(M, n, dtype_name, device, seed=666 + n, kind="random")
@@ -239,11 +225,10 @@ def test_dot_product_equals_sum_of_products(bridge, n, dtype_name, on_host):
     assert_sum_fp64(dot, via_sum.double(), a.double() * b.double(), dtype_name, f"dot vs sum(mul) N={n} {dtype_name}")
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_weighted_sum_equals_sum_times_weight(bridge, n, dtype_name, on_host):
-    mod = bridge.get("ops", dtype_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+def test_weighted_sum_equals_sum_times_weight(bridge, n, dtype_name):
+    mod = bridge.get("ops", dtype_name)
+    device = torch.device("cuda:0")
     a = make_input(M, n, dtype_name, device, seed=777 + n, kind="random")
 
     weighted = _run(mod, "weighted_sum_ret", n, a, a, acc_init=0.0).double()

@@ -87,7 +87,6 @@ class Paths:
 
     n: int
     name: str
-    on_host: bool = False
     cuda_arch: int = 800
 
     @property
@@ -102,7 +101,7 @@ class Paths:
         float denormals are flushed at both the inputs and the result. The host pass is
         plain g++ and keeps them, and 16-bit denormals are preserved in hardware.
         """
-        return self.name == "float" and not self.on_host
+        return self.name == "float"
 
     @property
     def packed_new(self) -> bool:

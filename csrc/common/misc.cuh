@@ -16,7 +16,7 @@
 #define FULL_WARP_MASK 0xffffffff
 #endif
 
-inline constexpr size_t kWarpSize = 32;
+inline constexpr size_t kWarpSize          = 32;
 inline constexpr size_t kMaxThreadsInBlock = 1024;
 
 #if defined(__CUDA_ARCH__)
@@ -25,6 +25,38 @@ inline constexpr int kCudaArch       = __CUDA_ARCH__;
 #else
 inline constexpr bool is_device_pass = false;
 inline constexpr int kCudaArch       = 0;
+#endif
+
+#ifdef CUDA_KERNEL_DEBUG
+#define CUDA_KERNEL_CHECK()                                                    \
+  do {                                                                         \
+    cudaDeviceSynchronize();                                                   \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                                            \
+  } while (0)
+#else
+#define CUDA_KERNEL_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
+#endif
+
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t error = call;                                                  \
+    if (error != cudaSuccess) {                                                \
+      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,         \
+              cudaGetErrorString(error));                                      \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
+// ============================================================================
+// CUDA comparison operators -- pytorch disables them
+// ============================================================================
+#ifdef __CUDA_NO_HALF_OPERATORS__
+__device__ __forceinline__ bool operator<(const __half& a, const __half& b) { return __hlt(a, b); }
+__device__ __forceinline__ bool operator>(const __half& a, const __half& b) { return __hgt(a, b); }
+__device__ __forceinline__ bool operator<=(const __half& a, const __half& b) { return __hle(a, b); }
+__device__ __forceinline__ bool operator>=(const __half& a, const __half& b) { return __hge(a, b); }
+__device__ __forceinline__ bool operator==(const __half& a, const __half& b) { return __heq(a, b); }
+__device__ __forceinline__ bool operator!=(const __half& a, const __half& b) { return __hne(a, b); }
 #endif
 
 // Helper to extract typed pointer from tensor using untyped data_ptr()

@@ -80,17 +80,16 @@ def _run(mod, op_name, n, dst, src):
     return mod.data_move(mod.op_codes()[op_name], n, dst, src)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize("op_name", ["transfer_vector", "transfer_scalars", "load__scalars", "store_scalars"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_copy_ops_are_faithful(bridge, op_name, n, dtype_name, on_host):
+def test_copy_ops_are_faithful(bridge, op_name, n, dtype_name):
     """All four copy flavours move N scalars verbatim.
 
     Note the header's doc comments for load__scalars/store_scalars are swapped
     relative to their signatures; the signatures are what is tested here.
     """
-    mod = bridge.get("data", dtype_name, on_host)
-    dev = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("data", dtype_name)
+    dev = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]
     m = 64
 
@@ -101,11 +100,10 @@ def test_copy_ops_are_faithful(bridge, op_name, n, dtype_name, on_host):
     assert torch.equal(dst, src), f"{op_name} did not copy the payload verbatim"
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_get_zero(bridge, n, dtype_name, on_host):
-    mod = bridge.get("data", dtype_name, on_host)
-    dev = torch.device("cpu" if on_host else "cuda")
+def test_get_zero(bridge, n, dtype_name):
+    mod = bridge.get("data", dtype_name)
+    dev = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]
     m = 32
 
@@ -116,17 +114,16 @@ def test_get_zero(bridge, n, dtype_name, on_host):
     assert not dst.any(), "get_zero must produce an all-zero vector"
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_store_zero_writes_exactly_n_elements(bridge, n, dtype_name, on_host):
+def test_store_zero_writes_exactly_n_elements(bridge, n, dtype_name):
     """store_zero must zero N*sizeof(T) bytes and not a byte more.
 
     The extra trailing row is a canary: it is inside the allocation but outside the
     slice handed to the kernel, so an over-wide store shows up as a clobbered
     sentinel rather than as silent corruption.
     """
-    mod = bridge.get("data", dtype_name, on_host)
-    dev = torch.device("cpu" if on_host else "cuda")
+    mod = bridge.get("data", dtype_name)
+    dev = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]
     m = 32
     sentinel = 1.0

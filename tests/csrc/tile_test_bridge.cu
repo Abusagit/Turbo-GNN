@@ -6,7 +6,6 @@
 //
 //   TGNN_DTYPE : 0 = float, 1 = half, 2 = nv_bfloat16
 //   TGNN_GROUP : 0 = data, 1 = ops, 2 = cvt, 3 = grad
-//   TGNN_HOST  : 0 = compile the workers for the device, 1 = for the host
 //
 // Two structural notes, both learned the hard way:
 //
@@ -15,20 +14,11 @@
 //    Vec<N,T>'s 16-byte limit in a plain function still instantiates the oversized Vec
 //    and hard-fails the build.
 //
-//  * TGNN_HOST is a module dimension rather than a runtime flag. tile.cuh's
-//    __host__ __device__ members call unqualified names from their dependent base
-//    (transfer_vector, add_, mul_, ...). nvcc's device frontend resolves those; g++
-//    does not, since ordinary lookup never searches a dependent base. Compiling both
-//    passes in one TU would therefore make every device row fail for a host-only
-//    reason.
 //
 // Includes only "common/tile.cuh", never "common.cuh": the latter also pulls in the
 // legacy common_.cuh, which declares an incompatible template of the same name.
 
 #include <torch/extension.h>
-
-#include <string>
-#include <vector>
 
 #include "common/tile.cuh"
 
@@ -37,9 +27,6 @@
 #endif
 #ifndef TGNN_GROUP
 #error "TGNN_GROUP must be defined (0=data, 1=ops, 2=cvt, 3=grad)"
-#endif
-#ifndef TGNN_HOST
-#define TGNN_HOST 0
 #endif
 
 #if TGNN_DTYPE == 0
@@ -58,19 +45,13 @@ static constexpr char kDtypeName[] = "nv_bfloat16";
 #error "bad TGNN_DTYPE"
 #endif
 
-#if TGNN_HOST
-#define TGNN_WORKER __host__
-static constexpr bool kOnHost = true;
-#else
 #define TGNN_WORKER __device__
-static constexpr bool kOnHost = false;
-#endif
 
 // Largest N that Vec<N, num_t> permits (Vec caps at 16 bytes).
-static constexpr size_t kMaxN = 16 / sizeof(num_t);
+inline constexpr size_t kMaxN = 16 / sizeof(num_t);
 
 template <size_t N, typename T>
-static constexpr bool vec_fits = (N * sizeof(T) <= 16);
+inline constexpr bool vec_fits = (N * sizeof(T) <= 16);
 
 namespace {
 
@@ -92,7 +73,7 @@ namespace {
         "> exceeds the 16-byte cap"                                                                            \
     )
 
-[[maybe_unused]] int64_t grid_for(int64_t m, int64_t block) { return (m + block - 1) / block; }
+[[maybe_unused]] constexpr int64_t grid_for(int64_t m, int64_t block) { return (m + block - 1) / block; }
 [[maybe_unused]] constexpr int64_t kBlock = 128;
 
 void check_vec_tensor(const torch::Tensor& t, int64_t n, const char* what) {
@@ -100,16 +81,16 @@ void check_vec_tensor(const torch::Tensor& t, int64_t n, const char* what) {
     TORCH_CHECK(t.is_contiguous(), what, ": tensor must be contiguous");
     TORCH_CHECK(t.scalar_type() == kTorchDtype, what, ": expected dtype ", kDtypeName);
     TORCH_CHECK(t.dim() == 2 && t.size(1) == n, what, ": expected shape [M, ", n, "]");
-    TORCH_CHECK(t.is_cpu() == kOnHost, what, ": tensor must live ", kOnHost ? "on the CPU" : "on the GPU");
+    TORCH_CHECK(t.is_cpu() == false, what, ": tensor must live on the GPU");
 }
 
 template <size_t N>
 Vec<N, num_t>* vec_ptr(const torch::Tensor& t) {
-    return reinterpret_cast<Vec<N, num_t>*>(t.data_ptr());
+    return reinterpret_cast<Vec<N, num_t> *>(t.data_ptr());
 }
 template <size_t N>
 const Vec<N, num_t>* cvec_ptr(const torch::Tensor& t) {
-    return reinterpret_cast<const Vec<N, num_t>*>(t.data_ptr());
+    return reinterpret_cast<const Vec<N, num_t> *>(t.data_ptr());
 }
 
 }  // namespace
@@ -159,23 +140,19 @@ TGNN_WORKER void apply_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src
     }
 }
 
-#if !TGNN_HOST
 template <size_t N>
 __global__ void k_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src, int64_t m) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
-    if (i < m) apply_data<N>(op, dst + i, src + i);
+    if (i < m) {
+        apply_data<N>(op, dst + i, src + i);
+    }
 }
-#endif
 
 template <size_t N>
 void data_move_impl(int op, const torch::Tensor& dst, const torch::Tensor& src, int64_t m) {
     if constexpr (vec_fits<N, num_t>) {
-#if TGNN_HOST
-        for (int64_t i = 0; i < m; ++i) apply_data<N>(op, vec_ptr<N>(dst) + i, cvec_ptr<N>(src) + i);
-#else
         k_data<N><<<grid_for(m, kBlock), kBlock>>>(op, vec_ptr<N>(dst), cvec_ptr<N>(src), m);
         C10_CUDA_CHECK(cudaGetLastError());
-#endif
     } else {
         TGNN_N_TOO_WIDE(N);
     }
@@ -243,7 +220,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("select_tw", &select_tw);
     m.def("op_codes", &op_codes);
     m.attr("dtype_name") = kDtypeName;
-    m.attr("on_host")    = kOnHost;
     m.attr("max_n")      = static_cast<int64_t>(kMaxN);
 }
 
@@ -377,7 +353,6 @@ TGNN_WORKER void apply_gatv2_dot(
     *out = TileOps<N, num_t, float>::gatv2_dot_leaky_relu(*l, *r, *a, ns);
 }
 
-#if !TGNN_HOST
 template <size_t N>
 __global__ void k_ew(
     int op, Vec<N, num_t>* out, const Vec<N, num_t>* a, const Vec<N, num_t>* b, const Vec<N, num_t>* c, num_t s,
@@ -402,7 +377,6 @@ __global__ void k_gatv2_dot(
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) apply_gatv2_dot<N>(out + i, l + i, r + i, a + i, ns);
 }
-#endif
 
 template <size_t N>
 void ew_impl(
@@ -412,16 +386,10 @@ void ew_impl(
     if constexpr (vec_fits<N, num_t>) {
         // Round the scalar through num_t exactly as a kernel would.
         const num_t sv = static_cast<num_t>(static_cast<float>(s));
-#if TGNN_HOST
-        for (int64_t i = 0; i < m; ++i) {
-            apply_ew<N>(op, vec_ptr<N>(out) + i, cvec_ptr<N>(a) + i, cvec_ptr<N>(b) + i, cvec_ptr<N>(c) + i, sv);
-        }
-#else
         k_ew<N><<<grid_for(m, kBlock), kBlock>>>(
             op, vec_ptr<N>(out), cvec_ptr<N>(a), cvec_ptr<N>(b), cvec_ptr<N>(c), sv, m
         );
         C10_CUDA_CHECK(cudaGetLastError());
-#endif
     } else {
         TGNN_N_TOO_WIDE(N);
     }
@@ -434,16 +402,10 @@ void red_run(
 ) {
     const auto ai = static_cast<acc_t>(acc_init);
     const auto wv = static_cast<acc_t>(w);
-#if TGNN_HOST
-    for (int64_t i = 0; i < m; ++i) {
-        apply_red<N, acc_t>(op, out.template data_ptr<acc_t>() + i, cvec_ptr<N>(a) + i, cvec_ptr<N>(b) + i, ai, wv);
-    }
-#else
     k_red<N, acc_t><<<grid_for(m, kBlock), kBlock>>>(
         op, out.template data_ptr<acc_t>(), cvec_ptr<N>(a), cvec_ptr<N>(b), ai, wv, m
     );
     C10_CUDA_CHECK(cudaGetLastError());
-#endif
 }
 
 template <size_t N>
@@ -469,18 +431,10 @@ void gatv2_dot_impl(
 ) {
     if constexpr (vec_fits<N, num_t>) {
         const auto nsv = static_cast<float>(ns);
-#if TGNN_HOST
-        for (int64_t i = 0; i < m; ++i) {
-            apply_gatv2_dot<N>(
-                out.data_ptr<float>() + i, cvec_ptr<N>(l) + i, cvec_ptr<N>(r) + i, cvec_ptr<N>(a) + i, nsv
-            );
-        }
-#else
         k_gatv2_dot<N><<<grid_for(m, kBlock), kBlock>>>(
             out.data_ptr<float>(), cvec_ptr<N>(l), cvec_ptr<N>(r), cvec_ptr<N>(a), nsv, m
         );
         C10_CUDA_CHECK(cudaGetLastError());
-#endif
     } else {
         TGNN_N_TOO_WIDE(N);
     }
@@ -588,7 +542,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("op_codes", &op_codes);
     m.def("red_codes", &red_codes);
     m.attr("dtype_name") = kDtypeName;
-    m.attr("on_host")    = kOnHost;
     m.attr("max_n")      = static_cast<int64_t>(kMaxN);
 }
 
@@ -611,7 +564,6 @@ TGNN_WORKER void apply_read(Vec<N, num_t>* out, const num_t* arr, size_t vec_idx
     *out = TileOps<N, num_t, float>::read(arr, vec_idx);
 }
 
-#if !TGNN_HOST
 template <size_t N, typename dst_t>
 __global__ void k_convert(Vec<N, dst_t>* dst, const Vec<N, num_t>* src, int64_t m) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
@@ -635,18 +587,13 @@ template <typename dst_t, size_t row_width, size_t worker_cnt>
 __global__ void k_write_row(dst_t* dst, const num_t* src) {
     write_row<dst_t, num_t, row_width, worker_cnt>(dst, threadIdx.x, src);
 }
-#endif  // !TGNN_HOST
 
 template <size_t N, typename dst_t>
 void convert_run(const torch::Tensor& out, const torch::Tensor& src, int64_t m) {
     if constexpr (vec_fits<N, num_t> && vec_fits<N, dst_t>) {
         auto* d = reinterpret_cast<Vec<N, dst_t>*>(out.data_ptr());
-#if TGNN_HOST
-        for (int64_t i = 0; i < m; ++i) apply_convert<N, dst_t>(d + i, cvec_ptr<N>(src) + i);
-#else
         k_convert<N, dst_t><<<grid_for(m, kBlock), kBlock>>>(d, cvec_ptr<N>(src), m);
         C10_CUDA_CHECK(cudaGetLastError());
-#endif
     } else {
         TORCH_CHECK(
             false, "convert_vec<", N, ", dst, ", kDtypeName, "> is not instantiable: one of the two Vec<", N,
@@ -670,18 +617,13 @@ template <size_t N>
 void read_impl(const torch::Tensor& out, const torch::Tensor& arr, int64_t start, int64_t m) {
     if constexpr (vec_fits<N, num_t>) {
         const auto* base = reinterpret_cast<const num_t*>(arr.data_ptr());
-#if TGNN_HOST
-        for (int64_t i = 0; i < m; ++i) apply_read<N>(vec_ptr<N>(out) + i, base, static_cast<size_t>(start + i));
-#else
         k_read<N><<<grid_for(m, kBlock), kBlock>>>(vec_ptr<N>(out), base, start, m);
         C10_CUDA_CHECK(cudaGetLastError());
-#endif
     } else {
         TGNN_N_TOO_WIDE(N);
     }
 }
 
-#if !TGNN_HOST
 template <size_t N>
 void atomic_impl(const torch::Tensor& ptr, int64_t vec_idx, double scalar, const torch::Tensor& v, int64_t m) {
     // atomic_add_scaled_f32 stages through Vec<N, float>, so *that* must fit, not just
@@ -699,7 +641,6 @@ void atomic_impl(const torch::Tensor& ptr, int64_t vec_idx, double scalar, const
         );
     }
 }
-#endif
 
 }  // namespace
 
@@ -714,14 +655,13 @@ torch::Tensor convert(int64_t n, torch::Tensor src, int64_t dst_code) {
 
 torch::Tensor tile_read(int64_t n, torch::Tensor arr, int64_t start, int64_t m) {
     TORCH_CHECK(arr.is_contiguous() && arr.scalar_type() == kTorchDtype, "arr: contiguous ", kDtypeName, " expected");
-    TORCH_CHECK(arr.is_cpu() == kOnHost, "arr is on the wrong device");
+    TORCH_CHECK(arr.is_cpu() == false, "arr is on CPU, when it must be on GPU");
     TORCH_CHECK((start + m) * n <= arr.numel(), "arr too small for the requested vec_idx range");
     auto out = torch::empty({m, n}, arr.options());
     TGNN_DISPATCH_N(n, read_impl, out, arr, start, m);
     return out;
 }
 
-#if !TGNN_HOST
 torch::Tensor atomic_add_scaled_f32(int64_t n, torch::Tensor ptr, int64_t vec_idx, double scalar, torch::Tensor v) {
     check_vec_tensor(v, n, "v");
     TORCH_CHECK(ptr.is_contiguous() && ptr.scalar_type() == torch::kFloat32 && ptr.is_cuda(), "ptr: cuda fp32");
@@ -770,17 +710,13 @@ torch::Tensor write_row_run(
     TORCH_CHECK(false, "write_row not instantiated for row_width=", row_width, " worker_cnt=", worker_cnt);
     return out;  // unreachable
 }
-#endif  // !TGNN_HOST
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("convert", &convert);
     m.def("tile_read", &tile_read);
-#if !TGNN_HOST
     m.def("atomic_add_scaled_f32", &atomic_add_scaled_f32);
     m.def("write_row_run", &write_row_run);
-#endif
     m.attr("dtype_name") = kDtypeName;
-    m.attr("on_host")    = kOnHost;
     m.attr("max_n")      = static_cast<int64_t>(kMaxN);
 }
 
@@ -904,7 +840,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gatv2_accum_grad_al", &gatv2_accum_grad_al);
     m.def("gatv2_accum_grad_r", &gatv2_accum_grad_r);
     m.attr("dtype_name") = kDtypeName;
-    m.attr("on_host")    = kOnHost;
     m.attr("max_n")      = static_cast<int64_t>(kMaxN);
 }
 

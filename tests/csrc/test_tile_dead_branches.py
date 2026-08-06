@@ -44,7 +44,7 @@ ARCH = "sm_100a"
 
 
 def _nvcc() -> str:
-    for candidate in ("nvcc", "/usr/local/cuda/bin/nvcc"):
+    for candidate in "/usr/local/cuda-13.2/bin/nvcc":
         found = shutil.which(candidate) or (candidate if Path(candidate).exists() else None)
         if found:
             return found

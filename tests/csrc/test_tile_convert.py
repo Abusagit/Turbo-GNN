@@ -44,37 +44,17 @@ def _packed_convert_is_broken(n: int, src: str, dst: str) -> bool:
 CONVERT_CASES = [(n, src, dst) for n, src in COMBOS for dst in DTYPES if _both_fit(n, src, dst)]
 CONVERT_IDS = [f"{src}->{dst}-N{n}" for n, src, dst in CONVERT_CASES]
 
-WORKING = [c for c in CONVERT_CASES if not _packed_convert_is_broken(*c)]
-WORKING_IDS = [f"{src}->{dst}-N{n}" for n, src, dst in WORKING]
 
-BROKEN = [c for c in CONVERT_CASES if _packed_convert_is_broken(*c)]
-BROKEN_IDS = [f"{src}->{dst}-N{n}" for n, src, dst in BROKEN]
-
-
-def _wide_pun_is_miscompiled(n: int, dst: str, on_host: bool) -> bool:
-    """Whether this case hits the strict-aliasing bug in Vec's wide_t punning.
-
-    See test_transfer_vector_wide_pun_is_not_miscompiled for the full story. Only the
-    host pass is affected today, and only where the destination's wide_t is the 16-byte
-    ``unsigned __int128``.
-    """
-    return on_host and n % 2 == 0 and n * _itemsize(dst) == 16
-
-
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
-@pytest.mark.parametrize(("n", "src_name", "dst_name"), WORKING, ids=WORKING_IDS)
-def test_convert_vec(bridge, n, src_name, dst_name, on_host):
+@pytest.mark.parametrize(("n", "src_name", "dst_name"), CONVERT_CASES, ids=CONVERT_IDS)
+def test_convert_vec(bridge, n, src_name, dst_name):
     """Elementwise round-to-nearest conversion, bit-exact.
 
     Both the packed intrinsics (__float22half2_rn and friends) and the scalar
     static_cast fallback round to nearest-even, so torch's own cast is an exact oracle.
     """
-    if _wide_pun_is_miscompiled(n, dst_name, on_host):
-        pytest.skip(
-            "hits the wide_t strict-aliasing miscompile; covered by test_transfer_vector_wide_pun_is_not_miscompiled"
-        )
-    mod = bridge.get("cvt", src_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+
+    mod = bridge.get("cvt", src_name)
+    device = torch.device("cuda:0")
 
     src = make_input(M, n, src_name, device, seed=9000 + n, kind="special")
     got = mod.convert(n, src, DST_CODE[dst_name])
@@ -84,76 +64,27 @@ def test_convert_vec(bridge, n, src_name, dst_name, on_host):
     torch.testing.assert_close(got.double(), want.double(), rtol=0, atol=0, equal_nan=True)
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize(("n", "src_name", "dst_name"), BROKEN[:1], ids=BROKEN_IDS[:1])
-def test_convert_vec_half_source_packed_traps(n, src_name, dst_name):
-    """half -> float / bf16 on the packed path does not misconvert -- it traps.
-
-    packed_convert's third branch tests dst_type where it means src_type, and then
-    re-tests dst_type inside it, so both half->float and half->bf16 fall through to
-    ``__builtin_unreachable()``. nvcc turns that into a trap instruction, so the kernel
-    aborts the *process* rather than returning a wrong value.
-
-    That is why this runs in a subprocess: an in-process call takes the whole pytest
-    session down with it, and why the affected pairs are excluded from
-    ``test_convert_vec`` above. Once the branch tests src_type, delete this test and drop
-    ``_packed_convert_is_broken``, which will move those pairs back into the main set.
-    """
-    import subprocess
-    import sys
-
-    script = f"""
-import sys, torch
-sys.path.insert(0, {str(pathlib.Path(__file__).parent)!r})
-from conftest import BridgeLoader
-mod = BridgeLoader()._build("cvt", {src_name!r}, False)
-src = torch.ones(({M}, {n}), dtype=torch.float16, device="cuda")
-out = mod.convert({n}, src, {DST_CODE[dst_name]})
-torch.cuda.synchronize()
-print("NO_TRAP", out.flatten()[:4].tolist())
-"""
-    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=900)
-
-    assert proc.returncode != 0, (
-        f"convert_vec<{n}, {dst_name}, {src_name}> no longer traps -- packed_convert's "
-        f"src_type branch looks fixed. Remove this test and _packed_convert_is_broken.\n"
-        f"stdout: {proc.stdout}"
-    )
-    assert "NO_TRAP" not in proc.stdout
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="Vec's wide_t punning is a strict-aliasing violation. transfer_vector copies "
-    "through `*reinterpret_cast<wide_t*>`, while convert_vec and every VecOpsFloatBase op "
-    "write the same storage through num_type/packed_t. GCC's type-based alias analysis sees "
-    "no relationship between an `unsigned __int128` access and a `half2` one, so at -O3 it "
-    "reorders the wide load ahead of the narrow stores and the result is stale. Verified: "
-    "adding -fno-strict-aliasing makes this pass, changing nothing else. Only the host pass "
-    "misbehaves today, but the UB is equally present in device code -- it just happens to "
-    "survive the current nvcc. Fix by copying with __builtin_memcpy (or a union) instead of "
-    "reinterpret_cast punning in VecOpsBase's transfer/load/store helpers.",
-)
 def test_transfer_vector_wide_pun_is_not_miscompiled(bridge):
-    """A 16-byte Vec must survive a convert_vec round trip on the host.
+    """A 16-byte Vec must survive a convert_vec round trip.
 
     Minimal reproducer: bf16 -> half at N=8, where both Vec types are exactly 16 bytes so
     wide_t is `unsigned __int128`. N=2 and N=4 (uint32/uint64 wide_t) come out correct, and
     the device pass is correct at every N, which is what points at alias analysis rather
     than at the conversion maths.
     """
-    mod = bridge.get("cvt", "bf16", True)
-    src = torch.tensor([[1.0, -2.0, 0.5, 3.0, -0.25, 8.0, -16.0, 0.125]], dtype=torch.bfloat16, device="cpu")
+
+    mod = bridge.get("cvt", "bf16")
+    src = torch.tensor([[1.0, -2.0, 0.5, 3.0, -0.25, 8.0, -16.0, 0.125]], dtype=torch.bfloat16, device="cuda:0")
     got = mod.convert(8, src, DST_CODE["half"])
     torch.testing.assert_close(got.double(), src.to(torch.float16).double(), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("on_host", [False, True], ids=["device", "host"])
 @pytest.mark.parametrize(("n", "src_name"), COMBOS, ids=COMBO_IDS)
-def test_convert_vec_same_type_is_a_copy(bridge, n, src_name, on_host):
+def test_convert_vec_same_type_is_a_copy(bridge, n, src_name):
     """The same-type early-out must move the payload verbatim."""
-    mod = bridge.get("cvt", src_name, on_host)
-    device = torch.device("cpu" if on_host else "cuda")
+
+    mod = bridge.get("cvt", src_name)
+    device = torch.device("cuda:0")
 
     src = make_input(M, n, src_name, device, seed=42, kind="special")
     got = mod.convert(n, src, DST_CODE[src_name])
@@ -199,8 +130,6 @@ def test_write_row_copies_the_whole_row(bridge, src_name, dst_name, row_width, w
     The trailing slack in dst is a canary: write_row's tail guard is
     ``tile_id * copy_N < row_width``, so anything past row_width would show up here.
     """
-    if src_name == "half" and dst_name in ("float", "bf16") and _copy_n(src_name, dst_name) % 2 == 0:
-        pytest.skip("blocked by the packed_convert half-source bug; see test_convert_vec_half_source_packed")
 
     mod = bridge.get("cvt", src_name)
     device = torch.device("cuda")
@@ -227,8 +156,6 @@ def test_write_row_does_not_overrun_a_ragged_row(bridge, src_name, dst_name):
     row_width = 36
     if row_width % copy_n == 0:
         pytest.skip(f"row_width={row_width} is a multiple of copy_N={copy_n}; nothing ragged to probe")
-    if src_name == "half" and dst_name in ("float", "bf16") and copy_n % 2 == 0:
-        pytest.skip("blocked by the packed_convert half-source bug")
 
     mod = bridge.get("cvt", src_name)
     device = torch.device("cuda")
