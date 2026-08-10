@@ -149,7 +149,7 @@ struct OnlineSoftmaxState {
     float max_val = -FLT_MAX;
     float sum_exp = 0.0f;
 
-    __device__ __forceinline__ float update(float logit) {
+    __device__ float update(float logit) {
         float old_max = max_val;
         max_val       = fmaxf(max_val, logit);
 
@@ -160,7 +160,7 @@ struct OnlineSoftmaxState {
         return correction;
     }
 
-    __device__ __forceinline__ float get_alpha(float logit) const { return __expf(logit - max_val) / sum_exp; }
+    __device__ float get_alpha(float logit) const { return __expf(logit - max_val) / sum_exp; }
 };
 
 // FlashAttention logsumexp trick

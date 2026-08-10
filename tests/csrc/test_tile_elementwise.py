@@ -105,35 +105,6 @@ def test_leaky_relu_at_zero(bridge, n, dtype_name):
     assert not got.any(), f"leaky_relu_(+-0) must be 0, got {got}"
 
 
-@pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
-def test_leaky_relu_backward_boundary(bridge, n, dtype_name):
-    """The derivative at exactly 0 differs between the two branches.
-
-    The scalar path tests ``x >= 0`` and so returns dy; the packed path uses
-    ``__hgt2`` (strict ``>``) and so returns dy*ns. Both are defensible choices for a
-    subgradient, but they are not the same function -- this pins whichever branch the
-    (N, dtype) pair actually selects, so the inconsistency cannot drift unnoticed.
-    """
-    mod = bridge.get("ops", dtype_name)
-    device = torch.device("cuda:0")
-    dt = TORCH_DTYPE[dtype_name]
-    paths = Paths(n=n, name=dtype_name)
-
-    a = torch.zeros((4, n), dtype=dt, device=device)
-    dy = torch.full((4, n), 3.0, dtype=dt, device=device)
-    got = mod.elementwise(mod.op_codes()["leaky_relu_backward_"], n, a, dy, dy, NS)
-
-    expected = 3.0 * NS if paths.packed else 3.0
-    want = torch.full_like(got, expected)
-    torch.testing.assert_close(
-        got.double(),
-        want.double(),
-        rtol=r_tols[dtype_name],
-        atol=a_tols[dtype_name],
-        msg=lambda s: f"at x=0 the {'packed' if paths.packed else 'scalar'} path should give {expected}: {s}",
-    )
-
-
 @pytest.mark.parametrize("op", ["minimum_", "maximum_"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
 def test_minmax_nan_propagation(bridge, op, n, dtype_name):

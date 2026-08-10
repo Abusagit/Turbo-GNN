@@ -128,22 +128,12 @@ class Paths:
 
 def ulp_of(x: torch.Tensor, name: str) -> torch.Tensor:
     """Width of one ulp of ``name`` at each magnitude in ``x`` (a float64 tensor)."""
+
     fi = torch.finfo(TORCH_DTYPE[name])
     ax = x.abs().clamp(min=fi.smallest_normal)
     binade = torch.floor(torch.log2(ax))
+
     return torch.exp2(binade) * fi.eps
-
-
-# Relative tolerance for the approximate intrinsics. exp/log go through hexp/hlog on
-# the device but cuda::std:: on the host, so they are not bit-comparable.
-REL_TOL: dict[tuple[str, str], float] = {
-    ("exp_", "float"): 2e-6,
-    ("exp_", "half"): 2e-2,
-    ("exp_", "bf16"): 2e-2,
-    ("log_", "float"): 2e-6,
-    ("log_", "half"): 2e-2,
-    ("log_", "bf16"): 2e-2,
-}
 
 
 def _report(got: torch.Tensor, ref: torch.Tensor, ok: torch.Tensor, label: str) -> None:
@@ -204,10 +194,12 @@ def assert_rel(
     deliver. __logf is accurate to a few ulp *of the argument's scale*, so the floor
     expresses the right error model rather than just loosening the number.
     """
+
     g = got.double()
     scale = ref64.abs().clamp(min=rel_floor)
     tol = scale * rtol + torch.finfo(TORCH_DTYPE[name]).smallest_normal
     ok = ((g - ref64).abs() <= tol) | _agree_nonfinite(g, ref64)
+
     _report(g, ref64, ok, f"{label} (rtol={rtol}, floor={rel_floor})")
 
 
@@ -302,9 +294,11 @@ def make_input(
 
 def ref_leaky_relu(a: torch.Tensor, ns: float, name: str) -> torch.Tensor:
     """max(a,0) + ns*min(a,0), with the header's rounding at each step."""
+
     ns_r = rnd(torch.tensor(ns, dtype=torch.float64), name)
     hi = torch.clamp(a, min=0.0)
     lo = torch.clamp(a, max=0.0)
+
     return rnd(hi + rnd(ns_r * lo, name), name)
 
 
@@ -334,6 +328,7 @@ def ref_elementwise(
     op: str, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, s: float, name: str, paths: Paths
 ) -> torch.Tensor:
     """fp64 reference for one elementwise op. Inputs are float64 views of the dtype."""
+
     s_r = rnd(torch.tensor(s, dtype=torch.float64), name)
     if paths.ftz and op in FTZ_ARITH_OPS:
         a, b, c = (flush_subnormals(t, name) for t in (a, b, c))
@@ -418,7 +413,7 @@ def check_elementwise(got: torch.Tensor, ref64: torch.Tensor, op: str, name: str
     if op in REL_OPS:
         # log's error is absolute in the argument's scale, not in the result's.
         floor = 1.0 if op == "log_" else 0.0
-        assert_rel(got, ref64, name, label, REL_TOL[(op, name)], rel_floor=floor)
+        assert_rel(got, ref64, name, label, r_tols[name], rel_floor=floor)
     elif op in ULP_OPS:
         # float division under --use_fast_math becomes __fdividef: ~2 ulp, and it zeroes
         # quotients near the subnormal boundary.
@@ -465,35 +460,86 @@ def _step(x: torch.Tensor, name: str, paths: Paths) -> torch.Tensor:
     return flush_subnormals(r, name) if (paths.ftz and name == "float") else r
 
 
-def emul_sum_num(v: torch.Tensor, paths: Paths) -> torch.Tensor:
-    """``buf_acc`` from tile.cuh's ``sum``.
+def _compact_n(paths: Paths, acc_name: str) -> int:
+    """``min(N, 16 / max(sizeof(accum_t), sizeof(num_type)))`` -- the chunk width the header
+    widens through, so a converted chunk never exceeds the 16-byte vector cap."""
+    itemsize = max(torch.finfo(TORCH_DTYPE[paths.name]).bits, torch.finfo(TORCH_DTYPE[acc_name]).bits) // 8
+    return min(paths.n, 16 // itemsize)
 
-    Note it accumulates in *num_type*, not accum_t -- that is the header's choice and
-    the reason the fp64 cross-check is reported separately.
+
+def _acc_packs(acc_name: str, paths: Paths) -> bool:
+    """Mirrors ``can_be_packed_new_b<accum_t>``: 16-bit always packs; float only from sm_100."""
+    return is_half_fp(acc_name) or (acc_name == "float" and paths.cuda_arch >= 1000)
+
+
+def _step_acc(x: torch.Tensor, acc_name: str) -> torch.Tensor:
+    """One accum_t arithmetic step: round into accum_t; single-precision arithmetic
+    flushes subnormals under -ftz regardless of the input dtype."""
+    r = rnd(x, acc_name)
+    return flush_subnormals(r, acc_name) if acc_name == "float" else r
+
+
+def _engage(v: torch.Tensor, paths: Paths) -> torch.Tensor:
+    """Terms as the accumulator's arithmetic sees them.
+
+    Every accum_t step goes through the single-precision pipeline -- an f32 add/mul, or
+    a cvt.f64.f32 under -ftz for the double accumulator -- and bf16 subnormals *are*
+    f32-subnormal bit patterns, so they flush to signed zero on contact. Float
+    subnormals flush the same way. half subnormals are f32-normal and survive.
     """
-    n, name = paths.n, paths.name
-    if paths.packed_new and n >= 4:
-        acc = _pairs(v, 0).clone()
-        for i in range(1, n // 2):
-            acc = _step(acc + _pairs(v, i), name, paths)
-        return _step(acc[:, 0] + acc[:, 1], name, paths)
+    if paths.name in ("float", "bf16"):
+        return flush_subnormals(v, paths.name)
+    return v
+
+
+def _convert_result(x: torch.Tensor, paths: Paths, acc_name: str) -> torch.Tensor:
+    """``static_cast<accum_t>`` of a num_type reduction result.
+
+    Widening is exact, with one exception: a bf16 subnormal is an f32-subnormal bit
+    pattern, and converting it to double goes through cvt.f64.f32, which flushes it
+    under -ftz. Conversion to float is a pure bit shift and preserves it.
+    """
+    out = rnd(x, acc_name)
+    if paths.name == "bf16" and acc_name == "double":
+        out = flush_subnormals(out, "bf16")
+    return out
+
+
+def emul_sum(v: torch.Tensor, paths: Paths, acc_name: str) -> torch.Tensor:
+    """``buf_acc`` from tile.cuh's ``sum``: chunks widened to accum_t, reduced in accum_t."""
+    n = paths.n
+    v = _engage(v, paths)
+    compact_n = _compact_n(paths, acc_name)
     acc = torch.zeros(v.shape[0], dtype=torch.float64, device=v.device)
+    if paths.packed_new and _acc_packs(acc_name, paths) and compact_n >= 4:
+        for j in range(n // compact_n):
+            chunk = v[:, j * compact_n : (j + 1) * compact_n]
+            pair_acc = _pairs(chunk, 0).clone()
+            for i in range(1, compact_n // 2):
+                pair_acc = _step_acc(pair_acc + _pairs(chunk, i), acc_name)
+            acc = _step_acc(acc + _step_acc(pair_acc[:, 0] + pair_acc[:, 1], acc_name), acc_name)
+        return acc
     for i in range(n):
-        acc = _step(acc + v[:, i], name, paths)
+        acc = _step_acc(acc + v[:, i], acc_name)
     return acc
 
 
 def emul_prod(v: torch.Tensor, paths: Paths, acc_name: str) -> torch.Tensor:
-    """``buf_acc`` from tile.cuh's ``prod``. Unlike sum, this one accumulates in accum_t."""
-    n, name = paths.n, paths.name
-    if paths.packed_new and n >= 4:
-        acc = _pairs(v, 0).clone()
-        for i in range(1, n // 2):
-            acc = _step(acc * _pairs(v, i), name, paths)
-        return _step(rnd(acc[:, 0], acc_name) * rnd(acc[:, 1], acc_name), acc_name, paths)
+    """``buf_acc`` from tile.cuh's ``prod``: chunks widened to accum_t, reduced in accum_t."""
+    n = paths.n
+    v = _engage(v, paths)
+    compact_n = _compact_n(paths, acc_name)
     acc = torch.ones(v.shape[0], dtype=torch.float64, device=v.device)
+    if paths.packed_new and _acc_packs(acc_name, paths) and compact_n >= 4:
+        for j in range(n // compact_n):
+            chunk = v[:, j * compact_n : (j + 1) * compact_n]
+            pair_acc = _pairs(chunk, 0).clone()
+            for i in range(1, compact_n // 2):
+                pair_acc = _step_acc(pair_acc * _pairs(chunk, i), acc_name)
+            acc = _step_acc(acc * _step_acc(pair_acc[:, 0] * pair_acc[:, 1], acc_name), acc_name)
+        return acc
     for i in range(n):
-        acc = _step(acc * rnd(v[:, i], acc_name), acc_name, paths)
+        acc = _step_acc(acc * v[:, i], acc_name)
     return acc
 
 
@@ -525,38 +571,42 @@ def ref_reduce(
     w_r = rnd(torch.tensor(w, dtype=torch.float64), acc_name)
 
     if op in ("sum_acc", "sum_ret"):
-        buf = emul_sum_num(a, paths)
+        buf = emul_sum(a, paths, acc_name)
         start = init if op == "sum_acc" else 0.0
-        return rnd(start + rnd(buf, acc_name), acc_name)
+        return _step_acc(start + buf, acc_name)
 
     if op in ("weighted_sum_acc", "weighted_sum_ret"):
-        buf = rnd(rnd(emul_sum_num(a, paths), acc_name) * w_r, acc_name)
-        start = init if op == "weighted_sum_acc" else 0.0
-        return rnd(start + buf, acc_name)
+        s = emul_sum(a, paths, acc_name)
+        if op.endswith("_acc"):
+            # buf_acc = sum; buf_acc *= w; *acc += buf_acc
+            return _step_acc(init + _step_acc(s * w_r, acc_name), acc_name)
+        # acc{}; sum(&acc); acc *= w
+        return _step_acc(_step_acc(0.0 + s, acc_name) * w_r, acc_name)
 
     if op in ("prod_acc", "prod_ret"):
         buf = emul_prod(a, paths, acc_name)
         # The value-returning form seeds 1; the acc form multiplies into *acc.
         start = init if op == "prod_acc" else 1.0
-        return rnd(start * buf, acc_name)
+        return _step_acc(start * buf, acc_name)
 
     if op in ("min_acc", "min_ret", "max_acc", "max_ret"):
         want_max = op.startswith("max")
         buf = emul_minmax(a, paths, want_max)
-        pick = torch.maximum if want_max else torch.minimum
-        # The value-returning form seeds accum_t{} == 0, so the result is clamped
-        # against zero -- modelled here so the test states the current behaviour.
-        start = init if op.endswith("_acc") else 0.0
-        # AdOps<num_type>::min/max takes num_type, so the fp32 accumulator is
-        # narrowed through num_type before the comparison.
-        start_t = rnd(torch.full_like(buf, start), name)
-        return rnd(pick(start_t, buf), name)
+        if op.endswith("_acc"):
+            # The acc form compares in num_type: *acc is narrowed through num_type
+            # before the comparison.
+            pick = torch.maximum if want_max else torch.minimum
+            start_t = rnd(torch.full_like(buf, init), name)
+            buf = pick(start_t, buf)
+        # The value forms return the true min/max element; there is no clamp against
+        # the zero seed.
+        return _convert_result(buf, paths, acc_name)
 
     if op in ("dot_product_acc", "dot_product_ret"):
         prod = _step(a * b, name, paths)  # mul_ in num_type
-        buf = emul_sum_num(prod, paths)
+        buf = emul_sum(prod, paths, acc_name)
         start = init if op == "dot_product_acc" else 0.0
-        return rnd(start + rnd(buf, acc_name), acc_name)
+        return _step_acc(start + buf, acc_name)
 
     raise ValueError(f"no reference for reduction {op!r}")
 
@@ -570,9 +620,13 @@ def ref_reduce_fp64(op: str, a: torch.Tensor, b: torch.Tensor, acc_init: float, 
     if op in ("prod_acc", "prod_ret"):
         return (acc_init if op.endswith("_acc") else 1.0) * a.prod(dim=1)
     if op in ("min_acc", "min_ret"):
-        return torch.minimum(a.min(dim=1).values, torch.full_like(a[:, 0], acc_init if op.endswith("_acc") else 0.0))
+        if op.endswith("_ret"):
+            return a.min(dim=1).values
+        return torch.minimum(a.min(dim=1).values, torch.full_like(a[:, 0], acc_init))
     if op in ("max_acc", "max_ret"):
-        return torch.maximum(a.max(dim=1).values, torch.full_like(a[:, 0], acc_init if op.endswith("_acc") else 0.0))
+        if op.endswith("_ret"):
+            return a.max(dim=1).values
+        return torch.maximum(a.max(dim=1).values, torch.full_like(a[:, 0], acc_init))
     if op in ("dot_product_acc", "dot_product_ret"):
         return (acc_init if op.endswith("_acc") else 0.0) + (a * b).sum(dim=1)
     raise ValueError(f"no fp64 reference for reduction {op!r}")
@@ -593,7 +647,7 @@ def ref_gatv2_dot_leaky_relu(
     edge = _step(lv + r, name, paths)
     act = _step(ref_leaky_relu(edge, ns, name), name, paths)
     prod = _step(act * a, name, paths)
-    return rnd(emul_sum_num(prod, paths), "float")
+    return _step_acc(0.0 + emul_sum(prod, paths, "float"), "float")
 
 
 def ref_gatv2_accum_grad_al(

@@ -5,8 +5,6 @@
 
 template <FloatingNum T>
 struct AdOps {
-    using packed_t = deduce_packed_type_t<T>;
-
     // Singluar functions
 
     static constexpr __device__ __forceinline__ T log(T a) {
@@ -58,6 +56,11 @@ struct AdOps {
             return cuda::std::fma(a, b, c);
         }
     }
+};
+
+template <FloatingNum T>
+struct AdOpsPacked : AdOps<T> {
+    using packed_t = deduce_packed_type_t<T>;
 
     // Packed functions
     static constexpr __device__ __forceinline__ packed_t packed_neg(packed_t a) {
@@ -108,7 +111,7 @@ struct AdOps {
         if constexpr (is_half_fp_v<T>) {
             return __hadd2(a, b);
         } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, float> && kCudaArch >= 1000) {
-            __fadd2_rn(a, b);
+            return __fadd2_rn(a, b);
         } else {
             return {a.x + b.x, a.y + b.y};
         }
@@ -126,7 +129,7 @@ struct AdOps {
         if constexpr (is_half_fp_v<T>) {
             return __hmul2(a, b);
         } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, float> && kCudaArch >= 1000) {
-            __fmul2_rn(a, b);
+            return __fmul2_rn(a, b);
         } else {
             return {a.x * b.x, a.y * b.y};
         }
@@ -144,7 +147,7 @@ struct AdOps {
         if constexpr (is_half_fp_v<T>) {
             return __hfma2(a, b, c);
         } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, float> && kCudaArch >= 1000) {
-            __ffma2_rn(a, b, c);
+            return __ffma2_rn(a, b, c);
         } else {
             return {a.x * b.x + c.x, a.y * b.y + c.y};
         }

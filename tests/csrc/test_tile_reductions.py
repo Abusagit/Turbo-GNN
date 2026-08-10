@@ -91,7 +91,11 @@ def test_reduction_matches_header_order(bridge, op, n, dtype_name, acc_name, use
         terms = a.double() * b.double() if op.startswith("dot_product") else a.double() * WEIGHT
         assert_sum_fp64(got, ref, terms, dtype_name, label, seed=seed)
     else:
-        assert_exact(got, ref, acc_name, label, ftz=paths.ftz, ftz_name=dtype_name)
+        # bf16 subnormals are f32-subnormal bit patterns, so -ftz applies to them too --
+        # but *whether* one flushes depends on which f32 instruction (if any) touches it,
+        # and a 1.0f*x that the compiler folds away touches nothing. Treat the subnormal
+        # band as don't-care for bf16 just as for float.
+        assert_exact(got, ref, acc_name, label, ftz=paths.ftz or dtype_name == "bf16", ftz_name=dtype_name)
 
 
 @pytest.mark.parametrize("op", ALL_REDUCTIONS)
@@ -118,8 +122,8 @@ def test_reduction_matches_fp64(bridge, op, n, dtype_name):
     label = f"{op} {dtype_name} N={n} vs fp64"
 
     if op.startswith(("sum", "weighted_sum", "dot_product")):
-        # The header accumulates these in num_type (tile.cuh:807), so the error is
-        # bounded in the *narrow* type and scales with the terms, not the result.
+        # The header accumulates these in accum_t; the term-scaled bound in the
+        # *narrow* type is looser than that and so still covers every step.
         terms = (a.double() * b.double()) if op.startswith("dot_product") else a.double()
         seed = ACC_INIT if op.endswith("_acc") else 0.0
         scaled = terms * WEIGHT if op.startswith("weighted_sum") else terms
@@ -162,13 +166,6 @@ def test_minmax_value_form_is_not_clamped_against_zero(bridge, n, dtype_name, wa
 
 
 @pytest.mark.parametrize("dtype_name", ["half", "bf16"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="sum declares `num_type buf_acc{}` (tile.cuh:807), so it accumulates in the "
-    "narrow type even when accum_t is float. With N=8 half terms of 1024 the running "
-    "total leaves half's exactly-representable range and the result is wrong by more "
-    "than rounding. Remove once the accumulator is accum_t.",
-)
 def test_sum_accumulates_in_accum_t(bridge, dtype_name):
     """A wide accum_t should protect the running total from the narrow input type."""
     n = 8

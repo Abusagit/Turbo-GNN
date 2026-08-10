@@ -626,19 +626,15 @@ void read_impl(const torch::Tensor& out, const torch::Tensor& arr, int64_t start
 
 template <size_t N>
 void atomic_impl(const torch::Tensor& ptr, int64_t vec_idx, double scalar, const torch::Tensor& v, int64_t m) {
-    // atomic_add_scaled_f32 stages through Vec<N, float>, so *that* must fit, not just
-    // Vec<N, num_t>. For the 16-bit types at N=8 it cannot be instantiated -- and
-    // SelectTW<256, half> == 8 makes that a reachable configuration, not a hypothetical.
-    if constexpr (vec_fits<N, num_t> && vec_fits<N, float>) {
+    // atomic_add_scaled_f32 stages through Vec<min(N, sizeof(float)), float>, which is
+    // always within the 16-byte cap, so only the input vector itself has to fit.
+    if constexpr (vec_fits<N, num_t>) {
         k_atomic<N><<<grid_for(m, kBlock), kBlock>>>(
             ptr.data_ptr<float>(), vec_idx, static_cast<float>(scalar), cvec_ptr<N>(v), m
         );
         C10_CUDA_CHECK(cudaGetLastError());
     } else {
-        TORCH_CHECK(
-            false, "atomic_add_scaled_f32 is not instantiable for N=", N, " with ", kDtypeName,
-            ": it stages through Vec<", N, ", float>, which exceeds the 16-byte cap"
-        );
+        TORCH_CHECK(false, "atomic_add_scaled_f32 is not instantiable for N=", N, " with ", kDtypeName, ": Vec<N, num_t> exceeds the 16-byte cap");
     }
 }
 

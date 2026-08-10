@@ -13,6 +13,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <variant>
 
@@ -30,7 +31,7 @@
 #define FULL_WARP_MASK 0xffffffff
 #endif
 
-inline constexpr int kWarpSize = 32;
+inline constexpr size_t kWarpSize = 32;
 
 #define CUDA_CHECK(call)                                                       \
   do {                                                                         \

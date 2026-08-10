@@ -1,4 +1,5 @@
-#include "common.cuh"
+// #include "common.cuh"
+#include "common/old_common.cuh"
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
