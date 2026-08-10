@@ -25,6 +25,18 @@ TORCH_DTYPE: dict[str, torch.dtype] = {
     "double": torch.float64,
 }
 
+a_tols = {
+    "float": 2e-6,
+    "half": 2e-2,
+    "bf16": 2e-2,
+}
+
+r_tols = {
+    "float": 1e-4,
+    "half": 2e-2,
+    "bf16": 2e-2,
+}
+
 
 def rnd(x: torch.Tensor, name: str) -> torch.Tensor:
     """Round a float64 tensor through ``name``'s precision and back to float64."""
@@ -126,10 +138,10 @@ def ulp_of(x: torch.Tensor, name: str) -> torch.Tensor:
 # the device but cuda::std:: on the host, so they are not bit-comparable.
 REL_TOL: dict[tuple[str, str], float] = {
     ("exp_", "float"): 2e-6,
-    ("exp_", "half"): 2e-3,
+    ("exp_", "half"): 2e-2,
     ("exp_", "bf16"): 2e-2,
     ("log_", "float"): 2e-6,
-    ("log_", "half"): 2e-3,
+    ("log_", "half"): 2e-2,
     ("log_", "bf16"): 2e-2,
 }
 

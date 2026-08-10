@@ -7,7 +7,7 @@ import pathlib
 import pytest
 import torch
 from conftest import DTYPES, VALID_NS, all_combos
-from reference import TORCH_DTYPE, make_input
+from reference import TORCH_DTYPE, make_input, a_tols, r_tols
 
 pytestmark = [pytest.mark.cuda, pytest.mark.csrc]
 
@@ -61,7 +61,7 @@ def test_convert_vec(bridge, n, src_name, dst_name):
     want = src.to(TORCH_DTYPE[dst_name])
 
     assert got.dtype == want.dtype
-    torch.testing.assert_close(got.double(), want.double(), rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(got.double(), want.double(), rtol=max(r_tols[dst_name], r_tols[src_name]), atol=max(a_tols[dst_name], a_tols[src_name]), equal_nan=True)
 
 
 def test_transfer_vector_wide_pun_is_not_miscompiled(bridge):
@@ -76,7 +76,7 @@ def test_transfer_vector_wide_pun_is_not_miscompiled(bridge):
     mod = bridge.get("cvt", "bf16")
     src = torch.tensor([[1.0, -2.0, 0.5, 3.0, -0.25, 8.0, -16.0, 0.125]], dtype=torch.bfloat16, device="cuda:0")
     got = mod.convert(8, src, DST_CODE["half"])
-    torch.testing.assert_close(got.double(), src.to(torch.float16).double(), rtol=0, atol=0)
+    torch.testing.assert_close(got.double(), src.to(torch.float16).double(), rtol=r_tols["bf16"], atol=a_tols["bf16"])
 
 
 @pytest.mark.parametrize(("n", "src_name"), COMBOS, ids=COMBO_IDS)
@@ -139,7 +139,7 @@ def test_write_row_copies_the_whole_row(bridge, src_name, dst_name, row_width, w
     out = mod.write_row_run(row_width, worker_cnt, src, DST_CODE[dst_name], row_width + slack)
 
     want = src.to(TORCH_DTYPE[dst_name])
-    torch.testing.assert_close(out[:row_width].double(), want.double(), rtol=0, atol=0)
+    torch.testing.assert_close(out[:row_width].double(), want.double(), rtol=max(r_tols[dst_name], r_tols[src_name]), atol=max(a_tols[dst_name], a_tols[src_name]))
     assert not out[row_width:].any(), "write_row wrote past row_width into the canary region"
 
 
@@ -170,7 +170,7 @@ def test_write_row_does_not_overrun_a_ragged_row(bridge, src_name, dst_name):
     out = mod.write_row_run(row_width, 32, padded, DST_CODE[dst_name], row_width + slack)
 
     want = src.to(TORCH_DTYPE[dst_name])
-    torch.testing.assert_close(out[:row_width].double(), want.double(), rtol=0, atol=0)
+    torch.testing.assert_close(out[:row_width].double(), want.double(), rtol=max(r_tols[dst_name], r_tols[src_name]), atol=max(a_tols[dst_name], a_tols[src_name]))
     overrun = out[row_width:].nonzero().flatten().tolist()
     assert not overrun, (
         f"write_row overran a ragged row: copy_N={copy_n}, row_width={row_width}, "

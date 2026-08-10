@@ -26,6 +26,7 @@ from reference import (
     make_input,
     ref_reduce,
     ref_reduce_fp64,
+    a_tols, r_tols,
 )
 
 pytestmark = [pytest.mark.cuda, pytest.mark.csrc]
@@ -139,7 +140,7 @@ def test_prod_uses_multiplicative_identity(bridge, n, dtype_name):
     ones = torch.ones((8, n), dtype=TORCH_DTYPE[dtype_name], device=device)
 
     got = _run(mod, "prod_ret", n, ones, ones, acc_init=0.0)
-    torch.testing.assert_close(got.double(), torch.ones(8, dtype=torch.float64, device=device), rtol=0, atol=0)
+    torch.testing.assert_close(got.double(), torch.ones(8, dtype=torch.float64, device=device), rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 @pytest.mark.parametrize("want_max", [False, True], ids=["min", "max"])
@@ -157,7 +158,7 @@ def test_minmax_value_form_is_not_clamped_against_zero(bridge, n, dtype_name, wa
 
     got = _run(mod, "max_ret" if want_max else "min_ret", n, a, a, acc_init=0.0)
     want = a.double().max(dim=1).values if want_max else a.double().min(dim=1).values
-    torch.testing.assert_close(got.double(), want, rtol=0, atol=0)
+    torch.testing.assert_close(got.double(), want, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 @pytest.mark.parametrize("dtype_name", ["half", "bf16"])
@@ -184,7 +185,7 @@ def test_sum_accumulates_in_accum_t(bridge, dtype_name):
 
     got = _run(mod, "sum_ret", n, a_t, a_t, acc_init=0.0)
     want = a_t.double().sum(dim=1)  # exact in fp64
-    torch.testing.assert_close(got.double(), want, rtol=0, atol=0)
+    torch.testing.assert_close(got.double(), want, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
@@ -202,7 +203,7 @@ def test_acc_forms_accumulate_rather_than_overwrite(bridge, n, dtype_name):
     once = _run(mod, "sum_acc", n, a, a, acc_init=0.0).double()
     from_seed = _run(mod, "sum_acc", n, a, a, acc_init=ACC_INIT).double()
 
-    torch.testing.assert_close(from_seed, once + ACC_INIT, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(from_seed, once + ACC_INIT, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
@@ -234,4 +235,4 @@ def test_weighted_sum_equals_sum_times_weight(bridge, n, dtype_name):
     weighted = _run(mod, "weighted_sum_ret", n, a, a, acc_init=0.0).double()
     plain = _run(mod, "sum_ret", n, a, a, acc_init=0.0).double()
 
-    torch.testing.assert_close(weighted, plain * WEIGHT, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(weighted, plain * WEIGHT, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])

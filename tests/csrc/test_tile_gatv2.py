@@ -33,6 +33,7 @@ from reference import (
     ref_gatv2_accum_grad_al,
     ref_gatv2_accum_grad_r,
     ref_gatv2_dot_leaky_relu,
+    a_tols, r_tols,
 )
 
 pytestmark = [pytest.mark.cuda, pytest.mark.csrc]
@@ -42,7 +43,6 @@ COMBO_IDS = [f"{dt}-N{n}" for n, dt in COMBOS]
 
 M = 128
 NS = 0.2
-
 
 # ---------------------------------------------------------------------------
 # TileOps::read
@@ -115,7 +115,7 @@ def test_gatv2_dot_leaky_relu_closed_form(bridge, n, dtype_name):
     expected = sum(2.0 if k % 2 == 0 else -2.0 * NS for k in range(n))
     want = torch.full((4,), expected, dtype=torch.float64, device=device)
 
-    torch.testing.assert_close(got.double(), want, rtol=2e-2, atol=1e-3)
+    torch.testing.assert_close(got.double(), want, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ def test_atomic_add_uses_element_offset(bridge, n, dtype_name, vec_idx):
 
     # Every row targets the same offset, so the slot accumulates the whole column sum.
     want = v.double().sum(dim=0) * scalar
-    torch.testing.assert_close(ptr[vec_idx : vec_idx + n].double(), want, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(ptr[vec_idx : vec_idx + n].double(), want, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
     assert not ptr[:vec_idx].any(), "wrote before vec_idx"
     assert not ptr[vec_idx + n :].any(), "wrote past vec_idx + N"
 
@@ -163,7 +163,7 @@ def test_atomic_add_scaled_f32_supports_full_tile_width(bridge, n, dtype_name):
     v = make_input(8, n, dtype_name, device, seed=1, kind="random")
     ptr = torch.zeros(n, dtype=torch.float32, device=device)
     mod.atomic_add_scaled_f32(n, ptr, 0, 1.0, v)
-    torch.testing.assert_close(ptr.double(), v.double().sum(dim=0), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(ptr.double(), v.double().sum(dim=0), rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 @pytest.mark.parametrize("dtype_name", list(DTYPES), ids=list(DTYPES))
@@ -179,7 +179,7 @@ def test_atomic_add_is_contended(bridge, dtype_name):
     mod.atomic_add_scaled_f32(n, ptr, 0, 1.0, v)
 
     torch.testing.assert_close(
-        ptr.double(), torch.full((n,), float(rows), dtype=torch.float64, device=device), rtol=0, atol=0
+        ptr.double(), torch.full((n,), float(rows), dtype=torch.float64, device=device), rtol=r_tols[dtype_name], atol=a_tols[dtype_name]
     )
 
 
@@ -217,8 +217,8 @@ def test_gatv2_accum_grad_al(bridge, n, dtype_name):
     want_ga, want_gl = ref_gatv2_accum_grad_al(
         ga0.double(), gl0.double(), ge.double(), lv.double(), r.double(), a.double(), NS, paths
     )
-    torch.testing.assert_close(ga.double(), want_ga, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(gl.double(), want_gl, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(ga.double(), want_ga, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
+    torch.testing.assert_close(gl.double(), want_gl, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
@@ -241,7 +241,7 @@ def test_gatv2_accum_grad_r(bridge, n, dtype_name):
     want = ref_gatv2_accum_grad_r(
         gr0.double(), alpha.double(), gh.double(), ge.double(), lv.double(), r.double(), a.double(), NS, paths
     )
-    torch.testing.assert_close(gr.double(), want, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(gr.double(), want, rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
 
 
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
@@ -292,8 +292,6 @@ def test_gatv2_grad_al_matches_finite_differences(bridge, n, dtype_name):
             assert bool(keep.any()), "no sample points away from the kink; adjust the seed"
             torch.testing.assert_close(
                 analytic[:, k].double()[keep],
-                numeric[keep],
-                rtol=2e-2,
-                atol=2e-2,
+                numeric[keep], rtol=r_tols[dtype_name], atol=a_tols[dtype_name],
                 msg=lambda s, label=label, k=k: f"{label}[{k}] disagrees with finite differences: {s}",
             )

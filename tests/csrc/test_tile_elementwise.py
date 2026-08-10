@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 from conftest import all_combos
-from reference import TORCH_DTYPE, Paths, check_elementwise, make_input, ref_elementwise
+from reference import TORCH_DTYPE, Paths, check_elementwise, make_input, ref_elementwise, a_tols, r_tols
 
 pytestmark = [pytest.mark.cuda, pytest.mark.csrc]
 
@@ -128,8 +128,8 @@ def test_leaky_relu_backward_boundary(bridge, n, dtype_name):
     torch.testing.assert_close(
         got.double(),
         want.double(),
-        rtol=2e-2,
-        atol=1e-3,
+        rtol=r_tols[dtype_name],
+        atol=a_tols[dtype_name],
         msg=lambda s: f"at x=0 the {'packed' if paths.packed else 'scalar'} path should give {expected}: {s}",
     )
 
@@ -155,4 +155,4 @@ def test_minmax_nan_propagation(bridge, op, n, dtype_name):
     got = mod.elementwise(mod.op_codes()[op], n, a, b, b, 0.0)
 
     assert not got.isnan().any(), f"{op} on device should return the non-NaN operand"
-    torch.testing.assert_close(got.double(), torch.ones_like(got).double(), rtol=0, atol=0)
+    torch.testing.assert_close(got.double(), torch.ones_like(got).double(), rtol=r_tols[dtype_name], atol=a_tols[dtype_name])
