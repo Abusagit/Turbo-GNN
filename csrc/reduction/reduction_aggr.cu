@@ -1,4 +1,5 @@
-#include "common.cuh"
+// #include "common.cuh"
+#include "common/old_common.cuh"
 
 template <int WARPS_PER_BLOCK, typename cuda_t, ReductionOp Op, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(

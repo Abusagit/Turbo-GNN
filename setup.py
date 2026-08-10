@@ -18,6 +18,15 @@ FORCE_CXX11_ABI = os.getenv("TURBO_GNN_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
 BASE_WHEEL_URL = "https://github.com/Abusagit/Turbo-GNN/releases/download/{tag_name}/{wheel_name}"
 
+UNDEFINE_FLAGS = [
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -198,7 +207,9 @@ if not SKIP_CUDA_BUILD:
 
         # parallelise inside nvcc too:
         # need nvcc >= 11.2; gate on CUDA 12+ so older toolchains are safe.
-        _nvcc_flags = ["-O3", "--use_fast_math", "--generate-line-info", "-std=c++20"]
+        _nvcc_flags = [
+            "-O3", "--use_fast_math", "--generate-line-info", "-std=c++20",
+        ] + UNDEFINE_FLAGS
         _nvcc_threads = os.getenv("TURBO_GNN_NVCC_THREADS", "4")
         if torch.version.cuda and parse(torch.version.cuda).major >= 12:
             _nvcc_flags += [f"--threads={_nvcc_threads}", f"--split-compile={_nvcc_threads}"]
@@ -219,7 +230,7 @@ if not SKIP_CUDA_BUILD:
                 library_dirs=_extra_libdir,
                 libraries=["cusparse"],
                 extra_compile_args={
-                    "cxx": ["-O3", "-std=c++20"],
+                    "cxx": ["-O3", "-std=c++20"] + UNDEFINE_FLAGS,
                     "nvcc": _nvcc_flags,
                 },
             ),

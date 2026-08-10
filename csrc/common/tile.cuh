@@ -1071,7 +1071,9 @@ static __device__ void write_row(dst_type *const __restrict__ dst, size_t worker
         for (size_t j = 0; j < unroll_k; ++j) {
             const size_t tile_id = worker_cnt * (i * unroll_k + j) + worker_idx;
             if (tile_id * copy_N < row_width) [[likely]] {
-                convert_vec<copy_N, dst_type, src_type>(&reinterpret_cast<dst_vec_type *>(dst)[tile_id], &reinterpret_cast<src_vec_type const *>(src)[tile_id]);
+                convert_vec<copy_N, dst_type, src_type>(
+                    &reinterpret_cast<dst_vec_type *>(dst)[tile_id], &reinterpret_cast<src_vec_type const *>(src)[tile_id]
+                );
             }
         }
     }
@@ -1098,7 +1100,7 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
     static_assert(sizeof(accum_t) >= sizeof(num_type), "Accumulator type must not be smaller than basic num type");
 
     using scal_t = num_type;
-    using vec_t  = Vec<N, num_type>;
+    using vec_t  = VecOpsFloatBase<N, num_type>::vec_t;
     using wide_t = VecOpsFloatBase<N, num_type>::wide_t;
     using ns_t   = decltype(deduce_ns_t());
 
@@ -1107,6 +1109,30 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
     // Common
     static __device__ __forceinline__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
         return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
+    }
+    static __device__ __forceinline__ void write_zero(num_type *const __restrict__ dst_arr, size_t vec_idx) {
+        store_zero(reinterpret_cast<vec_t *>(&dst_arr[vec_idx * TW]));
+    }
+    static __device__ __forceinline__ void write(
+        num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t const *const __restrict__ src_val_ptr
+    ) {
+        *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(src_val_ptr);
+    }
+    static __device__ __forceinline__ void write_convert_to_accum(accum_t *const __restrict__ dst, num_type const *const __restrict__ src) {
+        constexpr size_t compact_N = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
+        constexpr size_t repeat_cnt = N / compact_N;
+
+        for (size_t i = 0; i < repeat_cnt; ++i) {
+            convert_vec<compact_N, accum_t, num_type>(&reinterpret_cast<Vec<compact_N, accum_t> *>(dst)[i], &reinterpret_cast<Vec<compact_N, num_type> const *>(src)[i]);
+        }
+    }
+    static __device__ __forceinline__ void write_convert_from_accum(num_type *const __restrict__ dst, accum_t const *const __restrict__ src) {
+        constexpr size_t compact_N = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
+        constexpr size_t repeat_cnt = N / compact_N;
+
+        for (size_t i = 0; i < repeat_cnt; ++i) {
+            convert_vec<compact_N, num_type, accum_t>(&reinterpret_cast<Vec<compact_N, num_type> *>(dst)[i], &reinterpret_cast<Vec<compact_N, accum_t> const *>(src)[i]);
+        }
     }
 
     // GATv2
