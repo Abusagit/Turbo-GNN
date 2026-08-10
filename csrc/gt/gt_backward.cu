@@ -120,7 +120,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     // vj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
     // warp_gq:   WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)       -- per-warp dQ accumulators
     // warp_gv:   WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)       -- per-warp dV accumulators
-    extern __shared__ uint8_t sh_raw[];
+    extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *qj_shared = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *vj_shared = qj_shared + D_CONST;
     accum_t *warp_gq  = reinterpret_cast<accum_t *>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
@@ -309,7 +309,7 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     //   gk_shared:  D_CONST * sizeof(accum_t)  -- float32 accumulator for dK[d]
     //   gq_shared:  D_CONST * sizeof(accum_t)  -- float32 accumulator for dQ[d]
     //   gv_shared:  D_CONST * sizeof(accum_t)  -- float32 accumulator for dV[d]
-    extern __shared__ uint8_t sh_raw[];
+    extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *const kd_shared  = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *const qd_shared  = kd_shared + D_CONST;
     cuda_t *const vd_shared  = qd_shared + D_CONST;

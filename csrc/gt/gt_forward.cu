@@ -45,23 +45,29 @@ __global__ void __launch_bounds__(WARPS_PER_N * N_PER_BLOCK * kWarpSize) GraphAt
         return;
     }
 
-    const index_t edge_start = row_ptr[node_i];
-    const index_t edge_end   = row_ptr[node_i + 1];
-    const size_t num_neighbors  = static_cast<int>(edge_end - edge_start);
+    const index_t edge_start   = row_ptr[node_i];
+    const index_t edge_end     = row_ptr[node_i + 1];
+    const size_t num_neighbors = static_cast<int>(edge_end - edge_start);
 
-    // Shared memory layout (unchanged):
-    // k_shared[D_CONST] as cuda_t
-    // warp_sum_storage[neighbor_block_size * neighbor_warp_cnt] as accum_t
-    // neighbor_out[neighbor_block_size * D_CONST] as accum_t
-    // neighbor_max[neighbor_block_size] as accum_t
-    // neighbor_sum[neighbor_block_size] as accum_t
-    extern __shared__ uint8_t sh_raw[];
-    cuda_t *const k_shared = reinterpret_cast<cuda_t *>(sh_raw);  // Loading K_i into shared memory, because it's the same in one block
+    // Shared memory layout. Ordered so that every array written through a vector
+    // (Vec<N>/float4) store starts on a 16-byte boundary; the scalar-only arrays go last:
+    // k_shared[D_CONST] as cuda_t                                    -- float4 loads, needs 16B
+    // neighbor_out[neighbor_block_size * D_CONST] as accum_t         -- Vec<compact_N> stores, needs up to 16B
+    // warp_sum_storage[2 * neighbor_block_size * neighbor_warp_cnt] as accum_t -- scalar, double-buffered on (r & 1)
+    // neighbor_max[neighbor_block_size] as accum_t                   -- scalar
+    // neighbor_sum[neighbor_block_size] as accum_t                   -- scalar
+    //
+    // D_CONST * sizeof(cuda_t) is a multiple of 16 for every supported (D, dtype),
+    // so neighbor_out lands 16B-aligned; putting the scalar arrays first would offset
+    // it by a single accum_t and misalign the wide stores below.
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *const k_shared      = reinterpret_cast<cuda_t *>(sh_raw);  // Loading K_i into shared memory, because it's the same in one block
+    accum_t *const neighbor_out = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t));  // Outs for each neighbor in one block
     accum_t *const warp_sum_storage =
-        reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t));  // Space to store warp sums to agregate them later
-    accum_t *const neighbor_out = warp_sum_storage + neighbor_block_size * neighbor_warp_cnt;  // Outs for each neighbor in one block
-    accum_t *const neighbor_max = neighbor_out + neighbor_block_size * D_CONST;   // Space to store local neighbor maximums of scores
-    accum_t *const neighbor_sum = neighbor_max + neighbor_block_size;             // Space to store local neighbor sums of score
+        neighbor_out + neighbor_block_size * D_CONST;  // Space to store warp sums to agregate them later (2 round buffers)
+    accum_t *const neighbor_max =
+        warp_sum_storage + 2 * neighbor_block_size * neighbor_warp_cnt;  // Space to store local neighbor maximums of scores
+    accum_t *const neighbor_sum = neighbor_max + neighbor_block_size;    // Space to store local neighbor sums of score
 
     accum_t *const my_out = neighbor_out + block_neighbor_id * D_CONST;
 
@@ -84,10 +90,10 @@ __global__ void __launch_bounds__(WARPS_PER_N * N_PER_BLOCK * kWarpSize) GraphAt
     if (block_neighbor_id == 0) {
         constexpr size_t ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);  // remainder is guaranteed to be zero
         static_assert(D_CONST % ELEMS_PER_F4 == 0, "Per-head feature dim should be divisible by 8");
-        constexpr size_t NUM_K_LOADS  = D_CONST / ELEMS_PER_F4;
-        cuda_t const *const k_base = K + node_i * stride_k_n + head_h * stride_k_h;
-        float4 const *const k_src  = reinterpret_cast<float4 const *>(k_base);
-        float4 *const k_sh         = reinterpret_cast<float4 *>(k_shared);
+        constexpr size_t NUM_K_LOADS = D_CONST / ELEMS_PER_F4;
+        cuda_t const *const k_base   = K + node_i * stride_k_n + head_h * stride_k_h;
+        float4 const *const k_src    = reinterpret_cast<float4 const *>(k_base);
+        float4 *const k_sh           = reinterpret_cast<float4 *>(k_shared);
         for (size_t i = warp_id * lane_cnt + lane_id; i < NUM_K_LOADS; i += neighbor_warp_cnt * lane_cnt) {
             k_sh[i] = k_src[i];
         }
@@ -102,8 +108,8 @@ __global__ void __launch_bounds__(WARPS_PER_N * N_PER_BLOCK * kWarpSize) GraphAt
     const size_t rounds = (num_neighbors + neighbor_block_size - 1) / neighbor_block_size;
     for (size_t r = 0; r < rounds; ++r) {
         const size_t neighbor_id = r * neighbor_block_size + block_neighbor_id;
-        const bool active     = neighbor_id < num_neighbors;
-        const index_t j       = active ? col_idx[edge_start + neighbor_id] : index_t{0};
+        const bool active        = neighbor_id < num_neighbors;
+        const index_t j          = active ? col_idx[edge_start + neighbor_id] : index_t{0};
 
         const cuda_t *q_base = Q + j * stride_q_n + head_h * stride_q_h;
         const cuda_t *v_base = V + j * stride_v_n + head_h * stride_v_h;
@@ -169,18 +175,20 @@ __global__ void __launch_bounds__(WARPS_PER_N * N_PER_BLOCK * kWarpSize) GraphAt
         }
     }
 
-__syncthreads();
+    __syncthreads();
 
 // write per-warp results to float32 shared
 #pragma unroll
     for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
         const size_t vi = warp_id * lane_cnt + lane_id + lane_cnt * neighbor_warp_cnt * t;
         if (vi < TILES) [[likely]] {
-            constexpr size_t compact_N = std::min(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+            constexpr size_t compact_N  = std::min(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
             constexpr size_t repeat_cnt = TW / compact_N;
 
             for (size_t i = 0; i < repeat_cnt; ++i) {
-                TileOps<compact_N, accum_t>::write(my_out, vi, &reinterpret_cast<Vec<compact_N, accum_t> const *>(o_acc)[t]);
+                TileOps<compact_N, accum_t>::write(
+                    my_out, vi * repeat_cnt + i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(o_acc)[t * repeat_cnt + i]
+                );
             }
         }
     }

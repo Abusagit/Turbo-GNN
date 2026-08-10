@@ -1119,19 +1119,23 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
         *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(src_val_ptr);
     }
     static __device__ __forceinline__ void write_convert_to_accum(accum_t *const __restrict__ dst, num_type const *const __restrict__ src) {
-        constexpr size_t compact_N = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
+        constexpr size_t compact_N  = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
         constexpr size_t repeat_cnt = N / compact_N;
 
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            convert_vec<compact_N, accum_t, num_type>(&reinterpret_cast<Vec<compact_N, accum_t> *>(dst)[i], &reinterpret_cast<Vec<compact_N, num_type> const *>(src)[i]);
+            convert_vec<compact_N, accum_t, num_type>(
+                &reinterpret_cast<Vec<compact_N, accum_t> *>(dst)[i], &reinterpret_cast<Vec<compact_N, num_type> const *>(src)[i]
+            );
         }
     }
     static __device__ __forceinline__ void write_convert_from_accum(num_type *const __restrict__ dst, accum_t const *const __restrict__ src) {
-        constexpr size_t compact_N = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
+        constexpr size_t compact_N  = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
         constexpr size_t repeat_cnt = N / compact_N;
 
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            convert_vec<compact_N, num_type, accum_t>(&reinterpret_cast<Vec<compact_N, num_type> *>(dst)[i], &reinterpret_cast<Vec<compact_N, accum_t> const *>(src)[i]);
+            convert_vec<compact_N, num_type, accum_t>(
+                &reinterpret_cast<Vec<compact_N, num_type> *>(dst)[i], &reinterpret_cast<Vec<compact_N, accum_t> const *>(src)[i]
+            );
         }
     }
 
