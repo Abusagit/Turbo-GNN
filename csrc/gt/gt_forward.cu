@@ -170,7 +170,7 @@ __global__ void __launch_bounds__(WARPS_PER_N * N_PER_BLOCK * kWarpSize) GraphAt
                     o_acc[t * TW + ep] *= correction;
                 }
                 const typename Tile::vec_t vv = Tile::read(v_base, vi);
-                Tile::weighted_sum(&o_acc[t * TW], w, &vv);
+                Tile::weighted_accum(&o_acc[t * TW], w, &vv);
             }
         }
     }

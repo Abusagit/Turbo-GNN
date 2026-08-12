@@ -899,6 +899,33 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         return acc;
     }
 
+    // Weighted accumulate (elementwise): acc[i] += w * src[i].
+    // NOT the same as weighted_sum, which is a reduction (*acc += w * sum(src)). The attention
+    // kernels accumulate a scaled row (V, dO, K, Q) into a per-position accumulator and need the
+    // elementwise form — this is the legacy TileOps::weighted_accum. Each element is one
+    // single-rounding fma in accum_t, matching the legacy fmaf(w, r, acc).
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void weighted_accum(accum_t *const __restrict__ acc, accum_t w, vec_t const *const __restrict__ src) {
+        constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
+        constexpr size_t repeat_cnt = N / compact_N;
+        using vec_compact_t         = Vec<compact_N, num_type>;
+        using FloatOps              = VecOpsFloatBase<compact_N, accum_t>;
+
+        Vec<compact_N, accum_t> w_vec;
+#pragma unroll
+        for (size_t j = 0; j < compact_N; ++j) {
+            w_vec[j] = w;
+        }
+
+        Vec<compact_N, accum_t> src_out;
+#pragma unroll
+        for (size_t i = 0; i < repeat_cnt; ++i) {
+            convert_vec<compact_N, accum_t, num_type>(&src_out, &reinterpret_cast<vec_compact_t const *>(src)[i]);
+            FloatOps::fmaa_(&reinterpret_cast<Vec<compact_N, accum_t> *>(acc)[i], &src_out, &w_vec);
+        }
+    }
+
     // Prod
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))

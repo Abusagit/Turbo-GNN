@@ -213,8 +213,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
             const typename Tile::vec_t dOi = Tile::read(dOi_base, fv);
             const typename Tile::vec_t qj  = Tile::read(qj_shared, fv);
 
-            Tile::weighted_sum(&my_gv[base_f], alpha, &dOi);
-            Tile::weighted_sum(&my_gq[base_f], dS_scaled, &ki);
+            Tile::weighted_accum(&my_gv[base_f], alpha, &dOi);
+            Tile::weighted_accum(&my_gq[base_f], dS_scaled, &ki);
             Tile::atomic_add_scaled_f32(dK_i_base, base_f, dS_scaled, qj);
         }
     }
@@ -438,9 +438,9 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
             const typename Tile::vec_t ks  = Tile::read(ks_base, fv);
             const typename Tile::vec_t dOs = Tile::read(dOs_base, fv);
 
-            Tile::weighted_sum(&gk_shared[base_f], dS_fwd_scaled, &qs);  // dK[d] += dS_fwd * Q[s]
-            Tile::weighted_sum(&gq_shared[base_f], dS_rev_scaled, &ks);  // dQ[d] += dS_rev * K[s]
-            Tile::weighted_sum(&gv_shared[base_f], alpha_rev, &dOs);     // dV[d] += P_rev * dO[s]
+            Tile::weighted_accum(&gk_shared[base_f], dS_fwd_scaled, &qs);  // dK[d] += dS_fwd * Q[s]
+            Tile::weighted_accum(&gq_shared[base_f], dS_rev_scaled, &ks);  // dQ[d] += dS_rev * K[s]
+            Tile::weighted_accum(&gv_shared[base_f], alpha_rev, &dOs);     // dV[d] += P_rev * dO[s]
         }
     }
 
