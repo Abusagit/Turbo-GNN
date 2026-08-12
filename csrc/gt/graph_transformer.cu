@@ -1,7 +1,7 @@
-#include <cstdint>
-
 #include <torch/extension.h>
 #include <torch/torch.h>
+
+#include <cstdint>
 
 #include "gt/gt_backward.cu"
 #include "gt/gt_forward.cu"

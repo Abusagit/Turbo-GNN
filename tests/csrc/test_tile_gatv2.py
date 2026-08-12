@@ -290,8 +290,17 @@ def test_gatv2_grad_al_matches_finite_differences(bridge, n, dtype_name):
             numeric = (e_plus.double() - e_minus.double()) / (2 * eps)
             keep = away_from_kink[:, k]
             assert bool(keep.any()), "no sample points away from the kink; adjust the seed"
+            # Away from the kink the forward is piecewise linear in the perturbed
+            # operand, so the central difference has no truncation error -- but the
+            # f32 rounding of the forward pass itself is amplified by /(2*eps):
+            # |noise| <= (|e_plus| + |e_minus|) * eps32 / (2*eps). Add that floor to
+            # atol; it stays orders of magnitude below the O(1) signal of a wrong
+            # gradient formula.
+            fwd_noise = (
+                (e_plus.double().abs() + e_minus.double().abs()).max() * torch.finfo(torch.float32).eps / (2 * eps)
+            ).item()
             torch.testing.assert_close(
                 analytic[:, k].double()[keep],
-                numeric[keep], rtol=r_tols[dtype_name], atol=a_tols[dtype_name],
+                numeric[keep], rtol=r_tols[dtype_name], atol=a_tols[dtype_name] + fwd_noise,
                 msg=lambda s, label=label, k=k: f"{label}[{k}] disagrees with finite differences: {s}",
             )

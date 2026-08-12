@@ -61,7 +61,7 @@ def test_convert_vec(bridge, n, src_name, dst_name):
     want = src.to(TORCH_DTYPE[dst_name])
 
     assert got.dtype == want.dtype
-    torch.testing.assert_close(got.double(), want.double(), rtol=max(r_tols[dst_name], r_tols[src_name]), atol=max(a_tols[dst_name], a_tols[src_name]), equal_nan=True)
+    torch.testing.assert_close(got.double(), want.double(), rtol=0.0, atol=0.0, equal_nan=True)
 
 
 def test_transfer_vector_wide_pun_is_not_miscompiled(bridge):

@@ -8,27 +8,6 @@
 #include "common/misc.cuh"
 #include "common/traits.cuh"
 
-// ==================================================================================
-// SelectTW: pick widest TW where all threads are working but not wider than 128 bits
-// ==================================================================================
-
-template <int D_CONST, typename cuda_t, int THREADS_PER_D = kWarpSize>
-struct SelectTW {
-   private:
-    static consteval int calculate_tile_width(size_t type_size, size_t d, size_t thread_count) {
-        size_t elems_per_thread = (d + thread_count - 1) / thread_count;
-
-        return std::min(elems_per_thread, 16 / type_size);  // 16 bytes is the most wide load/store
-    }
-
-   public:
-    static_assert(THREADS_PER_D == kWarpSize, "For now only whole warp count can operate on a single row.");
-    static_assert(std::popcount(sizeof(cuda_t)) == 1, "Only types with size of power of 2 are supported.");
-
-    static constexpr int threads_per_d = THREADS_PER_D;
-    static constexpr int value         = calculate_tile_width(sizeof(cuda_t), D_CONST, THREADS_PER_D);
-};
-
 // Vec data struct
 
 template <size_t N, typename num_type>
@@ -42,8 +21,29 @@ struct alignas(sizeof(num_type) * N) Vec {
     num_type data[N];
     using wide_t = deduce_uint_type_t<N * sizeof(num_type)>;
 
-    __device__ __forceinline__ num_type operator[](size_t n) const { return data[n]; }
-    __device__ __forceinline__ num_type& operator[](size_t n) { return data[n]; }
+    __device__ num_type operator[](size_t n) const { return data[n]; }
+    __device__ num_type& operator[](size_t n) { return data[n]; }
+};
+
+// ==================================================================================
+// SelectTW: pick widest TW where all threads are working but not wider than 128 bits
+// ==================================================================================
+
+template <int D_CONST, typename cuda_t, int THREADS_PER_D = kWarpSize>
+struct SelectTW {
+   private:
+    static consteval int calculate_tile_width(size_t type_size, size_t d, size_t thread_count) {
+        size_t elems_per_thread = (d + thread_count - 1) / thread_count;
+
+        return std::min(elems_per_thread, Vec<1, float>::max_vec_size_bytes / type_size);  // 16 bytes is the most wide load/store
+    }
+
+   public:
+    static_assert(THREADS_PER_D == kWarpSize, "For now only whole warp count can operate on a single row.");
+    static_assert(std::popcount(sizeof(cuda_t)) == 1, "Only types with size of power of 2 are supported.");
+
+    static constexpr int threads_per_d = THREADS_PER_D;
+    static constexpr int value         = calculate_tile_width(sizeof(cuda_t), D_CONST, THREADS_PER_D);
 };
 
 // Operations with vecs
@@ -52,7 +52,7 @@ struct VecOpsBase {
     using vec_t  = Vec<N, num_type>;  // TODO: Change to N, num_type
     using wide_t = vec_t::wide_t;
 
-    static __device__ __forceinline__ void store_zero(vec_t *const __restrict__ dst) {
+    static __device__ void store_zero(vec_t *const __restrict__ dst) {
         if constexpr (sizeof(num_type) * N == 1) {
             *reinterpret_cast<uint8_t *>(dst) = 0;
         } else if constexpr (sizeof(num_type) * N == 2) {
@@ -67,24 +67,22 @@ struct VecOpsBase {
             __builtin_unreachable();
         }
     }
-    static constexpr __device__ __forceinline__ vec_t get_zero() { return vec_t{}; };
+    static constexpr __device__ vec_t get_zero() { return vec_t{}; };
 
     // Loads N scalars from src vector to the address, pointed by dst
-    static constexpr __device__ __forceinline__ void load__scalars(num_type *const __restrict__ dst, vec_t const *const __restrict__ src) {
+    static constexpr __device__ void load__scalars(num_type *const __restrict__ dst, vec_t const *const __restrict__ src) {
         *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
     }
     // Loads N scalars from src location to the dst vector
-    static constexpr __device__ __forceinline__ void store_scalars(vec_t *const __restrict__ dst, num_type const *const __restrict__ src) {
+    static constexpr __device__ void store_scalars(vec_t *const __restrict__ dst, num_type const *const __restrict__ src) {
         *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
     }
     // Copies N scalars from src location into dst location
-    static constexpr __device__ __forceinline__ void transfer_scalars(
-        num_type *const __restrict__ dst, num_type const *const __restrict__ src
-    ) {
+    static constexpr __device__ void transfer_scalars(num_type *const __restrict__ dst, num_type const *const __restrict__ src) {
         *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
     }
     // Copies a vector from src to dst
-    static constexpr __device__ __forceinline__ void transfer_vector(vec_t *const __restrict__ dst, vec_t const *const __restrict__ src) {
+    static constexpr __device__ void transfer_vector(vec_t *const __restrict__ dst, vec_t const *const __restrict__ src) {
         *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
     }
 };
@@ -92,10 +90,18 @@ struct VecOpsBase {
 template <size_t N, FloatingNum num_type>
 struct VecOpsFloatBase : VecOpsBase<N, num_type> {
    private:
+    template <typename T>
+    static consteval bool can_be_packed_b() {
+        return is_half_fp_v<T>;
+    }
+    template <typename T>
+    static consteval bool can_be_packed_new_b() {
+        return std::is_same_v<std::remove_cvref_t<T>, float> && kCudaArch >= 1000 || is_half_fp_v<T>;
+    }
+
     // N > 1 is implicit, because of Vec properties
-    static constexpr bool can_be_packed = is_half_fp_v<num_type> && (N % 2 == 0);
-    static constexpr bool can_be_packed_new =
-        ((std::is_same_v<std::remove_cvref_t<num_type>, float> && kCudaArch >= 1000 || is_half_fp_v<num_type>) && (N % 2 == 0));
+    static constexpr bool can_be_packed     = can_be_packed_b<num_type>() && (N % 2 == 0);
+    static constexpr bool can_be_packed_new = can_be_packed_new_b<num_type>() && (N % 2 == 0);
 
     using adops_ = AdOps<num_type>;
 
@@ -109,6 +115,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf, src);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -131,6 +138,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf, src);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -153,6 +161,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf, src);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -173,6 +182,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf, src);
 
         if constexpr (can_be_packed_new) {
+            using adops_      = AdOpsPacked<num_type>;
             using packed_t    = deduce_packed_type_t<num_type>;
             packed_t packed_s = adops::broadcast_scalar_to_packed<num_type, num_type>(s);
 #pragma unroll
@@ -194,6 +204,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf, src);
 
         if constexpr (can_be_packed) {
+            using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
             constexpr packed_t zero = packed_t{};
 
@@ -216,6 +227,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf, src);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
             constexpr packed_t packed_zero{};
             const packed_t packed_ns = adops::broadcast_scalar_to_packed<num_type, num_type>(ns);
@@ -242,6 +254,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf_y, dy);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
             constexpr packed_t packed_zero{};
             const packed_t packed_diff = adops::broadcast_scalar_to_packed<num_type, num_type>(static_cast<num_type>(1.0f) - ns);
@@ -273,6 +286,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -297,6 +311,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -319,6 +334,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -343,6 +359,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -367,6 +384,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -389,6 +407,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -413,6 +432,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -437,6 +457,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -459,6 +480,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -483,6 +505,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -507,6 +530,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -529,6 +553,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -556,6 +581,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf2, src2);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -567,7 +593,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = buf0[i] * buf1[i] + buf2[i];
+                buf0[i] = adops_::fma(buf0[i], buf1[i], buf2[i]);
             }
         }
 
@@ -583,6 +609,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf2, src2);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -594,7 +621,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = buf2[i] * buf1[i] + buf0[i];
+                buf0[i] = adops_::fma(buf2[i], buf1[i], buf0[i]);
             }
         }
 
@@ -611,6 +638,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf2, src2);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -622,7 +650,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = buf0[i] * buf1[i] + buf2[i];
+                buf0[i] = adops_::fma(buf0[i], buf1[i], buf2[i]);
             }
         }
 
@@ -638,6 +666,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf2, src2);
 
         if constexpr (can_be_packed_new) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -649,7 +678,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = buf0[i] * buf1[i] + buf2[i];
+                buf0[i] = adops_::fma(buf0[i], buf1[i], buf2[i]);
             }
         }
 
@@ -664,6 +693,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -688,6 +718,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -710,6 +741,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -734,6 +766,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -758,6 +791,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -780,6 +814,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         transfer_vector(&buf1, src1);
 
         if constexpr (can_be_packed) {
+            using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
@@ -801,29 +836,43 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
     static constexpr __device__ void sum(accum_t *const __restrict__ acc, vec_t const *const __restrict__ src) {
-        num_type buf_acc{};
-        vec_t buf;
+        // Accumulate in accum_t: chunks are widened via convert_vec (exact for accum_t wider than
+        // num_type), then reduced with accum_t arithmetic. 16-bit pair-trees lose low bits on
+        // every step; accum_t accumulation keeps the result within one accum_t rounding.
+        constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
+        constexpr size_t repeat_cnt = N / compact_N;
 
-        transfer_vector(&buf, src);
+        using NumVec   = Vec<compact_N, num_type>;
+        using AccumVec = Vec<compact_N, accum_t>;
 
-        if constexpr (can_be_packed_new && N >= 4) {
-            using packed_t          = deduce_packed_type_t<num_type>;
-            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
+        accum_t buf_acc{};
+        AccumVec buf;
 
 #pragma unroll
-            for (size_t i = 1; i < N / 2; ++i) {
-                double_buf_acc = adops_::packed_add(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
-            }
+        for (size_t j = 0; j < repeat_cnt; ++j) {
+            convert_vec<compact_N, accum_t, num_type>(&buf, &reinterpret_cast<NumVec const *>(src)[j]);
 
-            buf_acc = double_buf_acc.x + double_buf_acc.y;
-        } else {
+            if constexpr (can_be_packed_new && can_be_packed_new_b<accum_t>() && compact_N >= 4) {
+                using AccOps   = AdOpsPacked<accum_t>;
+                using packed_t = deduce_packed_type_t<accum_t>;
+
+                packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
+
 #pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf_acc += buf[i];
+                for (size_t i = 1; i < compact_N / 2; ++i) {
+                    double_buf_acc = AccOps::packed_add(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
+                }
+
+                buf_acc += double_buf_acc.x + double_buf_acc.y;
+            } else {
+#pragma unroll
+                for (size_t i = 0; i < compact_N; ++i) {
+                    buf_acc += buf[i];
+                }
             }
         }
 
-        *acc += static_cast<accum_t>(buf_acc);
+        *acc += buf_acc;
     }
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
@@ -854,25 +903,34 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
     static constexpr __device__ void prod(accum_t *const __restrict__ acc, vec_t const *const __restrict__ src) {
+        constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
+        constexpr size_t repeat_cnt = N / compact_N;
+
+        using NumVec    = Vec<compact_N, num_type>;
+        using AccumVec  = Vec<compact_N, accum_t>;
+        using AccOps    = AdOps<accum_t>;
         accum_t buf_acc = static_cast<accum_t>(1.0f);
-        vec_t buf;
+        AccumVec buf;
 
-        transfer_vector(&buf, src);
+        for (size_t j = 0; j < repeat_cnt; ++j) {
+            convert_vec<compact_N, accum_t, num_type>(&buf, &reinterpret_cast<NumVec const *>(src)[j]);
 
-        if constexpr (can_be_packed_new && N >= 4) {
-            using packed_t          = deduce_packed_type_t<num_type>;
-            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
+            if constexpr (can_be_packed_new && can_be_packed_new_b<accum_t>() && compact_N >= 4) {
+                using AccOps            = AdOpsPacked<accum_t>;
+                using packed_t          = deduce_packed_type_t<accum_t>;
+                packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
 
 #pragma unroll
-            for (size_t i = 1; i < N / 2; ++i) {
-                double_buf_acc = adops_::packed_mul(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
-            }
+                for (size_t i = 1; i < compact_N / 2; ++i) {
+                    double_buf_acc = AccOps::packed_mul(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
+                }
 
-            buf_acc = static_cast<accum_t>(double_buf_acc.x) * static_cast<accum_t>(double_buf_acc.y);
-        } else {
+                buf_acc *= double_buf_acc.x * double_buf_acc.y;
+            } else {
 #pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf_acc *= static_cast<accum_t>(buf[i]);
+                for (size_t i = 0; i < compact_N; ++i) {
+                    buf_acc *= buf[i];
+                }
             }
         }
 
@@ -895,6 +953,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         num_type buf_acc = buf[0];
 
         if constexpr (can_be_packed && N >= 4) {
+            using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
             packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
 
@@ -920,6 +979,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         num_type buf_acc = buf[0];
 
         if constexpr (can_be_packed && N >= 4) {
+            using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
             packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
 
@@ -947,6 +1007,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         num_type buf_acc = buf[0];
 
         if constexpr (can_be_packed && N >= 4) {
+            using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
             packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
 
@@ -972,6 +1033,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         num_type buf_acc = buf[0];
 
         if constexpr (can_be_packed && N >= 4) {
+            using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
             packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
 
@@ -1017,9 +1079,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
 };
 
 template <size_t N, FloatingNum dst_type, FloatingNum src_type>
-constexpr __device__ __forceinline__ void convert_vec(
-    Vec<N, dst_type> *const __restrict__ dst, Vec<N, src_type> const *const __restrict__ src
-) {
+constexpr __device__ void convert_vec(Vec<N, dst_type> *const __restrict__ dst, Vec<N, src_type> const *const __restrict__ src) {
     if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, std::remove_cvref_t<src_type>>) {
         VecOpsFloatBase<N, src_type>::transfer_vector(dst, src);
         return;
@@ -1057,8 +1117,7 @@ constexpr __device__ __forceinline__ void convert_vec(
 // worker_cnt is total numer of workers(threads), working on the whole row
 template <FloatingNum dst_type, FloatingNum src_type, size_t row_width, size_t worker_cnt>
 static __device__ void write_row(dst_type *const __restrict__ dst, size_t worker_idx, src_type const *const __restrict__ src) {
-    constexpr size_t copy_N = Vec<1, src_type>::max_vec_size_bytes / std::max(sizeof(src_type), sizeof(dst_type));
-    __builtin_assume(copy_N % 2 == 0 && copy_N > 1);
+    constexpr size_t copy_N                  = Vec<1, src_type>::max_vec_size_bytes / std::max(sizeof(src_type), sizeof(dst_type));
     constexpr size_t total_copies_per_worker = (row_width + copy_N * worker_cnt - 1) / (copy_N * worker_cnt);
 
     using src_vec_type = Vec<copy_N, src_type>;
@@ -1107,18 +1166,16 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
     static constexpr int TW = N;
 
     // Common
-    static __device__ __forceinline__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
+    static __device__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
         return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
     }
-    static __device__ __forceinline__ void write_zero(num_type *const __restrict__ dst_arr, size_t vec_idx) {
+    static __device__ void write_zero(num_type *const __restrict__ dst_arr, size_t vec_idx) {
         store_zero(reinterpret_cast<vec_t *>(&dst_arr[vec_idx * TW]));
     }
-    static __device__ __forceinline__ void write(
-        num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t const *const __restrict__ src_val_ptr
-    ) {
+    static __device__ void write(num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t const *const __restrict__ src_val_ptr) {
         *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(src_val_ptr);
     }
-    static __device__ __forceinline__ void write_convert_to_accum(accum_t *const __restrict__ dst, num_type const *const __restrict__ src) {
+    static __device__ void write_convert_to_accum(accum_t *const __restrict__ dst, num_type const *const __restrict__ src) {
         constexpr size_t compact_N  = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
         constexpr size_t repeat_cnt = N / compact_N;
 
@@ -1128,7 +1185,7 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
             );
         }
     }
-    static __device__ __forceinline__ void write_convert_from_accum(num_type *const __restrict__ dst, accum_t const *const __restrict__ src) {
+    static __device__ void write_convert_from_accum(num_type *const __restrict__ dst, accum_t const *const __restrict__ src) {
         constexpr size_t compact_N  = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
         constexpr size_t repeat_cnt = N / compact_N;
 
@@ -1140,23 +1197,24 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
     }
 
     // GATv2
-    static __device__ __forceinline__ ns_t make_ns(accum_t ns) {
+    static __device__ ns_t make_ns(accum_t ns) {
         // Static casts to float are temporary. If somebody wants to fix it, be my guest.
         if constexpr (std::is_same_v<half, std::remove_cvref_t<num_type>>) {
-            __float2half2_rn(static_cast<float>(ns));
+            return __float2half2_rn(static_cast<float>(ns));
         } else if constexpr (std::is_same_v<nv_bfloat16, std::remove_cvref_t<num_type>>) {
             return __float2bfloat162_rn(static_cast<float>(ns));
         } else {
             return static_cast<num_type>(ns);
         }
     }
-    static __device__ __forceinline__ accum_t gatv2_dot_leaky_relu(vec_t l, vec_t r, vec_t a, accum_t ns) {
+    static __device__ accum_t gatv2_dot_leaky_relu(vec_t l, vec_t r, vec_t a, accum_t ns) {
         add_(&l, &r);
         leaky_relu_(&l, ns);
         mul_(&l, &a);
+
         return sum<accum_t>(&l);
     }
-    static __device__ __forceinline__ void gatv2_accum_grad_al(
+    static __device__ void gatv2_accum_grad_al(
         accum_t *const __restrict__ ga, accum_t *const __restrict__ gl, accum_t ge, vec_t l, vec_t r, vec_t a, accum_t ns
     ) {
         Vec<N, num_type> ge_vec;
@@ -1177,15 +1235,17 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
 
 #pragma unroll
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            Vec<compact_N, accum_t> l_out, bv_out;
+            Vec<compact_N, accum_t> l_out, bv_out, a_out;
             convert_vec<compact_N, accum_t, num_type>(&l_out, &reinterpret_cast<vec_compact_t const *>(&l)[i]);
             convert_vec<compact_N, accum_t, num_type>(&bv_out, &reinterpret_cast<vec_compact_t const *>(&buf_vec)[i]);
+            convert_vec<compact_N, accum_t, num_type>(&a_out, &reinterpret_cast<vec_compact_t const *>(&a)[i]);
 
+            // ga += (ge * t) * edge,  gl += (ge * t) * a
             FloatOps::fmaa_(&reinterpret_cast<Vec<compact_N, accum_t> *>(ga)[i], &bv_out, &l_out);
-            FloatOps::fmaa_(&reinterpret_cast<Vec<compact_N, accum_t> *>(gl)[i], &bv_out, &l_out);
+            FloatOps::fmaa_(&reinterpret_cast<Vec<compact_N, accum_t> *>(gl)[i], &bv_out, &a_out);
         }
     }
-    static __device__ __forceinline__ void gatv2_accum_grad_r(
+    static __device__ void gatv2_accum_grad_r(
         accum_t *const __restrict__ gr, accum_t alpha, vec_t gh, accum_t ge, vec_t l, vec_t r, vec_t a, accum_t ns
     ) {
         Vec<N, num_type> ge_vec, alpha_vec;
@@ -1214,7 +1274,7 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
         }
     }
     template <FloatingNum atomic_t = float>
-    static __device__ __forceinline__ void atomic_add_scaled_f32(atomic_t *const __restrict__ ptr, size_t vec_idx, atomic_t scalar, vec_t v) {
+    static __device__ void atomic_add_scaled_f32(atomic_t *const __restrict__ ptr, size_t vec_idx, atomic_t scalar, vec_t v) {
         static_assert(std::is_same_v<std::remove_cvref_t<atomic_t>, float>, "atomic add is only implememnted for float atomic type.");
 
         constexpr size_t compact_N  = std::min(N, sizeof(atomic_t));
