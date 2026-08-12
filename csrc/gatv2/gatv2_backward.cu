@@ -134,7 +134,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
         const accum_t e_ij = warp_reduce_sum(e_lane);
         const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        const accum_t alpha_ij = recompute_alpha(e_ij, L_i);
+        const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_partial              = AccumOps::fma(alpha_ij, p_ij, G_partial);
     }
 
@@ -173,7 +173,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
         const accum_t e_ij = warp_reduce_sum(e_lane);
         const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        const accum_t alpha_ij  = recompute_alpha(e_ij, L_i);
+        const accum_t alpha_ij  = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         const accum_t grad_e_ij = alpha_ij * (p_ij - G_i_h);
 
 #pragma unroll
@@ -333,7 +333,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
         const accum_t e_ij = warp_reduce_sum(e_lane);
         const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        const accum_t alpha_ij  = recompute_alpha(e_ij, L_i_h);
+        const accum_t alpha_ij  = OnlineSoftmaxState::recompute_alpha(e_ij, L_i_h);
         const accum_t grad_e_ij = alpha_ij * (p_ij - G_i_h);
 
 #pragma unroll
@@ -526,7 +526,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
         const accum_t e_ij = warp_reduce_sum(e_lane);
         const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        const accum_t alpha_ij = recompute_alpha(e_ij, L_i);
+        const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_i_h                  = AccumOps::fma(alpha_ij, p_ij, G_i_h);
     }
 
@@ -687,13 +687,13 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
         const accum_t p_rev = warp_reduce_sum(p_rev_lane);
 
         // Forward: alpha(i,j), grad_e(i,j)
-        const accum_t alpha_fwd  = recompute_alpha(e_fwd, L_i);
+        const accum_t alpha_fwd  = OnlineSoftmaxState::recompute_alpha(e_fwd, L_i);
         const accum_t grad_e_fwd = alpha_fwd * (p_fwd - G_i_h);
 
         // Reverse: alpha(j,i), grad_e(j,i) — uses L[j] and G[j]
         const accum_t L_j        = d_logsumexp[neighbor_j * H + head_h];
         const accum_t G_j_h      = d_G[neighbor_j * H + head_h];
-        const accum_t alpha_rev  = recompute_alpha(e_rev, L_j);
+        const accum_t alpha_rev  = OnlineSoftmaxState::recompute_alpha(e_rev, L_j);
         const accum_t grad_e_rev = alpha_rev * (p_rev - G_j_h);
 
 // Accumulate gradients
