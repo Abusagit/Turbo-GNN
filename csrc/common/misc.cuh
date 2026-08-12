@@ -51,12 +51,12 @@ inline constexpr int kCudaArch       = 0;
 // CUDA comparison operators -- pytorch disables them
 // ============================================================================
 #ifdef __CUDA_NO_HALF_OPERATORS__
-__device__ __forceinline__ bool operator<(const __half& a, const __half& b) { return __hlt(a, b); }
-__device__ __forceinline__ bool operator>(const __half& a, const __half& b) { return __hgt(a, b); }
-__device__ __forceinline__ bool operator<=(const __half& a, const __half& b) { return __hle(a, b); }
-__device__ __forceinline__ bool operator>=(const __half& a, const __half& b) { return __hge(a, b); }
-__device__ __forceinline__ bool operator==(const __half& a, const __half& b) { return __heq(a, b); }
-__device__ __forceinline__ bool operator!=(const __half& a, const __half& b) { return __hne(a, b); }
+__device__ __forceinline__ bool operator<(const __half a, const __half b) { return __hlt(a, b); }
+__device__ __forceinline__ bool operator>(const __half a, const __half b) { return __hgt(a, b); }
+__device__ __forceinline__ bool operator<=(const __half a, const __half b) { return __hle(a, b); }
+__device__ __forceinline__ bool operator>=(const __half a, const __half b) { return __hge(a, b); }
+__device__ __forceinline__ bool operator==(const __half a, const __half b) { return __heq(a, b); }
+__device__ __forceinline__ bool operator!=(const __half a, const __half b) { return __hne(a, b); }
 #endif
 
 // Helper to extract typed pointer from tensor using untyped data_ptr()
@@ -76,54 +76,6 @@ index_t *index_ptr_mut(at::Tensor& t) {
 inline bool is_supported_index_type(at::ScalarType type) {
     return type == at::kInt || type == at::kLong || type == c10::ScalarType::UInt32 || type == c10::ScalarType::UInt64;
 }
-
-// // float --> CUDA type
-// template <typename cuda_t>
-// constexpr __device__ __forceinline__ cuda_t make_cuda_value(float val);
-
-// template <>
-// constexpr __device__ __forceinline__ float make_cuda_value<float>(float val) {
-//     return val;
-// }
-
-// template <>
-// constexpr __device__ __forceinline__ double make_cuda_value<double>(float val) {
-//     return static_cast<double>(val);
-// }
-
-// template <>
-// constexpr __device__ __forceinline__ __half make_cuda_value<__half>(float val) {
-//     return __float2half(val);
-// }
-
-// template <>
-// constexpr __device__ __forceinline__ __nv_bfloat16 make_cuda_value<__nv_bfloat16>(float val) {
-//     return __float2bfloat16(val);
-// }
-
-// // CUDA type --> float
-// template <typename cuda_t>
-// constexpr __device__ __forceinline__ float cuda_to_float(cuda_t val);
-
-// template <>
-// constexpr __device__ __forceinline__ float cuda_to_float<float>(float val) {
-//     return val;
-// }
-
-// template <>
-// constexpr __device__ __forceinline__ float cuda_to_float<double>(double val) {
-//     return static_cast<float>(val);
-// }
-
-// template <>
-// constexpr __device__ __forceinline__ float cuda_to_float<__half>(__half val) {
-//     return __half2float(val);
-// }
-
-// template <>
-// constexpr __device__ __forceinline__ float cuda_to_float<__nv_bfloat16>(__nv_bfloat16 val) {
-//     return __bfloat162float(val);
-// }
 
 // Warp reductions
 
@@ -161,55 +113,15 @@ struct OnlineSoftmaxState {
     }
 
     __device__ float get_alpha(float logit) const { return __expf(logit - max_val) / sum_exp; }
+
+    // FlashAttention logsumexp trick
+    static __device__ __forceinline__ float recompute_alpha(
+        float e_ij,  // logit
+        float L_i    // saved log-sum-exp
+    ) {
+        return __expf(e_ij - L_i);
+    }
 };
-
-// FlashAttention logsumexp trick
-__device__ __forceinline__ float recompute_alpha(
-    float e_ij,  // logit
-    float L_i    // saved log-sum-exp
-) {
-    return __expf(e_ij - L_i);
-}
-
-constexpr __device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
-    float acc = a.x * b.x;
-
-    acc = fmaf(a.y, b.y, acc);
-    acc = fmaf(a.z, b.z, acc);
-    acc = fmaf(a.w, b.w, acc);
-
-    return acc;
-}
-
-constexpr __device__ __forceinline__ float leaky_relu_elementwise(float x, float negative_slope) { return (x >= 0.0f) ? x : negative_slope * x; }
-
-constexpr __device__ __forceinline__ float leaky_relu_der_elementwise(float x, float negative_slope) { return (x >= 0.0f) ? 1.0f : negative_slope; }
-
-constexpr __device__ __forceinline__ float4 f4_leaky_relu_der(float4 edge, float ns) {
-    return float4{
-        leaky_relu_der_elementwise(edge.x, ns),
-        leaky_relu_der_elementwise(edge.y, ns),
-        leaky_relu_der_elementwise(edge.z, ns),
-        leaky_relu_der_elementwise(edge.w, ns)
-    };
-}
-
-constexpr __device__ __forceinline__ float4 f4_add(float4 a, float4 b) { return float4{a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w}; }
-constexpr __device__ __forceinline__ float4 f4_mul(float4 a, float4 b) { return float4{a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w}; }
-
-__device__ __forceinline__ void f4_fma(float4& acc, float s, float4 v) {
-    acc.x = fmaf(s, v.x, acc.x);
-    acc.y = fmaf(s, v.y, acc.y);
-    acc.z = fmaf(s, v.z, acc.z);
-    acc.w = fmaf(s, v.w, acc.w);
-}
-
-__device__ __forceinline__ void f4_fma_vec(float4& acc, float4 s, float4 v) {
-    acc.x = fmaf(s.x, v.x, acc.x);
-    acc.y = fmaf(s.y, v.y, acc.y);
-    acc.z = fmaf(s.z, v.z, acc.z);
-    acc.w = fmaf(s.w, v.w, acc.w);
-}
 
 // =============================================================================
 // ReductionOps<Op> — compile-time traits for min/max reduction kernels
@@ -222,7 +134,7 @@ struct ReductionOps;
 
 template <>
 struct ReductionOps<ReductionOp::MIN> {
-    static constexpr float IDENTITY                     = INFINITY;  // +inf
+    static constexpr float IDENTITY           = INFINITY;  // +inf
     static constexpr uint64_t PACKED_IDENTITY = 0xff800000ffffffffULL;
 
     template <typename cuda_t>
@@ -239,7 +151,7 @@ struct ReductionOps<ReductionOp::MIN> {
 
 template <>
 struct ReductionOps<ReductionOp::MAX> {
-    static constexpr float IDENTITY                     = -INFINITY;  // -inf
+    static constexpr float IDENTITY           = -INFINITY;  // -inf
     static constexpr uint64_t PACKED_IDENTITY = 0x007fffffffffffffULL;
 
     template <typename cuda_t>
