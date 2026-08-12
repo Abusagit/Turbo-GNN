@@ -1,5 +1,4 @@
-// #include "common.cuh"
-
+#include "common.cuh"
 #include "gatv2/gatv2_backward.cu"
 #include "gatv2/gatv2_forward.cu"
 

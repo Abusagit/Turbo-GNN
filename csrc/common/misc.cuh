@@ -77,53 +77,53 @@ inline bool is_supported_index_type(at::ScalarType type) {
     return type == at::kInt || type == at::kLong || type == c10::ScalarType::UInt32 || type == c10::ScalarType::UInt64;
 }
 
-// float --> CUDA type
-template <typename cuda_t>
-__device__ __forceinline__ cuda_t make_cuda_value(float val);
+// // float --> CUDA type
+// template <typename cuda_t>
+// constexpr __device__ __forceinline__ cuda_t make_cuda_value(float val);
 
-template <>
-__device__ __forceinline__ float make_cuda_value<float>(float val) {
-    return val;
-}
+// template <>
+// constexpr __device__ __forceinline__ float make_cuda_value<float>(float val) {
+//     return val;
+// }
 
-template <>
-__device__ __forceinline__ double make_cuda_value<double>(float val) {
-    return static_cast<double>(val);
-}
+// template <>
+// constexpr __device__ __forceinline__ double make_cuda_value<double>(float val) {
+//     return static_cast<double>(val);
+// }
 
-template <>
-__device__ __forceinline__ __half make_cuda_value<__half>(float val) {
-    return __float2half(val);
-}
+// template <>
+// constexpr __device__ __forceinline__ __half make_cuda_value<__half>(float val) {
+//     return __float2half(val);
+// }
 
-template <>
-__device__ __forceinline__ __nv_bfloat16 make_cuda_value<__nv_bfloat16>(float val) {
-    return __float2bfloat16(val);
-}
+// template <>
+// constexpr __device__ __forceinline__ __nv_bfloat16 make_cuda_value<__nv_bfloat16>(float val) {
+//     return __float2bfloat16(val);
+// }
 
-// CUDA type --> float
-template <typename cuda_t>
-__device__ __forceinline__ float cuda_to_float(cuda_t val);
+// // CUDA type --> float
+// template <typename cuda_t>
+// constexpr __device__ __forceinline__ float cuda_to_float(cuda_t val);
 
-template <>
-__device__ __forceinline__ float cuda_to_float<float>(float val) {
-    return val;
-}
+// template <>
+// constexpr __device__ __forceinline__ float cuda_to_float<float>(float val) {
+//     return val;
+// }
 
-template <>
-__device__ __forceinline__ float cuda_to_float<double>(double val) {
-    return static_cast<float>(val);
-}
+// template <>
+// constexpr __device__ __forceinline__ float cuda_to_float<double>(double val) {
+//     return static_cast<float>(val);
+// }
 
-template <>
-__device__ __forceinline__ float cuda_to_float<__half>(__half val) {
-    return __half2float(val);
-}
+// template <>
+// constexpr __device__ __forceinline__ float cuda_to_float<__half>(__half val) {
+//     return __half2float(val);
+// }
 
-template <>
-__device__ __forceinline__ float cuda_to_float<__nv_bfloat16>(__nv_bfloat16 val) {
-    return __bfloat162float(val);
-}
+// template <>
+// constexpr __device__ __forceinline__ float cuda_to_float<__nv_bfloat16>(__nv_bfloat16 val) {
+//     return __bfloat162float(val);
+// }
 
 // Warp reductions
 
@@ -171,7 +171,7 @@ __device__ __forceinline__ float recompute_alpha(
     return __expf(e_ij - L_i);
 }
 
-__device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
+constexpr __device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
     float acc = a.x * b.x;
 
     acc = fmaf(a.y, b.y, acc);
@@ -181,21 +181,21 @@ __device__ __forceinline__ float dot_product_f4(float4 a, float4 b) {
     return acc;
 }
 
-__device__ __forceinline__ float leaky_relu_elementwise(float x, float negative_slope) { return (x >= 0.0f) ? x : negative_slope * x; }
+constexpr __device__ __forceinline__ float leaky_relu_elementwise(float x, float negative_slope) { return (x >= 0.0f) ? x : negative_slope * x; }
 
-__device__ __forceinline__ float leaky_relu_der_elementwise(float x, float negative_slope) { return (x >= 0.0f) ? 1.0f : negative_slope; }
+constexpr __device__ __forceinline__ float leaky_relu_der_elementwise(float x, float negative_slope) { return (x >= 0.0f) ? 1.0f : negative_slope; }
 
-__device__ __forceinline__ float4 f4_leaky_relu_der(float4 edge, float ns) {
-    return make_float4(
+constexpr __device__ __forceinline__ float4 f4_leaky_relu_der(float4 edge, float ns) {
+    return float4{
         leaky_relu_der_elementwise(edge.x, ns),
         leaky_relu_der_elementwise(edge.y, ns),
         leaky_relu_der_elementwise(edge.z, ns),
         leaky_relu_der_elementwise(edge.w, ns)
-    );
+    };
 }
 
-__device__ __forceinline__ float4 f4_add(float4 a, float4 b) { return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }
-__device__ __forceinline__ float4 f4_mul(float4 a, float4 b) { return make_float4(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
+constexpr __device__ __forceinline__ float4 f4_add(float4 a, float4 b) { return float4{a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w}; }
+constexpr __device__ __forceinline__ float4 f4_mul(float4 a, float4 b) { return float4{a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w}; }
 
 __device__ __forceinline__ void f4_fma(float4& acc, float s, float4 v) {
     acc.x = fmaf(s, v.x, acc.x);
@@ -223,7 +223,7 @@ struct ReductionOps;
 template <>
 struct ReductionOps<ReductionOp::MIN> {
     static constexpr float IDENTITY                     = INFINITY;  // +inf
-    static constexpr unsigned long long PACKED_IDENTITY = 0xff800000ffffffffULL;
+    static constexpr uint64_t PACKED_IDENTITY = 0xff800000ffffffffULL;
 
     template <typename cuda_t>
     static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) {
@@ -232,15 +232,15 @@ struct ReductionOps<ReductionOp::MIN> {
 
     static __device__ __forceinline__ bool is_better_f(float a, float b) { return a < b; }
 
-    static __device__ __forceinline__ unsigned long long atomic_reduce(unsigned long long *addr, unsigned long long val) {
-        return atomicMin(addr, val);
+    static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
+        return atomicMin(reinterpret_cast<unsigned long long *>(addr), val);
     }
 };
 
 template <>
 struct ReductionOps<ReductionOp::MAX> {
     static constexpr float IDENTITY                     = -INFINITY;  // -inf
-    static constexpr unsigned long long PACKED_IDENTITY = 0x007fffffffffffffULL;
+    static constexpr uint64_t PACKED_IDENTITY = 0x007fffffffffffffULL;
 
     template <typename cuda_t>
     static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) {
@@ -249,8 +249,8 @@ struct ReductionOps<ReductionOp::MAX> {
 
     static __device__ __forceinline__ bool is_better_f(float a, float b) { return a > b; }
 
-    static __device__ __forceinline__ unsigned long long atomic_reduce(unsigned long long *addr, unsigned long long val) {
-        return atomicMax(addr, val);
+    static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
+        return atomicMax(reinterpret_cast<unsigned long long *>(addr), val);
     }
 };
 

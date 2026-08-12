@@ -1,12 +1,14 @@
 #pragma once
 
-#include "common/tile.cuh"
+#include <cstdint>
+
+#include "common.cuh"
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
     size_t N,
     size_t H,
@@ -32,10 +34,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
     constexpr int ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                                                  // Accumulatores used by one thread
 
-    using Tile = TileOps<TW, cuda_t>;
+    using AccumOps = AdOps<accum_t>;
+    using Tile     = TileOps<TW, cuda_t, accum_t>;
 
     using vec_t = typename Tile::vec_t;
-    using ns_t  = typename Tile::ns_t;
 
     const int node_i  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
@@ -70,16 +72,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
 
     // Shared memory layout:
     //   l_sh:      D_CONST * sizeof(cuda_t)                        -- read-only
-    //   warp_out:  WARPS_PER_BLOCK * D_CONST * sizeof(float)       -- per-warp output accum
-    //   warp_max:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax max
-    //   warp_sum:  WARPS_PER_BLOCK * sizeof(float)                 -- per-warp softmax sum_exp
-    extern __shared__ uint8_t sh_raw[];
-    cuda_t *l_sh    = reinterpret_cast<cuda_t *>(sh_raw);
-    float *warp_out = reinterpret_cast<float *>(sh_raw + D_CONST * sizeof(cuda_t));
-    float *warp_max = warp_out + WARPS_PER_BLOCK * D_CONST;
-    float *warp_sum = warp_max + WARPS_PER_BLOCK;
+    //   warp_out:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)     -- per-warp output accum
+    //   warp_max:  WARPS_PER_BLOCK * sizeof(accum_t)               -- per-warp softmax max
+    //   warp_sum:  WARPS_PER_BLOCK * sizeof(accum_t)               -- per-warp softmax sum_exp
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *l_sh      = reinterpret_cast<cuda_t *>(sh_raw);
+    accum_t *warp_out = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t));
+    accum_t *warp_max = warp_out + WARPS_PER_BLOCK * D_CONST;
+    accum_t *warp_sum = warp_max + WARPS_PER_BLOCK;
 
-    float *my_out = warp_out + warp_id * D_CONST;
+    accum_t *my_out = warp_out + warp_id * D_CONST;
 
     // Cooperative load of l into shared memory using all threads
     {
@@ -92,13 +94,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     }
     __syncthreads();
 
-    ns_t ns = Tile::make_ns(negative_slope);
-
     // Per-warp register accumulators
-    float h_acc[ACCS_PER_THREAD];
+    accum_t h_acc[ACCS_PER_THREAD];
 #pragma unroll
     for (int i = 0; i < ACCS_PER_THREAD; ++i) {
-        h_acc[i] = 0.f;
+        h_acc[i] = accum_t{};
     }
 
     OnlineSoftmaxState softmax_state;
@@ -108,32 +108,32 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
         index_t neighbor_j   = d_col_idx[edge_start + static_cast<index_t>(k)];
         const cuda_t *r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
 
-        float dot_lane = 0.f;
+        accum_t dot_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv = Tile::load(l_sh, v);
-                vec_t rv = Tile::load(r_base, v);
-                vec_t av = Tile::load(a_base, v);
-                dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+                const vec_t lv = Tile::read(l_sh, v);
+                const vec_t rv = Tile::read(r_base, v);
+                const vec_t av = Tile::read(a_base, v);
+                dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
             }
         }
-        float dot = warp_reduce_sum(dot_lane);
+        const accum_t dot = warp_reduce_sum(dot_lane);
 
-        float rescale = softmax_state.update(dot);
+        const accum_t rescale = softmax_state.update(dot);
 #pragma unroll
         for (int i = 0; i < ACCS_PER_THREAD; ++i) {
             h_acc[i] *= rescale;
         }
 
-        float contrib = __expf(dot - softmax_state.max_val);
+        const accum_t contrib = AccumOps::exp(dot - softmax_state.max_val);
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t rv = Tile::load(r_base, v);
-                Tile::weighted_accum(&h_acc[t * TW], contrib, rv);
+                const vec_t rv = Tile::read(r_base, v);
+                Tile::weighted_accum(&h_acc[t * TW], contrib, &rv);
             }
         }
     }
@@ -141,9 +141,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
 // Write per-warp results to shared memory
 #pragma unroll
     for (int t = 0; t < TILES_PER_THREAD; ++t) {
-        int v = lane + kWarpSize * t;
+        const int v = lane + kWarpSize * t;
         if (v < TILES) {
-            Tile::write_float(my_out, v, &h_acc[t * TW]);
+            constexpr size_t compact_N  = std::min<size_t>(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+            constexpr size_t repeat_cnt = TW / compact_N;
+#pragma unroll
+            for (size_t i = 0; i < repeat_cnt; ++i) {
+                TileOps<compact_N, accum_t>::write(
+                    my_out, v * repeat_cnt + i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(h_acc)[t * repeat_cnt + i]
+                );
+            }
         }
     }
 
@@ -155,25 +162,25 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
 
     // Cross-warp online-softmax reduction (warp 0 only)
     if (warp_id == 0) {
-        float global_max = -FLT_MAX;
-        float global_sum = 0.0f;
-        float inv_sum    = 0.0f;
+        accum_t global_max = -FLT_MAX;
+        accum_t global_sum{};
+        accum_t inv_sum{};
 
         if (lane == 0) {
 #pragma unroll
             for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                global_max = fmaxf(global_max, warp_max[w]);
+                global_max = AccumOps::max(global_max, warp_max[w]);
             }
 #pragma unroll
             for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                global_sum = fmaf(warp_sum[w], __expf(warp_max[w] - global_max), global_sum);
+                global_sum = AccumOps::fma(warp_sum[w], AccumOps::exp(warp_max[w] - global_max), global_sum);
             }
 #pragma unroll
             for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                warp_sum[w] = __expf(warp_max[w] - global_max);
+                warp_sum[w] = AccumOps::exp(warp_max[w] - global_max);
             }
             inv_sum                                       = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
-            d_logsumexp_out[(int64_t)node_i * H + head_h] = (global_sum > 0.0f) ? (global_max + logf(global_sum)) : -INFINITY;
+            d_logsumexp_out[(int64_t)node_i * H + head_h] = (global_sum > 0.0f) ? (global_max + AccumOps::log(global_sum)) : -INFINITY;
         }
 
         inv_sum = __shfl_sync(FULL_WARP_MASK, inv_sum, 0);
@@ -183,18 +190,18 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                float combined[TW];
+                accum_t combined[TW];
 #pragma unroll
                 for (int ep = 0; ep < TW; ++ep) {
-                    combined[ep] = 0.0f;
-                    int d_idx    = v * TW + ep;
+                    combined[ep]    = accum_t{};
+                    const int d_idx = v * TW + ep;
 #pragma unroll
                     for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-                        combined[ep] = fmaf(warp_sum[w], warp_out[w * D_CONST + d_idx], combined[ep]);
+                        combined[ep] = AccumOps::fma(warp_sum[w], warp_out[w * D_CONST + d_idx], combined[ep]);
                     }
                     combined[ep] *= inv_sum;
                 }
-                Tile::write_typed(h_out_base, v, combined);
+                Tile::write_convert_from_accum(&h_out_base[v * TW], combined);
             }
         }
     }

@@ -1,11 +1,13 @@
 #pragma once
 
-#include "common/tile.cuh"
+#include <cstdint>
+
+#include "common.cuh"
 
 // =============================================================================
 // Unified GATv2 Backward AL kernel (computes grad_a, grad_l, G)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -24,16 +26,18 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
     constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
 
-    using Tile  = TileOps<TW, cuda_t>;
-    using vec_t = typename Tile::vec_t;
-    using ns_t  = typename Tile::ns_t;
+    using AccumOps = AdOps<accum_t>;
+    using Tile     = TileOps<TW, cuda_t, accum_t>;
+    using vec_t    = typename Tile::vec_t;
 
     const int node_i  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
     const int warp_id = threadIdx.x / kWarpSize;
     const int lane    = threadIdx.x % kWarpSize;
 
-    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) [[unlikely]] {
+        return;
+    }
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -42,20 +46,20 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // Shared memory layout:
     //   li_sh:      D_CONST * sizeof(cuda_t)                       -- read-only
     //   ghi_sh:     D_CONST * sizeof(cuda_t)                       -- read-only
-    //   warp_grada: WARPS_PER_BLOCK * D_CONST * sizeof(float)      -- per-warp
-    //   warp_gradl: WARPS_PER_BLOCK * D_CONST * sizeof(float)      -- per-warp
-    //   warp_G:     WARPS_PER_BLOCK * sizeof(float)                -- per-warp G partial
-    //   G_broadcast: sizeof(float)                                  -- broadcast slot
-    extern __shared__ uint8_t sh_raw[];
-    cuda_t *li_sh      = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *ghi_sh     = li_sh + D_CONST;
-    float *warp_grada  = reinterpret_cast<float *>(ghi_sh + D_CONST);
-    float *warp_gradl  = warp_grada + WARPS_PER_BLOCK * D_CONST;
-    float *warp_G      = warp_gradl + WARPS_PER_BLOCK * D_CONST;
-    float *G_broadcast = warp_G + WARPS_PER_BLOCK;
+    //   warp_grada: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
+    //   warp_gradl: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
+    //   warp_G:     WARPS_PER_BLOCK * sizeof(accum_t)              -- per-warp G partial
+    //   G_broadcast: sizeof(accum_t)                               -- broadcast slot
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *li_sh        = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *ghi_sh       = li_sh + D_CONST;
+    accum_t *warp_grada  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
+    accum_t *warp_gradl  = warp_grada + WARPS_PER_BLOCK * D_CONST;
+    accum_t *warp_G      = warp_gradl + WARPS_PER_BLOCK * D_CONST;
+    accum_t *G_broadcast = warp_G + WARPS_PER_BLOCK;
 
-    float *my_grada = warp_grada + warp_id * D_CONST;
-    float *my_gradl = warp_gradl + warp_id * D_CONST;
+    accum_t *my_grada = warp_grada + warp_id * D_CONST;
+    accum_t *my_gradl = warp_gradl + warp_id * D_CONST;
 
     cuda_t *grad_l_base = grad_l + ((int64_t)(node_i * H + head_h) * D_CONST);
     float *grad_a_base  = grad_a + ((int64_t)(node_i * H + head_h) * D_CONST);
@@ -78,7 +82,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
         return;
     }
 
-    float L_i = d_logsumexp[node_i * H + head_h];
+    const accum_t L_i = d_logsumexp[node_i * H + head_h];
 
     const cuda_t *li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
@@ -106,41 +110,39 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     }
     __syncthreads();
 
-    ns_t ns = Tile::make_ns(negative_slope);
-
     // pass 1: compute G_{i,h} = sum_j alpha_ij * <grad_h_i, r_j> (warp-strided)
-    float G_partial = 0.f;
+    accum_t G_partial{};
 
     for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
         index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
         const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
 
-        float e_lane = 0.f;
-        float p_lane = 0.f;
+        accum_t e_lane{};
+        accum_t p_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv  = Tile::load(li_sh, v);
-                vec_t rv  = Tile::load(rj_base, v);
-                vec_t av  = Tile::load(a_base, v);
-                vec_t ghv = Tile::load(ghi_sh, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
-                p_lane += Tile::dot_product(ghv, rv);
+                const vec_t lv  = Tile::read(li_sh, v);
+                const vec_t rv  = Tile::read(rj_base, v);
+                const vec_t av  = Tile::read(a_base, v);
+                const vec_t ghv = Tile::read(ghi_sh, v);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
+                Tile::dot_product(&p_lane, &ghv, &rv);
             }
         }
-        float e_ij = warp_reduce_sum(e_lane);
-        float p_ij = warp_reduce_sum(p_lane);
+        const accum_t e_ij = warp_reduce_sum(e_lane);
+        const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        float alpha_ij = recompute_alpha(e_ij, L_i);
-        G_partial      = fmaf(alpha_ij, p_ij, G_partial);
+        const accum_t alpha_ij = recompute_alpha(e_ij, L_i);
+        G_partial              = AccumOps::fma(alpha_ij, p_ij, G_partial);
     }
 
     // Cross-warp reduction for G
     if (lane == 0) warp_G[warp_id] = G_partial;
     __syncthreads();
 
-    float G_i_h = 0.f;
+    accum_t G_i_h{};
     if (warp_id == 0 && lane == 0) {
         for (int w = 0; w < WARPS_PER_BLOCK; ++w) G_i_h += warp_G[w];
         *G_broadcast             = G_i_h;
@@ -154,34 +156,34 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
         index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
         const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
 
-        float e_lane = 0.f;
-        float p_lane = 0.f;
+        accum_t e_lane{};
+        accum_t p_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv  = Tile::load(li_sh, v);
-                vec_t rv  = Tile::load(rj_base, v);
-                vec_t av  = Tile::load(a_base, v);
-                vec_t ghv = Tile::load(ghi_sh, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
-                p_lane += Tile::dot_product(ghv, rv);
+                const vec_t lv  = Tile::read(li_sh, v);
+                const vec_t rv  = Tile::read(rj_base, v);
+                const vec_t av  = Tile::read(a_base, v);
+                const vec_t ghv = Tile::read(ghi_sh, v);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
+                Tile::dot_product(&p_lane, &ghv, &rv);
             }
         }
-        float e_ij = warp_reduce_sum(e_lane);
-        float p_ij = warp_reduce_sum(p_lane);
+        const accum_t e_ij = warp_reduce_sum(e_lane);
+        const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        float alpha_ij  = recompute_alpha(e_ij, L_i);
-        float grad_e_ij = alpha_ij * (p_ij - G_i_h);
+        const accum_t alpha_ij  = recompute_alpha(e_ij, L_i);
+        const accum_t grad_e_ij = alpha_ij * (p_ij - G_i_h);
 
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv   = Tile::load(li_sh, v);
-                vec_t rv   = Tile::load(rj_base, v);
-                vec_t av   = Tile::load(a_base, v);
-                int base_f = v * TW;
+                const vec_t lv   = Tile::read(li_sh, v);
+                const vec_t rv   = Tile::read(rj_base, v);
+                const vec_t av   = Tile::read(a_base, v);
+                const int base_f = v * TW;
                 Tile::gatv2_accum_grad_al(&my_grada[base_f], &my_gradl[base_f], grad_e_ij, lv, rv, av, negative_slope);
             }
         }
@@ -195,13 +197,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                int base_f = v * TW;
-                float ga_sum[TW];
-                float gl_sum[TW];
+                const int base_f = v * TW;
+                accum_t ga_sum[TW];
+                accum_t gl_sum[TW];
 #pragma unroll
                 for (int ep = 0; ep < TW; ++ep) {
-                    ga_sum[ep] = 0.f;
-                    gl_sum[ep] = 0.f;
+                    ga_sum[ep] = accum_t{};
+                    gl_sum[ep] = accum_t{};
                 }
 #pragma unroll
                 for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
@@ -211,8 +213,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
                         gl_sum[ep] += warp_gradl[w * D_CONST + base_f + ep];
                     }
                 }
-                Tile::write_typed(grad_l_base, v, gl_sum);
-                Tile::write_float(grad_a_base, v, ga_sum);
+                Tile::write_convert_from_accum(&grad_l_base[base_f], gl_sum);
+
+                // grad_a is kept in accum_t (float32), so write accumulators directly
+                constexpr size_t compact_N =
+                    std::min<size_t>(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+                constexpr size_t repeat_cnt = TW / compact_N;
+#pragma unroll
+                for (size_t i = 0; i < repeat_cnt; ++i) {
+                    TileOps<compact_N, accum_t>::write(grad_a_base + base_f, i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(ga_sum)[i]);
+                }
             }
         }
     }
@@ -221,7 +231,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 // =============================================================================
 // Unified GATv2 Backward R kernel (computes grad_r)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, typename cuda_t, typename index_t>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -239,16 +249,18 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
     constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
 
-    using Tile  = TileOps<TW, cuda_t>;
-    using vec_t = typename Tile::vec_t;
-    using ns_t  = typename Tile::ns_t;
+    using AccumOps = AdOps<accum_t>;
+    using Tile     = TileOps<TW, cuda_t, accum_t>;
+    using vec_t    = typename Tile::vec_t;
 
     const int node_j  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
     const int warp_id = threadIdx.x / kWarpSize;
     const int lane    = threadIdx.x % kWarpSize;
 
-    if (node_j >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
+    if (node_j >= static_cast<int>(N) || head_h >= static_cast<int>(H)) [[unlikely]] {
+        return;
+    }
 
     index_t edge_start = d_row_ptr_T[node_j];
     index_t edge_end   = d_row_ptr_T[node_j + 1];
@@ -256,12 +268,12 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
 
     // Shared memory layout:
     //   rj_sh:       D_CONST * sizeof(cuda_t)                      -- read-only
-    //   warp_gradr:  WARPS_PER_BLOCK * D_CONST * sizeof(float)     -- per-warp
-    extern __shared__ uint8_t sh_raw[];
-    cuda_t *rj_sh     = reinterpret_cast<cuda_t *>(sh_raw);
-    float *warp_gradr = reinterpret_cast<float *>(rj_sh + D_CONST);
+    //   warp_gradr:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)   -- per-warp
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *rj_sh       = reinterpret_cast<cuda_t *>(sh_raw);
+    accum_t *warp_gradr = reinterpret_cast<accum_t *>(rj_sh + D_CONST);
 
-    float *my_gradr = warp_gradr + warp_id * D_CONST;
+    accum_t *my_gradr = warp_gradr + warp_id * D_CONST;
 
     cuda_t *grad_r_base = grad_r + ((int64_t)(node_j * H + head_h) * D_CONST);
 
@@ -295,46 +307,44 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     }
     __syncthreads();
 
-    ns_t ns = Tile::make_ns(negative_slope);
-
     // Warp-strided edge loop
     for (int idx = warp_id; idx < num_incoming; idx += WARPS_PER_BLOCK) {
         index_t node_i         = d_col_idx_T[edge_start + static_cast<index_t>(idx)];
         const cuda_t *li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
         const cuda_t *ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
 
-        float L_i_h = d_logsumexp[node_i * H + head_h];
-        float G_i_h = d_G[node_i * H + head_h];
+        const accum_t L_i_h = d_logsumexp[node_i * H + head_h];
+        const accum_t G_i_h = d_G[node_i * H + head_h];
 
-        float e_lane = 0.f;
-        float p_lane = 0.f;
+        accum_t e_lane{};
+        accum_t p_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv  = Tile::load(li_base, v);
-                vec_t rv  = Tile::load(rj_sh, v);
-                vec_t av  = Tile::load(a_base, v);
-                vec_t ghv = Tile::load(ghi_base, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
-                p_lane += Tile::dot_product(ghv, rv);
+                const vec_t lv  = Tile::read(li_base, v);
+                const vec_t rv  = Tile::read(rj_sh, v);
+                const vec_t av  = Tile::read(a_base, v);
+                const vec_t ghv = Tile::read(ghi_base, v);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
+                Tile::dot_product(&p_lane, &ghv, &rv);
             }
         }
-        float e_ij = warp_reduce_sum(e_lane);
-        float p_ij = warp_reduce_sum(p_lane);
+        const accum_t e_ij = warp_reduce_sum(e_lane);
+        const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        float alpha_ij  = recompute_alpha(e_ij, L_i_h);
-        float grad_e_ij = alpha_ij * (p_ij - G_i_h);
+        const accum_t alpha_ij  = recompute_alpha(e_ij, L_i_h);
+        const accum_t grad_e_ij = alpha_ij * (p_ij - G_i_h);
 
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv   = Tile::load(li_base, v);
-                vec_t rv   = Tile::load(rj_sh, v);
-                vec_t av   = Tile::load(a_base, v);
-                vec_t ghv  = Tile::load(ghi_base, v);
-                int base_f = v * TW;
+                const vec_t lv   = Tile::read(li_base, v);
+                const vec_t rv   = Tile::read(rj_sh, v);
+                const vec_t av   = Tile::read(a_base, v);
+                const vec_t ghv  = Tile::read(ghi_base, v);
+                const int base_f = v * TW;
                 Tile::gatv2_accum_grad_r(&my_gradr[base_f], alpha_ij, ghv, grad_e_ij, lv, rv, av, negative_slope);
             }
         }
@@ -348,16 +358,20 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                int base_f = v * TW;
-                float gr_sum[TW];
+                const int base_f = v * TW;
+                accum_t gr_sum[TW];
 #pragma unroll
-                for (int ep = 0; ep < TW; ++ep) gr_sum[ep] = 0.f;
+                for (int ep = 0; ep < TW; ++ep) {
+                    gr_sum[ep] = accum_t{};
+                }
 #pragma unroll
                 for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
 #pragma unroll
-                    for (int ep = 0; ep < TW; ++ep) gr_sum[ep] += warp_gradr[w * D_CONST + base_f + ep];
+                    for (int ep = 0; ep < TW; ++ep) {
+                        gr_sum[ep] += warp_gradr[w * D_CONST + base_f + ep];
+                    }
                 }
-                Tile::write_typed(grad_r_base, v, gr_sum);
+                Tile::write_convert_from_accum(&grad_r_base[base_f], gr_sum);
             }
         }
     }
@@ -383,8 +397,8 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
     int fx = feature_chunk_start + tx;
 
     // define shared memory chunk and accumulatur
-    __shared__ float tile_reduce[kWarpSize][kWarpSize + 1];
-    __shared__ float result_accum[kWarpSize];
+    __shared__ __align__(16) float tile_reduce[kWarpSize][kWarpSize + 1];
+    __shared__ __align__(16) float result_accum[kWarpSize];
 
     float accum = 0.0f;
 
@@ -428,7 +442,7 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
 // =============================================================================
 // Undirected GATv2 backward: G computation kernel (extracts pass 1 of AL)
 // =============================================================================
-template <int D_CONST, typename cuda_t, typename index_t>
+template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -444,15 +458,17 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
     constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
 
-    using Tile  = TileOps<TW, cuda_t>;
-    using vec_t = typename Tile::vec_t;
-    using ns_t  = typename Tile::ns_t;
+    using AccumOps = AdOps<accum_t>;
+    using Tile     = TileOps<TW, cuda_t, accum_t>;
+    using vec_t    = typename Tile::vec_t;
 
     int node_i = blockIdx.x;
     int head_h = blockIdx.y;
     int lane   = threadIdx.x % kWarpSize;
 
-    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) [[unlikely]] {
+        return;
+    }
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -463,10 +479,10 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
         return;
     }
 
-    float L_i = d_logsumexp[node_i * H + head_h];
+    const accum_t L_i = d_logsumexp[node_i * H + head_h];
 
     // Shared memory: li_sh + ghi_sh
-    extern __shared__ uint8_t sh_raw[];
+    extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *li_sh  = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *ghi_sh = li_sh + D_CONST;
 
@@ -488,32 +504,30 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     }
     __syncthreads();
 
-    ns_t ns = Tile::make_ns(negative_slope);
-
-    float G_i_h = 0.f;
+    accum_t G_i_h{};
     for (int k = 0; k < num_neighbors; ++k) {
         index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
         const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
 
-        float e_lane = 0.f;
-        float p_lane = 0.f;
+        accum_t e_lane{};
+        accum_t p_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv  = Tile::load(li_sh, v);
-                vec_t rv  = Tile::load(rj_base, v);
-                vec_t av  = Tile::load(a_base, v);
-                vec_t ghv = Tile::load(ghi_sh, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
-                p_lane += Tile::dot_product(ghv, rv);
+                const vec_t lv  = Tile::read(li_sh, v);
+                const vec_t rv  = Tile::read(rj_base, v);
+                const vec_t av  = Tile::read(a_base, v);
+                const vec_t ghv = Tile::read(ghi_sh, v);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
+                Tile::dot_product(&p_lane, &ghv, &rv);
             }
         }
-        float e_ij = warp_reduce_sum(e_lane);
-        float p_ij = warp_reduce_sum(p_lane);
+        const accum_t e_ij = warp_reduce_sum(e_lane);
+        const accum_t p_ij = warp_reduce_sum(p_lane);
 
-        float alpha_ij = recompute_alpha(e_ij, L_i);
-        G_i_h          = fmaf(alpha_ij, p_ij, G_i_h);
+        const accum_t alpha_ij = recompute_alpha(e_ij, L_i);
+        G_i_h                  = AccumOps::fma(alpha_ij, p_ij, G_i_h);
     }
 
     if (lane == 0) {
@@ -527,7 +541,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 // direction) in a single pass over forward CSR neighbors.
 // Requires G[j] to be pre-computed globally.
 // =============================================================================
-template <int D_CONST, typename cuda_t, typename index_t>
+template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -546,15 +560,17 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
     constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
 
-    using Tile  = TileOps<TW, cuda_t>;
-    using vec_t = typename Tile::vec_t;
-    using ns_t  = typename Tile::ns_t;
+    using AccumOps = AdOps<accum_t>;
+    using Tile     = TileOps<TW, cuda_t, accum_t>;
+    using vec_t    = typename Tile::vec_t;
 
     int node_i = blockIdx.x;
     int head_h = blockIdx.y;
     int lane   = threadIdx.x % kWarpSize;
 
-    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) return;
+    if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) [[unlikely]] {
+        return;
+    }
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -564,16 +580,16 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     //   li_sh:      D_CONST * sizeof(cuda_t)   -- l[i]
     //   ri_sh:      D_CONST * sizeof(cuda_t)   -- r[i]
     //   ghi_sh:     D_CONST * sizeof(cuda_t)   -- grad_h[i]
-    //   grada_sh:   D_CONST * sizeof(float)    -- accumulator for grad_a[i]
-    //   gradli_sh:  D_CONST * sizeof(float)    -- accumulator for grad_l[i]
-    //   gradri_sh:  D_CONST * sizeof(float)    -- accumulator for grad_r[i]
-    extern __shared__ uint8_t sh_raw[];
-    cuda_t *li_sh    = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *ri_sh    = li_sh + D_CONST;
-    cuda_t *ghi_sh   = ri_sh + D_CONST;
-    float *grada_sh  = reinterpret_cast<float *>(ghi_sh + D_CONST);
-    float *gradli_sh = grada_sh + D_CONST;
-    float *gradri_sh = gradli_sh + D_CONST;
+    //   grada_sh:   D_CONST * sizeof(accum_t)  -- accumulator for grad_a[i]
+    //   gradli_sh:  D_CONST * sizeof(accum_t)  -- accumulator for grad_l[i]
+    //   gradri_sh:  D_CONST * sizeof(accum_t)  -- accumulator for grad_r[i]
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *li_sh      = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *ri_sh      = li_sh + D_CONST;
+    cuda_t *ghi_sh     = ri_sh + D_CONST;
+    accum_t *grada_sh  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
+    accum_t *gradli_sh = grada_sh + D_CONST;
+    accum_t *gradri_sh = gradli_sh + D_CONST;
 
     cuda_t *grad_l_base = grad_l + ((int64_t)(node_i * H + head_h) * D_CONST);
     cuda_t *grad_r_base = grad_r + ((int64_t)(node_i * H + head_h) * D_CONST);
@@ -593,8 +609,8 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
         return;
     }
 
-    float L_i   = d_logsumexp[node_i * H + head_h];
-    float G_i_h = d_G[node_i * H + head_h];
+    const accum_t L_i   = d_logsumexp[node_i * H + head_h];
+    const accum_t G_i_h = d_G[node_i * H + head_h];
 
     const cuda_t *li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *ri_base  = d_r + node_i * stride_r_n + head_h * stride_r_h;
@@ -628,8 +644,6 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     }
     __syncthreads();
 
-    ns_t ns = Tile::make_ns(negative_slope);
-
     for (int k = 0; k < num_neighbors; ++k) {
         index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
 
@@ -638,67 +652,67 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
         const cuda_t *ghj_base = grad_h + neighbor_j * stride_gh_n + head_h * stride_gh_h;
 
         // ── Forward direction: score(i,j) = a^T . LeakyReLU(l[i] + r[j]) ──
-        float e_fwd_lane = 0.f;
-        float p_fwd_lane = 0.f;
+        accum_t e_fwd_lane{};
+        accum_t p_fwd_lane{};
         // ── Reverse direction: score(j,i) = a^T . LeakyReLU(l[j] + r[i]) ──
-        float e_rev_lane = 0.f;
-        float p_rev_lane = 0.f;
+        accum_t e_rev_lane{};
+        accum_t p_rev_lane{};
 
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv  = Tile::load(li_sh, v);    // l[i]
-                vec_t rv  = Tile::load(rj_base, v);  // r[j]
-                vec_t av  = Tile::load(a_base, v);
-                vec_t ghv = Tile::load(ghi_sh, v);  // grad_h[i]
+                const vec_t lv  = Tile::read(li_sh, v);    // l[i]
+                const vec_t rv  = Tile::read(rj_base, v);  // r[j]
+                const vec_t av  = Tile::read(a_base, v);
+                const vec_t ghv = Tile::read(ghi_sh, v);  // grad_h[i]
 
-                vec_t ljv  = Tile::load(lj_base, v);   // l[j]
-                vec_t riv  = Tile::load(ri_sh, v);     // r[i]
-                vec_t ghjv = Tile::load(ghj_base, v);  // grad_h[j]
+                const vec_t ljv  = Tile::read(lj_base, v);   // l[j]
+                const vec_t riv  = Tile::read(ri_sh, v);     // r[i]
+                const vec_t ghjv = Tile::read(ghj_base, v);  // grad_h[j]
 
                 // Forward: e(i,j) and <grad_h[i], r[j]>
-                e_fwd_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
-                p_fwd_lane += Tile::dot_product(ghv, rv);
+                e_fwd_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
+                Tile::dot_product(&p_fwd_lane, &ghv, &rv);
 
                 // Reverse: e(j,i) and <grad_h[j], r[i]>
-                e_rev_lane += Tile::gatv2_dot_leaky_relu(ljv, riv, av, ns);
-                p_rev_lane += Tile::dot_product(ghjv, riv);
+                e_rev_lane += Tile::gatv2_dot_leaky_relu(ljv, riv, av, negative_slope);
+                Tile::dot_product(&p_rev_lane, &ghjv, &riv);
             }
         }
 
-        float e_fwd = warp_reduce_sum(e_fwd_lane);
-        float p_fwd = warp_reduce_sum(p_fwd_lane);
-        float e_rev = warp_reduce_sum(e_rev_lane);
-        float p_rev = warp_reduce_sum(p_rev_lane);
+        const accum_t e_fwd = warp_reduce_sum(e_fwd_lane);
+        const accum_t p_fwd = warp_reduce_sum(p_fwd_lane);
+        const accum_t e_rev = warp_reduce_sum(e_rev_lane);
+        const accum_t p_rev = warp_reduce_sum(p_rev_lane);
 
         // Forward: alpha(i,j), grad_e(i,j)
-        float alpha_fwd  = recompute_alpha(e_fwd, L_i);
-        float grad_e_fwd = alpha_fwd * (p_fwd - G_i_h);
+        const accum_t alpha_fwd  = recompute_alpha(e_fwd, L_i);
+        const accum_t grad_e_fwd = alpha_fwd * (p_fwd - G_i_h);
 
         // Reverse: alpha(j,i), grad_e(j,i) — uses L[j] and G[j]
-        float L_j        = d_logsumexp[neighbor_j * H + head_h];
-        float G_j_h      = d_G[neighbor_j * H + head_h];
-        float alpha_rev  = recompute_alpha(e_rev, L_j);
-        float grad_e_rev = alpha_rev * (p_rev - G_j_h);
+        const accum_t L_j        = d_logsumexp[neighbor_j * H + head_h];
+        const accum_t G_j_h      = d_G[neighbor_j * H + head_h];
+        const accum_t alpha_rev  = recompute_alpha(e_rev, L_j);
+        const accum_t grad_e_rev = alpha_rev * (p_rev - G_j_h);
 
 // Accumulate gradients
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
             int v = lane + kWarpSize * t;
             if (v < TILES) {
-                vec_t lv   = Tile::load(li_sh, v);
-                vec_t rv   = Tile::load(rj_base, v);
-                vec_t av   = Tile::load(a_base, v);
-                int base_f = v * Tile::TW;
+                const vec_t lv   = Tile::read(li_sh, v);
+                const vec_t rv   = Tile::read(rj_base, v);
+                const vec_t av   = Tile::read(a_base, v);
+                const int base_f = v * TW;
 
                 // Forward: grad_a[i], grad_l[i] from score(i,j)
                 Tile::gatv2_accum_grad_al(&grada_sh[base_f], &gradli_sh[base_f], grad_e_fwd, lv, rv, av, negative_slope);
 
                 // Reverse: grad_r[i] from score(j,i) = a^T . LeakyReLU(l[j] + r[i])
-                vec_t ljv  = Tile::load(lj_base, v);
-                vec_t riv  = Tile::load(ri_sh, v);
-                vec_t ghjv = Tile::load(ghj_base, v);
+                const vec_t ljv  = Tile::read(lj_base, v);
+                const vec_t riv  = Tile::read(ri_sh, v);
+                const vec_t ghjv = Tile::read(ghj_base, v);
                 Tile::gatv2_accum_grad_r(&gradri_sh[base_f], alpha_rev, ghjv, grad_e_rev, ljv, riv, av, negative_slope);
             }
         }
@@ -711,10 +725,19 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     for (int t = 0; t < TILES_PER_THREAD; ++t) {
         int v = lane + kWarpSize * t;
         if (v < TILES) {
-            int base_f = v * Tile::TW;
-            Tile::write_typed(grad_l_base, v, &gradli_sh[base_f]);
-            Tile::write_float(grad_a_base, v, &grada_sh[base_f]);
-            Tile::write_typed(grad_r_base, v, &gradri_sh[base_f]);
+            const int base_f = v * TW;
+            Tile::write_convert_from_accum(&grad_l_base[base_f], &gradli_sh[base_f]);
+            Tile::write_convert_from_accum(&grad_r_base[base_f], &gradri_sh[base_f]);
+
+            // grad_a is kept in accum_t (float32), so write accumulators directly
+            constexpr size_t compact_N  = std::min<size_t>(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+            constexpr size_t repeat_cnt = TW / compact_N;
+#pragma unroll
+            for (size_t i = 0; i < repeat_cnt; ++i) {
+                TileOps<compact_N, accum_t>::write(
+                    grad_a_base + base_f, i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(&grada_sh[base_f])[i]
+                );
+            }
         }
     }
 }
