@@ -131,7 +131,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
-    int heavy_warps_per_block
+    int heavy_warps_per_block,
+    int num_pipeline_stages
 ) {
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
     TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
@@ -194,7 +195,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
         if (num_nodes_bucket == 0) return;
 
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto stage_c) {
                 using index_t    = typename decltype(idxInfo)::Type;
                 using torch_t    = typename decltype(typeInfo)::TorchType;
                 using cuda_t     = typename decltype(typeInfo)::CudaType;
@@ -206,19 +207,24 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 auto *attn_ptr  = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                 auto *h_out_ptr = reinterpret_cast<cuda_t *>(h_out.data_ptr<torch_t>());
 
-                // l_sh + W * D float + 2 * W float
-                size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+                constexpr size_t ST = decltype(stage_c)::value;
+                using Pipe          = RowPipeline<ST, DC, cuda_t>;
+
+                size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float) + Pipe::smem_bytes(W);
 
                 dim3 blocks(num_nodes_bucket, H);
                 dim3 threads(W * kWarpSize);
 
-                GATv2Forward_Kernel<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                // above 48 KB the kernel has to opt in, otherwise the launch just fails
+                enable_dynamic_smem(GATv2Forward_Kernel<W, DC, ST, cuda_t, index_t>, shmem);
+
+                GATv2Forward_Kernel<W, DC, ST, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h, index_ptr<index_t>(row_ptr),
                     index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), attn_ptr, h_out_ptr, d_logsumexp, negative_slope
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant
+            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<1, 2, 3, 4>(num_pipeline_stages)
         );
     };
 

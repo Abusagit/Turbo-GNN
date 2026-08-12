@@ -40,7 +40,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 1,
-    int heavy_warps_per_block = 8
+    int heavy_warps_per_block = 8,
+    int num_pipeline_stages = 1
 );
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
