@@ -62,7 +62,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor bwd_heavy_nodes,
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
-    bool is_directed          = true
+    bool is_directed          = true,
+    int num_pipeline_stages = 1
 );
 
 // ============================================================================

@@ -7,7 +7,7 @@
 // =============================================================================
 // Unified GATv2 Backward AL kernel (computes grad_a, grad_l, G)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <int WARPS_PER_BLOCK, int D_CONST, size_t STAGES, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -29,6 +29,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
     using vec_t    = typename Tile::vec_t;
+    using Pipe = RowPipeline<STAGES, D_CONST, cuda_t>;
 
     const int node_i  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
@@ -51,7 +52,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     //   warp_G:     WARPS_PER_BLOCK * sizeof(accum_t)              -- per-warp G partial
     //   G_broadcast: sizeof(accum_t)                               -- broadcast slot
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *li_sh        = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *r_stage      = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *li_sh        = reinterpret_cast<cuda_t *>(sh_raw + Pipe::smem_bytes(WARPS_PER_BLOCK));
     cuda_t *ghi_sh       = li_sh + D_CONST;
     accum_t *warp_grada  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
     accum_t *warp_gradl  = warp_grada + WARPS_PER_BLOCK * D_CONST;
@@ -113,9 +115,23 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // pass 1: compute G_{i,h} = sum_j alpha_ij * <grad_h_i, r_j> (warp-strided)
     accum_t G_partial{};
 
-    for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
-        index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
-        const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+    const auto rj_row = [&](int k) -> const cuda_t * {
+        if (k >= num_neighbors) {
+            return nullptr;
+        }
+        const index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
+        return d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+    };
+
+    Pipe pipe(r_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
+#pragma unroll
+    for (size_t s = 0; s + 1 < STAGES; ++s) {
+        pipe.prefetch(rj_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
+    }
+
+    for (int k = warp_id, it = 0; k < num_neighbors; k += WARPS_PER_BLOCK, ++it) {
+        pipe.prefetch(rj_row(warp_id + (it + static_cast<int>(STAGES) - 1) * WARPS_PER_BLOCK));
+        const cuda_t *rj_base = pipe.consume();
 
         accum_t e_lane{};
         accum_t p_lane{};
@@ -136,6 +152,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 
         const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_partial              = AccumOps::fma(alpha_ij, p_ij, G_partial);
+
+        pipe.release();
     }
 
     // Cross-warp reduction for G
@@ -152,9 +170,15 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     G_i_h = *G_broadcast;
 
     // pass 2: accumulate gradients (warp-strided)
-    for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
-        index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
-        const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+    Pipe pipe2(r_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
+#pragma unroll
+    for (size_t s = 0; s + 1 < STAGES; ++s) {
+        pipe2.prefetch(rj_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
+    }
+
+    for (int k = warp_id, it = 0; k < num_neighbors; k += WARPS_PER_BLOCK, ++it) {
+        pipe2.prefetch(rj_row(warp_id + (it + static_cast<int>(STAGES) - 1) * WARPS_PER_BLOCK));
+        const cuda_t *rj_base = pipe2.consume();
 
         accum_t e_lane{};
         accum_t p_lane{};
@@ -187,6 +211,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
                 Tile::gatv2_accum_grad_al(&my_grada[base_f], &my_gradl[base_f], grad_e_ij, lv, rv, av, negative_slope);
             }
         }
+
+        pipe2.release();
     }
 
     // Cross-warp reduction: warp 0 sums all per-warp accumulators
@@ -231,7 +257,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 // =============================================================================
 // Unified GATv2 Backward R kernel (computes grad_r)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <int WARPS_PER_BLOCK, int D_CONST, size_t STAGES, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -252,6 +278,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
     using vec_t    = typename Tile::vec_t;
+    using Pipe     = RowPipeline<STAGES, D_CONST, cuda_t>;
 
     const int node_j  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
@@ -270,7 +297,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     //   rj_sh:       D_CONST * sizeof(cuda_t)                      -- read-only
     //   warp_gradr:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)   -- per-warp
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *rj_sh       = reinterpret_cast<cuda_t *>(sh_raw);
+    // l_stage / gh_stage first: memcpy_async needs 16-byte aligned destinations
+    cuda_t *l_stage     = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *gh_stage    = reinterpret_cast<cuda_t *>(sh_raw + Pipe::smem_bytes(WARPS_PER_BLOCK));
+    cuda_t *rj_sh       = reinterpret_cast<cuda_t *>(sh_raw + 2 * Pipe::smem_bytes(WARPS_PER_BLOCK));
     accum_t *warp_gradr = reinterpret_cast<accum_t *>(rj_sh + D_CONST);
 
     accum_t *my_gradr = warp_gradr + warp_id * D_CONST;
@@ -308,10 +338,32 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     __syncthreads();
 
     // Warp-strided edge loop
-    for (int idx = warp_id; idx < num_incoming; idx += WARPS_PER_BLOCK) {
-        index_t node_i         = d_col_idx_T[edge_start + static_cast<index_t>(idx)];
-        const cuda_t *li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
-        const cuda_t *ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
+    const auto edge_node = [&](int idx) -> index_t {
+        return d_col_idx_T[edge_start + static_cast<index_t>(idx)];
+    };
+    const auto l_row = [&](int idx) -> const cuda_t * {
+        return idx >= num_incoming ? nullptr : d_l + edge_node(idx) * stride_l_n + head_h * stride_l_h;
+    };
+    const auto gh_row = [&](int idx) -> const cuda_t * {
+        return idx >= num_incoming ? nullptr : grad_h + edge_node(idx) * stride_gh_n + head_h * stride_gh_h;
+    };
+
+    Pipe pipe_l(l_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
+    Pipe pipe_gh(gh_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
+#pragma unroll
+    for (size_t s = 0; s + 1 < STAGES; ++s) {
+        pipe_l.prefetch(l_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
+        pipe_gh.prefetch(gh_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
+    }
+
+    for (int idx = warp_id, it = 0; idx < num_incoming; idx += WARPS_PER_BLOCK, ++it) {
+        const int next = warp_id + (it + static_cast<int>(STAGES) - 1) * WARPS_PER_BLOCK;
+        pipe_l.prefetch(l_row(next));
+        pipe_gh.prefetch(gh_row(next));
+
+        index_t node_i         = edge_node(idx);
+        const cuda_t *li_base  = pipe_l.consume();
+        const cuda_t *ghi_base = pipe_gh.consume();
 
         const accum_t L_i_h = d_logsumexp[node_i * H + head_h];
         const accum_t G_i_h = d_G[node_i * H + head_h];
@@ -348,6 +400,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
                 Tile::gatv2_accum_grad_r(&my_gradr[base_f], alpha_ij, ghv, grad_e_ij, lv, rv, av, negative_slope);
             }
         }
+
+        pipe_l.release();
+        pipe_gh.release();
     }
 
     // Cross-warp reduction: warp 0 sums per-warp accumulators
