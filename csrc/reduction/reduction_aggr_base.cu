@@ -1,5 +1,4 @@
-// #include "common.cuh"
-#include "common/old_common.cuh"
+#include "common.cuh"
 
 void reduction_aggr_backward_cuda(const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8);
 

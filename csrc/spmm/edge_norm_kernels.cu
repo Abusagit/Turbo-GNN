@@ -1,5 +1,4 @@
-// #include "common.cuh"
-#include "common/old_common.cuh"
+#include "common.cuh"
 
 enum class NormType { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
 

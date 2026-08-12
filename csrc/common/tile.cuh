@@ -909,20 +909,20 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     static constexpr __device__ void weighted_accum(accum_t *const __restrict__ acc, accum_t w, vec_t const *const __restrict__ src) {
         constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
         constexpr size_t repeat_cnt = N / compact_N;
-        using vec_compact_t         = Vec<compact_N, num_type>;
-        using FloatOps              = VecOpsFloatBase<compact_N, accum_t>;
+        using NumVec    = Vec<compact_N, num_type>;
+        using AccumVec  = Vec<compact_N, accum_t>;
+        using AccOps              = VecOpsFloatBase<compact_N, accum_t>;
 
-        Vec<compact_N, accum_t> w_vec;
+        AccumVec w_vec, src_out;
 #pragma unroll
         for (size_t j = 0; j < compact_N; ++j) {
             w_vec[j] = w;
         }
 
-        Vec<compact_N, accum_t> src_out;
 #pragma unroll
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            convert_vec<compact_N, accum_t, num_type>(&src_out, &reinterpret_cast<vec_compact_t const *>(src)[i]);
-            FloatOps::fmaa_(&reinterpret_cast<Vec<compact_N, accum_t> *>(acc)[i], &src_out, &w_vec);
+            convert_vec<compact_N, accum_t, num_type>(&src_out, &reinterpret_cast<NumVec const *>(src)[i]);
+            AccOps::fmaa_(&reinterpret_cast<AccumVec *>(acc)[i], &src_out, &w_vec);
         }
     }
 
