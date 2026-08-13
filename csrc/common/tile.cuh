@@ -49,7 +49,7 @@ struct SelectTW {
 // Operations with vecs
 template <size_t N, typename num_type>
 struct VecOpsBase {
-    using vec_t  = Vec<N, num_type>;  // TODO: Change to N, num_type
+    using vec_t  = Vec<N, num_type>;
     using wide_t = vec_t::wide_t;
 
     static __device__ void store_zero(vec_t *const __restrict__ dst) {
@@ -909,9 +909,9 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     static constexpr __device__ void weighted_accum(accum_t *const __restrict__ acc, accum_t w, vec_t const *const __restrict__ src) {
         constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
         constexpr size_t repeat_cnt = N / compact_N;
-        using NumVec    = Vec<compact_N, num_type>;
-        using AccumVec  = Vec<compact_N, accum_t>;
-        using AccOps              = VecOpsFloatBase<compact_N, accum_t>;
+        using NumVec                = Vec<compact_N, num_type>;
+        using AccumVec              = Vec<compact_N, accum_t>;
+        using AccOps                = VecOpsFloatBase<compact_N, accum_t>;
 
         AccumVec w_vec, src_out;
 #pragma unroll

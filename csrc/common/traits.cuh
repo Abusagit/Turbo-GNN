@@ -7,8 +7,6 @@
 #include <type_traits>
 #include <variant>
 
-// Dispatch and datatype Traits TODO move to the separate file in the final
-// version
 
 template <typename T>
 struct TTypeTraits;
