@@ -46,9 +46,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     const size_t num_neighbors = static_cast<int>(edge_end - edge_start);
 
     // Shared memory layout. Ordered so that every array written through a vector
-    // (Vec<N>/float4) store starts on a 16-byte boundary; the scalar-only arrays go last:
+    // (VecFloat<N>/float4) store starts on a 16-byte boundary; the scalar-only arrays go last:
     // k_shared[D_CONST] as cuda_t                                    -- float4 loads, needs 16B
-    // neighbor_out[neighbor_block_size * D_CONST] as accum_t         -- Vec<compact_N> stores, needs up to 16B
+    // neighbor_out[neighbor_block_size * D_CONST] as accum_t         -- VecFloat<compact_N> stores, needs up to 16B
     // warp_sum_storage[2 * neighbor_block_size * neighbor_warp_cnt] as accum_t -- scalar, double-buffered on (r & 1)
     // neighbor_max[neighbor_block_size] as accum_t                   -- scalar
     // neighbor_sum[neighbor_block_size] as accum_t                   -- scalar
@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
         for (size_t tile_id = lane_id; tile_id < TILES; tile_id += lane_cnt) {
             const typename Tile::vec_t kv = Tile::read(k_shared, tile_id);
             const typename Tile::vec_t qv = Tile::read(q_base, tile_id);
-            Tile::dot_product(&s_partial, &kv, &qv);
+            kv.dot_product_(&s_partial, qv);
         }
 
         accum_t score = warp_reduce_sum(s_partial) * scale;
@@ -136,7 +136,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
                     o_acc[t * TW + ep] *= correction;
                 }
                 const typename Tile::vec_t vv = Tile::read(v_base, vi);
-                Tile::weighted_accum(&o_acc[t * TW], w, &vv);
+                vv.template weighted_accum_<accum_t>(&o_acc[t * TW], w);
             }
         }
     }
@@ -148,12 +148,12 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
         const size_t vi = lane_id + lane_cnt * t;
         if (vi < TILES) [[likely]] {
-            constexpr size_t compact_N  = std::min(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+            constexpr size_t compact_N  = std::min(TW, VecFloat<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
             constexpr size_t repeat_cnt = TW / compact_N;
 
             for (size_t i = 0; i < repeat_cnt; ++i) {
                 TileOps<compact_N, accum_t>::write(
-                    my_out, vi * repeat_cnt + i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(o_acc)[t * repeat_cnt + i]
+                    my_out, vi * repeat_cnt + i, reinterpret_cast<VecFloat<compact_N, accum_t> const *>(o_acc)[t * repeat_cnt + i]
                 );
             }
         }
