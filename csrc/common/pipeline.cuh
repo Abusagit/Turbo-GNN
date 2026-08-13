@@ -2,10 +2,6 @@
 
 #include <cuda/pipeline>
 
-// Диагностика: 0 -- обычный путь (async-копия + чтение из shared),
-//              1 -- копию выдаём и ждём, но читаем по-прежнему из глобальной памяти
-//                   (изоляция цены самой машинерии cp.async),
-//              2 -- копируем синхронно, читаем из shared (изоляция цены круга через shared).
 #ifndef TGNN_PIPE_MODE
 #define TGNN_PIPE_MODE 0
 #endif
@@ -76,7 +72,7 @@ class RowPipeline {
 #endif
             __syncwarp();
 #if TGNN_PIPE_MODE == 1
-            return src_ring_[cons_idx_];  // платим за копию, но читаем из глобальной памяти
+            return src_ring_[cons_idx_];
 #else
             return stage_base_ + cons_idx_ * ROW_ELEMS;
 #endif
