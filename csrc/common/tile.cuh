@@ -49,7 +49,7 @@ struct SelectTW {
 // Operations with vecs
 template <size_t N, typename num_type>
 struct VecOpsBase {
-    using vec_t  = Vec<N, num_type>;  // TODO: Change to N, num_type
+    using vec_t  = Vec<N, num_type>;
     using wide_t = vec_t::wide_t;
 
     static __device__ void store_zero(vec_t *const __restrict__ dst) {
