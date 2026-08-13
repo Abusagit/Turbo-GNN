@@ -1,7 +1,6 @@
 #pragma once
 
 #include <bit>
-#include <cstdint>
 #include <type_traits>
 
 #include "common/adaptive_ops.cuh"
@@ -19,11 +18,50 @@ struct alignas(sizeof(num_type) * N) Vec {
     static_assert(std::popcount(sizeof(num_type)) == 1, "Vec element size must be a power of 2 in bytes");
 
     num_type data[N];
+    using vec_t  = Vec<N, num_type>;
     using wide_t = deduce_uint_type_t<N * sizeof(num_type)>;
+
+    Vec() noexcept = default;
+    __device__ Vec(num_type num) {
+#pragma unroll
+        for (size_t i = 0; i < N; ++i) {
+            data[i] = num;
+        }
+    }
+    Vec(const Vec& other) noexcept            = default;
+    Vec(Vec&& other) noexcept                 = default;
+    Vec& operator=(const Vec& other) noexcept = default;
+    Vec& operator=(Vec&& other) noexcept      = default;
+    ~Vec() noexcept                           = default;
 
     __device__ num_type operator[](size_t n) const { return data[n]; }
     __device__ num_type& operator[](size_t n) { return data[n]; }
+
+    __device__ void store_zero_() noexcept { *reinterpret_cast<wide_t *>(data) = 0; }
+    static __device__ void store_zero(vec_t *const __restrict__ dst) { *reinterpret_cast<wide_t *>(dst) = 0; }
+    static constexpr __device__ vec_t get_zero() { return vec_t{}; };
+
+    // Loads N scalars from src vector to the address, pointed by dst
+    static constexpr __device__ void load_scalars(num_type *const __restrict__ dst, vec_t const *const __restrict__ src) {
+        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
+    }
+    // Loads N scalars from src location to the dst vector
+    static constexpr __device__ void store_scalars(vec_t *const __restrict__ dst, num_type const *const __restrict__ src) {
+        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
+    }
+    // Copies N scalars from src location into dst location
+    static constexpr __device__ void transfer_scalars(num_type *const __restrict__ dst, num_type const *const __restrict__ src) {
+        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
+    }
+    // Copies a vector from src to dst
+    static constexpr __device__ void transfer_vector(vec_t *const __restrict__ dst, vec_t const *const __restrict__ src) {
+        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
+    }
 };
+
+static_assert(std::is_trivially_copyable_v<Vec<8, nv_bfloat16>>);
+static_assert(std::is_trivially_default_constructible_v<Vec<8, nv_bfloat16>>);
+static_assert(std::is_trivially_destructible_v<Vec<8, nv_bfloat16>>);
 
 // ==================================================================================
 // SelectTW: pick widest TW where all threads are working but not wider than 128 bits
@@ -47,48 +85,8 @@ struct SelectTW {
 };
 
 // Operations with vecs
-template <size_t N, typename num_type>
-struct VecOpsBase {
-    using vec_t  = Vec<N, num_type>;
-    using wide_t = vec_t::wide_t;
-
-    static __device__ void store_zero(vec_t *const __restrict__ dst) {
-        if constexpr (sizeof(num_type) * N == 1) {
-            *reinterpret_cast<uint8_t *>(dst) = 0;
-        } else if constexpr (sizeof(num_type) * N == 2) {
-            *reinterpret_cast<uint16_t *>(dst) = 0;
-        } else if constexpr (sizeof(num_type) * N == 4) {
-            *reinterpret_cast<uint32_t *>(dst) = 0;
-        } else if constexpr (sizeof(num_type) * N == 8) {
-            *reinterpret_cast<uint64_t *>(dst) = 0;
-        } else if constexpr (sizeof(num_type) * N == 16) {
-            *reinterpret_cast<unsigned __int128 *>(dst) = 0;
-        } else {
-            __builtin_unreachable();
-        }
-    }
-    static constexpr __device__ vec_t get_zero() { return vec_t{}; };
-
-    // Loads N scalars from src vector to the address, pointed by dst
-    static constexpr __device__ void load__scalars(num_type *const __restrict__ dst, vec_t const *const __restrict__ src) {
-        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
-    }
-    // Loads N scalars from src location to the dst vector
-    static constexpr __device__ void store_scalars(vec_t *const __restrict__ dst, num_type const *const __restrict__ src) {
-        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
-    }
-    // Copies N scalars from src location into dst location
-    static constexpr __device__ void transfer_scalars(num_type *const __restrict__ dst, num_type const *const __restrict__ src) {
-        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
-    }
-    // Copies a vector from src to dst
-    static constexpr __device__ void transfer_vector(vec_t *const __restrict__ dst, vec_t const *const __restrict__ src) {
-        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
-    }
-};
-
 template <size_t N, FloatingNum num_type>
-struct VecOpsFloatBase : VecOpsBase<N, num_type> {
+struct alignas(sizeof(num_type) * N) VecFloat: Vec<N, num_type> {
    private:
     template <typename T>
     static consteval bool can_be_packed_b() {
@@ -106,103 +104,138 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     using adops_ = AdOps<num_type>;
 
    public:
-    using vec_t  = VecOpsBase<N, num_type>::vec_t;
+    using vec_t  = VecFloat<N, num_type>;
     using wide_t = vec_t::wide_t;
 
     // Unary elementwise ops
-    static constexpr __device__ void neg_(vec_t *const __restrict__ src) {
-        vec_t buf;
-        transfer_vector(&buf, src);
-
+    constexpr __device__ void neg_() noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf.data)[i] = adops_::packed_neg(reinterpret_cast<packed_t const *>(buf.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] = adops_::packed_neg(reinterpret_cast<packed_t const *>(this->data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf[i] = -buf[i];
+                this->data[i] = -this->data[i];
             }
         }
-
-        transfer_vector(src, &buf);
     }
 
-    static constexpr __device__ void log_(vec_t *const __restrict__ src)
-        requires(sizeof(num_type) >= 2 && sizeof(num_type) <= 8)
-    {
-        vec_t buf;
-        transfer_vector(&buf, src);
-
+    constexpr __device__ void log_() noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf.data)[i] = adops_::packed_log(reinterpret_cast<packed_t const *>(buf.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] = adops_::packed_log(reinterpret_cast<packed_t const *>(this->data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf[i] = adops_::log(buf[i]);
+                this->data[i] = adops_::log(this->data[i]);
             }
         }
-
-        transfer_vector(src, &buf);
     }
 
-    static constexpr __device__ void exp_(vec_t *const __restrict__ src)
-        requires(sizeof(num_type) >= 2 && sizeof(num_type) <= 8)
-    {
-        vec_t buf;
-        transfer_vector(&buf, src);
-
+    constexpr __device__ void exp_() noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf.data)[i] = adops_::packed_exp(reinterpret_cast<packed_t const *>(buf.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] = adops_::packed_exp(reinterpret_cast<packed_t const *>(this->data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf[i] = adops_::exp(buf[i]);
+                this->data[i] = adops_::exp(this->data[i]);
             }
         }
-
-        transfer_vector(src, &buf);
     }
 
-    static constexpr __device__ void scalar_mul_(vec_t *const __restrict__ src, num_type s) {
-        vec_t buf;
-        transfer_vector(&buf, src);
-
+    // Scalar add
+    constexpr __device__ void scalar_add_(num_type s) noexcept {
         if constexpr (can_be_packed_new) {
-            using adops_      = AdOpsPacked<num_type>;
-            using packed_t    = deduce_packed_type_t<num_type>;
-            packed_t packed_s = adops::broadcast_scalar_to_packed<num_type, num_type>(s);
+            using adops_            = AdOpsPacked<num_type>;
+            using packed_t          = deduce_packed_type_t<num_type>;
+            const packed_t packed_s = adops::broadcast_scalar_to_packed<num_type, num_type>(s);
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf.data)[i] = adops_::packed_mul(packed_s, reinterpret_cast<packed_t const *>(buf.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] = adops_::packed_add(packed_s, reinterpret_cast<packed_t const *>(this->data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf[i] *= s;
+                this->data[i] += s;
             }
         }
-
-        transfer_vector(src, &buf);
+    }
+    constexpr __device__ vec_t& operator+=(num_type s) noexcept {
+        scalar_add_(s);
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator+(vec_t vec, num_type s) noexcept {
+        vec += s;
+        return vec;
+    }
+    friend constexpr __device__ vec_t operator+(num_type s, vec_t vec) noexcept {
+        vec += s;
+        return vec;
+    }
+    // Scalar sub
+    constexpr __device__ void scalar_sub_(num_type s) noexcept { scalar_add_(-s); }
+    constexpr __device__ vec_t& operator-=(num_type s) noexcept {
+        scalar_sub_(s);
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator-(vec_t vec, num_type s) noexcept {
+        vec -= s;
+        return vec;
+    }
+    // Scalar mul
+    constexpr __device__ void scalar_mul_(num_type s) noexcept {
+        if constexpr (can_be_packed_new) {
+            using adops_            = AdOpsPacked<num_type>;
+            using packed_t          = deduce_packed_type_t<num_type>;
+            const packed_t packed_s = adops::broadcast_scalar_to_packed<num_type, num_type>(s);
+#pragma unroll
+            for (size_t i = 0; i < N / 2; ++i) {
+                reinterpret_cast<packed_t *>(this->data)[i] = adops_::packed_mul(packed_s, reinterpret_cast<packed_t const *>(this->data)[i]);
+            }
+        } else {
+#pragma unroll
+            for (size_t i = 0; i < N; ++i) {
+                this->data[i] *= s;
+            }
+        }
+    }
+    constexpr __device__ vec_t& operator*=(num_type s) noexcept {
+        scalar_mul_(s);
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator*(vec_t vec, num_type s) noexcept {
+        vec *= s;
+        return vec;
+    }
+    friend constexpr __device__ vec_t operator*(num_type s, vec_t vec) noexcept {
+        vec *= s;
+        return vec;
+    }
+    // Scalar div
+    constexpr __device__ void scalar_div_(num_type s) noexcept { scalar_mul_(static_cast<num_type>(1.0f) / s); }
+    constexpr __device__ vec_t& operator/=(num_type s) noexcept {
+        scalar_div_(s);
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator/(vec_t vec, num_type s) noexcept {
+        vec /= s;
+        return vec;
     }
 
-    static constexpr __device__ void relu_(vec_t *const __restrict__ src) {
-        vec_t buf;
-        transfer_vector(&buf, src);
-
+    constexpr __device__ void relu_() noexcept {
         if constexpr (can_be_packed) {
             using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
@@ -210,22 +243,18 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
 
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                packed_t& val = reinterpret_cast<packed_t *>(buf.data)[i];
+                packed_t& val = reinterpret_cast<packed_t *>(this->data)[i];
                 val           = adops_::packed_max(zero, val);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf[i] = adops_::max(buf[i], num_type{});
+                this->data[i] = adops_::max(this->data[i], num_type{});
             }
         }
-
-        transfer_vector(src, &buf);
     }
-    static constexpr __device__ void leaky_relu_(vec_t *const __restrict__ src, num_type ns) {
-        vec_t buf;
-        transfer_vector(&buf, src);
 
+    constexpr __device__ void leaky_relu_(num_type ns) noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
@@ -234,7 +263,7 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
 
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                packed_t& val = reinterpret_cast<packed_t *>(buf.data)[i];
+                packed_t& val = reinterpret_cast<packed_t *>(this->data)[i];
                 val           = adops_::packed_add(
                     adops_::packed_max(val, packed_zero), adops_::packed_mul(packed_ns, adops_::packed_min(val, packed_zero))
                 );
@@ -242,17 +271,12 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf[i] = adops_::max(buf[i], num_type{}) + ns * adops_::min(buf[i], num_type{});
+                this->data[i] = adops_::max(this->data[i], num_type{}) + ns * adops_::min(this->data[i], num_type{});
             }
         }
-
-        transfer_vector(src, &buf);
     }
-    static constexpr __device__ void leaky_relu_backward_(vec_t *const __restrict__ src, vec_t const *const __restrict__ dy, num_type ns) {
-        vec_t buf, buf_y;
-        transfer_vector(&buf, src);
-        transfer_vector(&buf_y, dy);
 
+    constexpr __device__ void leaky_relu_backward_(vec_t dy, num_type ns) noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
@@ -262,595 +286,310 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
 
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                packed_t& val  = reinterpret_cast<packed_t *>(buf.data)[i];
-                packed_t val_y = reinterpret_cast<packed_t const *>(buf_y.data)[i];
+                packed_t& val  = reinterpret_cast<packed_t *>(this->data)[i];
+                packed_t val_y = reinterpret_cast<packed_t const *>(dy.data)[i];
 
                 val = adops_::packed_mul(val_y, adops_::packed_fma(__hgt2(val, packed_zero), packed_diff, packed_ns));
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf[i] = buf[i] >= num_type{} ? buf_y[i] : buf_y[i] * ns;
+                this->data[i] = this->data[i] >= num_type{} ? dy[i] : dy[i] * ns;
             }
         }
-
-        transfer_vector(src, &buf);
     }
 
     // Binary elementwise ops
     // Add
-    static constexpr __device__ void add_(vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ void add_(vec_t other) noexcept {
         if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_add(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_add(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] += buf1[i];
+                this->data[i] += other[i];
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void add(
-        vec_t *const __restrict__ dst, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1
-    ) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed_new) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_add(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] += buf1[i];
-            }
-        }
-
-        transfer_vector(dst, &buf0);
+    static constexpr __device__ vec_t add(vec_t src0, vec_t src1) noexcept {
+        src0.add_(src1);
+        return src0;
     }
-    static constexpr __device__ vec_t add(vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ vec_t& operator+=(vec_t other) noexcept {
         if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_add(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_add(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] += buf1[i];
+                this->data[i] += other[i];
             }
         }
 
-        return buf0;
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator+(vec_t first, vec_t other) noexcept {
+        first += other;
+        return first;
     }
 
     // Sub
-    static constexpr __device__ void sub_(vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ void sub_(vec_t other) noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_sub(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_sub(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] -= buf1[i];
+                this->data[i] -= other[i];
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void sub(
-        vec_t *const __restrict__ dst, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1
-    ) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_sub(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] -= buf1[i];
-            }
-        }
-
-        transfer_vector(dst, &buf0);
+    static constexpr __device__ vec_t sub(vec_t src0, vec_t src1) noexcept {
+        src0.sub_(src1);
+        return src0;
     }
-    static constexpr __device__ vec_t sub(vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
+    constexpr __device__ vec_t& operator-=(vec_t other) noexcept {
+        if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_sub(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_sub(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] -= buf1[i];
+                this->data[i] -= other[i];
             }
         }
 
-        return buf0;
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator-(vec_t first, vec_t other) noexcept {
+        first -= other;
+        return first;
     }
 
     // Mul
-    static constexpr __device__ void mul_(vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ void mul_(vec_t other) noexcept {
         if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_mul(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_mul(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] *= buf1[i];
+                this->data[i] *= other[i];
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void mul(
-        vec_t *const __restrict__ dst, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1
-    ) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed_new) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_mul(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] *= buf1[i];
-            }
-        }
-
-        transfer_vector(dst, &buf0);
+    static constexpr __device__ vec_t mul(vec_t src0, vec_t src1) noexcept {
+        src0.mul_(src1);
+        return src0;
     }
-    static constexpr __device__ vec_t mul(vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ vec_t& operator*=(vec_t other) noexcept {
         if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_mul(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_mul(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] *= buf1[i];
+                this->data[i] *= other[i];
             }
         }
 
-        return buf0;
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator*(vec_t first, vec_t other) noexcept {
+        first *= other;
+        return first;
     }
 
     // Div
-    static constexpr __device__ void div_(vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ void div_(vec_t other) noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_div(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_div(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] /= buf1[i];
+                this->data[i] /= other[i];
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void div(
-        vec_t *const __restrict__ dst, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1
-    ) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_div(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] /= buf1[i];
-            }
-        }
-
-        transfer_vector(dst, &buf0);
+    static constexpr __device__ vec_t div(vec_t src0, vec_t src1) noexcept {
+        src0.div_(src1);
+        return src0;
     }
-    static constexpr __device__ vec_t div(vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
+    constexpr __device__ vec_t& operator/=(vec_t other) {
+        if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_div(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_div(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] /= buf1[i];
+                this->data[i] /= other[i];
             }
         }
 
-        return buf0;
+        return *this;
+    }
+    friend constexpr __device__ vec_t operator/(vec_t first, vec_t other) noexcept {
+        first /= other;
+        return first;
     }
 
     // FMA
-    static constexpr __device__ void fmam_(
-        vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1, vec_t const *const __restrict__ src2
-    ) {
-        vec_t buf0, buf1, buf2;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-        transfer_vector(&buf2, src2);
-
+    constexpr __device__ void fmam_(vec_t src1, vec_t src2) noexcept {
         if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] = adops_::packed_fma(
-                    reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i],
-                    reinterpret_cast<packed_t const *>(buf2.data)[i]
+                reinterpret_cast<packed_t *>(this->data)[i] = adops_::packed_fma(
+                    reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(src1.data)[i],
+                    reinterpret_cast<packed_t const *>(src2.data)[i]
                 );
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::fma(buf0[i], buf1[i], buf2[i]);
+                this->data[i] = adops_::fma(this->data[i], src1[i], src2[i]);
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void fmaa_(
-        vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1, vec_t const *const __restrict__ src2
-    ) {
-        vec_t buf0, buf1, buf2;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-        transfer_vector(&buf2, src2);
-
+    constexpr __device__ void fmaa_(vec_t src0, vec_t src1) noexcept {
         if constexpr (can_be_packed_new) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] = adops_::packed_fma(
-                    reinterpret_cast<packed_t const *>(buf1.data)[i], reinterpret_cast<packed_t const *>(buf2.data)[i],
-                    reinterpret_cast<packed_t const *>(buf0.data)[i]
+                reinterpret_cast<packed_t *>(this->data)[i] = adops_::packed_fma(
+                    reinterpret_cast<packed_t const *>(src0.data)[i], reinterpret_cast<packed_t const *>(src1.data)[i],
+                    reinterpret_cast<packed_t const *>(this->data)[i]
                 );
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::fma(buf2[i], buf1[i], buf0[i]);
+                this->data[i] = adops_::fma(src0[i], src1[i], this->data[i]);
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void fma(
-        vec_t *const __restrict__ dst, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1,
-        vec_t const *const __restrict__ src2
-    ) {
-        vec_t buf0, buf1, buf2;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-        transfer_vector(&buf2, src2);
-
-        if constexpr (can_be_packed_new) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] = adops_::packed_fma(
-                    reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i],
-                    reinterpret_cast<packed_t const *>(buf2.data)[i]
-                );
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::fma(buf0[i], buf1[i], buf2[i]);
-            }
-        }
-
-        transfer_vector(dst, &buf0);
-    }
-    static constexpr __device__ vec_t fma(
-        vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1, vec_t const *const __restrict__ src2
-    ) {
-        vec_t buf0, buf1, buf2;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-        transfer_vector(&buf2, src2);
-
-        if constexpr (can_be_packed_new) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] = adops_::packed_fma(
-                    reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i],
-                    reinterpret_cast<packed_t const *>(buf2.data)[i]
-                );
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::fma(buf0[i], buf1[i], buf2[i]);
-            }
-        }
-
-        return buf0;
+    static constexpr __device__ vec_t fma(vec_t src0, vec_t src1, vec_t src2) noexcept {
+        src2.fmaa_(src0, src1);
+        return src2;
     }
 
     // Min
-    static constexpr __device__ void minimum_(vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ void minimum_(vec_t other) noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_min(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_min(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::min(buf0[i], buf1[i]);
+                this->data[i] = adops_::min(this->data[i], other[i]);
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void minimum(
-        vec_t *const __restrict__ dst, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1
-    ) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_min(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::min(buf0[i], buf1[i]);
-            }
-        }
-
-        transfer_vector(dst, &buf0);
+    static constexpr __device__ void minimum(vec_t *const __restrict__ dst, vec_t src0, vec_t src1) noexcept {
+        src0.minimum_(src1);
+        transfer_vector(dst, &src0);
     }
-    static constexpr __device__ vec_t minimum(vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_min(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::min(buf0[i], buf1[i]);
-            }
-        }
-
-        return buf0;
+    static constexpr __device__ vec_t minimum(vec_t src0, vec_t src1) noexcept{
+        src0.minimum_(src1);
+        return src0;
     }
 
     // Max
-    static constexpr __device__ void maximum_(vec_t *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
+    constexpr __device__ void maximum_(vec_t other) noexcept {
         if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
             for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_max(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
+                reinterpret_cast<packed_t *>(this->data)[i] =
+                    adops_::packed_max(reinterpret_cast<packed_t const *>(this->data)[i], reinterpret_cast<packed_t const *>(other.data)[i]);
             }
         } else {
 #pragma unroll
             for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::max(buf0[i], buf1[i]);
+                this->data[i] = adops_::max(this->data[i], other[i]);
             }
         }
-
-        transfer_vector(src0, &buf0);
     }
-    static constexpr __device__ void maximum(
-        vec_t *const __restrict__ dst, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1
-    ) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_max(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::max(buf0[i], buf1[i]);
-            }
-        }
-
-        transfer_vector(dst, &buf0);
+    static constexpr __device__ void maximum(vec_t *const __restrict__ dst, vec_t src0, vec_t src1) noexcept {
+        src0.maximum_(src1);
+        transfer_vector(dst, &src0);
     }
-    static constexpr __device__ vec_t maximum(vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1) {
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        if constexpr (can_be_packed) {
-            using adops_   = AdOpsPacked<num_type>;
-            using packed_t = deduce_packed_type_t<num_type>;
-#pragma unroll
-            for (size_t i = 0; i < N / 2; ++i) {
-                reinterpret_cast<packed_t *>(buf0.data)[i] =
-                    adops_::packed_max(reinterpret_cast<packed_t const *>(buf0.data)[i], reinterpret_cast<packed_t const *>(buf1.data)[i]);
-            }
-        } else {
-#pragma unroll
-            for (size_t i = 0; i < N; ++i) {
-                buf0[i] = adops_::max(buf0[i], buf1[i]);
-            }
-        }
-
-        return buf0;
+    static constexpr __device__ vec_t maximum(vec_t src0, vec_t src1) noexcept {
+        src0.maximum_(src1);
+        return src0;
     }
 
     // Reduction ops
     // Sum
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ void sum(accum_t *const __restrict__ acc, vec_t const *const __restrict__ src) {
+    constexpr __device__ void sum_(accum_t *const __restrict__ acc) const noexcept {
         // Accumulate in accum_t: chunks are widened via convert_vec (exact for accum_t wider than
         // num_type), then reduced with accum_t arithmetic. 16-bit pair-trees lose low bits on
         // every step; accum_t accumulation keeps the result within one accum_t rounding.
-        constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
+        constexpr size_t compact_N  = std::min(N, VecFloat<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
         constexpr size_t repeat_cnt = N / compact_N;
 
-        using NumVec   = Vec<compact_N, num_type>;
-        using AccumVec = Vec<compact_N, accum_t>;
+        using NumVec   = VecFloat<compact_N, num_type>;
+        using AccumVec = VecFloat<compact_N, accum_t>;
 
         accum_t buf_acc{};
         AccumVec buf;
 
 #pragma unroll
         for (size_t j = 0; j < repeat_cnt; ++j) {
-            convert_vec<compact_N, accum_t, num_type>(&buf, &reinterpret_cast<NumVec const *>(src)[j]);
+            buf = reinterpret_cast<NumVec const *>(this->data)[j].template convert_vec<accum_t>();
 
             if constexpr (can_be_packed_new && can_be_packed_new_b<accum_t>() && compact_N >= 4) {
                 using AccOps   = AdOpsPacked<accum_t>;
@@ -876,27 +615,46 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     }
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ accum_t sum(vec_t const *const __restrict__ src) {
+    constexpr __device__ accum_t sum_() const noexcept {
         accum_t acc{};
-        sum(&acc, src);
+        this->sum_<accum_t>(&acc);
         return acc;
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void sum(accum_t *const __restrict__ acc, vec_t vec) {
+        vec.sum_<accum_t>(acc);
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ accum_t sum(vec_t vec) {
+        return vec.sum_<accum_t>();
     }
 
     // Weighted sum
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ void weighted_sum(accum_t *const __restrict__ acc, accum_t w, vec_t const *const __restrict__ src) {
-        accum_t buf_acc = sum<accum_t>(src);
+    constexpr __device__ void weighted_sum_(accum_t *const __restrict__ acc, accum_t w) const noexcept {
+        accum_t buf_acc = this->sum_<accum_t>();
         buf_acc *= w;
         *acc += buf_acc;
     }
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ accum_t weighted_sum(accum_t w, vec_t const *const __restrict__ src) {
-        accum_t acc{};
-        sum(&acc, src);
+    constexpr __device__ accum_t weighted_sum_(accum_t w) const noexcept {
+        accum_t acc = this->sum_<accum_t>();
         acc *= w;
         return acc;
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void weighted_sum(accum_t *const __restrict__ acc, accum_t w, vec_t vec) {
+        vec.weighted_sum_<accum_t>(acc);
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ accum_t weighted_sum(accum_t w, vec_t vec) {
+        return vec.weighted_sum_<accum_t>(w);
     }
 
     // Weighted accumulate (elementwise): acc[i] += w * src[i].
@@ -906,41 +664,53 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     // single-rounding fma in accum_t, matching the legacy fmaf(w, r, acc).
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ void weighted_accum(accum_t *const __restrict__ acc, accum_t w, vec_t const *const __restrict__ src) {
-        constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
+    constexpr __device__ void weighted_accum_(accum_t *const __restrict__ acc, accum_t w) const noexcept {
+        constexpr size_t compact_N  = std::min(N, VecFloat<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
         constexpr size_t repeat_cnt = N / compact_N;
-        using NumVec                = Vec<compact_N, num_type>;
-        using AccumVec              = Vec<compact_N, accum_t>;
-        using AccOps                = VecOpsFloatBase<compact_N, accum_t>;
+        using NumVec                = VecFloat<compact_N, num_type>;
+        using AccumVec              = VecFloat<compact_N, accum_t>;
 
-        AccumVec w_vec, src_out;
-#pragma unroll
-        for (size_t j = 0; j < compact_N; ++j) {
-            w_vec[j] = w;
-        }
+        AccumVec src_out, w_vec(w);
 
 #pragma unroll
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            convert_vec<compact_N, accum_t, num_type>(&src_out, &reinterpret_cast<NumVec const *>(src)[i]);
-            AccOps::fmaa_(&reinterpret_cast<AccumVec *>(acc)[i], &src_out, &w_vec);
+            src_out = reinterpret_cast<NumVec const *>(this->data)[i].template convert_vec<accum_t>();
+            reinterpret_cast<AccumVec *>(acc)[i].fmaa_(src_out, w_vec);
         }
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    constexpr __device__ accum_t weighted_accum_(accum_t w) const noexcept {
+        accum_t acc{};
+        this->weighted_accum_<accum_t>(&acc, w);
+        return acc;
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void weighted_accum(accum_t *const __restrict__ acc, accum_t w, vec_t vec) {
+        vec.weighted_accum_<accum_t>(acc, w);
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ accum_t weighted_accum(accum_t w, vec_t vec) {
+        return vec.weighted_accum_<accum_t>(w);
     }
 
     // Prod
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ void prod(accum_t *const __restrict__ acc, vec_t const *const __restrict__ src) {
-        constexpr size_t compact_N  = std::min(N, Vec<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
+    constexpr __device__ void prod_(accum_t *const __restrict__ acc) const noexcept {
+        constexpr size_t compact_N  = std::min(N, VecFloat<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(num_type)));
         constexpr size_t repeat_cnt = N / compact_N;
 
-        using NumVec    = Vec<compact_N, num_type>;
-        using AccumVec  = Vec<compact_N, accum_t>;
+        using NumVec    = VecFloat<compact_N, num_type>;
+        using AccumVec  = VecFloat<compact_N, accum_t>;
         using AccOps    = AdOps<accum_t>;
         accum_t buf_acc = static_cast<accum_t>(1.0f);
         AccumVec buf;
 
         for (size_t j = 0; j < repeat_cnt; ++j) {
-            convert_vec<compact_N, accum_t, num_type>(&buf, &reinterpret_cast<NumVec const *>(src)[j]);
+            buf = reinterpret_cast<NumVec const *>(this->data)[j].template convert_vec<accum_t>();
 
             if constexpr (can_be_packed_new && can_be_packed_new_b<accum_t>() && compact_N >= 4) {
                 using AccOps            = AdOpsPacked<accum_t>;
@@ -965,34 +735,42 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     }
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ accum_t prod(vec_t const *const __restrict__ src) {
+    constexpr __device__ accum_t prod_() const noexcept {
         accum_t acc = static_cast<accum_t>(1.0f);
-        prod(&acc, src);
+        this->prod_<accum_t>(&acc);
         return acc;
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void prod(accum_t *const __restrict__ acc, vec_t vec) {
+        vec.prod_<accum_t>(acc);
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ accum_t prod(vec_t vec) {
+        return vec.prod_<accum_t>();
     }
 
     // Min
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ void min(accum_t *const __restrict__ acc, vec_t const *const __restrict__ src) {
-        vec_t buf;
-        transfer_vector(&buf, src);
-        num_type buf_acc = buf[0];
+    constexpr __device__ void min_(accum_t *const __restrict__ acc) const noexcept {
+        num_type buf_acc = this->data[0];
 
         if constexpr (can_be_packed && N >= 4) {
             using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
-            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
+            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(this->data)[0];
 
 #pragma unroll
             for (size_t i = 1; i < N / 2; ++i) {
-                double_buf_acc = adops_::packed_min(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
+                double_buf_acc = adops_::packed_min(double_buf_acc, reinterpret_cast<packed_t const *>(this->data)[i]);
             }
             buf_acc = adops_::min(double_buf_acc.x, double_buf_acc.y);
         } else {
 #pragma unroll
             for (size_t i = 1; i < N; ++i) {
-                buf_acc = adops_::min(buf_acc, buf[i]);
+                buf_acc = adops_::min(buf_acc, this->data[i]);
             }
         }
 
@@ -1000,53 +778,42 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     }
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ accum_t min(vec_t const *const __restrict__ src) {
-        vec_t buf;
-        transfer_vector(&buf, src);
-        num_type buf_acc = buf[0];
-
-        if constexpr (can_be_packed && N >= 4) {
-            using adops_            = AdOpsPacked<num_type>;
-            using packed_t          = deduce_packed_type_t<num_type>;
-            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
-
-#pragma unroll
-            for (size_t i = 1; i < N / 2; ++i) {
-                double_buf_acc = adops_::packed_min(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
-            }
-            buf_acc = adops_::min(double_buf_acc.x, double_buf_acc.y);
-        } else {
-#pragma unroll
-            for (size_t i = 1; i < N; ++i) {
-                buf_acc = adops_::min(buf_acc, buf[i]);
-            }
-        }
-
-        return static_cast<accum_t>(buf_acc);
+    constexpr __device__ accum_t min_() const noexcept {
+        accum_t acc = static_cast<accum_t>(this->data[0]);
+        this->min_<accum_t>(&acc);
+        return acc;
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void min(accum_t *const __restrict__ acc, vec_t vec) {
+        vec.min_<accum_t>(acc);
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ accum_t min(vec_t vec) {
+        return vec.min_<accum_t>();
     }
 
     // Max
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ void max(accum_t *const __restrict__ acc, vec_t const *const __restrict__ src) {
-        vec_t buf;
-        transfer_vector(&buf, src);
-        num_type buf_acc = buf[0];
+    constexpr __device__ void max_(accum_t *const __restrict__ acc) const noexcept {
+        num_type buf_acc = this->data[0];
 
         if constexpr (can_be_packed && N >= 4) {
             using adops_            = AdOpsPacked<num_type>;
             using packed_t          = deduce_packed_type_t<num_type>;
-            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
+            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(this->data)[0];
 
 #pragma unroll
             for (size_t i = 1; i < N / 2; ++i) {
-                double_buf_acc = adops_::packed_max(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
+                double_buf_acc = adops_::packed_max(double_buf_acc, reinterpret_cast<packed_t const *>(this->data)[i]);
             }
             buf_acc = adops_::max(double_buf_acc.x, double_buf_acc.y);
         } else {
 #pragma unroll
             for (size_t i = 1; i < N; ++i) {
-                buf_acc = adops_::max(buf_acc, buf[i]);
+                buf_acc = adops_::max(buf_acc, this->data[i]);
             }
         }
 
@@ -1054,101 +821,88 @@ struct VecOpsFloatBase : VecOpsBase<N, num_type> {
     }
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ accum_t max(vec_t const *const __restrict__ src) {
-        vec_t buf;
-        transfer_vector(&buf, src);
-        num_type buf_acc = buf[0];
-
-        if constexpr (can_be_packed && N >= 4) {
-            using adops_            = AdOpsPacked<num_type>;
-            using packed_t          = deduce_packed_type_t<num_type>;
-            packed_t double_buf_acc = reinterpret_cast<packed_t const *>(&buf)[0];
-
-#pragma unroll
-            for (size_t i = 1; i < N / 2; ++i) {
-                double_buf_acc = adops_::packed_max(double_buf_acc, reinterpret_cast<packed_t const *>(&buf)[i]);
-            }
-            buf_acc = adops_::max(double_buf_acc.x, double_buf_acc.y);
-        } else {
-#pragma unroll
-            for (size_t i = 1; i < N; ++i) {
-                buf_acc = adops_::max(buf_acc, buf[i]);
-            }
-        }
-
-        return static_cast<accum_t>(buf_acc);
+    constexpr __device__ accum_t max_() const noexcept {
+        accum_t acc = static_cast<accum_t>(this->data[0]);
+        this->max_<accum_t>(&acc);
+        return acc;
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void max(accum_t *const __restrict__ acc, vec_t vec) {
+        vec.max_<accum_t>(acc);
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ accum_t max(vec_t vec) {
+        return vec.max_<accum_t>();
     }
 
     // Dot product
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ void dot_product(
-        accum_t *const __restrict__ acc, vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1
-    ) {
-        accum_t buf_acc{};
-        vec_t buf0, buf1;
-
-        transfer_vector(&buf0, src0);
-        transfer_vector(&buf1, src1);
-
-        mul_(&buf0, &buf1);
-        sum(&buf_acc, &buf0);
-
-        *acc += buf_acc;
+    constexpr __device__ void dot_product_(accum_t *const __restrict__ acc, vec_t other) const noexcept {
+        other *= *this;
+        *acc += other.sum_<accum_t>();
     }
     template <FloatingNum accum_t>
         requires(sizeof(accum_t) >= sizeof(num_type))
-    static constexpr __device__ accum_t dot_product(vec_t const *const __restrict__ src0, vec_t const *const __restrict__ src1) {
+    constexpr __device__ accum_t dot_product_(vec_t other) const noexcept {
         accum_t acc{};
-        dot_product(&acc, src0, src1);
+        dot_product_<accum_t>(&acc, other);
         return acc;
     }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ void dot_product(accum_t *const __restrict__ acc, vec_t src0, vec_t src1) {
+        src0.dot_product_<accum_t>(acc, src1);
+    }
+    template <FloatingNum accum_t>
+        requires(sizeof(accum_t) >= sizeof(num_type))
+    static constexpr __device__ accum_t dot_product(vec_t src0, vec_t src1) {
+        return src0.dot_product_<accum_t>(src1);
+    }
+
+    template <FloatingNum dst_type>
+    constexpr __device__ VecFloat<N, dst_type> convert_vec() const noexcept {
+        using DstOps = VecFloat<N, dst_type>;
+        DstOps out_buf;
+
+        if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, std::remove_cvref_t<num_type>>) {
+            VecFloat<N, num_type>::transfer_vector(&out_buf, this);
+            return out_buf;
+        }
+
+        if constexpr (((std::is_same_v<std::remove_cvref_t<num_type>, float> || is_half_fp_v<num_type>) &&
+                          (std::is_same_v<std::remove_cvref_t<dst_type>, float> || is_half_fp_v<dst_type>) && (N % 2 == 0))) {
+            using packed_src_t = deduce_packed_type_t<num_type>;
+            using packed_dst_t = deduce_packed_type_t<dst_type>;
+
+#pragma unroll
+            for (size_t i = 0; i < N / 2; ++i) {
+                reinterpret_cast<packed_dst_t *>(out_buf.data)[i] =
+                    adops::packed_convert<dst_type, num_type>(reinterpret_cast<packed_src_t const *>(this->data)[i]);
+            }
+        } else {
+#pragma unroll
+            for (size_t i = 0; i < N; ++i) {
+                out_buf[i] = static_cast<dst_type>(this->data[i]);
+            }
+        }
+
+        return out_buf;
+    }
 };
-
-template <size_t N, FloatingNum dst_type, FloatingNum src_type>
-constexpr __device__ void convert_vec(Vec<N, dst_type> *const __restrict__ dst, Vec<N, src_type> const *const __restrict__ src) {
-    if constexpr (std::is_same_v<std::remove_cvref_t<dst_type>, std::remove_cvref_t<src_type>>) {
-        VecOpsFloatBase<N, src_type>::transfer_vector(dst, src);
-        return;
-    }
-
-    using SrcOps = VecOpsFloatBase<N, src_type>;
-    using DstOps = VecOpsFloatBase<N, dst_type>;
-
-    typename SrcOps::vec_t in_buf;
-    typename DstOps::vec_t out_buf;
-    SrcOps::transfer_vector(&in_buf, src);
-
-    if constexpr (((std::is_same_v<std::remove_cvref_t<src_type>, float> || is_half_fp_v<src_type>) &&
-                      (std::is_same_v<std::remove_cvref_t<dst_type>, float> || is_half_fp_v<dst_type>) && (N % 2 == 0))) {
-        using packed_src_t = deduce_packed_type_t<src_type>;
-        using packed_dst_t = deduce_packed_type_t<dst_type>;
-
-#pragma unroll
-        for (size_t i = 0; i < N / 2; ++i) {
-            reinterpret_cast<packed_dst_t *>(out_buf.data)[i] =
-                adops::packed_convert<dst_type, src_type>(reinterpret_cast<packed_src_t *>(in_buf.data)[i]);
-        }
-    } else {
-#pragma unroll
-        for (size_t i = 0; i < N; ++i) {
-            out_buf[i] = static_cast<dst_type>(in_buf[i]);
-        }
-    }
-
-    DstOps::transfer_vector(dst, &out_buf);
-}
 
 // Something like cooperative kernel-like function for copying the whole row with conversions
 // row_width is D size
 // worker_cnt is total numer of workers(threads), working on the whole row
 template <FloatingNum dst_type, FloatingNum src_type, size_t row_width, size_t worker_cnt>
 static __device__ void write_row(dst_type *const __restrict__ dst, size_t worker_idx, src_type const *const __restrict__ src) {
-    constexpr size_t copy_N                  = Vec<1, src_type>::max_vec_size_bytes / std::max(sizeof(src_type), sizeof(dst_type));
+    constexpr size_t copy_N                  = VecFloat<1, src_type>::max_vec_size_bytes / std::max(sizeof(src_type), sizeof(dst_type));
     constexpr size_t total_copies_per_worker = (row_width + copy_N * worker_cnt - 1) / (copy_N * worker_cnt);
 
-    using src_vec_type = Vec<copy_N, src_type>;
-    using dst_vec_type = Vec<copy_N, dst_type>;
+    using src_vec_type = VecFloat<copy_N, src_type>;
+    using dst_vec_type = VecFloat<copy_N, dst_type>;
 
     constexpr size_t unroll_k = 4;
 
@@ -1157,9 +911,7 @@ static __device__ void write_row(dst_type *const __restrict__ dst, size_t worker
         for (size_t j = 0; j < unroll_k; ++j) {
             const size_t tile_id = worker_cnt * (i * unroll_k + j) + worker_idx;
             if (tile_id * copy_N < row_width) [[likely]] {
-                convert_vec<copy_N, dst_type, src_type>(
-                    &reinterpret_cast<dst_vec_type *>(dst)[tile_id], &reinterpret_cast<src_vec_type const *>(src)[tile_id]
-                );
+                reinterpret_cast<dst_vec_type *>(dst)[tile_id] = reinterpret_cast<src_vec_type const *>(src)[tile_id].template convert_vec<dst_type>();
             }
         }
     }
@@ -1167,10 +919,14 @@ static __device__ void write_row(dst_type *const __restrict__ dst, size_t worker
     __syncthreads();
 }
 
+static_assert(std::is_trivially_copyable_v<VecFloat<4, float>>);
+static_assert(std::is_trivially_default_constructible_v<VecFloat<4, float>>);
+static_assert(std::is_trivially_destructible_v<VecFloat<4, float>>);
+
 // Operations with whole tiles
 
 template <size_t N, FloatingNum num_type, FloatingNum accum_t = float>
-struct TileOps : VecOpsFloatBase<N, num_type> {
+struct TileOps {
    private:
     static consteval auto deduce_ns_t() {
         if constexpr (std::is_same_v<std::remove_cvref_t<num_type>, half>) {
@@ -1186,8 +942,8 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
     static_assert(sizeof(accum_t) >= sizeof(num_type), "Accumulator type must not be smaller than basic num type");
 
     using scal_t = num_type;
-    using vec_t  = VecOpsFloatBase<N, num_type>::vec_t;
-    using wide_t = VecOpsFloatBase<N, num_type>::wide_t;
+    using vec_t  = VecFloat<N, num_type>;
+    using wide_t = vec_t::wide_t;
     using ns_t   = decltype(deduce_ns_t());
 
     static constexpr int TW = N;
@@ -1197,29 +953,27 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
         return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
     }
     static __device__ void write_zero(num_type *const __restrict__ dst_arr, size_t vec_idx) {
-        store_zero(reinterpret_cast<vec_t *>(&dst_arr[vec_idx * TW]));
+        reinterpret_cast<vec_t *>(&dst_arr[vec_idx * TW])->store_zero_();
     }
-    static __device__ void write(num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t const *const __restrict__ src_val_ptr) {
-        *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(src_val_ptr);
+    static __device__ void write(num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t src_val) {
+        *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(&src_val);
     }
     static __device__ void write_convert_to_accum(accum_t *const __restrict__ dst, num_type const *const __restrict__ src) {
-        constexpr size_t compact_N  = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
+        constexpr size_t compact_N  = std::min(N, VecFloat<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
         constexpr size_t repeat_cnt = N / compact_N;
 
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            convert_vec<compact_N, accum_t, num_type>(
-                &reinterpret_cast<Vec<compact_N, accum_t> *>(dst)[i], &reinterpret_cast<Vec<compact_N, num_type> const *>(src)[i]
-            );
+            reinterpret_cast<VecFloat<compact_N, accum_t> *>(dst)[i] =
+                reinterpret_cast<VecFloat<compact_N, num_type> const *>(src)[i].template convert_vec<accum_t>();
         }
     }
     static __device__ void write_convert_from_accum(num_type *const __restrict__ dst, accum_t const *const __restrict__ src) {
-        constexpr size_t compact_N  = std::min(N, Vec<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
+        constexpr size_t compact_N  = std::min(N, VecFloat<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
         constexpr size_t repeat_cnt = N / compact_N;
 
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            convert_vec<compact_N, num_type, accum_t>(
-                &reinterpret_cast<Vec<compact_N, num_type> *>(dst)[i], &reinterpret_cast<Vec<compact_N, accum_t> const *>(src)[i]
-            );
+            reinterpret_cast<VecFloat<compact_N, num_type> *>(dst)[i] =
+                reinterpret_cast<VecFloat<compact_N, accum_t> const *>(src)[i].template convert_vec<num_type>();
         }
     }
 
@@ -1235,69 +989,57 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
         }
     }
     static __device__ accum_t gatv2_dot_leaky_relu(vec_t l, vec_t r, vec_t a, accum_t ns) {
-        add_(&l, &r);
-        leaky_relu_(&l, ns);
-        mul_(&l, &a);
+        l += r;
+        l.leaky_relu_(ns);
+        l *= a;
 
-        return sum<accum_t>(&l);
+        return l.template sum_<accum_t>();
     }
     static __device__ void gatv2_accum_grad_al(
         accum_t *const __restrict__ ga, accum_t *const __restrict__ gl, accum_t ge, vec_t l, vec_t r, vec_t a, accum_t ns
     ) {
-        Vec<N, num_type> ge_vec;
-#pragma unroll
-        for (size_t i = 0; i < N; ++i) {
-            ge_vec[i] = static_cast<num_type>(ge);
-        }
+        VecFloat<N, num_type> ge_vec(static_cast<num_type>(ge));
+        l += r;
+        VecFloat<N, num_type> buf_vec = l;
 
-        add_(&l, &r);
-        Vec<N, num_type> buf_vec = l;
-
-        leaky_relu_backward_(&buf_vec, &ge_vec, ns);
+        buf_vec.leaky_relu_backward_(ge_vec, ns);
 
         constexpr size_t compact_N  = std::min(N, sizeof(accum_t));
         constexpr size_t repeat_cnt = N / compact_N;
-        using vec_compact_t         = Vec<compact_N, num_type>;
-        using FloatOps              = VecOpsFloatBase<compact_N, accum_t>;
+        using vec_compact_t         = VecFloat<compact_N, num_type>;
+        using AccumVec              = VecFloat<compact_N, accum_t>;
 
 #pragma unroll
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            Vec<compact_N, accum_t> l_out, bv_out, a_out;
-            convert_vec<compact_N, accum_t, num_type>(&l_out, &reinterpret_cast<vec_compact_t const *>(&l)[i]);
-            convert_vec<compact_N, accum_t, num_type>(&bv_out, &reinterpret_cast<vec_compact_t const *>(&buf_vec)[i]);
-            convert_vec<compact_N, accum_t, num_type>(&a_out, &reinterpret_cast<vec_compact_t const *>(&a)[i]);
+            AccumVec l_out, bv_out, a_out;
+            l_out  = reinterpret_cast<vec_compact_t const *>(&l)[i].template convert_vec<accum_t>();
+            bv_out = reinterpret_cast<vec_compact_t const *>(&buf_vec)[i].template convert_vec<accum_t>();
+            a_out  = reinterpret_cast<vec_compact_t const *>(&a)[i].template convert_vec<accum_t>();
 
             // ga += (ge * t) * edge,  gl += (ge * t) * a
-            FloatOps::fmaa_(&reinterpret_cast<Vec<compact_N, accum_t> *>(ga)[i], &bv_out, &l_out);
-            FloatOps::fmaa_(&reinterpret_cast<Vec<compact_N, accum_t> *>(gl)[i], &bv_out, &a_out);
+            reinterpret_cast<VecFloat<compact_N, accum_t> *>(ga)[i].fmaa_(bv_out, l_out);
+            reinterpret_cast<VecFloat<compact_N, accum_t> *>(gl)[i].fmaa_(bv_out, a_out);
         }
     }
     static __device__ void gatv2_accum_grad_r(
         accum_t *const __restrict__ gr, accum_t alpha, vec_t gh, accum_t ge, vec_t l, vec_t r, vec_t a, accum_t ns
     ) {
-        Vec<N, num_type> ge_vec, alpha_vec;
-#pragma unroll
-        for (size_t i = 0; i < N; ++i) {
-            ge_vec[i]    = static_cast<num_type>(ge);
-            alpha_vec[i] = static_cast<num_type>(alpha);
-        }
+        VecFloat<N, num_type> ge_vec(static_cast<num_type>(ge)), alpha_vec(static_cast<num_type>(alpha));
 
-        add_(&l, &r);
-        leaky_relu_backward_(&l, &ge_vec, ns);
-        mul_(&l, &a);
-        fmaa_(&l, &gh, &alpha_vec);
+        l += r;
+        l.leaky_relu_backward_(ge_vec, ns);
+        l *= a;
+        l.fmaa_(gh, alpha_vec);
 
         constexpr size_t compact_N  = std::min(N, sizeof(accum_t));
         constexpr size_t repeat_cnt = N / compact_N;
-        using vec_compact_t         = Vec<compact_N, num_type>;
-        using FloatOps              = VecOpsFloatBase<compact_N, accum_t>;
+        using vec_compact_t         = VecFloat<compact_N, num_type>;
+        using AccumVec              = VecFloat<compact_N, accum_t>;
 
 #pragma unroll
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            Vec<compact_N, accum_t> l_out;
-            convert_vec<compact_N, accum_t, num_type>(&l_out, &reinterpret_cast<vec_compact_t const *>(&l)[i]);
-
-            FloatOps::add_(&reinterpret_cast<Vec<compact_N, accum_t> *>(gr)[i], &l_out);
+            AccumVec l_out = reinterpret_cast<vec_compact_t const *>(&l)[i].template convert_vec<accum_t>();
+            reinterpret_cast<VecFloat<compact_N, accum_t> *>(gr)[i] += l_out;
         }
     }
     template <FloatingNum atomic_t = float>
@@ -1306,14 +1048,14 @@ struct TileOps : VecOpsFloatBase<N, num_type> {
 
         constexpr size_t compact_N  = std::min(N, sizeof(atomic_t));
         constexpr size_t repeat_cnt = N / compact_N;
-        using vec_compact_t         = Vec<compact_N, num_type>;
-        using FloatOps              = VecOpsFloatBase<compact_N, atomic_t>;
+        using vec_compact_t         = VecFloat<compact_N, num_type>;
+        using AtomicVec             = VecFloat<compact_N, atomic_t>;
 
-        Vec<compact_N, atomic_t> buf;
+        VecFloat<compact_N, atomic_t> buf;
 #pragma unroll
         for (size_t i = 0; i < repeat_cnt; ++i) {
-            convert_vec<compact_N, atomic_t, num_type>(&buf, &reinterpret_cast<vec_compact_t const *>(&v)[i]);
-            FloatOps::scalar_mul_(&buf, scalar);
+            buf = reinterpret_cast<vec_compact_t const *>(&v)[i].template convert_vec<atomic_t>();
+            buf *= scalar;
 #pragma unroll
             for (size_t j = 0; j < compact_N; ++j) {
                 atomicAdd(&ptr[vec_idx + i * compact_N + j], buf[j]);
