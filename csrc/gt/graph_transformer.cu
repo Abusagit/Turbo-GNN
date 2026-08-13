@@ -62,16 +62,16 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
 
         std::visit(
             [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                using index_t    = typename decltype(idxInfo)::Type;
-                using torch_t    = typename decltype(typeInfo)::TorchType;
-                using cuda_t     = typename decltype(typeInfo)::CudaType;
-                constexpr int DC = decltype(d_c)::value;
-                constexpr int W  = decltype(warp_c)::value;
+                using index_t       = typename decltype(idxInfo)::Type;
+                using torch_t       = typename decltype(typeInfo)::TorchType;
+                using cuda_t        = typename decltype(typeInfo)::CudaType;
+                constexpr size_t DC = decltype(d_c)::value;
+                constexpr size_t W  = decltype(warp_c)::value;
 
-                auto *Q_ptr = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
-                auto *K_ptr = reinterpret_cast<const cuda_t *>(K.data_ptr<torch_t>());
-                auto *V_ptr = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
-                auto *O_ptr = reinterpret_cast<cuda_t *>(O.data_ptr<torch_t>());
+                cuda_t const *Q_ptr = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
+                cuda_t const *K_ptr = reinterpret_cast<const cuda_t *>(K.data_ptr<torch_t>());
+                cuda_t const *V_ptr = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
+                cuda_t *O_ptr       = reinterpret_cast<cuda_t *>(O.data_ptr<torch_t>());
 
                 dim3 blocks(num_nodes_bucket, H);
 
@@ -86,14 +86,12 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
 
                 static_assert(DC % kWarpSize == 0, "D size should be a whole number of kWarpSize");
                 constexpr int x_dim = kWarpSize;
-                // constexpr int y_dim = std::max(std::min(DC / SelectTW<DC, cuda_t>::value, 1024) / x_dim, 1);
-                constexpr int y_dim = 1;
-                constexpr int z_dim = std::max(std::min(W, 1024 / (x_dim * y_dim)), 1);
-                dim3 threads(x_dim, y_dim, z_dim);
+                constexpr int y_dim = std::max(std::min(W, kMaxThreadsInBlock / (x_dim)), 1ul);
+                dim3 threads(x_dim, y_dim);
 
-                size_t shmem = DC * sizeof(cuda_t) + z_dim * DC * sizeof(float) + 2 * z_dim * sizeof(float) + y_dim * z_dim * sizeof(float) * 2;
+                size_t shmem = DC * sizeof(cuda_t) + y_dim * DC * sizeof(float) + 2 * y_dim * sizeof(float) + y_dim * sizeof(float) * 2;
 
-                GraphAttentionForward_CSR_MH_v2_D<y_dim, z_dim, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                GraphAttentionForward_CSR_MH_v2_D<y_dim, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1],
                     index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), O_ptr, o_strides[0],
                     o_strides[1], lse.data_ptr<float>(), scale
@@ -219,19 +217,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
         dim3 threads_D(kWarpSize);
         std::visit(
             [&](auto typeInfo, auto d_c) {
-                using torch_t    = typename decltype(typeInfo)::TorchType;
-                using cuda_t     = typename decltype(typeInfo)::CudaType;
-                constexpr int DC = decltype(d_c)::value;
+                using torch_t       = typename decltype(typeInfo)::TorchType;
+                using cuda_t        = typename decltype(typeInfo)::CudaType;
+                constexpr size_t DC = decltype(d_c)::value;
 
-                auto cuda_stream = at::cuda::getDefaultCUDAStream();
-                auto *dO_ptr     = reinterpret_cast<const cuda_t *>(dO.data_ptr<torch_t>());
-                auto *O_ptr      = reinterpret_cast<const cuda_t *>(O.data_ptr<torch_t>());
+                auto cuda_stream     = at::cuda::getDefaultCUDAStream();
+                cuda_t const *dO_ptr = reinterpret_cast<const cuda_t *>(dO.data_ptr<torch_t>());
+                cuda_t const *O_ptr  = reinterpret_cast<const cuda_t *>(O.data_ptr<torch_t>());
 
                 compute_D_mh_kernel_D<DC, cuda_t><<<blocks_D, threads_D, 0, cuda_stream>>>(
                     dO_ptr, O_ptr, Delta.data_ptr<float>(), N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
                 );
             },
-            MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D)
+            MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(D)
         );
     }
 
@@ -261,13 +259,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
 
                     auto cuda_stream = at::cuda::getDefaultCUDAStream();
 
-                    auto *Q_ptr  = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
-                    auto *K_ptr  = reinterpret_cast<const cuda_t *>(K.data_ptr<torch_t>());
-                    auto *V_ptr  = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
-                    auto *dO_ptr = reinterpret_cast<const cuda_t *>(dO.data_ptr<torch_t>());
-                    auto *dQ_ptr = reinterpret_cast<cuda_t *>(dQ.data_ptr<torch_t>());
-                    auto *dV_ptr = reinterpret_cast<cuda_t *>(dV.data_ptr<torch_t>());
-                    auto *dK_ptr = dK_f32.data_ptr<float>();
+                    cuda_t const *Q_ptr  = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
+                    cuda_t const *K_ptr  = reinterpret_cast<const cuda_t *>(K.data_ptr<torch_t>());
+                    cuda_t const *V_ptr  = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
+                    cuda_t const *dO_ptr = reinterpret_cast<const cuda_t *>(dO.data_ptr<torch_t>());
+                    cuda_t *dQ_ptr       = reinterpret_cast<cuda_t *>(dQ.data_ptr<torch_t>());
+                    cuda_t *dV_ptr       = reinterpret_cast<cuda_t *>(dV.data_ptr<torch_t>());
+                    float *dK_ptr        = dK_f32.data_ptr<float>();
 
                     // qj + vj (read-only) + W * (gq + gv) per-warp accumulators
                     size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
@@ -302,13 +300,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
 
                 auto cuda_stream = at::cuda::getDefaultCUDAStream();
 
-                auto *Q_ptr  = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
-                auto *K_ptr  = reinterpret_cast<const cuda_t *>(K.data_ptr<torch_t>());
-                auto *V_ptr  = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
-                auto *dO_ptr = reinterpret_cast<const cuda_t *>(dO.data_ptr<torch_t>());
-                auto *dQ_ptr = reinterpret_cast<cuda_t *>(dQ.data_ptr<torch_t>());
-                auto *dV_ptr = reinterpret_cast<cuda_t *>(dV.data_ptr<torch_t>());
-                auto *dK_ptr = reinterpret_cast<cuda_t *>(dK_typed.data_ptr<torch_t>());
+                cuda_t const *Q_ptr  = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
+                cuda_t const *K_ptr  = reinterpret_cast<const cuda_t *>(K.data_ptr<torch_t>());
+                cuda_t const *V_ptr  = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
+                cuda_t const *dO_ptr = reinterpret_cast<const cuda_t *>(dO.data_ptr<torch_t>());
+                cuda_t *dQ_ptr       = reinterpret_cast<cuda_t *>(dQ.data_ptr<torch_t>());
+                cuda_t *dV_ptr       = reinterpret_cast<cuda_t *>(dV.data_ptr<torch_t>());
+                cuda_t *dK_ptr       = reinterpret_cast<cuda_t *>(dK_typed.data_ptr<torch_t>());
 
                 // 3 cuda_t vectors (K,Q,V) + 3 float accumulators (dK,dQ,dV)
                 size_t shmem_bwd = 3 * DC * sizeof(cuda_t) + 3 * DC * sizeof(float);
@@ -323,7 +321,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D)
+            MakeIntVariant<32, 64, 128, 256>(D)
         );
     }
 

@@ -195,20 +195,20 @@ constexpr __device__ __forceinline__ packed_dst_type packed_convert(packed_src_t
     }
 }
 
-template <FloatingNum L, FloatingNum S>
-constexpr __device__ auto broadcast_scalar_to_packed(L val) {
-    if constexpr (is_half_fp_v<L>) {
-        if constexpr (std::is_same_v<std::remove_cvref_t<S>, half>) {
+template <FloatingNum SrcType, FloatingNum DstType>
+constexpr __device__ auto broadcast_scalar_to_packed(SrcType val) {
+    if constexpr (is_half_fp_v<SrcType>) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<DstType>, half>) {
             return make_half2(val, val);
-        } else if constexpr (std::is_same_v<std::remove_cvref_t<S>, nv_bfloat16>) {
+        } else if constexpr (std::is_same_v<std::remove_cvref_t<DstType>, nv_bfloat16>) {
             return make_bfloat162(val, val);
         } else {
             __builtin_unreachable();
         }
     } else {
-        if constexpr (std::is_same_v<std::remove_cvref_t<S>, half>) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<DstType>, half>) {
             return __float2half2_rn(static_cast<float>(val));
-        } else if constexpr (std::is_same_v<std::remove_cvref_t<S>, nv_bfloat16>) {
+        } else if constexpr (std::is_same_v<std::remove_cvref_t<DstType>, nv_bfloat16>) {
             return __float2bfloat162_rn(static_cast<float>(val));
         } else {
             __builtin_unreachable();
