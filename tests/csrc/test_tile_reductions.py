@@ -1,4 +1,4 @@
-"""VecOpsFloatBase reductions: sum, weighted_sum, prod, min, max, dot_product.
+"""VecFloat reductions: sum, weighted_sum, prod, min, max, dot_product.
 
 Each reduction gets two independent checks, because "correct" means two things here:
 

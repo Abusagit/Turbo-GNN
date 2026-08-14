@@ -93,10 +93,20 @@ const Vec<N, num_t>* cvec_ptr(const torch::Tensor& t) {
     return reinterpret_cast<const Vec<N, num_t> *>(t.data_ptr());
 }
 
+// VecFloat adds no data members over Vec, so the same tensors reinterpret cleanly.
+template <size_t N>
+VecFloat<N, num_t>* vecf_ptr(const torch::Tensor& t) {
+    return reinterpret_cast<VecFloat<N, num_t> *>(t.data_ptr());
+}
+template <size_t N>
+const VecFloat<N, num_t>* cvecf_ptr(const torch::Tensor& t) {
+    return reinterpret_cast<const VecFloat<N, num_t> *>(t.data_ptr());
+}
+
 }  // namespace
 
 // ===========================================================================
-// group "data": Vec layout, SelectTW, VecOpsBase data movement
+// group "data": Vec layout, SelectTW, Vec data movement
 // ===========================================================================
 #if TGNN_GROUP == 0
 
@@ -113,7 +123,7 @@ enum DataOp : int {
 
 template <size_t N>
 TGNN_WORKER void apply_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src) {
-    using Ops = VecOpsBase<N, num_t>;
+    using Ops = Vec<N, num_t>;
     switch (op) {
         case OP_STORE_ZERO:
             Ops::store_zero(dst);
@@ -121,11 +131,9 @@ TGNN_WORKER void apply_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src
         case OP_GET_ZERO:
             *dst = Ops::get_zero();
             break;
-        // load__scalars(num_type* dst, vec_t const* src): vector -> scalar array.
-        // (The header's doc comment describes the opposite direction; the signature is
-        // authoritative and is what we test.)
+        // load_scalars(num_type* dst, vec_t const* src): vector -> scalar array.
         case OP_LOAD_SCALARS:
-            Ops::load__scalars(reinterpret_cast<num_t*>(dst), src);
+            Ops::load_scalars(reinterpret_cast<num_t*>(dst), src);
             break;
         // store_scalars(vec_t* dst, num_type const* src): scalar array -> vector.
         case OP_STORE_SCALARS:
@@ -207,7 +215,7 @@ py::dict op_codes() {
     py::dict d;
     d["store_zero"]       = static_cast<int>(OP_STORE_ZERO);
     d["get_zero"]         = static_cast<int>(OP_GET_ZERO);
-    d["load__scalars"]    = static_cast<int>(OP_LOAD_SCALARS);
+    d["load_scalars"]     = static_cast<int>(OP_LOAD_SCALARS);
     d["store_scalars"]    = static_cast<int>(OP_STORE_SCALARS);
     d["transfer_scalars"] = static_cast<int>(OP_TRANSFER_SCALARS);
     d["transfer_vector"]  = static_cast<int>(OP_TRANSFER_VECTOR);
@@ -266,45 +274,49 @@ enum EwOp : int {
 
 template <size_t N>
 TGNN_WORKER void apply_ew(
-    int op, Vec<N, num_t>* out, const Vec<N, num_t>* a, const Vec<N, num_t>* b, const Vec<N, num_t>* c, num_t s
+    int op, VecFloat<N, num_t>* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b,
+    const VecFloat<N, num_t>* c, num_t s
 ) {
-    using Ops = VecOpsFloatBase<N, num_t>;
+    using VF = VecFloat<N, num_t>;
     // The in-place flavours mutate their first argument, so seed `out` from `a` and let
     // them work on `out`. One uniform ABI then covers all three flavours.
     *out = *a;
     switch (op) {
-        case OP_NEG: Ops::neg_(out); break;
-        case OP_LOG: Ops::log_(out); break;
-        case OP_EXP: Ops::exp_(out); break;
-        case OP_RELU: Ops::relu_(out); break;
+        case OP_NEG: out->neg_(); break;
+        case OP_LOG: out->log_(); break;
+        case OP_EXP: out->exp_(); break;
+        case OP_RELU: out->relu_(); break;
 
-        case OP_SCALAR_MUL: Ops::scalar_mul_(out, s); break;
-        case OP_LEAKY_RELU: Ops::leaky_relu_(out, s); break;
-        case OP_LEAKY_RELU_BWD: Ops::leaky_relu_backward_(out, b, s); break;
+        case OP_SCALAR_MUL: out->scalar_mul_(s); break;
+        case OP_LEAKY_RELU: out->leaky_relu_(s); break;
+        case OP_LEAKY_RELU_BWD: out->leaky_relu_backward_(*b, s); break;
 
-        case OP_ADD_I: Ops::add_(out, b); break;
-        case OP_ADD_D: Ops::add(out, a, b); break;
-        case OP_ADD_R: *out = Ops::add(a, b); break;
-        case OP_SUB_I: Ops::sub_(out, b); break;
-        case OP_SUB_D: Ops::sub(out, a, b); break;
-        case OP_SUB_R: *out = Ops::sub(a, b); break;
-        case OP_MUL_I: Ops::mul_(out, b); break;
-        case OP_MUL_D: Ops::mul(out, a, b); break;
-        case OP_MUL_R: *out = Ops::mul(a, b); break;
-        case OP_DIV_I: Ops::div_(out, b); break;
-        case OP_DIV_D: Ops::div(out, a, b); break;
-        case OP_DIV_R: *out = Ops::div(a, b); break;
-        case OP_MIN_I: Ops::minimum_(out, b); break;
-        case OP_MIN_D: Ops::minimum(out, a, b); break;
-        case OP_MIN_R: *out = Ops::minimum(a, b); break;
-        case OP_MAX_I: Ops::maximum_(out, b); break;
-        case OP_MAX_D: Ops::maximum(out, a, b); break;
-        case OP_MAX_R: *out = Ops::maximum(a, b); break;
+        case OP_ADD_I: out->add_(*b); break;
+        // VecFloat has no dst-out static for add/sub/mul/div/fma: both non-mutating
+        // flavours go through the by-value static. minimum/maximum keep a real dst-out
+        // overload, so their _dst rows exercise a distinct code path.
+        case OP_ADD_D:
+        case OP_ADD_R: *out = VF::add(*a, *b); break;
+        case OP_SUB_I: out->sub_(*b); break;
+        case OP_SUB_D:
+        case OP_SUB_R: *out = VF::sub(*a, *b); break;
+        case OP_MUL_I: out->mul_(*b); break;
+        case OP_MUL_D:
+        case OP_MUL_R: *out = VF::mul(*a, *b); break;
+        case OP_DIV_I: out->div_(*b); break;
+        case OP_DIV_D:
+        case OP_DIV_R: *out = VF::div(*a, *b); break;
+        case OP_MIN_I: out->minimum_(*b); break;
+        case OP_MIN_D: VF::minimum(out, *a, *b); break;
+        case OP_MIN_R: *out = VF::minimum(*a, *b); break;
+        case OP_MAX_I: out->maximum_(*b); break;
+        case OP_MAX_D: VF::maximum(out, *a, *b); break;
+        case OP_MAX_R: *out = VF::maximum(*a, *b); break;
 
-        case OP_FMAM_I: Ops::fmam_(out, b, c); break;
-        case OP_FMAA_I: Ops::fmaa_(out, b, c); break;
-        case OP_FMA_D: Ops::fma(out, a, b, c); break;
-        case OP_FMA_R: *out = Ops::fma(a, b, c); break;
+        case OP_FMAM_I: out->fmam_(*b, *c); break;
+        case OP_FMAA_I: out->fmaa_(*b, *c); break;
+        case OP_FMA_D:
+        case OP_FMA_R: *out = VF::fma(*a, *b, *c); break;
     }
 }
 
@@ -325,38 +337,41 @@ enum RedOp : int {
 
 template <size_t N, typename acc_t>
 TGNN_WORKER void apply_red(
-    int op, acc_t* out, const Vec<N, num_t>* a, const Vec<N, num_t>* b, acc_t acc_init, acc_t w
+    int op, acc_t* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b, acc_t acc_init, acc_t w
 ) {
-    using Ops = VecOpsFloatBase<N, num_t>;
     acc_t acc = acc_init;
+    // The member overloads are the exercised API: the acc form folds into an existing
+    // accumulator (`*acc op= reduce(vec)`), the ret form returns `reduce(vec)`. The
+    // static weighted_sum(acc, w, vec) wrapper drops its weight argument and does not
+    // instantiate, so the members are what the tests go through.
     switch (op) {
-        case OP_SUM_ACC: Ops::sum(&acc, a); break;
-        case OP_SUM_RET: acc = Ops::template sum<acc_t>(a); break;
-        case OP_WSUM_ACC: Ops::weighted_sum(&acc, w, a); break;
-        case OP_WSUM_RET: acc = Ops::template weighted_sum<acc_t>(w, a); break;
-        case OP_PROD_ACC: Ops::prod(&acc, a); break;
-        case OP_PROD_RET: acc = Ops::template prod<acc_t>(a); break;
-        case OP_RMIN_ACC: Ops::min(&acc, a); break;
-        case OP_RMIN_RET: acc = Ops::template min<acc_t>(a); break;
-        case OP_RMAX_ACC: Ops::max(&acc, a); break;
-        case OP_RMAX_RET: acc = Ops::template max<acc_t>(a); break;
-        case OP_DOT_ACC: Ops::dot_product(&acc, a, b); break;
-        case OP_DOT_RET: acc = Ops::template dot_product<acc_t>(a, b); break;
+        case OP_SUM_ACC: a->template sum_<acc_t>(&acc); break;
+        case OP_SUM_RET: acc = a->template sum_<acc_t>(); break;
+        case OP_WSUM_ACC: a->template weighted_sum_<acc_t>(&acc, w); break;
+        case OP_WSUM_RET: acc = a->template weighted_sum_<acc_t>(w); break;
+        case OP_PROD_ACC: a->template prod_<acc_t>(&acc); break;
+        case OP_PROD_RET: acc = a->template prod_<acc_t>(); break;
+        case OP_RMIN_ACC: a->template min_<acc_t>(&acc); break;
+        case OP_RMIN_RET: acc = a->template min_<acc_t>(); break;
+        case OP_RMAX_ACC: a->template max_<acc_t>(&acc); break;
+        case OP_RMAX_RET: acc = a->template max_<acc_t>(); break;
+        case OP_DOT_ACC: a->template dot_product_<acc_t>(&acc, *b); break;
+        case OP_DOT_RET: acc = a->template dot_product_<acc_t>(*b); break;
     }
     *out = acc;
 }
 
 template <size_t N>
 TGNN_WORKER void apply_gatv2_dot(
-    float* out, const Vec<N, num_t>* l, const Vec<N, num_t>* r, const Vec<N, num_t>* a, float ns
+    float* out, const VecFloat<N, num_t>* l, const VecFloat<N, num_t>* r, const VecFloat<N, num_t>* a, float ns
 ) {
     *out = TileOps<N, num_t, float>::gatv2_dot_leaky_relu(*l, *r, *a, ns);
 }
 
 template <size_t N>
 __global__ void k_ew(
-    int op, Vec<N, num_t>* out, const Vec<N, num_t>* a, const Vec<N, num_t>* b, const Vec<N, num_t>* c, num_t s,
-    int64_t m
+    int op, VecFloat<N, num_t>* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b,
+    const VecFloat<N, num_t>* c, num_t s, int64_t m
 ) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) apply_ew<N>(op, out + i, a + i, b + i, c + i, s);
@@ -364,7 +379,7 @@ __global__ void k_ew(
 
 template <size_t N, typename acc_t>
 __global__ void k_red(
-    int op, acc_t* out, const Vec<N, num_t>* a, const Vec<N, num_t>* b, acc_t acc_init, acc_t w, int64_t m
+    int op, acc_t* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b, acc_t acc_init, acc_t w, int64_t m
 ) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) apply_red<N, acc_t>(op, out + i, a + i, b + i, acc_init, w);
@@ -372,7 +387,8 @@ __global__ void k_red(
 
 template <size_t N>
 __global__ void k_gatv2_dot(
-    float* out, const Vec<N, num_t>* l, const Vec<N, num_t>* r, const Vec<N, num_t>* a, float ns, int64_t m
+    float* out, const VecFloat<N, num_t>* l, const VecFloat<N, num_t>* r, const VecFloat<N, num_t>* a, float ns,
+    int64_t m
 ) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) apply_gatv2_dot<N>(out + i, l + i, r + i, a + i, ns);
@@ -387,7 +403,7 @@ void ew_impl(
         // Round the scalar through num_t exactly as a kernel would.
         const num_t sv = static_cast<num_t>(static_cast<float>(s));
         k_ew<N><<<grid_for(m, kBlock), kBlock>>>(
-            op, vec_ptr<N>(out), cvec_ptr<N>(a), cvec_ptr<N>(b), cvec_ptr<N>(c), sv, m
+            op, vecf_ptr<N>(out), cvecf_ptr<N>(a), cvecf_ptr<N>(b), cvecf_ptr<N>(c), sv, m
         );
         C10_CUDA_CHECK(cudaGetLastError());
     } else {
@@ -403,7 +419,7 @@ void red_run(
     const auto ai = static_cast<acc_t>(acc_init);
     const auto wv = static_cast<acc_t>(w);
     k_red<N, acc_t><<<grid_for(m, kBlock), kBlock>>>(
-        op, out.template data_ptr<acc_t>(), cvec_ptr<N>(a), cvec_ptr<N>(b), ai, wv, m
+        op, out.template data_ptr<acc_t>(), cvecf_ptr<N>(a), cvecf_ptr<N>(b), ai, wv, m
     );
     C10_CUDA_CHECK(cudaGetLastError());
 }
@@ -432,7 +448,7 @@ void gatv2_dot_impl(
     if constexpr (vec_fits<N, num_t>) {
         const auto nsv = static_cast<float>(ns);
         k_gatv2_dot<N><<<grid_for(m, kBlock), kBlock>>>(
-            out.data_ptr<float>(), cvec_ptr<N>(l), cvec_ptr<N>(r), cvec_ptr<N>(a), nsv, m
+            out.data_ptr<float>(), cvecf_ptr<N>(l), cvecf_ptr<N>(r), cvecf_ptr<N>(a), nsv, m
         );
         C10_CUDA_CHECK(cudaGetLastError());
     } else {
@@ -555,8 +571,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 namespace {
 
 template <size_t N, typename dst_t>
-TGNN_WORKER void apply_convert(Vec<N, dst_t>* dst, const Vec<N, num_t>* src) {
-    convert_vec<N, dst_t, num_t>(dst, src);
+TGNN_WORKER void apply_convert(VecFloat<N, dst_t>* dst, const VecFloat<N, num_t>* src) {
+    *dst = src->template convert_vec<dst_t>();
 }
 
 template <size_t N>
@@ -565,7 +581,7 @@ TGNN_WORKER void apply_read(Vec<N, num_t>* out, const num_t* arr, size_t vec_idx
 }
 
 template <size_t N, typename dst_t>
-__global__ void k_convert(Vec<N, dst_t>* dst, const Vec<N, num_t>* src, int64_t m) {
+__global__ void k_convert(VecFloat<N, dst_t>* dst, const VecFloat<N, num_t>* src, int64_t m) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) apply_convert<N, dst_t>(dst + i, src + i);
 }
@@ -578,7 +594,7 @@ __global__ void k_read(Vec<N, num_t>* out, const num_t* arr, int64_t start, int6
 
 // Every row targets the same vec_idx, so the atomicAdd is genuinely contended.
 template <size_t N>
-__global__ void k_atomic(float* ptr, int64_t vec_idx, float scalar, const Vec<N, num_t>* v, int64_t m) {
+__global__ void k_atomic(float* ptr, int64_t vec_idx, float scalar, const VecFloat<N, num_t>* v, int64_t m) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) TileOps<N, num_t, float>::atomic_add_scaled_f32(ptr, static_cast<size_t>(vec_idx), scalar, v[i]);
 }
@@ -591,8 +607,8 @@ __global__ void k_write_row(dst_t* dst, const num_t* src) {
 template <size_t N, typename dst_t>
 void convert_run(const torch::Tensor& out, const torch::Tensor& src, int64_t m) {
     if constexpr (vec_fits<N, num_t> && vec_fits<N, dst_t>) {
-        auto* d = reinterpret_cast<Vec<N, dst_t>*>(out.data_ptr());
-        k_convert<N, dst_t><<<grid_for(m, kBlock), kBlock>>>(d, cvec_ptr<N>(src), m);
+        auto* d = reinterpret_cast<VecFloat<N, dst_t>*>(out.data_ptr());
+        k_convert<N, dst_t><<<grid_for(m, kBlock), kBlock>>>(d, cvecf_ptr<N>(src), m);
         C10_CUDA_CHECK(cudaGetLastError());
     } else {
         TORCH_CHECK(
@@ -630,7 +646,7 @@ void atomic_impl(const torch::Tensor& ptr, int64_t vec_idx, double scalar, const
     // always within the 16-byte cap, so only the input vector itself has to fit.
     if constexpr (vec_fits<N, num_t>) {
         k_atomic<N><<<grid_for(m, kBlock), kBlock>>>(
-            ptr.data_ptr<float>(), vec_idx, static_cast<float>(scalar), cvec_ptr<N>(v), m
+            ptr.data_ptr<float>(), vec_idx, static_cast<float>(scalar), cvecf_ptr<N>(v), m
         );
         C10_CUDA_CHECK(cudaGetLastError());
     } else {
@@ -745,8 +761,8 @@ void make_ns_impl(const torch::Tensor& out, double ns) {
 
 template <size_t N>
 __global__ void k_grad_al(
-    float* ga, float* gl, const float* ge, const Vec<N, num_t>* l, const Vec<N, num_t>* r, const Vec<N, num_t>* a,
-    float ns, int64_t m
+    float* ga, float* gl, const float* ge, const VecFloat<N, num_t>* l, const VecFloat<N, num_t>* r,
+    const VecFloat<N, num_t>* a, float ns, int64_t m
 ) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) TileOps<N, num_t, float>::gatv2_accum_grad_al(ga + i * N, gl + i * N, ge[i], l[i], r[i], a[i], ns);
@@ -759,8 +775,8 @@ void grad_al_impl(
 ) {
     if constexpr (vec_fits<N, num_t>) {
         k_grad_al<N><<<grid_for(m, kBlock), kBlock>>>(
-            ga.data_ptr<float>(), gl.data_ptr<float>(), ge.data_ptr<float>(), cvec_ptr<N>(l), cvec_ptr<N>(r),
-            cvec_ptr<N>(a), static_cast<float>(ns), m
+            ga.data_ptr<float>(), gl.data_ptr<float>(), ge.data_ptr<float>(), cvecf_ptr<N>(l), cvecf_ptr<N>(r),
+            cvecf_ptr<N>(a), static_cast<float>(ns), m
         );
         C10_CUDA_CHECK(cudaGetLastError());
     } else {
@@ -770,8 +786,8 @@ void grad_al_impl(
 
 template <size_t N>
 __global__ void k_grad_r(
-    float* gr, const float* alpha, const Vec<N, num_t>* gh, const float* ge, const Vec<N, num_t>* l,
-    const Vec<N, num_t>* r, const Vec<N, num_t>* a, float ns, int64_t m
+    float* gr, const float* alpha, const VecFloat<N, num_t>* gh, const float* ge, const VecFloat<N, num_t>* l,
+    const VecFloat<N, num_t>* r, const VecFloat<N, num_t>* a, float ns, int64_t m
 ) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) {
@@ -786,8 +802,8 @@ void grad_r_impl(
 ) {
     if constexpr (vec_fits<N, num_t>) {
         k_grad_r<N><<<grid_for(m, kBlock), kBlock>>>(
-            gr.data_ptr<float>(), alpha.data_ptr<float>(), cvec_ptr<N>(gh), ge.data_ptr<float>(), cvec_ptr<N>(l),
-            cvec_ptr<N>(r), cvec_ptr<N>(a), static_cast<float>(ns), m
+            gr.data_ptr<float>(), alpha.data_ptr<float>(), cvecf_ptr<N>(gh), ge.data_ptr<float>(), cvecf_ptr<N>(l),
+            cvecf_ptr<N>(r), cvecf_ptr<N>(a), static_cast<float>(ns), m
         );
         C10_CUDA_CHECK(cudaGetLastError());
     } else {

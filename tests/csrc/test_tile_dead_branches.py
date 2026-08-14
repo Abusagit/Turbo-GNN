@@ -26,16 +26,16 @@ pytestmark = [pytest.mark.cuda, pytest.mark.csrc, pytest.mark.slow]
 PROBE_SOURCE = """
 #include "common/tile.cuh"
 
-using Ops = VecOpsFloatBase<4, float>;
+using VF = VecFloat<4, float>;
 
-__global__ void probe(Vec<4, float>* a, Vec<4, float>* b, Vec<4, float>* c) {
-    Ops::add_(a, b);
-    Ops::mul_(a, b);
-    Ops::fmam_(a, b, c);
-    Ops::sub_(a, b);
+__global__ void probe(VecFloat<4, float>* a, VecFloat<4, float>* b, VecFloat<4, float>* c) {
+    a->add_(*b);
+    a->mul_(*b);
+    a->fmam_(*b, *c);
+    a->sub_(*b);
     float acc = 0.0f;
-    Ops::sum(&acc, a);
-    Ops::prod(&acc, a);
+    a->sum_(&acc);
+    a->prod_(&acc);
     (*c)[0] = acc;
 }
 """
@@ -44,7 +44,7 @@ ARCH = "sm_100a"
 
 
 def _nvcc() -> str:
-    for candidate in "/usr/local/cuda-13.2/bin/nvcc":
+    for candidate in ("/usr/local/cuda-13.2/bin/nvcc",):
         found = shutil.which(candidate) or (candidate if Path(candidate).exists() else None)
         if found:
             return found
