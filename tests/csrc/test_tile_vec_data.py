@@ -80,10 +80,10 @@ def _run(mod, op_name, n, dst, src):
     return mod.data_move(mod.op_codes()[op_name], n, dst, src)
 
 
-@pytest.mark.parametrize("op_name", ["transfer_vector", "transfer_scalars", "load_scalars", "store_scalars"])
+@pytest.mark.parametrize("op_name", ["transfer_vector", "load_scalars", "store_scalars"])
 @pytest.mark.parametrize(("n", "dtype_name"), COMBOS, ids=COMBO_IDS)
 def test_copy_ops_are_faithful(bridge, op_name, n, dtype_name):
-    """All four copy flavours move N scalars verbatim."""
+    """All three copy flavours move N scalars verbatim."""
     mod = bridge.get("data", dtype_name)
     dev = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]

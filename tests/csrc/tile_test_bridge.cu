@@ -117,30 +117,26 @@ enum DataOp : int {
     OP_GET_ZERO,
     OP_LOAD_SCALARS,
     OP_STORE_SCALARS,
-    OP_TRANSFER_SCALARS,
     OP_TRANSFER_VECTOR,
 };
 
 template <size_t N>
-TGNN_WORKER void apply_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src) {
+TGNN_WORKER void apply_data(DataOp op, Vec<N, num_t>* dst, const Vec<N, num_t>* src) {
     using Ops = Vec<N, num_t>;
     switch (op) {
         case OP_STORE_ZERO:
-            Ops::store_zero(dst);
+            dst->store_zero_();
             break;
         case OP_GET_ZERO:
             *dst = Ops::get_zero();
             break;
-        // load_scalars(num_type* dst, vec_t const* src): vector -> scalar array.
+        // load_scalars(num_type const* src): scalar array -> this vector.
         case OP_LOAD_SCALARS:
-            Ops::load_scalars(reinterpret_cast<num_t*>(dst), src);
+            dst->load_scalars(reinterpret_cast<num_t const *>(src));
             break;
-        // store_scalars(vec_t* dst, num_type const* src): scalar array -> vector.
+        // store_scalars(num_type* dst) const: this vector -> scalar array.
         case OP_STORE_SCALARS:
-            Ops::store_scalars(dst, reinterpret_cast<const num_t*>(src));
-            break;
-        case OP_TRANSFER_SCALARS:
-            Ops::transfer_scalars(reinterpret_cast<num_t*>(dst), reinterpret_cast<const num_t*>(src));
+            src->store_scalars(reinterpret_cast<num_t *>(dst));
             break;
         case OP_TRANSFER_VECTOR:
             Ops::transfer_vector(dst, src);
@@ -149,7 +145,7 @@ TGNN_WORKER void apply_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src
 }
 
 template <size_t N>
-__global__ void k_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src, int64_t m) {
+__global__ void k_data(DataOp op, Vec<N, num_t>* dst, const Vec<N, num_t>* src, int64_t m) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) {
         apply_data<N>(op, dst + i, src + i);
@@ -157,7 +153,7 @@ __global__ void k_data(int op, Vec<N, num_t>* dst, const Vec<N, num_t>* src, int
 }
 
 template <size_t N>
-void data_move_impl(int op, const torch::Tensor& dst, const torch::Tensor& src, int64_t m) {
+void data_move_impl(DataOp op, const torch::Tensor& dst, const torch::Tensor& src, int64_t m) {
     if constexpr (vec_fits<N, num_t>) {
         k_data<N><<<grid_for(m, kBlock), kBlock>>>(op, vec_ptr<N>(dst), cvec_ptr<N>(src), m);
         C10_CUDA_CHECK(cudaGetLastError());
@@ -183,7 +179,7 @@ torch::Tensor data_move(int64_t op, int64_t n, torch::Tensor dst, torch::Tensor 
     check_vec_tensor(dst, n, "dst");
     check_vec_tensor(src, n, "src");
     TORCH_CHECK(dst.size(0) == src.size(0), "dst and src must have the same M");
-    TGNN_DISPATCH_N(n, data_move_impl, static_cast<int>(op), dst, src, dst.size(0));
+    TGNN_DISPATCH_N(n, data_move_impl, static_cast<DataOp>(op), dst, src, dst.size(0));
     return dst;
 }
 
@@ -217,7 +213,6 @@ py::dict op_codes() {
     d["get_zero"]         = static_cast<int>(OP_GET_ZERO);
     d["load_scalars"]     = static_cast<int>(OP_LOAD_SCALARS);
     d["store_scalars"]    = static_cast<int>(OP_STORE_SCALARS);
-    d["transfer_scalars"] = static_cast<int>(OP_TRANSFER_SCALARS);
     d["transfer_vector"]  = static_cast<int>(OP_TRANSFER_VECTOR);
     return d;
 }
@@ -274,7 +269,7 @@ enum EwOp : int {
 
 template <size_t N>
 TGNN_WORKER void apply_ew(
-    int op, VecFloat<N, num_t>* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b,
+    EwOp op, VecFloat<N, num_t>* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b,
     const VecFloat<N, num_t>* c, num_t s
 ) {
     using VF = VecFloat<N, num_t>;
@@ -337,7 +332,7 @@ enum RedOp : int {
 
 template <size_t N, typename acc_t>
 TGNN_WORKER void apply_red(
-    int op, acc_t* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b, acc_t acc_init, acc_t w
+    RedOp op, acc_t* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b, acc_t acc_init, acc_t w
 ) {
     acc_t acc = acc_init;
     // The member overloads are the exercised API: the acc form folds into an existing
@@ -370,7 +365,7 @@ TGNN_WORKER void apply_gatv2_dot(
 
 template <size_t N>
 __global__ void k_ew(
-    int op, VecFloat<N, num_t>* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b,
+    EwOp op, VecFloat<N, num_t>* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b,
     const VecFloat<N, num_t>* c, num_t s, int64_t m
 ) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
@@ -379,7 +374,7 @@ __global__ void k_ew(
 
 template <size_t N, typename acc_t>
 __global__ void k_red(
-    int op, acc_t* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b, acc_t acc_init, acc_t w, int64_t m
+    RedOp op, acc_t* out, const VecFloat<N, num_t>* a, const VecFloat<N, num_t>* b, acc_t acc_init, acc_t w, int64_t m
 ) {
     int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (i < m) apply_red<N, acc_t>(op, out + i, a + i, b + i, acc_init, w);
@@ -396,7 +391,7 @@ __global__ void k_gatv2_dot(
 
 template <size_t N>
 void ew_impl(
-    int op, const torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& c,
+    EwOp op, const torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& c,
     double s, int64_t m
 ) {
     if constexpr (vec_fits<N, num_t>) {
@@ -413,7 +408,7 @@ void ew_impl(
 
 template <size_t N, typename acc_t>
 void red_run(
-    int op, const torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, double acc_init, double w,
+    RedOp op, const torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, double acc_init, double w,
     int64_t m
 ) {
     const auto ai = static_cast<acc_t>(acc_init);
@@ -426,7 +421,7 @@ void red_run(
 
 template <size_t N>
 void red_impl(
-    int op, const torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, double acc_init, double w,
+    RedOp op, const torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, double acc_init, double w,
     bool use_double, int64_t m
 ) {
     if constexpr (vec_fits<N, num_t>) {
@@ -468,7 +463,7 @@ torch::Tensor elementwise(int64_t op, int64_t n, torch::Tensor a, torch::Tensor 
     TORCH_CHECK(b.size(0) == m && c.size(0) == m, "a, b, c must share M");
 
     auto out = torch::empty_like(a);
-    TGNN_DISPATCH_N(n, ew_impl, static_cast<int>(op), out, a, b, c, s, m);
+    TGNN_DISPATCH_N(n, ew_impl, static_cast<EwOp>(op), out, a, b, c, s, m);
     return out;
 }
 
@@ -482,7 +477,7 @@ torch::Tensor reduce(
     TORCH_CHECK(b.size(0) == m, "a and b must share M");
 
     auto out = torch::empty({m}, a.options().dtype(use_double ? torch::kFloat64 : torch::kFloat32));
-    TGNN_DISPATCH_N(n, red_impl, static_cast<int>(op), out, a, b, acc_init, w, use_double, m);
+    TGNN_DISPATCH_N(n, red_impl, static_cast<RedOp>(op), out, a, b, acc_init, w, use_double, m);
     return out;
 }
 
