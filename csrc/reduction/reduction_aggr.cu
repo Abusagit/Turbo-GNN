@@ -14,7 +14,6 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 ) {
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
-    // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
@@ -138,7 +137,6 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     static_assert(sizeof(index_t) <= 4, "Packed heavy kernel only supports 32-bit index types");
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
-    // constexpr size_t TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
@@ -263,7 +261,6 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 ) {
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
-    // constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
@@ -491,8 +488,8 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-                cuda_t const *X_ptr   = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
-                cuda_t *out_ptr = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
+                cuda_t const *X_ptr = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
+                cuda_t *out_ptr     = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
 
                 reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t><<<num_light, THREADS_PER_BLOCK>>>(
                     index_ptr<index_t>(light_nodes),
@@ -519,19 +516,19 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 using torch_t = typename decltype(typeInfo)::TorchType;
                 using cuda_t  = typename decltype(typeInfo)::CudaType;
 
-                cuda_t const *X_ptr   = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
-                cuda_t *out_ptr = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
+                cuda_t const *X_ptr = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
+                cuda_t *out_ptr     = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
 
                 if constexpr (sizeof(index_t) <= 4) {
                     // 32-bit: user can choose packed atomics or 2D
                     if (use_2d_kernel) {
-                        // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
                         constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
                         dim3 grid(num_heavy);
                         dim3 block(features_per_block, tiles_y);
 
-                        size_t shmem_size = (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                        size_t shmem_size =
+                            ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
 
                         reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                             index_ptr<index_t>(heavy_nodes),
@@ -591,13 +588,13 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     }
                 } else {
                     // 64-bit: must use 2D (packing doesn't fit)
-                    // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
                     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
                     dim3 grid(num_heavy);
                     dim3 block(features_per_block, tiles_y);
 
-                    size_t shmem_size = (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                    size_t shmem_size =
+                        ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
 
                     reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                         index_ptr<index_t>(heavy_nodes),
@@ -664,7 +661,7 @@ void reduction_aggr_backward_cuda(const at::Tensor& grad_out, const at::Tensor& 
             constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
             cuda_t const *grad_out_ptr = reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>());
-            cuda_t *grad_x_ptr   = reinterpret_cast<cuda_t *>(grad_x.data_ptr<torch_t>());
+            cuda_t *grad_x_ptr         = reinterpret_cast<cuda_t *>(grad_x.data_ptr<torch_t>());
 
             const dim3 threads(THREADS_PER_BLOCK);
 

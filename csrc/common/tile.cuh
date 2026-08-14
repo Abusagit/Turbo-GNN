@@ -34,24 +34,19 @@ struct alignas(sizeof(num_type) * N) Vec {
     Vec& operator=(Vec&& other) noexcept      = default;
     ~Vec() noexcept                           = default;
 
-    __device__ num_type operator[](size_t n) const { return data[n]; }
-    __device__ num_type& operator[](size_t n) { return data[n]; }
+    __device__ num_type operator[](size_t n) const noexcept { return data[n]; }
+    __device__ num_type& operator[](size_t n) noexcept { return data[n]; }
 
     __device__ void store_zero_() noexcept { *reinterpret_cast<wide_t *>(data) = 0; }
-    static __device__ void store_zero(vec_t *const __restrict__ dst) { *reinterpret_cast<wide_t *>(dst) = 0; }
     static constexpr __device__ vec_t get_zero() { return vec_t{}; };
 
-    // Loads N scalars from src vector to the address, pointed by dst
-    static constexpr __device__ void load_scalars(num_type *const __restrict__ dst, vec_t const *const __restrict__ src) {
-        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
+    // Loads N scalars to this vector
+    constexpr __device__ void load_scalars(num_type const *const __restrict__ src) noexcept {
+        *reinterpret_cast<wide_t *>(this->data) = *reinterpret_cast<wide_t const *>(src);
     }
-    // Loads N scalars from src location to the dst vector
-    static constexpr __device__ void store_scalars(vec_t *const __restrict__ dst, num_type const *const __restrict__ src) {
-        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
-    }
-    // Copies N scalars from src location into dst location
-    static constexpr __device__ void transfer_scalars(num_type *const __restrict__ dst, num_type const *const __restrict__ src) {
-        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(src);
+    // Loads N scalars from this vector into dst
+    constexpr __device__ void store_scalars(num_type *const __restrict__ dst) const noexcept {
+        *reinterpret_cast<wide_t *>(dst) = *reinterpret_cast<wide_t const *>(this->data);
     }
     // Copies a vector from src to dst
     static constexpr __device__ void transfer_vector(vec_t *const __restrict__ dst, vec_t const *const __restrict__ src) {
@@ -539,7 +534,7 @@ struct alignas(sizeof(num_type) * N) VecFloat: Vec<N, num_type> {
         src0.minimum_(src1);
         transfer_vector(dst, &src0);
     }
-    static constexpr __device__ vec_t minimum(vec_t src0, vec_t src1) noexcept{
+    static constexpr __device__ vec_t minimum(vec_t src0, vec_t src1) noexcept {
         src0.minimum_(src1);
         return src0;
     }
@@ -911,7 +906,8 @@ static __device__ void write_row(dst_type *const __restrict__ dst, size_t worker
         for (size_t j = 0; j < unroll_k; ++j) {
             const size_t tile_id = worker_cnt * (i * unroll_k + j) + worker_idx;
             if (tile_id * copy_N < row_width) [[likely]] {
-                reinterpret_cast<dst_vec_type *>(dst)[tile_id] = reinterpret_cast<src_vec_type const *>(src)[tile_id].template convert_vec<dst_type>();
+                reinterpret_cast<dst_vec_type *>(dst)[tile_id] =
+                    reinterpret_cast<src_vec_type const *>(src)[tile_id].template convert_vec<dst_type>();
             }
         }
     }
