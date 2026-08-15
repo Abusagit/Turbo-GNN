@@ -124,7 +124,7 @@ __device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int&
     idx = static_cast<int>(idxu);
 }
 
-// Packed heavy kernel: blockIdx.x = node, blockIdx.y = edge chunk
+// Packed heavy kernel: persistent worklist, blockIdx.x walks (node, edge chunk) pairs via chunk_offsets
 // Only for 32-bit index types (packs float32 + int32 into uint64)
 template <size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
@@ -132,31 +132,17 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     index_t const *const __restrict__ edge_ptr,
     index_t const *const __restrict__ edge_idx,
     cuda_t const *const __restrict__ X,
+    int const *const __restrict__ chunk_offsets,
     uint64_t *const __restrict__ packed,
+    int num_heavy,
+    int total_chunks,
     size_t d
 ) {
     static_assert(sizeof(index_t) <= 4, "Packed heavy kernel only supports 32-bit index types");
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
-    // constexpr size_t TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
-
-    const size_t node_idx  = blockIdx.x;
-    const size_t chunk_idx = blockIdx.y;
-    const index_t v        = heavy_nodes_indices[node_idx];
-
-    const index_t row_start = edge_ptr[v];
-    const index_t row_end   = edge_ptr[v + 1];
-
-    const index_t chunk_start         = row_start + static_cast<index_t>(chunk_idx * EDGES_PER_BLOCK);
-    const index_t chunk_end_candidate = chunk_start + static_cast<index_t>(EDGES_PER_BLOCK);
-    const index_t chunk_end           = (chunk_end_candidate < row_end) ? chunk_end_candidate : row_end;
-
-    // exit for chunks beyond this node's edges
-    if (chunk_start >= row_end) [[unlikely]] {
-        return;
-    }
 
     const size_t tid           = threadIdx.x;
     constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
@@ -164,59 +150,93 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 
     const size_t d_vec = d / TW;
 
-    for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
-        const size_t base_f = fv * TW;
+    __shared__ int s_node_idx;
+    __shared__ int s_chunk_idx;
 
-        cuda_t best_vals[TW];
-        index_t best_srcs[TW];
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            best_vals[e] = identity_val;
-            best_srcs[e] = Sentinel::INVALID;
+    for (int work = blockIdx.x; work < total_chunks; work += gridDim.x) {
+        // chunk_offsets is a prefix sum over heavy nodes: find the node owning this chunk
+        if (tid == 0) {
+            int lo = 0;
+            int hi = num_heavy;
+            while (lo + 1 < hi) {
+                const int mid = lo + (hi - lo) / 2;
+                if (chunk_offsets[mid] <= work) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            s_node_idx  = lo;
+            s_chunk_idx = work - chunk_offsets[lo];
         }
+        __syncthreads();
 
-        for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
-            index_t src                    = edge_idx[eid];
-            const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+        const size_t node_idx = static_cast<size_t>(s_node_idx);
+        const index_t v       = heavy_nodes_indices[node_idx];
+
+        const index_t row_start = edge_ptr[v];
+        const index_t row_end   = edge_ptr[v + 1];
+
+        const index_t chunk_start         = row_start + static_cast<index_t>(s_chunk_idx * EDGES_PER_BLOCK);
+        const index_t chunk_end_candidate = chunk_start + static_cast<index_t>(EDGES_PER_BLOCK);
+        const index_t chunk_end           = (chunk_end_candidate < row_end) ? chunk_end_candidate : row_end;
+
+        for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
+            const size_t base_f = fv * TW;
+
+            cuda_t best_vals[TW];
+            index_t best_srcs[TW];
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
-                cuda_t v_e = val[e];
-                if (ROps::is_better(v_e, best_vals[e])) {
-                    best_vals[e] = v_e;
-                    best_srcs[e] = src;
-                }
+                best_vals[e] = identity_val;
+                best_srcs[e] = Sentinel::INVALID;
             }
-        }
-
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            if (Sentinel::is_valid(best_srcs[e])) {
-                uint64_t new_val = pack_val_idx(static_cast<accum_t>(best_vals[e]), static_cast<size_t>(best_srcs[e]));
-                ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
-            }
-        }
-    }
-
-    // scalar tail for d % TW != 0
-    if (d % TW != 0 && tid == 0) {
-        for (size_t f = d_vec * TW; f < d; ++f) {
-            cuda_t local_best = identity_val;
-            index_t local_arg = Sentinel::INVALID;
 
             for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
-                const index_t src = edge_idx[eid];
-                const cuda_t val  = X[static_cast<size_t>(src) * d + f];
-                if (ROps::is_better(val, local_best)) {
-                    local_best = val;
-                    local_arg  = src;
+                const index_t src              = edge_idx[eid];
+                const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+#pragma unroll
+                for (size_t e = 0; e < TW; ++e) {
+                    const cuda_t v_e = val[e];
+                    if (ROps::is_better(v_e, best_vals[e])) {
+                        best_vals[e] = v_e;
+                        best_srcs[e] = src;
+                    }
                 }
             }
 
-            if (Sentinel::is_valid(local_arg)) {
-                const uint64_t new_val = pack_val_idx(static_cast<accum_t>(local_best), static_cast<size_t>(local_arg));
-                ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
+#pragma unroll
+            for (size_t e = 0; e < TW; ++e) {
+                if (Sentinel::is_valid(best_srcs[e])) {
+                    const uint64_t new_val = pack_val_idx(static_cast<accum_t>(best_vals[e]), static_cast<size_t>(best_srcs[e]));
+                    ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
+                }
             }
         }
+
+        // scalar tail for d % TW != 0
+        if (d % TW != 0 && tid == 0) {
+            for (size_t f = d_vec * TW; f < d; ++f) {
+                cuda_t local_best = identity_val;
+                index_t local_arg = Sentinel::INVALID;
+
+                for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
+                    const index_t src = edge_idx[eid];
+                    const cuda_t val  = X[static_cast<size_t>(src) * d + f];
+                    if (ROps::is_better(val, local_best)) {
+                        local_best = val;
+                        local_arg  = src;
+                    }
+                }
+
+                if (Sentinel::is_valid(local_arg)) {
+                    const uint64_t new_val = pack_val_idx(static_cast<accum_t>(local_best), static_cast<size_t>(local_arg));
+                    ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
+                }
+            }
+        }
+
+        __syncthreads();
     }
 }
 
@@ -451,6 +471,8 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     const at::Tensor& light_nodes,
     const at::Tensor& heavy_nodes,
     int max_degree,
+    const at::Tensor& chunk_offsets,
+    int64_t total_chunks,
     at::Tensor& out,
     at::Tensor& arg_idx,
     int warps_per_block,
@@ -555,15 +577,16 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-                                dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
-
                                 reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t>
-                                    <<<grid, THREADS_PER_BLOCK>>>(
+                                    <<<static_cast<unsigned>(total_chunks), THREADS_PER_BLOCK>>>(
                                         index_ptr<index_t>(heavy_nodes),
                                         index_ptr<index_t>(edge_ptr),
                                         index_ptr<index_t>(edge_idx),
                                         X_ptr,
+                                        chunk_offsets.data_ptr<int>(),
                                         reinterpret_cast<uint64_t *>(packed.template data_ptr<int64_t>()),
+                                        num_heavy,
+                                        static_cast<int>(total_chunks),
                                         d
                                     );
                             },
@@ -624,6 +647,8 @@ void reduction_aggr_forward_partitioned_cuda(
     const at::Tensor& light_nodes,
     const at::Tensor& heavy_nodes,
     int max_degree,
+    const at::Tensor& chunk_offsets,
+    int64_t total_chunks,
     at::Tensor& out,
     at::Tensor& arg_idx,
     int warps_per_block,
@@ -635,13 +660,13 @@ void reduction_aggr_forward_partitioned_cuda(
 ) {
     if (reduce == "min") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MIN>(
-            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y
+            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, chunk_offsets, total_chunks, out, arg_idx, warps_per_block,
+            edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y
         );
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
-            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y
+            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, chunk_offsets, total_chunks, out, arg_idx, warps_per_block,
+            edges_per_block_heavy_nodes, use_2d_kernel, features_per_block, tiles_y
         );
     } else {
         TORCH_CHECK(false, "Unsupported reduce: " + reduce);

@@ -61,6 +61,7 @@ def reduction_aggr(
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
         receive zeros (infinities are clamped internally).
     """
+    chunk_offsets, total_chunks = graph.chunk_offsets(edges_per_block_heavy_nodes)
     return ReductionAggrFunction.apply(
         graph.forward_indptr,
         graph.forward_indices,
@@ -68,6 +69,8 @@ def reduction_aggr(
         graph.light_nodes,
         graph.heavy_nodes,
         graph.max_degree,
+        chunk_offsets,
+        total_chunks,
         warps_per_block,
         edges_per_block_heavy_nodes,
         use_2d_kernel,

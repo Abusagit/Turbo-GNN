@@ -122,6 +122,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             assert t.dtype == idx_dtype, f"{name} dtype {t.dtype} doesn't match forward_indptr dtype {idx_dtype}"
         self.index_dtype = idx_dtype
 
+        self._chunk_offsets: dict[int, tuple[torch.Tensor, int]] = {}
+
         indptr = self._to_signed_view(self.forward_indptr)
         degrees = indptr[1:] - indptr[:-1]
         self.max_degree = degrees.max().item()
@@ -328,3 +330,24 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         return cls.from_edge_list(
             edge_index, num_nodes, quantile=quantile, index_dtype=index_dtype, is_directed=is_directed
         )
+
+    def chunk_offsets(self, edges_per_block: int) -> tuple[torch.Tensor, int]:
+        key = int(edges_per_block)
+        device = self.forward_heavy_nodes.device
+
+        cached = self._chunk_offsets.get(key)
+        if cached is None or cached[0].device != device:
+            num_heavy = self.forward_heavy_nodes.numel()
+            offsets = torch.zeros(num_heavy + 1, dtype=torch.int32, device=device)
+            if num_heavy > 0:
+                indptr = self._to_signed_view(self.forward_indptr)
+                degrees = indptr[1:] - indptr[:-1]
+                heavy_degrees = degrees[self.forward_heavy_nodes.long()]
+                chunks = (heavy_degrees + (key - 1)).div(key, rounding_mode="floor")
+                offsets[1:] = torch.cumsum(chunks, 0, dtype=torch.int32)
+
+            total = int(offsets[-1].item())
+            cached = (offsets, total)
+            self._chunk_offsets[key] = cached
+        return cached
+

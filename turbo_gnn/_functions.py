@@ -50,6 +50,8 @@ class ReductionAggrFunction(torch.autograd.Function):
         light,
         heavy,
         max_degree,
+        chunk_offsets,
+        total_chunks,
         warps_per_block,
         edges_per_block_heavy_nodes,
         use_2d_kernel=False,
@@ -85,6 +87,8 @@ class ReductionAggrFunction(torch.autograd.Function):
             light,
             heavy,
             max_degree,
+            chunk_offsets,
+            total_chunks,
             warps_per_block,
             edges_per_block_heavy_nodes,
             use_2d_kernel,
@@ -103,7 +107,7 @@ class ReductionAggrFunction(torch.autograd.Function):
         (arg_idx,) = ctx.saved_tensors
         num_src_nodes = ctx.num_src_nodes
         grad_x = _C.reduction_aggr_backward(grad_out, arg_idx, num_src_nodes, ctx.warps_per_block)
-        return None, None, grad_x, None, None, None, None, None, None, None, None, None
+        return None, None, grad_x, None, None, None, None, None, None, None, None, None, None, None
 
 
 class gatv2_function(torch.autograd.Function):
