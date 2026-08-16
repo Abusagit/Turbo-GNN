@@ -133,7 +133,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
             int v = lane + kWarpSize * t;
             if (v < TILES) {
                 const vec_t rv = Tile::read(r_base, v);
-                Tile::weighted_accum(&h_acc[t * TW], contrib, &rv);
+
+                rv.template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
             }
         }
     }
@@ -143,12 +144,12 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     for (int t = 0; t < TILES_PER_THREAD; ++t) {
         const int v = lane + kWarpSize * t;
         if (v < TILES) {
-            constexpr size_t compact_N  = std::min<size_t>(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+            constexpr size_t compact_N  = std::min<size_t>(TW, VecFloat<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
             constexpr size_t repeat_cnt = TW / compact_N;
 #pragma unroll
             for (size_t i = 0; i < repeat_cnt; ++i) {
                 TileOps<compact_N, accum_t>::write(
-                    my_out, v * repeat_cnt + i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(h_acc)[t * repeat_cnt + i]
+                    my_out, v * repeat_cnt + i, reinterpret_cast<VecFloat<compact_N, accum_t> const *>(h_acc)[t * repeat_cnt + i]
                 );
             }
         }

@@ -128,7 +128,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
                 const vec_t av  = Tile::read(a_base, v);
                 const vec_t ghv = Tile::read(ghi_sh, v);
                 e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                Tile::dot_product(&p_lane, &ghv, &rv);
+                ghv.dot_product_(&p_lane, rv);
             }
         }
         const accum_t e_ij = warp_reduce_sum(e_lane);
@@ -167,7 +167,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
                 const vec_t av  = Tile::read(a_base, v);
                 const vec_t ghv = Tile::read(ghi_sh, v);
                 e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                Tile::dot_product(&p_lane, &ghv, &rv);
+                ghv.dot_product_(&p_lane, rv);
             }
         }
         const accum_t e_ij = warp_reduce_sum(e_lane);
@@ -217,11 +217,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 
                 // grad_a is kept in accum_t (float32), so write accumulators directly
                 constexpr size_t compact_N =
-                    std::min<size_t>(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+                    std::min<size_t>(TW, VecFloat<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
                 constexpr size_t repeat_cnt = TW / compact_N;
 #pragma unroll
                 for (size_t i = 0; i < repeat_cnt; ++i) {
-                    TileOps<compact_N, accum_t>::write(grad_a_base + base_f, i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(ga_sum)[i]);
+                    TileOps<compact_N, accum_t>::write(grad_a_base + base_f, i, reinterpret_cast<VecFloat<compact_N, accum_t> const *>(ga_sum)[i]);
                 }
             }
         }
@@ -327,7 +327,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
                 const vec_t av  = Tile::read(a_base, v);
                 const vec_t ghv = Tile::read(ghi_base, v);
                 e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                Tile::dot_product(&p_lane, &ghv, &rv);
+                ghv.dot_product_(&p_lane, rv);
             }
         }
         const accum_t e_ij = warp_reduce_sum(e_lane);
@@ -520,7 +520,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
                 const vec_t av  = Tile::read(a_base, v);
                 const vec_t ghv = Tile::read(ghi_sh, v);
                 e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                Tile::dot_product(&p_lane, &ghv, &rv);
+                ghv.dot_product_(&p_lane, rv);
             }
         }
         const accum_t e_ij = warp_reduce_sum(e_lane);
@@ -673,11 +673,11 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
 
                 // Forward: e(i,j) and <grad_h[i], r[j]>
                 e_fwd_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                Tile::dot_product(&p_fwd_lane, &ghv, &rv);
+                ghv.dot_product_(&p_fwd_lane, rv);
 
                 // Reverse: e(j,i) and <grad_h[j], r[i]>
                 e_rev_lane += Tile::gatv2_dot_leaky_relu(ljv, riv, av, negative_slope);
-                Tile::dot_product(&p_rev_lane, &ghjv, &riv);
+                ghjv.dot_product_(&p_rev_lane, riv);
             }
         }
 
@@ -730,12 +730,12 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
             Tile::write_convert_from_accum(&grad_r_base[base_f], &gradri_sh[base_f]);
 
             // grad_a is kept in accum_t (float32), so write accumulators directly
-            constexpr size_t compact_N  = std::min<size_t>(TW, Vec<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
+            constexpr size_t compact_N  = std::min<size_t>(TW, VecFloat<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
             constexpr size_t repeat_cnt = TW / compact_N;
 #pragma unroll
             for (size_t i = 0; i < repeat_cnt; ++i) {
                 TileOps<compact_N, accum_t>::write(
-                    grad_a_base + base_f, i, &reinterpret_cast<Vec<compact_N, accum_t> const *>(&grada_sh[base_f])[i]
+                    grad_a_base + base_f, i, reinterpret_cast<VecFloat<compact_N, accum_t> const *>(&grada_sh[base_f])[i]
                 );
             }
         }

@@ -1,4 +1,4 @@
-"""VecOpsFloatBase elementwise ops, every (N, num_type).
+"""VecFloat elementwise ops, every (N, num_type).
 
 Each op is checked against a float64 reference at the strictness it deserves: bit-exact
 for the single-rounding ops, 1 ulp for div/fma, relative for the approximate

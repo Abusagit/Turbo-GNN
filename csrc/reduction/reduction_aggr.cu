@@ -15,7 +15,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    constexpr size_t TW = Vec<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
+    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
     const size_t i = blockIdx.x;
@@ -64,7 +64,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             result[e]                         = Sentinel::is_valid(best_srcs[e]) ? best_vals[e] : zero_val;
             arg_idx[node_stride + base_f + e] = best_srcs[e];
         }
-        Tile::write(&out[node_stride], fv, reinterpret_cast<Tile::vec_t const *>(&result));
+        Tile::write(&out[node_stride], fv, *reinterpret_cast<Tile::vec_t const *>(&result));
     }
 
     // Scalar tail for d % TW != 0 (compiles away for TW=1)
@@ -139,7 +139,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
     // constexpr size_t TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    constexpr size_t TW = Vec<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
+    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
     const size_t node_idx  = blockIdx.x;
@@ -264,7 +264,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
     // constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    constexpr size_t TW = Vec<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
+    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
     size_t i  = blockIdx.x;
@@ -362,7 +362,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
                 result[e]                         = Sentinel::is_valid(best_idx) ? static_cast<cuda_t>(shmem_val[fid * TW + e]) : zero_val;
                 arg_idx[node_stride + base_f + e] = best_idx;
             }
-            Tile::write(&out[node_stride], fv, reinterpret_cast<Tile::vec_t const *>(&result));
+            Tile::write(&out[node_stride], fv, *reinterpret_cast<Tile::vec_t const *>(&result));
         }
 
         __syncthreads();
@@ -526,7 +526,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     // 32-bit: user can choose packed atomics or 2D
                     if (use_2d_kernel) {
                         // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
-                        constexpr size_t TW = Vec<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
+                        constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
                         dim3 grid(num_heavy);
                         dim3 block(features_per_block, tiles_y);
@@ -592,7 +592,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 } else {
                     // 64-bit: must use 2D (packing doesn't fit)
                     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
-                    constexpr size_t TW = Vec<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);;
+                    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
                     dim3 grid(num_heavy);
                     dim3 block(features_per_block, tiles_y);
