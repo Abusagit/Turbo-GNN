@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     const cuda_t *l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *a_base = d_attn_vec + head_h * D_CONST;
 
-    static_assert(!USE_PIPELINE || NUM_STAGES >= 2, "pipeline needs >= 2 stages");
+    static_assert(!USE_PIPELINE || NUM_STAGES >= 1, "pipeline needs >= 1 stage");
 
     // Shared memory layout:
     //   l_sh:      D_CONST * sizeof(cuda_t)                              -- read-only
@@ -148,15 +148,26 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
             };
 
 #pragma unroll
-            for (int s = 0; s < NUM_STAGES - 1; ++s) {
+            for (int s = 0; s < NUM_STAGES; ++s) {
                 prefetch(s);
             }
 
-            for (int iter = 0; iter < loop_iters; ++iter) {
-                prefetch(iter + NUM_STAGES - 1);
+            vec_t r_regs[TILES_PER_THREAD];
 
+            for (int iter = 0; iter < loop_iters; ++iter) {
                 cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
                 cuda_t *r_cur = rows[iter % NUM_STAGES];
+
+#pragma unroll
+                for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                    int v = lane + kWarpSize * t;
+                    if (v < TILES) {
+                        r_regs[t] = Tile::read(r_cur, v);
+                    }
+                }
+
+                pipe.consumer_release();
+                prefetch(iter + NUM_STAGES);
 
                 accum_t dot_lane{};
 #pragma unroll
@@ -164,9 +175,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
                     int v = lane + kWarpSize * t;
                     if (v < TILES) {
                         const vec_t lv = Tile::read(l_sh, v);
-                        const vec_t rv = Tile::read(r_cur, v);
                         const vec_t av = Tile::read(a_base, v);
-                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
+                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, r_regs[t], av, negative_slope);
                     }
                 }
                 const accum_t dot = warp_reduce_sum(dot_lane);
@@ -182,12 +192,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
                 for (int t = 0; t < TILES_PER_THREAD; ++t) {
                     int v = lane + kWarpSize * t;
                     if (v < TILES) {
-                        const vec_t rv = Tile::read(r_cur, v);
-                        rv.template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
+                        r_regs[t].template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
                     }
                 }
-
-                pipe.consumer_release();
             }
         }
     } else {

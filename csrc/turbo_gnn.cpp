@@ -21,7 +21,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gatv2_forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)", py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),
         py::arg("attn_vec"), py::arg("negative_slope") = 0.2f, py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("use_pipeline") = false
+        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("use_pipeline") = false, py::arg("num_stages") = 2
     );
 
     m.def(

@@ -90,6 +90,7 @@ def gatv2_aggr(
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
     use_pipeline: bool = False,
+    num_stages: int = 2,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -134,6 +135,7 @@ def gatv2_aggr(
         backward_heavy_warps,
         graph.is_directed,
         use_pipeline,
+        num_stages,
     )
 
 
