@@ -144,6 +144,7 @@ class gatv2_function(torch.autograd.Function):
         backward_heavy_warps,
         is_directed,
         use_pipeline=False,
+        num_stages=2,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -160,6 +161,7 @@ class gatv2_function(torch.autograd.Function):
             forward_light_warps,
             forward_heavy_warps,
             use_pipeline,
+            num_stages,
         )
         ctx.negative_slope = negative_slope
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
@@ -230,8 +232,8 @@ class gatv2_function(torch.autograd.Function):
             ctx.is_directed,
         )
 
-        # 4 CSR tensors + 3 gradients + 12 non-Variable args = 18 total
-        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 12
+        # 4 CSR tensors + 3 gradients + 13 non-Variable args = 18 total
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 13
 
 
 class _FusedGraphAttention(torch.autograd.Function):

@@ -61,7 +61,8 @@ class _CUDAGATv2Conv(BaseConvolution):
 
         self.feature_dim = feature_dim
         self.head_dim = feature_dim
-        self.use_pipeline = False
+        self.use_pipeline = kwargs.pop("use_pipeline", False)
+        self.num_stages = kwargs.pop("num_stages", 2)
 
         self.attn_weights = nn.Parameter(torch.FloatTensor(size=(heads, feature_dim)))
 
@@ -90,6 +91,7 @@ class _CUDAGATv2Conv(BaseConvolution):
             self.attn_weights.data,
             self.negative_slope,
             use_pipeline=self.use_pipeline,
+            num_stages=self.num_stages,
         ).view(-1, self.heads * self.head_dim)
 
         out = self._outer_proj(out)

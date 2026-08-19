@@ -41,6 +41,24 @@ def _make_random_graph(
     return edge_index, None
 
 
+def _collect_kernel_params(conv) -> dict:
+    kernel = getattr(conv, "kernel", conv)
+
+    params = {}
+    for getter in (
+        "get_tunable_forward_kernel_params",
+        "get_tunable_backward_kernel_params",
+        "get_tunable_forward_graph_params",
+        "get_tunable_backward_graph_params",
+    ):
+        fn = getattr(kernel, getter, None)
+        if fn is None:
+            continue
+        for p in fn():
+            params[p.name] = getattr(kernel, p.name, None)
+    return params
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI args.
 
@@ -78,6 +96,9 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable async-copy pipeline for CUDA GATv2.",
+    )
+    p.add_argument(
+        "--num-stages", type=int, default=None, help="Pipeline stages for CUDA GATv2 (requires --use-pipeline)."
     )
     return p.parse_args()
 
@@ -160,10 +181,12 @@ def main() -> int:
 
     conv = conv.to(device)
     if args.layer == "gat_v2" and args.backend == "cuda":
-        if not hasattr(conv, "use_pipeline"):
-            raise AttributeError(f"{type(conv).__name__} has no use_pipeline attribute")
-
         conv.use_pipeline = args.use_pipeline
+        if args.num_stages is not None:
+            conv.num_stages = args.num_stages
+
+    kernel = getattr(conv, "kernel", conv)
+    print(f"[benchmark id={id(kernel)}] set pipe/stages")
 
     # measure function
     amp_dtype = None
@@ -212,6 +235,8 @@ def main() -> int:
         "amp": args.amp,
         "mode": args.mode,
         "use_pipeline": args.use_pipeline,
+        "num_stages": args.num_stages,
+        "kernel_params": _collect_kernel_params(conv),
         "iters": res.iters,
         "ms_per_iter": res.ms_per_iter,
         "device": res.device,

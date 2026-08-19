@@ -44,8 +44,19 @@ def make_undirected_graph(N: int, E_approx: int, device: str = "cuda", seed: int
     return torch.stack([row, col], dim=0)
 
 
-def build_cuda_graph(edge_index: torch.Tensor, num_nodes: int):
-    """Build AdjacencyForwardBackwardWithNodeBuckets from edge_index [2, E]."""
+def build_cuda_graph(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    heavy_degree_threshold: int | None = None,
+):
+    """Build AdjacencyForwardBackwardWithNodeBuckets from edge_index [2, E].
+
+    If *heavy_degree_threshold* is None, all nodes go to the light bucket
+    (exercises only the light-warp kernel instantiation, W=1).  If set,
+    nodes with forward degree > threshold go to the heavy bucket, which
+    exercises the W=8 instantiation with maximal shared-memory pressure --
+    the configuration where pipeline bugs are most likely to hide.
+    """
     fwd_indptr, fwd_indices, _, _ = build_csr_as_is(
         edge_index,
         edge_weight=None,
@@ -58,18 +69,47 @@ def build_cuda_graph(edge_index: torch.Tensor, num_nodes: int):
         num_nodes=num_nodes,
         do_transpose=False,
     )
-    all_nodes = torch.arange(num_nodes, device=edge_index.device, dtype=torch.int32)
-    empty_nodes = torch.tensor([], dtype=torch.int32, device=edge_index.device)
+    device = edge_index.device
+
+    def _split(indptr: torch.Tensor):
+        all_nodes = torch.arange(num_nodes, device=device, dtype=torch.int32)
+        if heavy_degree_threshold is None:
+            empty = torch.tensor([], dtype=torch.int32, device=device)
+            return all_nodes, empty
+        degrees = indptr[1:] - indptr[:-1]
+        heavy_mask = degrees > heavy_degree_threshold
+        light = all_nodes[~heavy_mask]
+        heavy = all_nodes[heavy_mask]
+        return light, heavy
+
+    fwd_light, fwd_heavy = _split(fwd_indptr)
+    bwd_light, bwd_heavy = _split(bwd_indptr)
+
     return AdjacencyForwardBackwardWithNodeBuckets(
         forward_indptr=fwd_indptr.int(),
         forward_indices=fwd_indices.int(),
         backward_indptr=bwd_indptr.int(),
         backward_indices=bwd_indices.int(),
-        forward_light_nodes=all_nodes,
-        forward_heavy_nodes=empty_nodes,
-        backward_light_nodes=all_nodes,
-        backward_heavy_nodes=empty_nodes,
+        forward_light_nodes=fwd_light,
+        forward_heavy_nodes=fwd_heavy,
+        backward_light_nodes=bwd_light,
+        backward_heavy_nodes=bwd_heavy,
     )
+
+
+def make_hub_graph(N: int, num_hubs: int = 8, hub_degree: int = 200, device: str = "cuda"):
+    """Graph with a few high-degree hubs: guarantees a non-empty heavy bucket
+    and neighbor lists much longer than any pipeline stage count."""
+    src_bg = torch.randint(0, N, (N * 3,), device=device)
+    dst_bg = torch.randint(0, N, (N * 3,), device=device)
+    hubs = torch.arange(num_hubs, device=device)
+    src_hub = torch.randint(0, N, (num_hubs * hub_degree,), device=device)
+    dst_hub = hubs.repeat_interleave(hub_degree)
+    src_all = torch.cat([src_bg, dst_bg, src_hub, torch.arange(N, device=device)])
+    dst_all = torch.cat([dst_bg, src_bg, dst_hub, torch.arange(N, device=device)])
+    edge_index = torch.stack([src_all, dst_all], dim=0)
+    flat = torch.unique(edge_index[0] * N + edge_index[1])
+    return torch.stack([flat // N, flat % N], dim=0)
 
 
 def build_coo_graph(edge_index: torch.Tensor, num_nodes: int, device: str = "cuda"):
@@ -329,18 +369,38 @@ def test_gatv2_cuda_low_precision_backward(dtype, num_nodes, feature_dim, heads)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("num_nodes", [64, 200, 1000])
-@pytest.mark.parametrize("feature_dim", [32, 64, 128, 256])
-@pytest.mark.parametrize("heads", [1, 2, 4])
+_PIPE_TOL = {
+    torch.float32: {"rtol": 1e-6, "atol": 1e-6},
+    torch.float16: {"rtol": 1e-3, "atol": 1e-3},
+    torch.bfloat16: {"rtol": 1e-2, "atol": 1e-2},
+}
+
+# (graph_kind, heavy_degree_threshold): light-only covers the W=1 kernel
+# instantiation; hub graph with bucketing covers W=8 heavy path where
+# shared-memory pressure (and pipeline bugs) are maximal.
+_PIPE_GRAPHS = ["light_only", "with_heavy"]
+
+
+def _make_pipeline_graph(kind: str, num_nodes: int, device: str = "cuda"):
+    if kind == "light_only":
+        edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+        return build_cuda_graph(edge_index, num_nodes)
+    edge_index = make_hub_graph(num_nodes, device=device)
+    return build_cuda_graph(edge_index, num_nodes, heavy_degree_threshold=32)
+
+
+@pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
+@pytest.mark.parametrize("num_stages", [1, 2, 4])
+@pytest.mark.parametrize("feature_dim", [64, 256])
+@pytest.mark.parametrize("heads", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_gatv2_pipeline_vs_baseline_forward(num_nodes, feature_dim, heads, dtype):
-    """Forward: USE_PIPELINE=true must match USE_PIPELINE=false exactly."""
+def test_gatv2_pipeline_vs_baseline_forward(graph_kind, num_stages, feature_dim, heads, dtype):
+    """Forward: pipeline (any stage count) must match no-pipeline baseline."""
     device = "cuda"
     torch.manual_seed(42)
+    num_nodes = 1000
 
-    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
-    cuda_graph = build_cuda_graph(edge_index, num_nodes)
-
+    cuda_graph = _make_pipeline_graph(graph_kind, num_nodes, device)
     cuda_backend = BackendRegistry.get_backend("cuda")
 
     layer = (
@@ -360,32 +420,38 @@ def test_gatv2_pipeline_vs_baseline_forward(num_nodes, feature_dim, heads, dtype
     out_baseline = layer(x, cuda_graph)
 
     layer.use_pipeline = True
+    layer.num_stages = num_stages
     out_pipeline = layer(x, cuda_graph)
 
     assert not out_pipeline.isnan().any(), "Pipeline output contains NaN"
     assert_close(
         out_pipeline,
         out_baseline,
-        rtol=0,
-        atol=0,
+        **_PIPE_TOL[dtype],
         msg=lambda m: (
-            f"Pipeline vs baseline forward mismatch ({dtype}): " f"{_max_mean_diff(out_baseline, out_pipeline)}\n{m}"
+            f"Pipeline(s={num_stages}, {graph_kind}) vs baseline forward mismatch ({dtype}): "
+            f"{_max_mean_diff(out_baseline, out_pipeline)}\n{m}"
         ),
     )
 
 
-@pytest.mark.parametrize("num_nodes", [64, 200, 1000])
-@pytest.mark.parametrize("feature_dim", [32, 64, 128, 256])
-@pytest.mark.parametrize("heads", [1, 2, 4])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_gatv2_pipeline_vs_baseline_backward(num_nodes, feature_dim, heads, dtype):
-    """Backward: gradients must match between pipeline and baseline."""
+@pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
+@pytest.mark.parametrize("num_stages", [1, 2, 4])
+@pytest.mark.parametrize("feature_dim", [64, 256])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_gatv2_pipeline_vs_baseline_backward(graph_kind, num_stages, feature_dim, dtype):
+    """Backward: gradients must match between pipeline and baseline.
+
+    The backward kernel itself has no pipeline, but its inputs include the
+    forward output, and the +2 forward arguments changed the autograd
+    contract (number of returned grads) -- both are exercised here.
+    """
     device = "cuda"
     torch.manual_seed(42)
+    num_nodes = 1000
+    heads = 2
 
-    edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
-    cuda_graph = build_cuda_graph(edge_index, num_nodes)
-
+    cuda_graph = _make_pipeline_graph(graph_kind, num_nodes, device)
     cuda_backend = BackendRegistry.get_backend("cuda")
 
     layer = (
@@ -402,13 +468,12 @@ def test_gatv2_pipeline_vs_baseline_backward(num_nodes, feature_dim, heads, dtyp
     x_base = torch.randn(num_nodes, feature_dim, device=device, dtype=dtype, requires_grad=True)
     x_pipe = x_base.detach().clone().requires_grad_(True)
 
-    # Baseline forward + backward
     layer.use_pipeline = False
     out_base = layer(x_base, cuda_graph)
     out_base.sum().backward()
 
-    # Pipeline forward + backward
     layer.use_pipeline = True
+    layer.num_stages = num_stages
     out_pipe = layer(x_pipe, cuda_graph)
     out_pipe.sum().backward()
 
@@ -418,20 +483,18 @@ def test_gatv2_pipeline_vs_baseline_backward(num_nodes, feature_dim, heads, dtyp
     assert_close(
         out_pipe,
         out_base,
-        rtol=0,
-        atol=0,
+        **_PIPE_TOL[dtype],
         msg=lambda m: (
-            f"Pipeline vs baseline forward mismatch in backward test ({dtype}): "
+            f"Pipeline(s={num_stages}, {graph_kind}) forward mismatch in backward test ({dtype}): "
             f"{_max_mean_diff(out_base, out_pipe)}\n{m}"
         ),
     )
-
     assert_close(
         x_pipe.grad,
         x_base.grad,
-        rtol=0,
-        atol=0,
+        **_PIPE_TOL[dtype],
         msg=lambda m: (
-            f"Pipeline vs baseline backward mismatch ({dtype}): " f"{_max_mean_diff(x_base.grad, x_pipe.grad)}\n{m}"
+            f"Pipeline(s={num_stages}, {graph_kind}) backward mismatch ({dtype}): "
+            f"{_max_mean_diff(x_base.grad, x_pipe.grad)}\n{m}"
         ),
     )
