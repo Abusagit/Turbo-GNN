@@ -196,11 +196,12 @@ class TunableKernel(ABC):
         kernel_params = self.get_tunable_forward_kernel_params()
         graph_params = self.get_tunable_forward_graph_params()
         if not kernel_params and not graph_params:
-            return {"kernel_config": {}, "graph_repr": graph_repr}
+            return {"kernel_config": {}, "graph_config": {}, "graph_repr": graph_repr, "ms_per_iter": None}
 
         graph_combos = _build_combinations(graph_params)
         kernel_combos = _build_combinations(kernel_params)
-        best_ms, best_result = float("inf"), {"kernel_config": {}, "graph_repr": graph_repr}
+        best_ms = float("inf")
+        best_result = {"kernel_config": {}, "graph_config": {}, "graph_repr": graph_repr, "ms_per_iter": None}
         self._is_autotuning = True
         try:
             for graph_cfg in graph_combos:
@@ -220,7 +221,14 @@ class TunableKernel(ABC):
                         continue
                     if ms < best_ms:
                         best_ms = ms
-                        best_result = {"kernel_config": kernel_cfg, "graph_repr": current_graph}
+                        # graph_config records which partitioning won; the caller
+                        # cannot recover it from graph_repr alone.
+                        best_result = {
+                            "kernel_config": kernel_cfg,
+                            "graph_config": graph_cfg,
+                            "graph_repr": current_graph,
+                            "ms_per_iter": ms,
+                        }
         finally:
             self._is_autotuning = False
         if best_result["kernel_config"]:

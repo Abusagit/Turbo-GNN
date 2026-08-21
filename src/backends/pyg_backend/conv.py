@@ -2,8 +2,11 @@ from typing import Any, TypedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import GATConv, GATv2Conv
 from torch_geometric.nn import GCNConv as _GCN
+from torch_geometric.nn.inits import glorot
+from torch_geometric.utils import scatter, softmax
 
 from ..base import BaseAggr, BaseBackend, BaseConvolution, ConvAsAggr
 from ..registry import BackendRegistry
@@ -135,6 +138,85 @@ class _PygGATv2Conv(BaseConvolution):
         return self._outer_proj(self._conv(x, edge_index))
 
 
+class _PygGATv2Aggr(BaseAggr):
+    """Aggregation-only PyG GATv2 (no linear projections).
+
+    The message passing is lifted verbatim out of ``GATv2Conv``: its
+    ``edge_update`` computes
+
+        x = x_i + x_j; alpha = (leaky_relu(x) * att).sum(-1); alpha = softmax(alpha, index)
+
+    and its ``message`` returns ``x_j * alpha``, summed at the destination.
+    That is reproduced here on PyG's own ``softmax`` and ``scatter`` primitives,
+    so no ``lin_l``/``lin_r`` exist to be bypassed and none of PyG's
+    MessagePassing dispatch runs. Only ``att`` is kept, initialised with PyG's
+    ``glorot`` exactly as ``GATv2Conv.reset_parameters`` does.
+    """
+
+    def __init__(self, heads: int, head_dim: int, negative_slope: float = 0.2, **kwargs: Any) -> None:
+        super().__init__(conv_type="gat_v2")
+        self.heads = heads
+        self.head_dim = head_dim
+        self.negative_slope = negative_slope
+        self.att = nn.Parameter(torch.empty(1, heads, head_dim))
+        glorot(self.att)
+
+    def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        edge_index, _edge_weight = graph
+        src, dst = edge_index[0], edge_index[1]
+        num_nodes = x_left.size(0)
+
+        # x_j is source-indexed, x_i destination-indexed; our x_right is the
+        # source/neighbour tensor and x_left the destination one.
+        x_j = x_right.index_select(0, src)
+        x_i = x_left.index_select(0, dst)
+
+        alpha = (F.leaky_relu(x_i + x_j, self.negative_slope) * self.att).sum(dim=-1)
+        alpha = softmax(alpha, dst, num_nodes=num_nodes)
+
+        out = scatter(x_j * alpha.unsqueeze(-1), dst, dim=0, dim_size=num_nodes, reduce="sum")
+        return out.view(-1, self.heads * self.head_dim)
+
+
+class _PygGTAggr(BaseAggr):
+    """Aggregation-only PyG graph transformer (no QKV projection).
+
+    ``TransformerConv.message`` computes
+
+        alpha = (query_i * key_j).sum(-1) / sqrt(out_channels); alpha = softmax(alpha, index)
+
+    and returns ``value_j * alpha``, summed at the destination. That is
+    reproduced here on PyG's own ``softmax`` and ``scatter``, so the layer's
+    ``lin_query``/``lin_key``/``lin_value`` (and the ``lin_skip`` PyG allocates
+    whenever ``concat=True``) are never created. The aggregation holds no
+    parameters at all.
+    """
+
+    def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
+        super().__init__(conv_type="gt")
+        self.heads = heads
+        self.head_dim = head_dim
+        # PyG divides by sqrt(out_channels), i.e. sqrt(head_dim).
+        self.scale = head_dim**-0.5
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        edge_index, _edge_weight = graph
+        src, dst = edge_index[0], edge_index[1]
+        num_nodes = Q.size(0)
+
+        # PyG's query is destination-indexed and its key source-indexed, while
+        # turbo_gnn puts Q on the source and K on the destination -- hence the swap.
+        query_i = K.index_select(0, dst)
+        key_j = Q.index_select(0, src)
+        value_j = V.index_select(0, src)
+
+        alpha = (query_i * key_j).sum(dim=-1) * self.scale
+        alpha = softmax(alpha, dst, num_nodes=num_nodes)
+
+        out = scatter(value_j * alpha.view(-1, self.heads, 1), dst, dim=0, dim_size=num_nodes, reduce="sum")
+        return out.view(-1, self.heads * self.head_dim)
+
+
 @BackendRegistry.register_backend("pyg")
 class PygBackend(BaseBackend):
     """Backend that instantiates PyG-based convolutions."""
@@ -173,9 +255,14 @@ class PygBackend(BaseBackend):
         raise KeyError(f"Unsupported conv_type for PyG backend: {conv_type}")
 
     def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
-        # PyG convolutions for GCN/aggregations are already projection-free.
-        # For GAT/GATv2 projections are fused inside PyG — not separable.
-        # Wrap the projection-free convs as BaseAggr.
+        """Build a projection-free aggregation.
+
+        GCN-style convs are already projection-free and are simply wrapped;
+        the attention convs bypass PyG's internal projections and call the
+        message-passing entry points directly. Head dimensions follow the
+        shared convention: gat_v2 uses feature_dim per head, gt splits
+        feature_dim across heads.
+        """
         feature_dim = kwargs.pop("feature_dim", None)
         ct = conv_type.lower()
         match ct:
@@ -185,7 +272,13 @@ class PygBackend(BaseBackend):
                 conv = _PygGCNConv(feature_dim, aggr="mean", normalize=False)
             case "sum_aggr":
                 conv = _PygGCNConv(feature_dim, normalize=False)
+            case "gat_v2":
+                heads = kwargs.pop("heads", 1)
+                return _PygGATv2Aggr(heads=heads, head_dim=feature_dim, **kwargs)
+            case "gt":
+                heads = kwargs.pop("heads", 8)
+                return _PygGTAggr(heads=heads, head_dim=feature_dim // heads, **kwargs)
             case _:
-                raise KeyError(f"Unsupported conv_type for PyG aggr (projections not separable): {conv_type}")
+                raise KeyError(f"Unsupported conv_type for PyG aggr: {conv_type}")
         # _PygGCNConv is already projection-free, wrap it as BaseAggr
         return ConvAsAggr(conv)

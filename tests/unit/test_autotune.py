@@ -1610,7 +1610,12 @@ class TestInlineAutotune:
     def test_inline_autotune_no_params(self, mock_tc, graph_repr):
         kernel = DummyKernel()  # no tunable params
         result = kernel._inline_autotune(torch.randn(100, 16), graph_repr)
-        assert result == {"kernel_config": {}, "graph_repr": graph_repr}
+        assert result == {
+            "kernel_config": {},
+            "graph_config": {},
+            "graph_repr": graph_repr,
+            "ms_per_iter": None,
+        }
         mock_tc.assert_not_called()
 
 
