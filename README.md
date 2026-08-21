@@ -157,6 +157,10 @@ python scripts/train.py \
 # Benchmark a single conv layer
 python scripts/benchmark.py --layer gcn --backend pyg --num-nodes 20000 --feature_dim 128
 
+# Benchmark the convolution alone (no projections), comparing backends at the same level
+python scripts/benchmark_kernels.py --backend cuda --conv max_aggr -K warps_per_block=4
+python scripts/benchmark_kernels.py --backend pyg  --conv gcn
+
 # Validate a trained checkpoint
 python scripts/validate.py \
     --dataset configs/datasets/pyg_cora.yaml \
@@ -217,6 +221,205 @@ Creates a random graph (or loads one from a dataset YAML), instantiates a conv, 
 --json-out      Optional path to write JSON result
 --device        CUDA device index (default: 0)
 ```
+
+### `benchmark_kernels.py` — Microbenchmark graph convolutions (no projections)
+
+The kernel-level counterpart to `benchmark.py`. Where `benchmark.py` times a whole conv layer, this
+times only the aggregation — the projection-free `BaseBackend.create_aggr` from `src/backends`, with
+no linear/QKV projections, no bias, no framework dispatch. Every backend goes through the same path,
+so implementations compare at the same level:
+
+```bash
+# turbo_gnn kernels
+python scripts/benchmark_kernels.py --backend cuda --conv min_aggr -K warps_per_block=4
+
+# any other backend, same interface
+python scripts/benchmark_kernels.py --backend dgl --conv gat_v2 --heads 4
+python scripts/benchmark_kernels.py --backend pyg --conv gcn --dataset configs/datasets/pyg_cora.yaml
+```
+
+`--backend cuda` reaches the turbo_gnn kernels, and its aggregations forward every kernel parameter,
+so `-K` and `--autotune` work there exactly as a direct kernel call would. Autotuning is **off by
+default**, so a run measures exactly the configuration you asked for.
+
+Results go to stdout as JSON — stdout carries **only** JSON, with backend chatter such as
+`ninja: no work to do.` redirected to stderr, so output is safe to pipe.
+
+#### Target selection
+
+```
+--backend       Backend name: cuda, pyg, dgl, cusparse, torch_native, ... (required)
+--conv          Conv type (required): `gcn`, `sum_aggr`, `mean_aggr`, `min_aggr`, `max_aggr`,
+                `gat_v2`, `gt`
+-K NAME=VALUE   Kernel argument, repeatable. For `--backend cuda` these are validated against
+                the conv's schema (see --help); for other backends they are forwarded to
+                create_aggr unvalidated, and a backend that does not use one ignores it
+--device        CUDA device ordinal (default: 0)
+--json-out      Optional path to write the JSON result
+```
+
+Not every backend implements every conv; those that don't say so rather than guessing. `--help`
+lists the backends actually registered in your environment.
+
+PyG's `gat_v2` and `gt` aggregations are the scoring/softmax/weighted-sum code lifted out of
+`GATv2Conv.edge_update`/`message` and `TransformerConv.message`, rebuilt on PyG's own `softmax` and
+`scatter` primitives. No `GATv2Conv`/`TransformerConv` is instantiated, so the projection layers are
+never created — `gat_v2` holds only the attention vector (`glorot`-initialised as PyG does), `gt`
+holds no parameters. They match the real PyG layers to ~1e-7.
+
+Because PyG's `MessagePassing.propagate` dispatch is bypassed along with the projections, these
+numbers are the aggregation math alone; they are noticeably faster than routing through the layer
+(gat_v2 at 20k nodes: 5.4 ms extracted vs 16.6 ms via `propagate`). That is the right comparison
+against a fused kernel, but it is not what a PyG user experiences end to end.
+
+#### Graph
+
+```
+--dataset         Dataset YAML path (optional; if omitted, a random graph is generated)
+--num-nodes       Nodes in the random graph (default: 20000)
+--avg-degree      Average out-degree of the random graph (default: 10)
+--quantile        Degree quantile splitting light from heavy nodes; -1 disables bucketing
+                  so every node is "light" (default: 0.99)
+--index-dtype     CSR index dtype: int32 | int64 | uint32 | uint64 (default: int32)
+--no-self-loops   Skip adding one self-loop per node. Self-loops are added by default so
+                  random graphs, datasets, and every backend see the same edge set
+--sweep NAME=V1,V2,...   Sweep a graph-construction parameter, repeatable (see below)
+```
+
+#### Inputs
+
+```
+--feature-dim   Total feature width (default: 128)
+--heads         Attention heads, attention convs only (default: 1)
+--dtype         fp32 | fp16 | bf16 (default: fp32)
+--seed          Seed for the generated graph and inputs (default: 0)
+```
+
+Inputs are synthesized already-projected, in whatever shape the aggregation expects:
+
+| conv | aggregation receives | per-head width |
+| --- | --- | --- |
+| `gcn`, `sum/mean/min/max_aggr` | `(x, graph)` | n/a — `x` is `[N, feature_dim]` |
+| `gat_v2` | `(x_left, x_right, graph)` | `feature_dim` (total `heads * feature_dim`) |
+| `gt` | `(Q, K, V, graph)` | `feature_dim // heads` |
+
+`gat_v2` treating `--feature-dim` as the *per-head* width is the convention `create_aggr` already
+uses across all backends; it is not a typo. Note `gt` on the cuda backend only supports head dims of
+32, 64, 128 or 256.
+
+#### Measurement
+
+```
+--mode      forward | backward | forward_backward (default: forward)
+            'backward' reuses one forward graph and times only the gradient kernels
+--iters     Timed budget in MILLISECONDS of repetition (default: 100)
+--warmup    Warmup budget in MILLISECONDS (default: 20)
+
+--launch-ncu-override-iters N    Issue exactly N timed calls instead of timing
+                                 against the --iters budget. Overrides --iters/--warmup
+--launch-ncu-override-warmup M   Exact warmup calls (default: N // 4, at least 1)
+```
+
+There are two ways to bound the measurement, and they use different units:
+
+| | `--iters` / `--warmup` | `--launch-ncu-override-iters` / `-warmup` |
+| --- | --- | --- |
+| unit | milliseconds of repetition | exact call counts |
+| timed by | `triton.testing.do_bench` | CUDA events around each call |
+| launch count | derived by do_bench, plus 6 calibration calls | exactly `1 + M + N` |
+| use for | normal benchmarking (do_bench flushes L2 between reps, so its numbers are the more trustworthy ones) | profiling under `ncu`, where the launch count must be small and deterministic |
+
+`do_bench` interprets its `warmup`/`rep` arguments as time budgets and derives its own repeat counts,
+so it cannot produce a fixed number of launches — hence the override. Under the override the total
+is `1 + M + N`: one priming call (which builds lazily-initialised state such as cuSPARSE descriptors
+outside the measured region), then `M` warmup and `N` timed calls.
+
+The JSON says which mode ran, and populates only the matching pair:
+
+```json
+"iters_are_exact": true,  "iters": 20,   "warmup_calls": 5,
+"timed_budget_ms": null,  "warmup_budget_ms": null
+```
+
+```bash
+# under ncu: 1 + 5 + 20 = 26 launches, every time
+ncu --kernel-name regex:reduction_aggr_forward .venv/bin/python scripts/benchmark_kernels.py \
+    --backend cuda --conv min_aggr --launch-ncu-override-iters 20 --launch-ncu-override-warmup 5
+```
+
+A memory breakdown is always reported — peak, steady-state resident, and the difference:
+
+```json
+"memory": {
+  "peak_mb": 42.14, "resident_mb": 31.60, "kernel_transient_mb": 10.54,
+  "graph_mb": 1.83, "inputs_mb": 29.30
+}
+```
+
+`kernel_transient_mb` (peak − resident) is what one call adds on top of the graph and inputs — the
+figure to compare across configurations, since `peak_mb` alone moves whenever `--feature-dim` does.
+`graph_mb` is `null` for representations that expose no reachable tensors (e.g. a DGL graph).
+
+There is no flag for this because it is essentially free. Under
+`--launch-ncu-override-iters` the peak is read straight off the allocator's high-water mark across
+the timing loop, costing zero extra launches — so the total stays exactly `1 + M + N`. In the
+`do_bench` path it comes from one isolated call *outside* the loop instead, because do_bench
+allocates a ~256 MB buffer to flush L2 between reps, which would otherwise swamp the number
+(291 MB reported instead of 35 MB). Both paths give identical figures for the same configuration.
+
+#### Tuning
+
+Two independent mechanisms, both off by default.
+
+**`--sweep`** measures a graph-construction parameter at every value you give and reports all of
+them. It works for any backend and any conv, including those with no tunable kernel parameters:
+
+```bash
+python scripts/benchmark_kernels.py --backend cuda --conv min_aggr \
+    --num-nodes 200000 --avg-degree 15 --sweep quantile=-1,0.9,0.95,0.99,0.999
+```
+
+```
+--sweep quantile=...            Heavy-node threshold, both directions
+--sweep forward_quantile=...    Forward CSR only
+--sweep backward_quantile=...   Backward CSR only
+--sweep index_dtype=...         int32 | int64 | uint32 | uint64
+```
+
+Repeating `--sweep` forms a grid. Top-level `ms_per_iter`/`graph` report the winning point,
+`graph_config` names it, and `sweep` lists every trial sorted fastest-first with its `heavy_nodes`
+count. Quantile sweeps reuse the CSR arrays via `repartition()`, so each extra point costs a quantile
+computation rather than a graph rebuild; `index_dtype` falls back to a full rebuild automatically.
+
+Note the quantile is only meaningful for representations that have light/heavy node buckets — the
+`cuda` backend. Sweeping it against PyG/DGL/torch_native yields flat noise.
+
+**`--autotune`** runs turbo_gnn's inline grid search over kernel parameters *and* the node
+partitioning before timing. Requires `--backend cuda`, and a conv whose kernel has an autotuning
+path (`min_aggr`, `max_aggr`, `gat_v2`, `gt` — the SpMM-based convs have none).
+
+```
+--autotune          Grid-search tunable parameters before timing
+--autotune-warmup   Warmup iterations per autotuning trial (default: 10)
+--autotune-iters    Timed iterations per autotuning trial (default: 50)
+```
+
+The selected configuration is reported under `autotune_selected`, including the partitioning that
+won — which the kernel applies to the graph, so it is worth seeing:
+
+```json
+"autotune_selected": {
+  "kernel_config": {"forward_warps_per_block": 8, "forward_edges_per_block_heavy_nodes": 1024},
+  "graph_config": {"forward_huge_degree_threshold_quantile": -1},
+  "ms_per_iter": 0.0587
+}
+```
+
+#### Discovering options
+
+`--help` lists every `--conv` with its input convention, the `-K` arguments and defaults for each
+conv on the cuda backend, and the backends actually registered in your environment (optional
+dependencies such as DGL or cuGraph are simply absent when not installed).
 
 ### `validate.py` — Validate a trained checkpoint
 
@@ -330,7 +533,7 @@ Requires: `pandas`, `comet_ml` (if `--use_comet`), and all backends listed in `-
 
 | Backend | Type | Registered names | Supported conv types |
 |---------|------|------------------|----------------------|
-| PyG | Library wrapper | `pyg` | gcn, mean_aggr, sum_aggr, gat, gat_v2, gin, sage |
+| PyG | Library wrapper | `pyg` | gcn, mean_aggr, sum_aggr, gat, gat_v2, gt, gin, sage |
 | DGL | Library wrapper | `dgl` | gcn, mean_aggr, sum_aggr, min_aggr, max_aggr, gat, gat_v2, gt |
 | cuGraph | Library wrapper | `cugraph` | gcn, mean_aggr, sum_aggr, min_aggr, max_aggr, gat_v2, gt |
 | cuSPARSE | Library wrapper | `cusparse`, `cusparse_precomputed_bwd` | gcn, sum_aggr, mean_aggr, random_walk |
