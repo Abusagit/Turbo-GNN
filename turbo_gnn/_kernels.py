@@ -94,8 +94,7 @@ class GATv2AggrKernel(TunableKernel):
         self.forward_heavy_warps = kwargs.get("forward_heavy_warps", 8)
         self.backward_light_warps = kwargs.get("backward_light_warps", 1)
         self.backward_heavy_warps = kwargs.get("backward_heavy_warps", 8)
-        self.forward_use_pipeline = kwargs.get("use_pipeline", False)
-        self.forward_num_stages = kwargs.get("num_stages", 2)
+        self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
 
     def _execute(self, graph, x, *, x_neighbors=None, attention_weights=None, negative_slope=None, **kwargs):
         return gatv2_function.apply(
@@ -117,16 +116,14 @@ class GATv2AggrKernel(TunableKernel):
             self.backward_light_warps,
             self.backward_heavy_warps,
             graph.is_directed,
-            self.forward_use_pipeline,
-            self.forward_num_stages,
+            self.forward_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
             TunableParam("forward_light_warps", [1, 2, 4], default=1),
             TunableParam("forward_heavy_warps", [8, 16, 32], default=8),
-            TunableParam("forward_use_pipeline", [False, True], default=False),
-            TunableParam("forward_num_stages", [1, 2, 4], default=2),
+            TunableParam("forward_pipeline_stages", [0, 1, 2, 4], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:

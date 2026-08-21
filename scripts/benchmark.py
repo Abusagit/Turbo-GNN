@@ -85,13 +85,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp", type=str, default="none", choices=["none", "bf16", "fp16"])
     p.add_argument("--json-out", type=str, default=None, help="Optional path to write JSON result.")
     p.add_argument(
-        "--use-pipeline",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable async-copy pipeline for CUDA GATv2.",
-    )
-    p.add_argument(
-        "--num-stages", type=int, default=None, help="Pipeline stages for CUDA GATv2 (requires --use-pipeline)."
+        "--pipeline-stages",
+        type=int,
+        default=0,
+        help="Async-copy pipeline stage count for CUDA GATv2 (0 disables the pipeline).",
     )
     return p.parse_args()
 
@@ -174,12 +171,7 @@ def main() -> int:
 
     conv = conv.to(device)
     if args.layer == "gat_v2" and args.backend == "cuda":
-        conv.use_pipeline = args.use_pipeline
-        if args.num_stages is not None:
-            conv.num_stages = args.num_stages
-
-    kernel = getattr(conv, "kernel", conv)
-    print(f"[benchmark id={id(kernel)}] set pipe/stages")
+        conv.configure(forward_pipeline_stages=args.pipeline_stages)
 
     # measure function
     amp_dtype = None
@@ -218,8 +210,7 @@ def main() -> int:
         "head_dim": head_dim,
         "amp": args.amp,
         "mode": args.mode,
-        "use_pipeline": args.use_pipeline,
-        "num_stages": args.num_stages,
+        "pipeline_stages": args.pipeline_stages,
         "kernel_params": _collect_kernel_params(conv),
         "iters": res.iters,
         "ms_per_iter": res.ms_per_iter,

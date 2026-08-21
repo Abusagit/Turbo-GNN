@@ -9,9 +9,9 @@
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template <
-    int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, bool USE_PIPELINE = false,
-    int NUM_STAGES = 2>
+// PIPELINE_STAGES == 0 disables the async-copy pipeline (plain warp-strided loop);
+// PIPELINE_STAGES >= 1 enables it with that many ping-pong stages for r[j].
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
     size_t N,
     size_t H,
@@ -73,7 +73,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     const cuda_t *l_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *a_base = d_attn_vec + head_h * D_CONST;
 
-    static_assert(!USE_PIPELINE || NUM_STAGES >= 1, "pipeline needs >= 1 stage");
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES;
 
     // Shared memory layout:
     //   l_sh:      D_CONST * sizeof(cuda_t)                              -- read-only
