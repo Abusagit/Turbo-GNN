@@ -89,6 +89,7 @@ def gatv2_aggr(
     forward_heavy_warps: int = 8,
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
+    pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -109,6 +110,8 @@ def gatv2_aggr(
         negative_slope: LeakyReLU negative slope (typically 0.2).
         grad_A_reduce_row_chunk_size: Row chunk size for backward attention gradient
             reduction. Larger values use more shared memory but fewer kernel launches.
+        pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
+            r[j] prefetch. 0 disables the pipeline (plain warp-strided loop).
 
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
@@ -132,6 +135,7 @@ def gatv2_aggr(
         backward_light_warps,
         backward_heavy_warps,
         graph.is_directed,
+        pipeline_stages,
     )
 
 

@@ -82,12 +82,12 @@ class _CUDAGATv2Conv(BaseConvolution):
         x_left = x_left.view(-1, self.heads, self.head_dim)
         x_right = x_right.view(-1, self.heads, self.head_dim)
 
-        out = gatv2_aggr(
+        out = self.kernel(
             graph,
             x_left,
-            x_right,
-            self.attn_weights.data,
-            self.negative_slope,
+            x_neighbors=x_right,
+            attention_weights=self.attn_weights.data,
+            negative_slope=self.negative_slope,
         ).view(-1, self.heads * self.head_dim)
 
         out = self._outer_proj(out)
