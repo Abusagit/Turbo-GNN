@@ -25,19 +25,19 @@ echo "===== Nsight Compute profiling =====" | tee "$OUTFILE"
 
 echo "Profiling baseline (D=128, fp32)..." | tee -a "$OUTFILE"
 sudo -E $NCU $NCU_ARGS -o "$NCU_DIR/baseline_D128_fp32" \
-    $PYTHON "$SCRIPT" --no-pipeline $NCU_BENCH_ARGS 2>&1 | tee -a "$OUTFILE"
+    $PYTHON "$SCRIPT" --pipeline-stages 0 $NCU_BENCH_ARGS 2>&1 | tee -a "$OUTFILE"
 
 echo "Profiling pipeline (D=128, fp32)..." | tee -a "$OUTFILE"
 sudo -E $NCU $NCU_ARGS -o "$NCU_DIR/pipeline_D128_fp32" \
-    $PYTHON "$SCRIPT" --use-pipeline $NCU_BENCH_ARGS 2>&1 | tee -a "$OUTFILE"
+    $PYTHON "$SCRIPT" --pipeline-stages 2 $NCU_BENCH_ARGS 2>&1 | tee -a "$OUTFILE"
 
 echo "Profiling baseline (D=128, fp16)..." | tee -a "$OUTFILE"
 sudo -E $NCU $NCU_ARGS -o "$NCU_DIR/baseline_D128_fp16" \
-    $PYTHON "$SCRIPT" --no-pipeline $NCU_BENCH_ARGS --dtype float16 2>&1 | tee -a "$OUTFILE"
+    $PYTHON "$SCRIPT" --pipeline-stages 0 $NCU_BENCH_ARGS --dtype float16 2>&1 | tee -a "$OUTFILE"
 
 echo "Profiling pipeline (D=128, fp16)..." | tee -a "$OUTFILE"
 sudo -E $NCU $NCU_ARGS -o "$NCU_DIR/pipeline_D128_fp16" \
-    $PYTHON "$SCRIPT" --use-pipeline $NCU_BENCH_ARGS --dtype float16 2>&1 | tee -a "$OUTFILE"
+    $PYTHON "$SCRIPT" --pipeline-stages 2 $NCU_BENCH_ARGS --dtype float16 2>&1 | tee -a "$OUTFILE"
 
 # Fix ownership (sudo creates files as root)
 sudo chown -R $USER:$USER "$NCU_DIR"

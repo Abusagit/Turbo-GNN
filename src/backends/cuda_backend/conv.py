@@ -61,8 +61,6 @@ class _CUDAGATv2Conv(BaseConvolution):
 
         self.feature_dim = feature_dim
         self.head_dim = feature_dim
-        self.use_pipeline = kwargs.pop("use_pipeline", False)
-        self.num_stages = kwargs.pop("num_stages", 2)
 
         self.attn_weights = nn.Parameter(torch.FloatTensor(size=(heads, feature_dim)))
 
@@ -84,14 +82,12 @@ class _CUDAGATv2Conv(BaseConvolution):
         x_left = x_left.view(-1, self.heads, self.head_dim)
         x_right = x_right.view(-1, self.heads, self.head_dim)
 
-        out = gatv2_aggr(
+        out = self.kernel(
             graph,
             x_left,
-            x_right,
-            self.attn_weights.data,
-            self.negative_slope,
-            use_pipeline=self.use_pipeline,
-            num_stages=self.num_stages,
+            x_neighbors=x_right,
+            attention_weights=self.attn_weights.data,
+            negative_slope=self.negative_slope,
         ).view(-1, self.heads * self.head_dim)
 
         out = self._outer_proj(out)

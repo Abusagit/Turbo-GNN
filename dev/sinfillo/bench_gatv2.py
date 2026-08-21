@@ -40,24 +40,24 @@ def partition_nodes(row_ptr: torch.Tensor, threshold: int = 32):
 
 def run_forward(l, r, row_ptr, col_idx, attn_vec, negative_slope,
                 light_nodes, heavy_nodes,
-                light_wpb, heavy_wpb, use_pipeline, num_iters=1):
+                light_wpb, heavy_wpb, pipeline_stages, num_iters=1):
     for _ in range(num_iters):
         _C.gatv2_forward(
             l, r, row_ptr, col_idx, attn_vec,
             negative_slope,
             light_nodes, heavy_nodes,
             light_wpb, heavy_wpb,
-            use_pipeline,
+            pipeline_stages,
         )
 
 
 def bench_timing(l, r, row_ptr, col_idx, attn_vec, negative_slope,
                  light_nodes, heavy_nodes,
-                 light_wpb, heavy_wpb, use_pipeline,
+                 light_wpb, heavy_wpb, pipeline_stages,
                  warmup=5, repeats=20):
     run_forward(l, r, row_ptr, col_idx, attn_vec, negative_slope,
                 light_nodes, heavy_nodes, light_wpb, heavy_wpb,
-                use_pipeline, num_iters=warmup)
+                pipeline_stages, num_iters=warmup)
     torch.cuda.synchronize()
 
     times = []
@@ -67,7 +67,7 @@ def bench_timing(l, r, row_ptr, col_idx, attn_vec, negative_slope,
         start.record()
         _C.gatv2_forward(l, r, row_ptr, col_idx, attn_vec,
                          negative_slope, light_nodes, heavy_nodes,
-                         light_wpb, heavy_wpb, use_pipeline)
+                         light_wpb, heavy_wpb, pipeline_stages)
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
@@ -77,9 +77,12 @@ def bench_timing(l, r, row_ptr, col_idx, attn_vec, negative_slope,
 
 def main():
     parser = argparse.ArgumentParser(description="GATv2 Forward Kernel Benchmark")
-    parser.add_argument("--use-pipeline", action="store_true", help="Enable async pipeline")
-    parser.add_argument("--no-pipeline", action="store_true", help="Disable async pipeline (baseline)")
-    parser.add_argument("--compare", action="store_true", help="Run both and print timing comparison")
+    parser.add_argument(
+        "--pipeline-stages", type=int, default=None,
+        help="Async-copy pipeline stage count to run with (0 disables the pipeline, i.e. baseline). "
+             "With --compare, this is the pipeline variant compared against the stages=0 baseline.",
+    )
+    parser.add_argument("--compare", action="store_true", help="Run both stages=0 baseline and --pipeline-stages, print timing comparison")
 
     parser.add_argument("--num-nodes", type=int, default=100_000)
     parser.add_argument("--avg-degree", type=int, default=16)
@@ -119,33 +122,28 @@ def main():
                light_nodes, heavy_nodes, args.light_wpb, args.heavy_wpb)
 
     if args.compare:
-        times_base = bench_timing(*common_args, use_pipeline=False,
+        stages = args.pipeline_stages if args.pipeline_stages is not None else 2
+        times_base = bench_timing(*common_args, pipeline_stages=0,
                                   warmup=args.warmup, repeats=args.repeats)
-        times_pipe = bench_timing(*common_args, use_pipeline=True,
+        times_pipe = bench_timing(*common_args, pipeline_stages=stages,
                                   warmup=args.warmup, repeats=args.repeats)
 
-        h_base, _ = _C.gatv2_forward(*common_args, False)
-        h_pipe, _ = _C.gatv2_forward(*common_args, True)
+        h_base, _ = _C.gatv2_forward(*common_args, 0)
+        h_pipe, _ = _C.gatv2_forward(*common_args, stages)
         max_diff = (h_base.float() - h_pipe.float()).abs().max().item()
 
         import statistics
         mean_b, std_b = statistics.mean(times_base), statistics.stdev(times_base)
         mean_p, std_p = statistics.mean(times_pipe), statistics.stdev(times_pipe)
 
-        print(f"Baseline:  {mean_b:.4f} ± {std_b:.4f} ms  (min={min(times_base):.4f}, max={max(times_base):.4f})")
-        print(f"Pipeline:  {mean_p:.4f} ± {std_p:.4f} ms  (min={min(times_pipe):.4f}, max={max(times_pipe):.4f})")
+        print(f"Baseline (stages=0):    {mean_b:.4f} ± {std_b:.4f} ms  (min={min(times_base):.4f}, max={max(times_base):.4f})")
+        print(f"Pipeline (stages={stages}): {mean_p:.4f} ± {std_p:.4f} ms  (min={min(times_pipe):.4f}, max={max(times_pipe):.4f})")
         print(f"Speedup:   {mean_b / mean_p:.3f}x")
         print(f"Max diff:  {max_diff:.2e}")
 
-    elif args.use_pipeline:
-        print("Running with pipeline=True ...")
-        run_forward(*common_args, use_pipeline=True, num_iters=args.warmup + args.repeats)
-        torch.cuda.synchronize()
-        print("Done.")
-
-    elif args.no_pipeline:
-        print("Running with pipeline=False ...")
-        run_forward(*common_args, use_pipeline=False, num_iters=args.warmup + args.repeats)
+    elif args.pipeline_stages is not None:
+        print(f"Running with pipeline_stages={args.pipeline_stages} ...")
+        run_forward(*common_args, pipeline_stages=args.pipeline_stages, num_iters=args.warmup + args.repeats)
         torch.cuda.synchronize()
         print("Done.")
 

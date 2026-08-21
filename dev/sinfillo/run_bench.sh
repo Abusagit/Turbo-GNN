@@ -93,22 +93,22 @@ NCU_BENCH_ARGS="--num-nodes 100000 --avg-degree 16 --head-dim 128 --warmup 5 --r
 
 echo "Profiling baseline (D=128, fp32, N=100k, deg=16)..." | tee -a "$OUTFILE"
 ncu $NCU_ARGS -o "$NCU_DIR/baseline_D128_fp32" \
-    python "$SCRIPT" --no-pipeline $NCU_BENCH_ARGS 2>&1 | tail -5 | tee -a "$OUTFILE"
+    python "$SCRIPT" --pipeline-stages 0 $NCU_BENCH_ARGS 2>&1 | tail -5 | tee -a "$OUTFILE"
 echo "" | tee -a "$OUTFILE"
 
 echo "Profiling pipeline (D=128, fp32, N=100k, deg=16)..." | tee -a "$OUTFILE"
 ncu $NCU_ARGS -o "$NCU_DIR/pipeline_D128_fp32" \
-    python "$SCRIPT" --use-pipeline $NCU_BENCH_ARGS 2>&1 | tail -5 | tee -a "$OUTFILE"
+    python "$SCRIPT" --pipeline-stages 2 $NCU_BENCH_ARGS 2>&1 | tail -5 | tee -a "$OUTFILE"
 echo "" | tee -a "$OUTFILE"
 
 echo "Profiling baseline (D=128, fp16, N=100k, deg=16)..." | tee -a "$OUTFILE"
 ncu $NCU_ARGS -o "$NCU_DIR/baseline_D128_fp16" \
-    python "$SCRIPT" --no-pipeline $NCU_BENCH_ARGS --dtype float16 2>&1 | tail -5 | tee -a "$OUTFILE"
+    python "$SCRIPT" --pipeline-stages 0 $NCU_BENCH_ARGS --dtype float16 2>&1 | tail -5 | tee -a "$OUTFILE"
 echo "" | tee -a "$OUTFILE"
 
 echo "Profiling pipeline (D=128, fp16, N=100k, deg=16)..." | tee -a "$OUTFILE"
 ncu $NCU_ARGS -o "$NCU_DIR/pipeline_D128_fp16" \
-    python "$SCRIPT" --use-pipeline $NCU_BENCH_ARGS --dtype float16 2>&1 | tail -5 | tee -a "$OUTFILE"
+    python "$SCRIPT" --pipeline-stages 2 $NCU_BENCH_ARGS --dtype float16 2>&1 | tail -5 | tee -a "$OUTFILE"
 echo "" | tee -a "$OUTFILE"
 
 echo "NCU reports saved to: $NCU_DIR/" | tee -a "$OUTFILE"
