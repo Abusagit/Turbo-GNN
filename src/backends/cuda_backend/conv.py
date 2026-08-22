@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
+from turbo_gnn._functions import DEFAULT_BLOCKS_PER_SM, DEFAULT_SCHED_CHUNK, DEFAULT_SCHEDULE
 
 from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
@@ -191,6 +192,12 @@ class _CudaSimpleAggr(BaseAggr):
             "use_2d_kernel": kwargs.get("use_2d_kernel", False),
             "features_per_block": kwargs.get("features_per_block", 32),
             "tiles_y": kwargs.get("tiles_y", 8),
+            # Node->block scheduling. Forwarded like any other kernel parameter so an
+            # aggregation-only benchmark can drive the scheduler exactly as a direct call
+            # does; defaults match the turbo_gnn op.
+            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
+            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
+            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
         }
 
     def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
@@ -214,6 +221,12 @@ class _CudaGATv2Aggr(BaseAggr):
             "forward_heavy_warps": kwargs.get("forward_heavy_warps", 8),
             "backward_light_warps": kwargs.get("backward_light_warps", 1),
             "backward_heavy_warps": kwargs.get("backward_heavy_warps", 8),
+            # Node->block scheduling. Forwarded like any other kernel parameter so an
+            # aggregation-only benchmark can drive the scheduler exactly as a direct call
+            # does; defaults match the turbo_gnn op.
+            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
+            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
+            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
         }
 
     def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
@@ -242,6 +255,12 @@ class _CudaGTAggr(BaseAggr):
             "forward_heavy_warps": kwargs.get("forward_heavy_warps", 8),
             "backward_light_warps": kwargs.get("backward_light_warps", 1),
             "backward_heavy_warps": kwargs.get("backward_heavy_warps", 8),
+            # Node->block scheduling. Forwarded like any other kernel parameter so an
+            # aggregation-only benchmark can drive the scheduler exactly as a direct call
+            # does; defaults match the turbo_gnn op.
+            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
+            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
+            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
         }
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:

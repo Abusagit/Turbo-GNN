@@ -27,3 +27,7 @@ out
 *.tex
 *.pdf
 *.ncu-rep
+
+# Raw per-run benchmark JSON; regenerate with scripts/run_kernel_benchmark_matrix.py.
+# The written report next to it is tracked.
+reports/kernel-benchmarks/*.json

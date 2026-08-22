@@ -228,13 +228,27 @@ ATTENTION_CONVS = frozenset(ct for ct in CONV_TYPES if CONV_TYPES[ct].name in {"
 #: turbo_gnn kernel parameters, per conv type, settable with ``-K name=value``.
 #: These describe the ``cuda`` backend's kernels, so they are validated only for
 #: that backend; every other backend takes -K as unvalidated pass-through.
+#: Node->block scheduling, shared by the convs whose kernels map nodes onto blocks.
+#: The SpMM convs are cuSPARSE and have no such mapping, so they do not take these.
+_SCHEDULE_PARAMS = (
+    KernelParam(
+        "schedule",
+        str,
+        "one_per_block",
+        "Node->block policy: one_per_block (grid.x == node count) | grid_stride | precomputed | dynamic.",
+        choices=("one_per_block", "grid_stride", "precomputed", "dynamic"),
+    ),
+    KernelParam("blocks_per_sm", int, 1024, "Resident blocks per SM targeted by the persistent policies."),
+    KernelParam("sched_chunk", int, 4, "Work items claimed per atomic (dynamic policy only)."),
+)
+
 _REDUCTION_PARAMS = (
     KernelParam("warps_per_block", int, 8, "Warps per block for the light-node atomic kernel."),
     KernelParam("edges_per_block_heavy_nodes", int, 128, "Edges per block for the heavy-node tiled kernel."),
     KernelParam("use_2d_kernel", _parse_bool, False, "Use the 2-D tiled heavy-node kernel variant."),
     KernelParam("features_per_block", int, 32, "Feature tile size (2-D kernel only)."),
     KernelParam("tiles_y", int, 8, "Row tile count (2-D kernel only)."),
-)
+) + _SCHEDULE_PARAMS
 
 _SPMM_PARAMS = (
     KernelParam("cu_sparse_algorithm_id", int, -1, "cuSPARSE algorithm id (-1 = library default)."),
@@ -248,7 +262,7 @@ _GATV2_PARAMS = (
     KernelParam("forward_heavy_warps", int, 8, "Warps per block, forward heavy-node kernel."),
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),
     KernelParam("backward_heavy_warps", int, 8, "Warps per block, backward heavy-node kernel."),
-)
+) + _SCHEDULE_PARAMS
 
 _GT_PARAMS = (
     KernelParam("scale", _parse_optional_float, None, "Score scale; 'none' means 1/sqrt(head_dim)."),
@@ -256,7 +270,7 @@ _GT_PARAMS = (
     KernelParam("forward_heavy_warps", int, 8, "Warps per block, forward heavy-node kernel."),
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),
     KernelParam("backward_heavy_warps", int, 8, "Warps per block, backward heavy-node kernel."),
-)
+) + _SCHEDULE_PARAMS
 
 CUDA_CONV_PARAMS: dict[str, tuple[KernelParam, ...]] = {
     "min_aggr": _REDUCTION_PARAMS,
@@ -482,7 +496,14 @@ SWEEPABLE: dict[str, Callable[[str], Any]] = {
     "forward_quantile": float,
     "backward_quantile": float,
     "index_dtype": str,
+    "node_order": str,
 }
+
+#: Order in which the light/heavy buckets are walked. This only changes *which node a block
+#: visits*, never where its result is written, so every order is bit-exact -- but it is the
+#: largest single performance parameter on these kernels, because cache reuse depends on
+#: whether nodes processed close together share neighbours.
+NODE_ORDERS = ("natural", "degree", "locality")
 
 QUANTILE_KEYS = ("quantile", "forward_quantile", "backward_quantile")
 
@@ -525,6 +546,10 @@ def parse_sweep(raw_args: Sequence[str] | None) -> dict[str, list[Any]]:
                 raise SystemExit(
                     f"--sweep index_dtype has unknown value(s) {unknown}; valid: {', '.join(INDEX_DTYPES)}"
                 )
+        if name == "node_order":
+            unknown = [v for v in values if v not in NODE_ORDERS]
+            if unknown:
+                raise SystemExit(f"--sweep node_order has unknown value(s) {unknown}; valid: {', '.join(NODE_ORDERS)}")
         sweep[name] = values
     return sweep
 
@@ -559,7 +584,42 @@ def apply_sweep_point(args: argparse.Namespace, point: dict[str, Any]) -> argpar
         merged.quantile = point["quantile"]
     if "index_dtype" in point:
         merged.index_dtype = point["index_dtype"]
+    if "node_order" in point:
+        merged.node_order = point["node_order"]
     return merged
+
+
+def reorder_nodes(graph: BenchGraph, order: str) -> BenchGraph:
+    """Return ``graph`` with its node buckets walked in ``order``.
+
+    Reordering shares the CSR arrays and rebuilds only the bucket index arrays, so it costs a
+    sort rather than a graph rebuild -- except ``locality``, which runs reverse Cuthill-McKee
+    on the host and is the one order worth measuring the preparation cost of separately.
+
+    Args:
+        graph (BenchGraph): Base graph.
+        order (str): One of ``natural``, ``degree``, ``locality``.
+
+    Returns:
+        BenchGraph: Reordered graph, or ``graph`` itself for ``natural``.
+
+    Raises:
+        SystemExit: On an unknown order, or if ``locality`` is asked for without scipy.
+    """
+    if order == "natural":
+        return graph
+    if not isinstance(graph.repr, AdjacencyForwardBackwardWithNodeBuckets):
+        raise SystemExit(f"--node-order {order!r} needs the turbo_gnn CSR representation (--backend cuda).")
+    if order == "degree":
+        reordered = graph.repr.sorted_by_degree()
+    elif order == "locality":
+        try:
+            reordered = graph.repr.sorted_by_locality()
+        except ImportError as exc:
+            raise SystemExit(f"--node-order locality needs scipy: {exc}") from exc
+    else:
+        raise SystemExit(f"Unknown --node-order {order!r}; valid: {', '.join(NODE_ORDERS)}")
+    return BenchGraph(reordered, graph.num_nodes, _csr_stats(reordered), _collect_tensors(reordered))
 
 
 def repartition_for(graph: BenchGraph, point: dict[str, Any]) -> BenchGraph | None:
@@ -954,6 +1014,16 @@ def parse_args() -> argparse.Namespace:
         f"Valid names: {', '.join(SWEEPABLE)}.",
     )
     graph_group.add_argument(
+        "--node-order",
+        type=str,
+        default="natural",
+        choices=list(NODE_ORDERS),
+        help="Order the light/heavy buckets are walked in. 'degree' is descending degree "
+        "(balances; cost tracks degree). 'locality' is reverse Cuthill-McKee (clusters "
+        "connected nodes so neighbouring feature rows stay in L2; needs scipy). Bit-exact "
+        "either way -- this changes only which node a block visits.",
+    )
+    graph_group.add_argument(
         "--no-self-loops",
         dest="self_loops",
         action="store_false",
@@ -1257,12 +1327,15 @@ def main() -> int:
         differentiable = [t for t in inputs.values() if t.requires_grad]
 
         for point in points:
-            if not point:
+            if not point or set(point) == {"node_order"}:
                 graph = base_graph
             else:
                 graph = repartition_for(base_graph, point)  # type: ignore
                 if graph is None:
                     graph = load_graph(apply_sweep_point(args, point), device, target.conv_backend)  # type: ignore
+            # Applied last, so it composes with a swept quantile or index dtype: bucketing
+            # decides bucket membership, ordering decides the walk within each bucket.
+            graph = reorder_nodes(graph, point.get("node_order", args.node_order))
 
             _forward = target.make_forward(graph, inputs)
             timed = build_timed_callable(_forward, args.mode, differentiable)
@@ -1329,6 +1402,7 @@ def main() -> int:
             "dtype": args.dtype,
             "dataset": args.dataset,
             "self_loops": args.self_loops,
+            "node_order": best["graph_config"].get("node_order", args.node_order),
             "graph": graph.stats,
             "iters_are_exact": timing.exact,
             # Exactly one pair is populated: launch counts, or millisecond budgets.
