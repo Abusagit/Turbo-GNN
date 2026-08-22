@@ -56,6 +56,9 @@ def main() -> int:
             incomplete.append(key)
             continue
         best_cfg, best_ms = min(grid.items(), key=lambda kv: kv[1])
+        # The baseline is one of the candidates, so `best` can never lose to it and a
+        # "cells at or above baseline" count would be 100% by construction, meaning nothing.
+        # What is worth counting is how often something *other* than the baseline wins.
         rows.append(
             {
                 "graph": key[0],
@@ -68,6 +71,7 @@ def main() -> int:
                 "best_order": best_cfg[1],
                 "speedup": base / best_ms,
                 "configs": len(grid),
+                "beat_baseline": best_cfg != BASELINE and best_ms < base * 0.995,
             }
         )
 
@@ -82,7 +86,7 @@ def main() -> int:
         rs = by_graph[graph]
         gm = statistics.geometric_mean([r["speedup"] for r in rs])
         f = facts[graph]
-        print(f"### {graph}   geomean {gm:.3f}x   {sum(r['speedup'] >= 1 for r in rs)}/{len(rs)} at or above")
+        print(f"### {graph}   geomean {gm:.3f}x   {sum(r['beat_baseline'] for r in rs)}/{len(rs)} cells improved")
         print(
             f"    N={f['num_nodes']:,} E={f['num_edges']:,} avg_deg={f['avg_degree']:.1f} "
             f"max_deg={f['max_degree']:,} heavy_fwd={f['forward_heavy_nodes']:,}"
@@ -98,16 +102,22 @@ def main() -> int:
     print("=" * 72)
     for dim in sorted({r["head_dim"] for r in rows}):
         for mode in ("forward", "backward"):
-            xs = [r["speedup"] for r in rows if r["head_dim"] == dim and r["mode"] == mode]
+            sub = [r for r in rows if r["head_dim"] == dim and r["mode"] == mode]
+            xs = [r["speedup"] for r in sub]
             if xs:
                 print(
                     f"  d={dim:<4} {mode:<9} geomean {statistics.geometric_mean(xs):.3f}x   "
-                    f"{sum(x >= 1 for x in xs)}/{len(xs)} at or above baseline"
+                    f"{sum(r['beat_baseline'] for r in sub)}/{len(sub)} cells improved"
                 )
     allx = [r["speedup"] for r in rows]
     print(
         f"\n  overall   geomean {statistics.geometric_mean(allx):.3f}x   "
-        f"{sum(x >= 1 for x in allx)}/{len(allx)} at or above baseline"
+        f"{sum(r['beat_baseline'] for r in rows)}/{len(rows)} cells improved on the baseline"
+    )
+    print(
+        "  Note: the baseline is itself one of the 12 candidates, so a best-of speedup can\n"
+        "  never fall below 1.00x and counting cells 'at or above baseline' would report 100%\n"
+        "  by construction. The per-configuration table below is where the real risk shows."
     )
 
     # How each fixed (schedule, order) would do if it had to be the single default.

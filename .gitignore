@@ -28,6 +28,7 @@ out
 *.pdf
 *.ncu-rep
 
-# Raw per-run benchmark JSON; regenerate with scripts/run_kernel_benchmark_matrix.py.
-# The written report next to it is tracked.
+# Raw per-run benchmark JSON (768 files); regenerate with run_kernel_benchmark_matrix.py.
+# The written report, the summary and the distilled per-cell grid next to them are tracked.
 reports/kernel-benchmarks/*.json
+!reports/kernel-benchmarks/grid.json
