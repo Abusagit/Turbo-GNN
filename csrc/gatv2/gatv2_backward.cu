@@ -125,26 +125,35 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 
     Pipe pipe(r_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
 #pragma unroll
-    for (size_t s = 0; s + 1 < STAGES; ++s) {
+    for (size_t s = 0; s < STAGES; ++s) {
         pipe.prefetch(rj_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
     }
 
     for (int k = warp_id, it = 0; k < num_neighbors; k += WARPS_PER_BLOCK, ++it) {
-        pipe.prefetch(rj_row(warp_id + (it + static_cast<int>(STAGES) - 1) * WARPS_PER_BLOCK));
         const cuda_t *rj_base = pipe.consume();
+
+        vec_t rj_regs[TILES_PER_THREAD];
+#pragma unroll
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            const int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                rj_regs[t] = Tile::read(rj_base, v);
+            }
+        }
+        pipe.release();
+        pipe.prefetch(rj_row(warp_id + (it + static_cast<int>(STAGES)) * WARPS_PER_BLOCK));
 
         accum_t e_lane{};
         accum_t p_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            int v = lane + kWarpSize * t;
+            const int v = lane + kWarpSize * t;
             if (v < TILES) {
                 const vec_t lv  = Tile::read(li_sh, v);
-                const vec_t rv  = Tile::read(rj_base, v);
                 const vec_t av  = Tile::read(a_base, v);
                 const vec_t ghv = Tile::read(ghi_sh, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                ghv.dot_product_(&p_lane, rv);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rj_regs[t], av, negative_slope);
+                ghv.dot_product_(&p_lane, rj_regs[t]);
             }
         }
         const accum_t e_ij = warp_reduce_sum(e_lane);
@@ -152,8 +161,6 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 
         const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_partial              = AccumOps::fma(alpha_ij, p_ij, G_partial);
-
-        pipe.release();
     }
 
     // Cross-warp reduction for G
@@ -172,26 +179,35 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // pass 2: accumulate gradients (warp-strided)
     Pipe pipe2(r_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
 #pragma unroll
-    for (size_t s = 0; s + 1 < STAGES; ++s) {
+    for (size_t s = 0; s < STAGES; ++s) {
         pipe2.prefetch(rj_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
     }
 
     for (int k = warp_id, it = 0; k < num_neighbors; k += WARPS_PER_BLOCK, ++it) {
-        pipe2.prefetch(rj_row(warp_id + (it + static_cast<int>(STAGES) - 1) * WARPS_PER_BLOCK));
         const cuda_t *rj_base = pipe2.consume();
+
+        vec_t rj_regs[TILES_PER_THREAD];
+#pragma unroll
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            const int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                rj_regs[t] = Tile::read(rj_base, v);
+            }
+        }
+        pipe2.release();
+        pipe2.prefetch(rj_row(warp_id + (it + static_cast<int>(STAGES)) * WARPS_PER_BLOCK));
 
         accum_t e_lane{};
         accum_t p_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            int v = lane + kWarpSize * t;
+            const int v = lane + kWarpSize * t;
             if (v < TILES) {
                 const vec_t lv  = Tile::read(li_sh, v);
-                const vec_t rv  = Tile::read(rj_base, v);
                 const vec_t av  = Tile::read(a_base, v);
                 const vec_t ghv = Tile::read(ghi_sh, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                ghv.dot_product_(&p_lane, rv);
+                e_lane += Tile::gatv2_dot_leaky_relu(lv, rj_regs[t], av, negative_slope);
+                ghv.dot_product_(&p_lane, rj_regs[t]);
             }
         }
         const accum_t e_ij = warp_reduce_sum(e_lane);
@@ -202,17 +218,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            int v = lane + kWarpSize * t;
+            const int v = lane + kWarpSize * t;
             if (v < TILES) {
                 const vec_t lv   = Tile::read(li_sh, v);
-                const vec_t rv   = Tile::read(rj_base, v);
                 const vec_t av   = Tile::read(a_base, v);
                 const int base_f = v * TW;
-                Tile::gatv2_accum_grad_al(&my_grada[base_f], &my_gradl[base_f], grad_e_ij, lv, rv, av, negative_slope);
+                Tile::gatv2_accum_grad_al(&my_grada[base_f], &my_gradl[base_f], grad_e_ij, lv, rj_regs[t], av, negative_slope);
             }
         }
-
-        pipe2.release();
     }
 
     // Cross-warp reduction: warp 0 sums all per-warp accumulators
@@ -351,19 +364,32 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     Pipe pipe_l(l_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
     Pipe pipe_gh(gh_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
 #pragma unroll
-    for (size_t s = 0; s + 1 < STAGES; ++s) {
+    for (size_t s = 0; s < STAGES; ++s) {
         pipe_l.prefetch(l_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
         pipe_gh.prefetch(gh_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
     }
 
     for (int idx = warp_id, it = 0; idx < num_incoming; idx += WARPS_PER_BLOCK, ++it) {
-        const int next = warp_id + (it + static_cast<int>(STAGES) - 1) * WARPS_PER_BLOCK;
-        pipe_l.prefetch(l_row(next));
-        pipe_gh.prefetch(gh_row(next));
-
         index_t node_i         = edge_node(idx);
         const cuda_t *li_base  = pipe_l.consume();
         const cuda_t *ghi_base = pipe_gh.consume();
+
+        vec_t li_regs[TILES_PER_THREAD];
+        vec_t ghi_regs[TILES_PER_THREAD];
+#pragma unroll
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            const int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                li_regs[t]  = Tile::read(li_base, v);
+                ghi_regs[t] = Tile::read(ghi_base, v);
+            }
+        }
+        pipe_l.release();
+        pipe_gh.release();
+
+        const int next = warp_id + (it + static_cast<int>(STAGES)) * WARPS_PER_BLOCK;
+        pipe_l.prefetch(l_row(next));
+        pipe_gh.prefetch(gh_row(next));
 
         const accum_t L_i_h = d_logsumexp[node_i * H + head_h];
         const accum_t G_i_h = d_G[node_i * H + head_h];
@@ -372,14 +398,12 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
         accum_t p_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            int v = lane + kWarpSize * t;
+            const int v = lane + kWarpSize * t;
             if (v < TILES) {
-                const vec_t lv  = Tile::read(li_base, v);
-                const vec_t rv  = Tile::read(rj_sh, v);
-                const vec_t av  = Tile::read(a_base, v);
-                const vec_t ghv = Tile::read(ghi_base, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
-                ghv.dot_product_(&p_lane, rv);
+                const vec_t rv = Tile::read(rj_sh, v);
+                const vec_t av = Tile::read(a_base, v);
+                e_lane += Tile::gatv2_dot_leaky_relu(li_regs[t], rv, av, negative_slope);
+                ghi_regs[t].dot_product_(&p_lane, rv);
             }
         }
         const accum_t e_ij = warp_reduce_sum(e_lane);
@@ -390,19 +414,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
 
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            int v = lane + kWarpSize * t;
+            const int v = lane + kWarpSize * t;
             if (v < TILES) {
-                const vec_t lv   = Tile::read(li_base, v);
                 const vec_t rv   = Tile::read(rj_sh, v);
                 const vec_t av   = Tile::read(a_base, v);
-                const vec_t ghv  = Tile::read(ghi_base, v);
                 const int base_f = v * TW;
-                Tile::gatv2_accum_grad_r(&my_gradr[base_f], alpha_ij, ghv, grad_e_ij, lv, rv, av, negative_slope);
+                Tile::gatv2_accum_grad_r(&my_gradr[base_f], alpha_ij, ghi_regs[t], grad_e_ij, li_regs[t], rv, av, negative_slope);
             }
         }
-
-        pipe_l.release();
-        pipe_gh.release();
     }
 
     // Cross-warp reduction: warp 0 sums per-warp accumulators

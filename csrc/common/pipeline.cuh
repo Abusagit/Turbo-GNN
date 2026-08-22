@@ -2,10 +2,6 @@
 
 #include <cuda/pipeline>
 
-#ifndef TGNN_PIPE_MODE
-#define TGNN_PIPE_MODE 0
-#endif
-
 #include "common/misc.cuh"
 #include "common/tile.cuh"
 #include "common/traits.cuh"
@@ -42,18 +38,6 @@ class RowPipeline {
         if constexpr (STAGES == 1) {
             direct_ = src;
         } else {
-#if TGNN_PIPE_MODE == 1
-            src_ring_[prod_idx_] = src;  // читается только в режиме 1
-#endif
-#if TGNN_PIPE_MODE == 2
-            if (src != nullptr) {
-                uint4 *const dst        = reinterpret_cast<uint4 *>(stage_base_ + prod_idx_ * ROW_ELEMS);
-                uint4 const *const from = reinterpret_cast<uint4 const *>(src);
-                for (size_t chunk = lane_; chunk < kChunksPerRow; chunk += lane_cnt_) {
-                    dst[chunk] = from[chunk];
-                }
-            }
-#else
             pipe_.producer_acquire();
             if (src != nullptr) {
                 char *const dst        = reinterpret_cast<char *>(stage_base_ + prod_idx_ * ROW_ELEMS);
@@ -65,7 +49,6 @@ class RowPipeline {
                 }
             }
             pipe_.producer_commit();
-#endif
             prod_idx_ = advance(prod_idx_);
         }
     }
@@ -74,27 +57,22 @@ class RowPipeline {
         if constexpr (STAGES == 1) {
             return direct_;
         } else {
-#if TGNN_PIPE_MODE != 2
             cuda::pipeline_consumer_wait_prior<STAGES - 1>(pipe_);
-#endif
-            // With lane-local copies each lane waited on its own memcpy_async above; only the
-            // 16-byte fallback has lanes reading bytes another lane brought in.
             if constexpr (!kLaneLocal) {
                 __syncwarp();
             }
-#if TGNN_PIPE_MODE == 1
-            return src_ring_[cons_idx_];
-#else
             return stage_base_ + cons_idx_ * ROW_ELEMS;
-#endif
         }
     }
 
     __device__ __forceinline__ void release() {
         if constexpr (STAGES > 1) {
-#if TGNN_PIPE_MODE != 2
+            // The next prefetch refills this slot, so with the 16-byte fallback a fast lane would
+            // overwrite bytes a slow lane is still reading.
+            if constexpr (!kLaneLocal) {
+                __syncwarp();
+            }
             pipe_.consumer_release();
-#endif
             cons_idx_ = advance(cons_idx_);
         }
     }
@@ -108,8 +86,5 @@ class RowPipeline {
     size_t prod_idx_;
     size_t cons_idx_;
     num_type const *direct_;
-#if TGNN_PIPE_MODE == 1
-    num_type const *src_ring_[STAGES];
-#endif
     cuda::pipeline<cuda::thread_scope_thread> pipe_;
 };
