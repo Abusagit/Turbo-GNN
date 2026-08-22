@@ -1,4 +1,12 @@
-"""All TunableKernel subclasses for turbo_gnn kernels."""
+"""All TunableKernel subclasses for turbo_gnn kernels.
+
+Note on ``schedule`` / ``blocks_per_sm``: both are accepted as constructor kwargs and
+forwarded to the kernels, but they are deliberately **not** ``TunableParam``s. The autotuner
+takes the full Cartesian product of the declared parameters, so adding a 3-value and a
+6-value axis multiplies the reduction grid from 1,344 to 24,192 combinations -- 120,960
+timed trials once graph repartitioning is included, which does not finish. Sweep them
+explicitly instead.
+"""
 
 from __future__ import annotations
 
@@ -33,6 +41,8 @@ class ReductionAggrKernel(TunableKernel):
     def __init__(self, reduce: str = "min", **kwargs):
         super().__init__()
         self.reduce = reduce
+        self.schedule = kwargs.get("schedule", "dynamic")
+        self.blocks_per_sm = kwargs.get("blocks_per_sm", 8)
         self.forward_warps_per_block = kwargs.get("warps_per_block", 8)
         self.forward_edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
         self.forward_use_2d_kernel = kwargs.get("use_2d_kernel", False)
@@ -53,6 +63,8 @@ class ReductionAggrKernel(TunableKernel):
             self.forward_features_per_block,
             self.forward_tiles_y,
             self.reduce,
+            self.schedule,
+            self.blocks_per_sm,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -90,6 +102,8 @@ class GATv2AggrKernel(TunableKernel):
     def __init__(self, **kwargs):
         super().__init__()
         self.backward_grad_A_reduce_row_chunk_size = kwargs.get("grad_A_reduce_row_chunk_size", 512)
+        self.schedule = kwargs.get("schedule", "dynamic")
+        self.blocks_per_sm = kwargs.get("blocks_per_sm", 8)
         self.forward_light_warps = kwargs.get("forward_light_warps", 1)
         self.forward_heavy_warps = kwargs.get("forward_heavy_warps", 8)
         self.backward_light_warps = kwargs.get("backward_light_warps", 1)
@@ -115,6 +129,8 @@ class GATv2AggrKernel(TunableKernel):
             self.backward_light_warps,
             self.backward_heavy_warps,
             graph.is_directed,
+            self.schedule,
+            self.blocks_per_sm,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -172,6 +188,8 @@ class GraphTransformerAggrKernel(TunableKernel):
     def __init__(self, **kwargs):
         super().__init__()
         self.forward_light_warps = kwargs.get("forward_light_warps", 4)
+        self.schedule = kwargs.get("schedule", "dynamic")
+        self.blocks_per_sm = kwargs.get("blocks_per_sm", 8)
         self.forward_heavy_warps = kwargs.get("forward_heavy_warps", 8)
         self.backward_light_warps = kwargs.get("backward_light_warps", 1)
         self.backward_heavy_warps = kwargs.get("backward_heavy_warps", 8)
@@ -195,6 +213,8 @@ class GraphTransformerAggrKernel(TunableKernel):
             self.backward_light_warps,
             self.backward_heavy_warps,
             graph.is_directed,
+            self.schedule,
+            self.blocks_per_sm,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:

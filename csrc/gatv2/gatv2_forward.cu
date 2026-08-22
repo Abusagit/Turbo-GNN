@@ -8,7 +8,9 @@
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
 
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <
+    turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
+    FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
     size_t N,
     size_t H,
@@ -21,7 +23,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr,
     const index_t *__restrict__ d_col_idx,
-    const index_t *__restrict__ node_indices,  // node indirection
+    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     const cuda_t *__restrict__ d_attn_vec,
     cuda_t *__restrict__ d_h_out,
     float *__restrict__ d_logsumexp_out,
@@ -39,8 +41,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
 
     using vec_t = typename Tile::vec_t;
 
-    const int node_i  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
+
+    // Body in a lambda: its `return`s become per-node `continue` semantics.
+    auto process_node = [&](const int node_i) {
     const int warp_id = threadIdx.x / kWarpSize;
     const int lane    = threadIdx.x % kWarpSize;
 
@@ -205,5 +209,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
                 Tile::write_convert_from_accum(&h_out_base[v * TW], combined);
             }
         }
+    }
+    };  // process_node
+
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+        process_node(static_cast<int>(sched.node(work)));
     }
 }

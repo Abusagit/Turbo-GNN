@@ -7,8 +7,9 @@
 // ===================================================
 
 // D[i,h] = sum_d dO[i,h,d] * O[i,h,d]
-template <int D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float>
+template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
+    turbo_gnn::sched::SchedulerParams<int32_t> sched_params,
     cuda_t const *const __restrict__ dO,    // [N, H, D]
     cuda_t const *const __restrict__ O_in,  // [N, H, D]
     accum_t *const __restrict__ D_out,      // [N, H]
@@ -29,9 +30,11 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 
     using Tile = TileOps<TW, cuda_t, accum_t>;
 
-    const int node_i = blockIdx.x;
     const int head_h = blockIdx.y;
     const int lane   = threadIdx.x;  // 0..31
+
+    // Body in a lambda: its `return`s become per-node `continue` semantics.
+    auto process_node = [&](const int node_i) {
 
     if (node_i >= static_cast<int>(N) || head_h >= static_cast<int>(H)) [[unlikely]] {
         return;
@@ -53,18 +56,29 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
     if (lane == 0) {
         D_out[node_i * H + head_h] = sum;
     }
+    };  // process_node
+
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, int32_t, /*SyncBlock=*/false>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+        process_node(static_cast<int>(sched.node(work)));
+    }
 }
+
 
 // Q, K, V, dO are [N, H, D] with contiguous D (stride(2)==1), D % 4 == 0
 // Q, K, V may be non-contiguous in N,H dims (e.g. from split/view).
 // logsumexp and Delta are [N, H].
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <
+    turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
+    FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr_T,     // [N+1], CSR^T row pointers
     index_t const *const __restrict__ col_idx_T,     // [E],   CSR^T col indices
-    index_t const *const __restrict__ node_indices,  // node indirection
+    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     cuda_t const *const __restrict__ Q,              // [N, H, D]
     cuda_t const *const __restrict__ K,              // [N, H, D]
     cuda_t const *const __restrict__ V,              // [N, H, D]
@@ -88,8 +102,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
 
-    const int node_j  = static_cast<int>(node_indices[blockIdx.x]);
     const int head_h  = blockIdx.y;
+
+    // Body in a lambda: its `return`s become per-node `continue` semantics.
+    auto process_node = [&](const int node_j) {
     const int warp_id = threadIdx.x / kWarpSize;
     const int lane    = threadIdx.x % kWarpSize;
 
@@ -242,7 +258,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
             Tile::write_convert_from_accum(&dV_base[fv * TW], gv_sum);
         }
     }
+    };  // process_node
+
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+        process_node(static_cast<int>(sched.node(work)));
+    }
 }
+
 
 // =============================================================================
 // Undirected backward kernel: uses forward CSR, zero atomics.
@@ -250,8 +275,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 //   Forward direction: dK[d] (local)
 //   Reverse direction: dQ[d], dV[d] (local, exploiting symmetric adjacency)
 // =============================================================================
-template <int D_CONST, typename cuda_t, typename index_t, FloatingNum accum_t = float>
+template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, typename cuda_t, typename index_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirected_kernel_D(
+    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr,  // [N+1], forward CSR row pointers
     index_t const *const __restrict__ col_idx,  // [E],   forward CSR col indices
@@ -278,8 +304,10 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
 
-    const int node_d = blockIdx.x;
     const int head_h = blockIdx.y;
+
+    // Body in a lambda: its `return`s become per-node `continue` semantics.
+    auto process_node = [&](const int node_d) {
     const int lane   = threadIdx.x;  // 0..31
 
     if (node_d >= N || head_h >= H) [[unlikely]] {
@@ -440,7 +468,7 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
 
             qs.weighted_accum_(&gk_shared[base_f], dS_fwd_scaled); // dK[d] += dS_fwd * Q[s]
             ks.weighted_accum_(&gq_shared[base_f], dS_rev_scaled); // dQ[d] += dS_rev * K[s]
-            dOs.weighted_accum_(&gv_shared[base_f], alpha_rev); // dV[d] += P_rev * dO[s]   
+            dOs.weighted_accum_(&gv_shared[base_f], alpha_rev); // dV[d] += P_rev * dO[s]
         }
     }
 
@@ -454,5 +482,13 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
         Tile::write_convert_from_accum(&dK_base[fv * TW], &gk_shared[base_f]);
         Tile::write_convert_from_accum(&dQ_base[fv * TW], &gq_shared[base_f]);
         Tile::write_convert_from_accum(&dV_base[fv * TW], &gv_shared[base_f]);
+    }
+    };  // process_node
+
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+        process_node(static_cast<int>(sched.node(work)));
     }
 }

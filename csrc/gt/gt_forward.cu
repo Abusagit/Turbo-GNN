@@ -2,7 +2,9 @@
 
 #include "common.cuh"
 
-template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <
+    turbo_gnn::sched::ScheduleKind SK, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t,
+    FloatingNum accum_t = float>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward_CSR_MH_v2_D( // no-format
     size_t N, size_t H,
     const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
@@ -10,7 +12,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     int64_t stride_k_n, int64_t stride_k_h,
     int64_t stride_v_n, int64_t stride_v_h,
     const index_t *__restrict__ row_ptr, const index_t *__restrict__ col_idx,
-    const index_t *__restrict__ node_indices,  // node indirection: node_i = node_indices[blockIdx.x]
+    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     cuda_t *__restrict__ O, int64_t stride_o_n, int64_t stride_o_h,
     accum_t *__restrict__ logsumexp, accum_t scale
 ) {
@@ -27,8 +29,10 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
 
-    const size_t node_i = static_cast<size_t>(node_indices[blockIdx.x]);
     const size_t head_h = blockIdx.y;
+
+    // Body in a lambda: its `return`s become per-node `continue` semantics.
+    auto process_node = [&](const size_t node_i) {
 
     __builtin_assume(threadIdx.y < static_cast<unsigned>(N_PER_BLOCK));
     const size_t lane_id = threadIdx.x;
@@ -209,5 +213,13 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
                 Tile::write_convert_from_accum(&out_base[vi * TW], combined);
             }
         }
+    }
+    };  // process_node
+
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+        process_node(static_cast<int>(sched.node(work)));
     }
 }

@@ -16,10 +16,15 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
-    int heavy_warps_per_block
+    int heavy_warps_per_block,
+    int schedule,
+    int blocks_per_sm,
+    int sched_chunk
 ) {
     at::cuda::CUDAGuard device_guard(Q.device());
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(Q.device().index());
+    namespace sched_ns                   = turbo_gnn::sched;
+    const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
 
     TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(), "CSR indices must be CUDA");
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be CUDA");
@@ -57,23 +62,37 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GT forward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
     // Lambda to launch the kernel for a bucket of nodes with a given warp count
+    // One counter row per bucket launch, so light cannot leave dirt for heavy.
+    at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/2, Q.device());
+    int bucket_id             = 0;
+
     auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+        const int this_bucket = bucket_id++;
         if (num_nodes_bucket == 0) return;
 
+        // Heads stay on gridDim.y, so the persistent target is divided by H to keep the
+        // *total* block count near blocks_per_sm * SM_count.
+        const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
+        at::Tensor offs;
+        if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+            offs = sched_ns::degree_balanced_block_offsets(row_ptr, node_indices, num_nodes_bucket, gx);
+        }
+
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
                 using index_t       = typename decltype(idxInfo)::Type;
                 using torch_t       = typename decltype(typeInfo)::TorchType;
                 using cuda_t        = typename decltype(typeInfo)::CudaType;
                 constexpr size_t DC = decltype(d_c)::value;
                 constexpr size_t W  = decltype(warp_c)::value;
+                constexpr auto SK   = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
 
                 cuda_t const *Q_ptr = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
                 cuda_t const *K_ptr = reinterpret_cast<const cuda_t *>(K.data_ptr<torch_t>());
                 cuda_t const *V_ptr = reinterpret_cast<const cuda_t *>(V.data_ptr<torch_t>());
                 cuda_t *O_ptr       = reinterpret_cast<cuda_t *>(O.data_ptr<torch_t>());
 
-                dim3 blocks(num_nodes_bucket, H);
+                dim3 blocks(gx, H);
 
                 // dim3 threads(W * kWarpSize);
                 // size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
@@ -91,14 +110,19 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
 
                 size_t shmem = DC * sizeof(cuda_t) + y_dim * DC * sizeof(float) + 2 * y_dim * sizeof(float) + y_dim * sizeof(float) * 2;
 
-                GraphAttentionForward_CSR_MH_v2_D<y_dim, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                auto sp = sched_ns::make_params<index_t>(
+                    SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H),
+                    this_bucket, offs, sched_chunk
+                );
+
+                GraphAttentionForward_CSR_MH_v2_D<SK, y_dim, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1],
-                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), O_ptr, o_strides[0],
+                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), sp, O_ptr, o_strides[0],
                     o_strides[1], lse.data_ptr<float>(), scale
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(D), warp_variant
+            MakeIntVariant<32, 64, 128, 256>(D), warp_variant, MakeIntVariant<0, 1, 2, 3>(schedule)
         );
     };
 
@@ -129,7 +153,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
     int heavy_warps_per_block,
-    bool is_directed
+    bool is_directed,
+    int schedule,
+    int blocks_per_sm,
+    int sched_chunk
 ) {
     TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(), "Forward CSR indices must be CUDA");
     TORCH_CHECK(row_ptr_T.is_cuda() && col_idx_T.is_cuda(), "CSR^T indices must be CUDA");
@@ -211,25 +238,40 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GT backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
+    namespace sched_ns                   = turbo_gnn::sched;
+    const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
+    // Rows: 0 = compute_D, 1 = light bucket / undirected, 2 = heavy bucket.
+    at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/3, Q.device());
+
     // Launch compute_D for ALL nodes (always 1 warp, no bucketing)
     {
-        dim3 blocks_D(N, H);
+        const int gxD = sched_ns::persistent_grid_x(SK_KIND, static_cast<int>(N), blocks_per_sm, static_cast<int>(H), sched_chunk);
+        dim3 blocks_D(gxD, H);
         dim3 threads_D(kWarpSize);
+        at::Tensor offsD;
+        if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+            offsD = sched_ns::degree_balanced_block_offsets(row_ptr, {}, static_cast<int>(N), gxD);
+        }
+        auto spD = sched_ns::make_params<int32_t>(
+            SK_KIND, /*nodes=*/nullptr, static_cast<int>(N), sched_counters, static_cast<int>(H), /*launch_index=*/0, offsD, sched_chunk
+        );
         std::visit(
-            [&](auto typeInfo, auto d_c) {
+            [&](auto typeInfo, auto d_c, auto sched_c) {
                 using torch_t       = typename decltype(typeInfo)::TorchType;
                 using cuda_t        = typename decltype(typeInfo)::CudaType;
                 constexpr size_t DC = decltype(d_c)::value;
+                constexpr auto SK   = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
 
                 auto cuda_stream     = at::cuda::getDefaultCUDAStream();
                 cuda_t const *dO_ptr = reinterpret_cast<const cuda_t *>(dO.data_ptr<torch_t>());
                 cuda_t const *O_ptr  = reinterpret_cast<const cuda_t *>(O.data_ptr<torch_t>());
 
-                compute_D_mh_kernel_D<DC, cuda_t><<<blocks_D, threads_D, 0, cuda_stream>>>(
-                    dO_ptr, O_ptr, Delta.data_ptr<float>(), N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
+                compute_D_mh_kernel_D<SK, DC, cuda_t><<<blocks_D, threads_D, 0, cuda_stream>>>(
+                    spD, dO_ptr, O_ptr, Delta.data_ptr<float>(), N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
                 );
             },
-            MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(D)
+            MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(D),
+            MakeIntVariant<0, 1, 2, 3>(schedule)
         );
     }
 
@@ -246,16 +288,25 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
 
     if (is_directed) {
         // Directed path: warp-parallel bucketed backward using CSR^T
+        int bucket_id      = 1;  // rows 1 and 2 of the counter slab
         auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+            const int this_bucket = bucket_id++;
             if (num_nodes_bucket == 0) return;
 
+            const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
+            at::Tensor offs;
+            if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+                offs = sched_ns::degree_balanced_block_offsets(row_ptr_T, node_indices, num_nodes_bucket, gx);
+            }
+
             std::visit(
-                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                    using index_t    = typename decltype(idxInfo)::Type;
-                    using torch_t    = typename decltype(typeInfo)::TorchType;
-                    using cuda_t     = typename decltype(typeInfo)::CudaType;
-                    constexpr int DC = decltype(d_c)::value;
-                    constexpr int W  = decltype(warp_c)::value;
+                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
+                    using index_t     = typename decltype(idxInfo)::Type;
+                    using torch_t     = typename decltype(typeInfo)::TorchType;
+                    using cuda_t      = typename decltype(typeInfo)::CudaType;
+                    constexpr int DC  = decltype(d_c)::value;
+                    constexpr int W   = decltype(warp_c)::value;
+                    constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
 
                     auto cuda_stream = at::cuda::getDefaultCUDAStream();
 
@@ -270,17 +321,23 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                     // qj + vj (read-only) + W * (gq + gv) per-warp accumulators
                     size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
 
-                    dim3 blocks(num_nodes_bucket, H);
+                    dim3 blocks(gx, H);
                     dim3 threads(W * kWarpSize);
 
-                    graph_attn_backward_csrT_kernel_D<W, DC, cuda_t, index_t><<<blocks, threads, shmem_bwd, cuda_stream>>>(
-                        N, H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), index_ptr<index_t>(node_indices), Q_ptr, K_ptr,
+                    auto sp = sched_ns::make_params<index_t>(
+                        SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H),
+                        this_bucket, offs, sched_chunk
+                    );
+
+                    graph_attn_backward_csrT_kernel_D<SK, W, DC, cuda_t, index_t><<<blocks, threads, shmem_bwd, cuda_stream>>>(
+                        N, H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), sp, Q_ptr, K_ptr,
                         V_ptr, q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr,
                         logsumexp.data_ptr<float>(), Delta.data_ptr<float>(), scale, dQ_ptr, dK_ptr, dV_ptr
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant
+                MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0, 1, 2, 3>(schedule)
             );
         };
 
@@ -292,11 +349,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     } else {
         // Undirected path: forward CSR, no atomics, no bucketing
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto d_c) {
-                using index_t    = typename decltype(idxInfo)::Type;
-                using torch_t    = typename decltype(typeInfo)::TorchType;
-                using cuda_t     = typename decltype(typeInfo)::CudaType;
-                constexpr int DC = decltype(d_c)::value;
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto sched_c) {
+                using index_t     = typename decltype(idxInfo)::Type;
+                using torch_t     = typename decltype(typeInfo)::TorchType;
+                using cuda_t      = typename decltype(typeInfo)::CudaType;
+                constexpr int DC  = decltype(d_c)::value;
+                constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
 
                 auto cuda_stream = at::cuda::getDefaultCUDAStream();
 
@@ -311,17 +369,26 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                 // 3 cuda_t vectors (K,Q,V) + 3 float accumulators (dK,dQ,dV)
                 size_t shmem_bwd = 3 * DC * sizeof(cuda_t) + 3 * DC * sizeof(float);
 
-                dim3 blocks_bwd(N, H);
+                const int gxU = sched_ns::persistent_grid_x(SK_KIND, static_cast<int>(N), blocks_per_sm, static_cast<int>(H), sched_chunk);
+                dim3 blocks_bwd(gxU, H);
                 dim3 threads_bwd(kWarpSize);
 
-                graph_attn_backward_fwd_csr_undirected_kernel_D<DC, cuda_t, index_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
-                    N, H, index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1],
+                at::Tensor offsU;
+                if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+                    offsU = sched_ns::degree_balanced_block_offsets(row_ptr, {}, static_cast<int>(N), gxU);
+                }
+                auto spU = sched_ns::make_params<index_t>(
+                    SK_KIND, /*nodes=*/nullptr, static_cast<int>(N), sched_counters, static_cast<int>(H), /*launch_index=*/1, offsU, sched_chunk
+                );
+
+                graph_attn_backward_fwd_csr_undirected_kernel_D<SK, DC, cuda_t, index_t><<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
+                    spU, N, H, index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1],
                     k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr, logsumexp.data_ptr<float>(), Delta.data_ptr<float>(), scale,
                     dQ_ptr, dK_ptr, dV_ptr
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(D)
+            MakeIntVariant<32, 64, 128, 256>(D), MakeIntVariant<0, 1, 2, 3>(schedule)
         );
     }
 

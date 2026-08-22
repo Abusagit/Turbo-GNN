@@ -12,6 +12,9 @@ import torch
 
 from turbo_gnn._autotune import with_autotune
 from turbo_gnn._functions import (
+    DEFAULT_BLOCKS_PER_SM,
+    DEFAULT_SCHED_CHUNK,
+    DEFAULT_SCHEDULE,
     ReductionAggrFunction,
     _CudaSpMMConvFn,
     _FusedGraphAttention,
@@ -36,6 +39,9 @@ def reduction_aggr(
     features_per_block: int = 32,
     tiles_y: int = 8,
     reduce: str = "min",
+    schedule: str = DEFAULT_SCHEDULE,
+    blocks_per_sm: int = DEFAULT_BLOCKS_PER_SM,
+    sched_chunk: int = DEFAULT_SCHED_CHUNK,
 ) -> torch.Tensor:
     """Element-wise min or max aggregation over incoming neighbors.
 
@@ -56,6 +62,13 @@ def reduction_aggr(
         features_per_block: Feature-dimension tile size (2-D kernel only).
         tiles_y: Number of row tiles (2-D kernel only).
         reduce: ``"min"`` or ``"max"``.
+        schedule: Node-to-block scheduling policy. ``"one_per_block"`` reproduces the
+            historical one-block-per-node launch; ``"grid_stride"``, ``"precomputed"`` and
+            ``"dynamic"`` launch persistently with ``blocks_per_sm * SM_count`` blocks and
+            loop. ``"dynamic"`` (the default) claims work from an atomic queue, which is
+            what balances heavy-tailed degree distributions.
+        blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
+            by ``"one_per_block"``.
 
     Returns:
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
@@ -74,6 +87,9 @@ def reduction_aggr(
         features_per_block,
         tiles_y,
         reduce,
+        schedule,
+        blocks_per_sm,
+        sched_chunk,
     )
 
 
@@ -89,6 +105,9 @@ def gatv2_aggr(
     forward_heavy_warps: int = 8,
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
+    schedule: str = DEFAULT_SCHEDULE,
+    blocks_per_sm: int = DEFAULT_BLOCKS_PER_SM,
+    sched_chunk: int = DEFAULT_SCHED_CHUNK,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -109,6 +128,13 @@ def gatv2_aggr(
         negative_slope: LeakyReLU negative slope (typically 0.2).
         grad_A_reduce_row_chunk_size: Row chunk size for backward attention gradient
             reduction. Larger values use more shared memory but fewer kernel launches.
+        schedule: Node-to-block scheduling policy. ``"one_per_block"`` reproduces the
+            historical one-block-per-node launch; ``"grid_stride"``, ``"precomputed"`` and
+            ``"dynamic"`` launch persistently with ``blocks_per_sm * SM_count`` blocks and
+            loop. ``"dynamic"`` (the default) claims work from an atomic queue, which is
+            what balances heavy-tailed degree distributions.
+        blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
+            by ``"one_per_block"``.
 
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
@@ -132,6 +158,9 @@ def gatv2_aggr(
         backward_light_warps,
         backward_heavy_warps,
         graph.is_directed,
+        schedule,
+        blocks_per_sm,
+        sched_chunk,
     )
 
 
@@ -147,6 +176,9 @@ def graph_transformer_aggr(
     forward_heavy_warps: int = 8,
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
+    schedule: str = DEFAULT_SCHEDULE,
+    blocks_per_sm: int = DEFAULT_BLOCKS_PER_SM,
+    sched_chunk: int = DEFAULT_SCHED_CHUNK,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
@@ -167,6 +199,13 @@ def graph_transformer_aggr(
         K: Key tensor, shape ``[N, H, D]``.
         V: Value tensor, shape ``[N, H, D]``.
         scale: Scaling factor, typically ``1 / sqrt(D)``.
+        schedule: Node-to-block scheduling policy. ``"one_per_block"`` reproduces the
+            historical one-block-per-node launch; ``"grid_stride"``, ``"precomputed"`` and
+            ``"dynamic"`` launch persistently with ``blocks_per_sm * SM_count`` blocks and
+            loop. ``"dynamic"`` (the default) claims work from an atomic queue, which is
+            what balances heavy-tailed degree distributions.
+        blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
+            by ``"one_per_block"``.
 
     Returns:
         Attended features, shape ``[N, H, D]``.
@@ -189,6 +228,9 @@ def graph_transformer_aggr(
         backward_light_warps,
         backward_heavy_warps,
         graph.is_directed,
+        schedule,
+        blocks_per_sm,
+        sched_chunk,
     )
 
 

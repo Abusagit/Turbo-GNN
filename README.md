@@ -142,6 +142,57 @@ out = reduction_aggr(graph, X, reduce="min", autotune=True)  # cache hit
 
 `spmm_aggr` and `csr_SPMM_normalized` are cuSPARSE wrappers and do not support autotuning.
 
+### Node scheduling
+
+All three CUDA ops accept `schedule`, `blocks_per_sm` and `sched_chunk`, which control how
+output nodes are mapped onto thread blocks.
+
+```python
+# Default: one thread block per node, grid.x == node count. The historical launch.
+out = reduction_aggr(graph, X, reduce="min")
+
+# Persistent: grid.x == blocks_per_sm * SM_count, each block loops over several nodes.
+out = reduction_aggr(graph, X, reduce="min", schedule="grid_stride", blocks_per_sm=1024)
+
+# Contiguous per-block slices balanced by edge count -- best on dense, cache-bound graphs.
+out = reduction_aggr(graph, X, reduce="min", schedule="precomputed", blocks_per_sm=1024)
+
+# Atomic work queue; sched_chunk items claimed per atomic.
+out = gatv2_aggr(graph, l, r, attn, 0.2, schedule="dynamic", blocks_per_sm=256, sched_chunk=4)
+
+# Longest-processing-time-first: run any policy over a descending-degree node order.
+out = reduction_aggr(graph.sorted_by_degree(), X, reduce="min", schedule="dynamic")
+```
+
+| `schedule` | Assignment | Costs |
+| --- | --- | --- |
+| `one_per_block` *(default)* | `blockIdx.x` is the node | nothing; identical to the pre-scheduler launch |
+| `grid_stride` | block `b` takes `b`, `b + gridDim.x`, … | nothing beyond the loop |
+| `precomputed` | contiguous slice with equal total degree | a cumsum + searchsorted per launch |
+| `dynamic` | claims chunks from a monotone atomic cursor | one atomic per `sched_chunk` nodes |
+
+Every policy is **bit-exact** with `one_per_block` on the forward pass and matches to
+float-atomic tolerance on the backward, so these only change speed. They are deliberately not
+autotuner parameters: adding `schedule` and `blocks_per_sm` would take the search space from
+1,344 to 24,192 combinations.
+
+The default is the historical launch because, measured over 108 (graph, conv, head dim,
+direction) cells, no persistent policy breaks even as a blanket default — the hardware block
+scheduler is already a dynamic *and* locality-optimal work queue at zero cost. The persistent
+policies are worth reaching for in specific regimes: `min_aggr` backward on small sparse graphs
+(1.24–1.35x), `min_aggr` forward on cache-bound graphs with `precomputed` (1.10x on
+ogbn-proteins), and `gat_v2` at head dim 256 (1.08x). See `SCHEDULER_PERF.md` for the full
+data and the reasoning, and:
+
+```bash
+# Which GPUs are free? Timing on a shared GPU produces garbage.
+CUDA_VISIBLE_DEVICES=$(python scripts/free_gpus.py --count 3) \
+  python scripts/benchmark_scheduler_suite.py --conv gt --head-dims 128 256
+
+python scripts/summarize_scheduler_bench.py results/full_*.json   # per-cell verdict table
+python scripts/scheduler_headroom.py                              # is there anything to win?
+```
+
 ## Quick Start
 
 ```bash

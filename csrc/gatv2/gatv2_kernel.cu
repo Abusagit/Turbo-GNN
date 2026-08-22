@@ -10,10 +10,26 @@ void GATv2Backward_CSR_Undirected_Impl(
     size_t N, size_t H, size_t D, const cuda_t *grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *d_l, int64_t stride_l_n,
     int64_t stride_l_h, const cuda_t *d_r, int64_t stride_r_n, int64_t stride_r_h, const index_t *d_row_ptr, const index_t *d_col_idx,
     const cuda_t *d_attn_vec, const float *d_logsumexp, float negative_slope, int grad_A_reduce_row_chunk_size, cudaStream_t stream,
-    cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced
+    cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced, int schedule, int blocks_per_sm, at::Tensor sched_counters, int sched_chunk
 ) {
+    namespace sched_ns                   = turbo_gnn::sched;
+    const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
+    const int gxN = sched_ns::persistent_grid_x(SK_KIND, static_cast<int>(N), blocks_per_sm, static_cast<int>(H), sched_chunk);
+
     dim3 nThreads(kWarpSize);
-    dim3 nBlocks(N, H);
+    dim3 nBlocks(gxN, H);
+
+    at::Tensor offsN;
+    if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+        // Even split: this impl takes the CSR as raw device pointers, so there is no at::Tensor
+        // to run the degree prefix sum over. Callers wanting a balanced assignment should use
+        // the directed path, which has row_ptr in scope.
+        // Device from the CUDA context, not from `sched_counters`: only DynamicQueue needs a
+        // counter slab, so that tensor is undefined on this path and has no device to ask.
+        offsN = sched_ns::default_block_offsets(
+            static_cast<int>(N), gxN, at::Device(at::kCUDA, at::cuda::current_device())
+        );
+    }
 
     // 1) Compute G[i,h] for all nodes
     float *d_G;
@@ -22,18 +38,36 @@ void GATv2Backward_CSR_Undirected_Impl(
     // G kernel shared: li (cuda_t) + ghi (cuda_t)
     size_t sh_g = 2 * D_CONST * sizeof(cuda_t);
 
-    GATv2Backward_G_Kernel<D_CONST, cuda_t, index_t><<<nBlocks, nThreads, sh_g, stream>>>(
-        N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx, d_attn_vec,
-        d_logsumexp, negative_slope, d_G
+    auto spG = sched_ns::make_params<index_t>(
+        SK_KIND, /*nodes=*/nullptr, static_cast<int>(N), sched_counters, static_cast<int>(H), /*launch_index=*/0, offsN, sched_chunk
+    );
+    std::visit(
+        [&](auto sched_c) {
+            constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+            GATv2Backward_G_Kernel<SK, D_CONST, cuda_t, index_t><<<nBlocks, nThreads, sh_g, stream>>>(
+                spG, N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx, d_attn_vec,
+                d_logsumexp, negative_slope, d_G
+            );
+        },
+        MakeIntVariant<0, 1, 2, 3>(schedule)
     );
 
     // 2) Fused ALR kernel: grad_a, grad_l, grad_r using forward CSR only
     // Shared: li + ri + ghi (cuda_t) + grada + gradli + gradri (float)
     size_t sh_alr = 3 * D_CONST * sizeof(cuda_t) + 3 * D_CONST * sizeof(float);
 
-    GATv2Backward_ALR_Undirected<D_CONST, cuda_t, index_t><<<nBlocks, nThreads, sh_alr, stream>>>(
-        N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx, d_attn_vec,
-        d_logsumexp, d_G, negative_slope, grad_a, grad_l, grad_r
+    auto spA = sched_ns::make_params<index_t>(
+        SK_KIND, /*nodes=*/nullptr, static_cast<int>(N), sched_counters, static_cast<int>(H), /*launch_index=*/1, offsN, sched_chunk
+    );
+    std::visit(
+        [&](auto sched_c) {
+            constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+            GATv2Backward_ALR_Undirected<SK, D_CONST, cuda_t, index_t><<<nBlocks, nThreads, sh_alr, stream>>>(
+                spA, N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx, d_attn_vec,
+                d_logsumexp, d_G, negative_slope, grad_a, grad_l, grad_r
+            );
+        },
+        MakeIntVariant<0, 1, 2, 3>(schedule)
     );
 
     // 3) Reduce grad_a [N, H, D] -> [H, D]
@@ -131,7 +165,10 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
-    int heavy_warps_per_block
+    int heavy_warps_per_block,
+    int schedule,
+    int blocks_per_sm,
+    int sched_chunk
 ) {
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
     TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
@@ -190,16 +227,29 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GATv2 forward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
+    namespace sched_ns                   = turbo_gnn::sched;
+    const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
+    at::Tensor sched_counters            = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/2, l.device());
+    int bucket_id                        = 0;
+
     auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+        const int this_bucket = bucket_id++;
         if (num_nodes_bucket == 0) return;
 
+        const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
+        at::Tensor offs;
+        if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+            offs = sched_ns::degree_balanced_block_offsets(row_ptr, node_indices, num_nodes_bucket, gx);
+        }
+
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                using index_t    = typename decltype(idxInfo)::Type;
-                using torch_t    = typename decltype(typeInfo)::TorchType;
-                using cuda_t     = typename decltype(typeInfo)::CudaType;
-                constexpr int DC = decltype(d_c)::value;
-                constexpr int W  = decltype(warp_c)::value;
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
+                using index_t     = typename decltype(idxInfo)::Type;
+                using torch_t     = typename decltype(typeInfo)::TorchType;
+                using cuda_t      = typename decltype(typeInfo)::CudaType;
+                constexpr int DC  = decltype(d_c)::value;
+                constexpr int W   = decltype(warp_c)::value;
+                constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
 
                 auto *l_ptr     = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
                 auto *r_ptr     = reinterpret_cast<const cuda_t *>(r.data_ptr<torch_t>());
@@ -209,16 +259,20 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 // l_sh + W * D float + 2 * W float
                 size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
-                dim3 blocks(num_nodes_bucket, H);
+                dim3 blocks(gx, H);
                 dim3 threads(W * kWarpSize);
 
-                GATv2Forward_Kernel<W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                auto sp = sched_ns::make_params<index_t>(
+                    SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs, sched_chunk
+                );
+
+                GATv2Forward_Kernel<SK, W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h, index_ptr<index_t>(row_ptr),
-                    index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), attn_ptr, h_out_ptr, d_logsumexp, negative_slope
+                    index_ptr<index_t>(col_idx), sp, attn_ptr, h_out_ptr, d_logsumexp, negative_slope
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant
+            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1, 2, 3>(schedule)
         );
     };
 
@@ -248,7 +302,10 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor bwd_heavy_nodes,
     int light_warps_per_block,
     int heavy_warps_per_block,
-    bool is_directed
+    bool is_directed,
+    int schedule,
+    int blocks_per_sm,
+    int sched_chunk
 ) {
     TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
     TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
@@ -332,6 +389,11 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GATv2 backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
+    namespace sched_ns                   = turbo_gnn::sched;
+    const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
+    // Rows: AL light/heavy = 0/1, R light/heavy = 2/3 (directed); G/ALR = 0/1 (undirected).
+    at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/4, l.device());
+
     if (is_directed) {
         // Directed path: warp-parallel bucketed AL + R kernels
 
@@ -340,15 +402,23 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         float *d_G             = G_tensor.data_ptr<float>();
 
         // Lambda to launch AL kernel for a bucket
+        int launch_al_bucket_id = 0;
         auto launch_al_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+            const int this_bucket = launch_al_bucket_id++;
             if (num_nodes_bucket == 0) return;
+            const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
+            at::Tensor offs;
+            if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+                offs = sched_ns::degree_balanced_block_offsets(row_ptr, node_indices, num_nodes_bucket, gx);
+            }
             std::visit(
-                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                    using index_t    = typename decltype(idxInfo)::Type;
-                    using torch_t    = typename decltype(typeInfo)::TorchType;
-                    using cuda_t     = typename decltype(typeInfo)::CudaType;
-                    constexpr int DC = decltype(d_c)::value;
-                    constexpr int W  = decltype(warp_c)::value;
+                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
+                    using index_t     = typename decltype(idxInfo)::Type;
+                    using torch_t     = typename decltype(typeInfo)::TorchType;
+                    using cuda_t      = typename decltype(typeInfo)::CudaType;
+                    constexpr int DC  = decltype(d_c)::value;
+                    constexpr int W   = decltype(warp_c)::value;
+                    constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
 
                     auto *grad_h_ptr = reinterpret_cast<const cuda_t *>(grad_h.data_ptr<torch_t>());
                     auto *l_ptr      = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
@@ -358,30 +428,43 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
                     size_t sh_al = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
 
-                    dim3 blocks(num_nodes_bucket, H);
+                    dim3 blocks(gx, H);
                     dim3 threads(W * kWarpSize);
 
-                    GATv2Backward_AL<W, DC, cuda_t, index_t><<<blocks, threads, sh_al, stream>>>(
+                    auto sp = sched_ns::make_params<index_t>(
+                        SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs, sched_chunk
+                    );
+
+                    GATv2Backward_AL<SK, W, DC, cuda_t, index_t><<<blocks, threads, sh_al, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
-                        index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), attn_ptr, d_logsumexp,
+                        index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), sp, attn_ptr, d_logsumexp,
                         negative_slope, d_grad_a, grad_l_ptr, d_G
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant
+                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0, 1, 2, 3>(schedule)
             );
         };
 
         // Lambda to launch R kernel for a bucket
+        int launch_r_bucket_id = 2;
         auto launch_r_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+            const int this_bucket = launch_r_bucket_id++;
             if (num_nodes_bucket == 0) return;
+            const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
+            at::Tensor offs;
+            if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+                offs = sched_ns::degree_balanced_block_offsets(row_ptr_T, node_indices, num_nodes_bucket, gx);
+            }
             std::visit(
-                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                    using index_t    = typename decltype(idxInfo)::Type;
-                    using torch_t    = typename decltype(typeInfo)::TorchType;
-                    using cuda_t     = typename decltype(typeInfo)::CudaType;
-                    constexpr int DC = decltype(d_c)::value;
-                    constexpr int W  = decltype(warp_c)::value;
+                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
+                    using index_t     = typename decltype(idxInfo)::Type;
+                    using torch_t     = typename decltype(typeInfo)::TorchType;
+                    using cuda_t      = typename decltype(typeInfo)::CudaType;
+                    constexpr int DC  = decltype(d_c)::value;
+                    constexpr int W   = decltype(warp_c)::value;
+                    constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
 
                     auto *grad_h_ptr = reinterpret_cast<const cuda_t *>(grad_h.data_ptr<torch_t>());
                     auto *l_ptr      = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
@@ -391,17 +474,22 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
                     size_t sh_r = DC * sizeof(cuda_t) + W * DC * sizeof(float);
 
-                    dim3 blocks(num_nodes_bucket, H);
+                    dim3 blocks(gx, H);
                     dim3 threads(W * kWarpSize);
 
-                    GATv2Backward_R<W, DC, cuda_t, index_t><<<blocks, threads, sh_r, stream>>>(
+                    auto sp = sched_ns::make_params<index_t>(
+                        SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs, sched_chunk
+                    );
+
+                    GATv2Backward_R<SK, W, DC, cuda_t, index_t><<<blocks, threads, sh_r, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
-                        index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), index_ptr<index_t>(node_indices), attn_ptr, d_logsumexp,
+                        index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), sp, attn_ptr, d_logsumexp,
                         d_G, negative_slope, grad_r_ptr
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant
+                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0, 1, 2, 3>(schedule)
             );
         };
 
@@ -451,7 +539,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 GATv2Backward_CSR_Undirected_Impl<DC, cuda_t, index_t>(
                     N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                     index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), attn_ptr, d_logsumexp, negative_slope,
-                    grad_A_reduce_row_chunk_size, stream, grad_l_ptr, grad_r_ptr, d_grad_a, grad_a_reduced_ptr
+                    grad_A_reduce_row_chunk_size, stream, grad_l_ptr, grad_r_ptr, d_grad_a, grad_a_reduced_ptr, schedule, blocks_per_sm,
+                    sched_counters, sched_chunk
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
