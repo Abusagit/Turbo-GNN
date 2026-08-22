@@ -198,6 +198,74 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             is_directed=self.is_directed,
         )
 
+    def sorted_by_locality(self) -> AdjacencyForwardBackwardWithNodeBuckets:
+        """New instance whose buckets are ordered so nearby nodes share neighbours.
+
+        These kernels are frequently limited by cache reuse rather than bandwidth: adjacent
+        output nodes read overlapping neighbour features, so if they are processed close
+        together the second one's reads hit in L2. ``scripts/scheduler_headroom.py`` shows
+        ogbn-proteins moving more feature traffic than HBM could have delivered in the measured
+        time, which is only possible because the caches carried it.
+
+        Visit order is therefore a real performance parameter, and a large one -- shuffling
+        ogbn-proteins' bucket randomly costs 30%. This orders each bucket by reverse
+        Cuthill-McKee, which is the standard bandwidth-reducing permutation of a sparse matrix
+        and clusters connected nodes together.
+
+        **It does not always win, so it is opt-in.** Graphs already stored in a locality-
+        friendly order have nothing to gain and can lose: ogbn-proteins measures 0.90x against
+        its natural order, while ogbn-arxiv measures 1.14x and twitch-views 1.09x. Try it, and
+        compare against :meth:`sorted_by_degree`, which balances instead and wins elsewhere
+        (twitch-views 1.16x).
+
+        Like :meth:`sorted_by_degree` this only changes *which node a block visits*, never
+        where its result is written, so results are unchanged. CSR tensors are shared; only the
+        bucket index arrays are new, so it is worth caching on the graph.
+
+        Requires scipy, which is an optional dependency of this package.
+        """
+        try:
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.csgraph import reverse_cuthill_mckee
+        except ImportError as exc:  # pragma: no cover - depends on the install
+            raise ImportError("sorted_by_locality() needs scipy, an optional dependency: pip install scipy") from exc
+
+        import numpy as np
+
+        indptr = self._to_signed_view(self.forward_indptr)
+        n = indptr.numel() - 1
+        adj = csr_matrix(
+            (
+                np.ones(self.forward_indices.numel(), dtype=np.int8),
+                self.forward_indices.cpu().numpy().astype(np.int64),
+                indptr.cpu().numpy().astype(np.int64),
+            ),
+            shape=(n, n),
+        )
+        # symmetric_mode=True treats the graph as undirected, which is what we want: reuse
+        # comes from sharing neighbours in either direction.
+        permutation = reverse_cuthill_mckee(adj, symmetric_mode=True)
+        rank_np = np.empty(n, dtype=np.int64)
+        rank_np[permutation] = np.arange(n)
+        rank = torch.from_numpy(rank_np).to(self.forward_indptr.device)
+
+        def _order(bucket: torch.Tensor) -> torch.Tensor:
+            if bucket.numel() == 0:
+                return bucket
+            return bucket[torch.argsort(rank[bucket.long()])].contiguous()
+
+        return AdjacencyForwardBackwardWithNodeBuckets(
+            forward_indptr=self.forward_indptr,
+            forward_indices=self.forward_indices,
+            backward_indptr=self.backward_indptr,
+            backward_indices=self.backward_indices,
+            forward_light_nodes=_order(self.forward_light_nodes),
+            forward_heavy_nodes=_order(self.forward_heavy_nodes),
+            backward_light_nodes=_order(self.backward_light_nodes),
+            backward_heavy_nodes=_order(self.backward_heavy_nodes),
+            is_directed=self.is_directed,
+        )
+
     def repartition(self, **kwargs) -> AdjacencyForwardBackwardWithNodeBuckets:
         """New instance with same CSR but re-bucketed nodes. CSR tensors are shared."""
         fwd_q = kwargs.get("forward_huge_degree_threshold_quantile")

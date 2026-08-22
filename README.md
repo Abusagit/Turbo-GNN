@@ -160,8 +160,36 @@ out = reduction_aggr(graph, X, reduce="min", schedule="precomputed", blocks_per_
 # Atomic work queue; sched_chunk items claimed per atomic.
 out = gatv2_aggr(graph, l, r, attn, 0.2, schedule="dynamic", blocks_per_sm=256, sched_chunk=4)
 
-# Longest-processing-time-first: run any policy over a descending-degree node order.
-out = reduction_aggr(graph.sorted_by_degree(), X, reduce="min", schedule="dynamic")
+# Node visit order. This is the single largest lever here -- larger than the policy.
+# sorted_by_degree() balances (cost tracks degree, so descending order is LPT);
+# sorted_by_locality() clusters connected nodes via reverse Cuthill-McKee so that
+# neighbouring feature rows stay in L2. Both are bit-exact; neither always wins.
+out = reduction_aggr(graph.sorted_by_degree(), X, reduce="min")
+out = reduction_aggr(graph.sorted_by_locality(), X, reduce="min")   # needs scipy
+```
+
+**Visit order is worth more than the policy.** Over the same 108 cells, adding the two orders
+takes the best-per-cell geomean from 1.02x to **1.09x** and the cells at or above baseline from
+66/108 to **96/108**. On the forward pass at the head dims that matter it is decisive:
+
+| | geomean | cells at or above baseline |
+| --- | --- | --- |
+| head dim 128, forward | **1.125x** | 25/27 |
+| head dim 256, forward | **1.170x** | 26/27 |
+| head dim 128, backward | 1.046x | 24/27 |
+| head dim 256, backward | 1.026x | 21/27 |
+
+The biggest single result is ogbn-products with GT at head dim 256: **573 ms to 322 ms (1.78x)**,
+from `sorted_by_locality()` alone. Reordering costs 0.1 s on ogbn-arxiv and 6.4 s on
+ogbn-products, one-off — cache the reordered graph and reuse it, since it shares its CSR
+tensors with the original.
+
+Neither order is a safe default: ogbn-proteins is already stored in a locality-friendly order
+and *loses* 21% under descending-degree. Measure per graph with:
+
+```bash
+CUDA_VISIBLE_DEVICES=$(python scripts/free_gpus.py --count 1) \
+  python scripts/benchmark_scheduler_suite.py --conv min_aggr --orders identity degree locality
 ```
 
 | `schedule` | Assignment | Costs |
@@ -176,8 +204,8 @@ float-atomic tolerance on the backward, so these only change speed. They are del
 autotuner parameters: adding `schedule` and `blocks_per_sm` would take the search space from
 1,344 to 24,192 combinations.
 
-The default is the historical launch because, measured over 108 (graph, conv, head dim,
-direction) cells, no persistent policy breaks even as a blanket default — the hardware block
+The default `schedule` is the historical launch because, measured over 108 (graph, conv, head
+dim, direction) cells, no persistent policy breaks even as a blanket default — the hardware block
 scheduler is already a dynamic *and* locality-optimal work queue at zero cost. The persistent
 policies are worth reaching for in specific regimes: `min_aggr` backward on small sparse graphs
 (1.24–1.35x), `min_aggr` forward on cache-bound graphs with `precomputed` (1.10x on

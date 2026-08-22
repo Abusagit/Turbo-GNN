@@ -475,7 +475,14 @@ inline at::Tensor degree_balanced_block_offsets(
     auto ip  = indptr.to(at::kLong);
     auto deg = ip.slice(0, 1) - ip.slice(0, 0, -1);
     auto d   = nodes.defined() ? deg.index_select(0, nodes.to(at::kLong)) : deg.slice(0, 0, count);
-    auto cum = d.cumsum(0);  // [count], non-decreasing
+    // Cost is a fixed per-node part plus a per-edge part, not edges alone. Splitting on edges
+    // alone gives every zero-degree node a cost of zero, so `searchsorted` piles all of them
+    // into a single slice -- and a zero-degree node is cheap per edge but still costs its
+    // block a loop iteration. On ogbn-arxiv, where 62,006 of the light bucket's 167,628 nodes
+    // have in-degree 0, that put 62,014 nodes in one block and ran 33x slower than the
+    // baseline; under a descending-degree order, where the zeros are contiguous at the tail,
+    // it was reliably catastrophic. Adding 1 bounds the worst slice at 9 nodes instead.
+    auto cum = (d + 1).cumsum(0);  // [count], strictly increasing
 
     const auto opts = at::TensorOptions().dtype(at::kLong).device(indptr.device());
     // Interior boundaries at 1/nb, 2/nb, ... of the total edge count. `searchsorted` on a

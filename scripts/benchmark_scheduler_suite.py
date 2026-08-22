@@ -155,6 +155,22 @@ def time_backward(conv, g, inputs, kw, warmup, iters) -> float:
     return max(total - fwd, 0.0)
 
 
+def build_orders(g, names: list[str]) -> list[tuple[str, AdjacencyForwardBackwardWithNodeBuckets]]:
+    """Materialise each requested visit order once per graph; they are reused across cells."""
+    out = []
+    for nm in names:
+        if nm == "identity":
+            out.append(("", g))
+        elif nm == "degree":
+            out.append(("+deg", g.sorted_by_degree()))
+        elif nm == "locality":
+            try:
+                out.append(("+rcm", g.sorted_by_locality()))
+            except ImportError as exc:
+                print(f"  skipping locality order: {exc}", file=sys.stderr)
+    return out
+
+
 def measure_cell(name, conv, hd, direction, g, orders, info, args) -> list[dict]:
     """Time every policy for one (graph, conv, head dim, direction) and return its rows.
 
@@ -181,10 +197,15 @@ def measure_cell(name, conv, hd, direction, g, orders, info, args) -> list[dict]
     out: list[dict] = []
     best: tuple[float, str] | None = None
     print(f"  {conv:<8} d={hd:<4} {direction}   baseline {base:8.3f} ms")
-    for sched in PERSISTENT:
-        for bps in args.blocks_per_sm:
+    # BASELINE is in the swept set, not just the reference, whenever more than one node order
+    # is in play: `one_per_block` on a reordered bucket is a real configuration -- and on
+    # several graphs it is the fastest one -- so leaving it out would hide the best result.
+    for sched in [BASELINE] + PERSISTENT if len(orders) > 1 else PERSISTENT:
+        for bps in args.blocks_per_sm[:1] if sched == BASELINE else args.blocks_per_sm:
             for chunk in args.sched_chunk if sched == "dynamic" else [1]:
                 for tag, gr in orders:
+                    if sched == BASELINE and not tag:
+                        continue  # that is the reference itself, already timed
                     kw = {"schedule": sched, "blocks_per_sm": bps, "sched_chunk": chunk}
                     try:
                         ms = runner(conv, gr, inputs, kw, args.warmup, args.iters)
@@ -226,7 +247,15 @@ def main() -> int:
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--blocks-per-sm", type=int, nargs="+", default=[256])
     p.add_argument("--sched-chunk", type=int, nargs="+", default=[4])
-    p.add_argument("--lpt", action="store_true", help="also try each policy on a descending-degree order")
+    p.add_argument(
+        "--orders",
+        nargs="+",
+        default=["identity"],
+        choices=["identity", "degree", "locality"],
+        help="node visit orders to sweep; 'degree' is sorted_by_degree (balance), "
+        "'locality' is sorted_by_locality (RCM, cache reuse). Order is a real performance "
+        "parameter here -- see SCHEDULER_PERF.md.",
+    )
     p.add_argument("--no-backward", action="store_true")
     p.add_argument("--json", default=None, help="write raw rows here")
     args = p.parse_args()
@@ -243,7 +272,7 @@ def main() -> int:
             print(f"\n### {name}: SKIPPED -- {type(exc).__name__}: {str(exc)[:160]}", file=sys.stderr)
             continue
         info = degree_summary(g)
-        orders = [("", g)] + ([("+LPT", g.sorted_by_degree())] if args.lpt else [])
+        orders = build_orders(g, args.orders)
         print(f"\n### {name}  ({time.time() - t0:.0f}s to load)")
         print(
             f"    N={info['N']:,} E={info['E']:,} mean={info['mean_deg']} p50={info['p50']} "

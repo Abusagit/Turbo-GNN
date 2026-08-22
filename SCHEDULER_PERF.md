@@ -221,6 +221,89 @@ The shape is consistent with the headroom table: wins concentrate where per-node
 (so block-launch overhead is a real fraction) or where a better *contiguous* assignment raises
 cache reuse. They vanish where the kernel is already DRAM-bound.
 
+## Where the win actually was: visit order
+
+Having exhausted the scheduling policies, the headroom table said the remaining lever had to be
+cache reuse -- and reuse is a function of the order nodes are visited in. That is not a
+data-layout change and it does not permute anything: the scheduler's `nodes` array decides
+*which node a block visits*, never where the result is written, which is why
+`sorted_by_degree()` has always been bit-exact. The same hook takes any order.
+
+First, does order matter at all? On ogbn-proteins with `min_aggr` at d=128:
+
+    identity       9.411 ms   x1.00
+    rcm           10.485 ms   x0.90
+    degree_desc   11.842 ms   x0.79
+    random        13.411 ms   x0.70
+
+A random shuffle costs 30%, so order is worth real money -- but ogbn-proteins is already stored
+in a good order and nothing beats it. That is exactly why the first probe was discouraging, and
+why it would have been wrong to stop there: other graphs are *not* stored in a good order.
+
+Sweeping all three convs over three orders x four policies, 108 cells, best per cell against
+the untouched baseline. **Forward at the head dims that matter:**
+
+    d=128 forward   geomean 1.125x   25/27 cells at or above baseline
+    d=256 forward   geomean 1.170x   26/27
+    d=128 backward  geomean 1.046x   24/27
+    d=256 backward  geomean 1.026x   21/27
+
+Overall the oracle goes from 1.02x to **1.09x**, and cells at or above baseline from 66/108 to
+**96/108**. For the first time a single blanket configuration beats the baseline on average:
+`one_per_block` on an RCM-ordered bucket, geomean 1.05 with a best of 1.78x.
+
+The largest cells:
+
+    ogbn-products  gt        256 fwd   573.4 -> 321.8 ms   x1.78   one_per_block + rcm
+    ogbn-products  gt        128 fwd   288.1 -> 173.4 ms   x1.66   one_per_block + rcm
+    ogbn-products  min_aggr  256 fwd    80.3 ->  51.2 ms   x1.57   one_per_block + rcm
+    ogbn-products  gat_v2    256 fwd   307.0 -> 199.2 ms   x1.54   one_per_block + rcm
+    tolokers-2     min_aggr  128 bwd     0.13 ->  0.09 ms  x1.45   grid_stride   + degree
+    city-reviews   gt        256 fwd     8.9 ->   6.7 ms   x1.33   one_per_block + rcm
+    twitch-views   gt        256 fwd    47.2 ->  38.4 ms   x1.23   one_per_block + degree
+
+And by graph (geomean of the best config per cell):
+
+    ogbn-products  1.26x      tolokers-2   1.16x      twitch-views  1.09x
+    avazu-ctr      1.08x      city-reviews 1.08x      ogbn-arxiv    1.06x
+    hm-categories  1.06x      city-roads-M 1.03x      ogbn-proteins 1.02x
+
+The backward pass gains much less than the forward one (1.03-1.05x against 1.13-1.17x). Its
+kernels scatter through float `atomicAdd` rather than reading a neighbourhood per output row,
+so there is far less reuse for a visit order to improve. ogbn-proteins is the weakest graph
+throughout, and GT on it is the one place still below baseline (0.88-0.92x); both facts have
+the same cause, that ogbn-proteins was already stored in a good order.
+
+ogbn-products is the largest graph here (2.4M nodes, 123M edges) and gains the most, which fits
+the mechanism: the bigger the working set relative to L2, the more a good visit order is worth.
+ogbn-proteins gains the least, for the same reason in reverse -- it was already ordered well.
+
+Two orders, because neither dominates:
+
+* `sorted_by_degree()` balances. Cost tracks degree, so descending order is
+  longest-processing-time-first. Wins on tolokers-2 (1.45x) and twitch-views.
+* `sorted_by_locality()` clusters, via reverse Cuthill-McKee. Wins on ogbn-products (1.57x)
+  and ogbn-arxiv. Needs scipy (an optional dependency) and costs 0.1 s on ogbn-arxiv, 6.4 s on
+  ogbn-products -- one-off and cacheable on the graph, so it pays back over a training run but
+  not over a single inference call.
+
+Both are opt-in for the same reason the policies are: the right choice is per graph, and
+picking wrong costs more than picking right gains (ogbn-proteins loses 21% under
+descending-degree order).
+
+## A landmine found on the way: `precomputed` at 0.03x
+
+Combining a reordered bucket with `precomputed` ran **33x slower than baseline**. The
+degree-balanced split was weighing nodes by edge count alone, so a zero-degree node had cost
+zero and `searchsorted` piled every one of them into a single slice -- and a zero-degree node
+is cheap per edge but still costs its block a loop iteration. ogbn-arxiv has 62,006 of them in
+a light bucket of 167,628, so one block received 62,014 nodes against a mean of 1.52. Under a
+descending-degree order, where the zeros are contiguous at the tail, it was deterministic.
+
+The cost model is now `1 + degree` rather than `degree`: a fixed per-node part plus a per-edge
+part. Worst slice on ogbn-arxiv drops from 62,014 nodes to 9, and from 95 to 8 even in the
+natural order, where the bug was silently costing ~20%.
+
 ## Benchmarking hygiene
 
 Every number above was taken on a GPU with no other compute process on it. The first run of

@@ -181,6 +181,33 @@ def test_sorted_by_degree_is_a_permutation_and_descending():
         assert torch.all(d[:-1] >= d[1:]), "bucket is not in descending-degree order"
 
 
+def test_sorted_by_locality_is_a_permutation():
+    """RCM reorders which node a block visits; it must not add, drop or duplicate one."""
+    pytest.importorskip("scipy")
+    g = _graph(4000, 6)
+    s = g.sorted_by_locality()
+    for orig, srt in ((g.forward_light_nodes, s.forward_light_nodes), (g.forward_heavy_nodes, s.forward_heavy_nodes)):
+        assert torch.equal(orig.sort().values, srt.sort().values), "reordering must not add or drop nodes"
+    assert not torch.equal(g.forward_light_nodes, s.forward_light_nodes) or g.forward_light_nodes.numel() <= 1
+
+
+@pytest.mark.parametrize("order", ["sorted_by_degree", "sorted_by_locality"])
+@pytest.mark.parametrize("schedule", [BASELINE] + PERSISTENT)
+def test_node_order_does_not_change_the_answer(order, schedule):
+    """Visit order is the largest performance lever here, so pin that it is only that.
+
+    The scheduler's `nodes` array chooses which node a block visits; the result is still
+    written to that node's own row, so every order must be bit-identical to the natural one.
+    """
+    if order == "sorted_by_locality":
+        pytest.importorskip("scipy")
+    g = _graph(5000, 8)
+    x = torch.randn(5000, 128, device="cuda")
+    ref = reduction_aggr(g, x, schedule=BASELINE)
+    got = reduction_aggr(getattr(g, order)(), x, schedule=schedule)
+    assert torch.equal(got, ref), f"{order} + {schedule} differs: max|d|={(got - ref).abs().max()}"
+
+
 @pytest.mark.parametrize("schedule", PERSISTENT)
 def test_lpt_order_does_not_change_the_answer(schedule):
     """LPT reorders *when* nodes are processed, never what is computed."""
