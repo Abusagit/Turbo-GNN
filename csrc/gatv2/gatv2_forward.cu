@@ -116,23 +116,32 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     };
 
 #pragma unroll
-    for (size_t s = 0; s + 1 < STAGES; ++s) {
+    for (size_t s = 0; s < STAGES; ++s) {
         pipe.prefetch(row_of(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
     }
 
     for (int k = warp_id, it = 0; k < num_neighbors; k += WARPS_PER_BLOCK, ++it) {
-        pipe.prefetch(row_of(warp_id + (it + static_cast<int>(STAGES) - 1) * WARPS_PER_BLOCK));
         const cuda_t *r_base = pipe.consume();
+
+        vec_t r_regs[TILES_PER_THREAD];
+#pragma unroll
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            const int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                r_regs[t] = Tile::read(r_base, v);
+            }
+        }
+        pipe.release();
+        pipe.prefetch(row_of(warp_id + (it + static_cast<int>(STAGES)) * WARPS_PER_BLOCK));
 
         accum_t dot_lane{};
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            int v = lane + kWarpSize * t;
+            const int v = lane + kWarpSize * t;
             if (v < TILES) {
                 const vec_t lv = Tile::read(l_sh, v);
-                const vec_t rv = Tile::read(r_base, v);
                 const vec_t av = Tile::read(a_base, v);
-                dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, negative_slope);
+                dot_lane += Tile::gatv2_dot_leaky_relu(lv, r_regs[t], av, negative_slope);
             }
         }
         const accum_t dot = warp_reduce_sum(dot_lane);
@@ -146,15 +155,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
         const accum_t contrib = AccumOps::exp(dot - softmax_state.max_val);
 #pragma unroll
         for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            int v = lane + kWarpSize * t;
+            const int v = lane + kWarpSize * t;
             if (v < TILES) {
-                const vec_t rv = Tile::read(r_base, v);
-
-                rv.template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
+                r_regs[t].template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
             }
         }
-
-        pipe.release();
     }
 
 // Write per-warp results to shared memory

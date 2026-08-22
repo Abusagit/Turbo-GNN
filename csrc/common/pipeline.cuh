@@ -7,12 +7,17 @@
 #endif
 
 #include "common/misc.cuh"
+#include "common/tile.cuh"
 #include "common/traits.cuh"
 
 template <size_t STAGES, size_t ROW_ELEMS, FloatingNum num_type>
 class RowPipeline {
    public:
-    static constexpr size_t kCopyBytes = 16;
+    static constexpr size_t kTileElems = SelectTW<ROW_ELEMS, num_type>::value;
+    static constexpr size_t kTileBytes = kTileElems * sizeof(num_type);
+    static constexpr bool kLaneLocal   = kTileBytes >= 4 && ROW_ELEMS % kTileElems == 0;
+
+    static constexpr size_t kCopyBytes = kLaneLocal ? kTileBytes : 16;
     static constexpr size_t kRowBytes  = ROW_ELEMS * sizeof(num_type);
 
     static constexpr size_t kChunksPerRow = kRowBytes / kCopyBytes;
@@ -37,7 +42,9 @@ class RowPipeline {
         if constexpr (STAGES == 1) {
             direct_ = src;
         } else {
-            src_ring_[prod_idx_] = src;
+#if TGNN_PIPE_MODE == 1
+            src_ring_[prod_idx_] = src;  // читается только в режиме 1
+#endif
 #if TGNN_PIPE_MODE == 2
             if (src != nullptr) {
                 uint4 *const dst        = reinterpret_cast<uint4 *>(stage_base_ + prod_idx_ * ROW_ELEMS);
@@ -70,7 +77,11 @@ class RowPipeline {
 #if TGNN_PIPE_MODE != 2
             cuda::pipeline_consumer_wait_prior<STAGES - 1>(pipe_);
 #endif
-            __syncwarp();
+            // With lane-local copies each lane waited on its own memcpy_async above; only the
+            // 16-byte fallback has lanes reading bytes another lane brought in.
+            if constexpr (!kLaneLocal) {
+                __syncwarp();
+            }
 #if TGNN_PIPE_MODE == 1
             return src_ring_[cons_idx_];
 #else
@@ -97,6 +108,8 @@ class RowPipeline {
     size_t prod_idx_;
     size_t cons_idx_;
     num_type const *direct_;
+#if TGNN_PIPE_MODE == 1
     num_type const *src_ring_[STAGES];
+#endif
     cuda::pipeline<cuda::thread_scope_thread> pipe_;
 };
