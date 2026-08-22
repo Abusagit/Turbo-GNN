@@ -21,7 +21,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gatv2_forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)", py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),
         py::arg("attn_vec"), py::arg("negative_slope") = 0.2f, py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8
+        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("num_pipeline_stages") = 1
     );
 
     m.def(
@@ -29,7 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("attn_vec"), py::arg("logsumexp"),
         py::arg("negative_slope") = 0.2f, py::arg("grad_A_reduce_row_chunk_size") = 512, py::arg("fwd_light_nodes"), py::arg("fwd_heavy_nodes"),
         py::arg("bwd_light_nodes"), py::arg("bwd_heavy_nodes"), py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8,
-        py::arg("is_directed") = true
+        py::arg("is_directed") = true, py::arg("num_pipeline_stages") = 1
     );
 
     // Graph Transformer aggregation
