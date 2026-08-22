@@ -2,10 +2,41 @@
 
 #include "common.cuh"
 
+/// Resident blocks per SM to ask the compiler for, so the persistent loop does not cost
+/// occupancy.
+///
+/// This kernel sits exactly on an occupancy cliff, and only this one does. At 4 warps per
+/// block the one-block-per-node build uses **32** registers -- precisely the budget for 2048
+/// resident threads, i.e. full occupancy on an A100. Wrapping the body in the scheduler's loop
+/// lengthens live ranges and pushes it to 38 (grid_stride) or 48 (dynamic), which drops the
+/// SM to 52 and 40 warps -- 81% and 62% of what the baseline got. At D_CONST=256 dynamic
+/// reaches 56 registers and 56%. That is the whole of GT's forward regression: measured 0.81x
+/// to 0.98x against occupancy ratios of 0.62 to 0.81.
+///
+/// `__launch_bounds__` with only a thread count, which is what every kernel in `csrc/` had,
+/// constrains nothing about registers. Supplying the second argument does: asking for B blocks
+/// of T threads caps the compiler at 65536/(B*T) registers per thread.
+///
+/// Applied only where the baseline was already register-cheap enough for the target to be
+/// reachable. The 8-warp heavy instantiation needs 47 registers by itself, so demanding 32
+/// there would trade an occupancy loss for a local-memory spill, which is worse; it gets 1,
+/// meaning no constraint. The reduction and GATv2 kernels are left alone entirely -- their
+/// register use is flat across policies (47.6 -> 48.2 and 55.9 -> 54.5) and they do not
+/// regress.
+/// Clamped to 32, the hardware's resident-blocks-per-SM limit: a 1-warp block would otherwise
+/// ask for 64, which is unsatisfiable and constrains nothing useful anyway.
+template <size_t N_PER_BLOCK>
+inline constexpr int kGtFwdMinBlocksPerSM =
+    (N_PER_BLOCK <= 4) ? static_cast<int>(2048 / (N_PER_BLOCK * kWarpSize) < 32
+                                              ? 2048 / (N_PER_BLOCK * kWarpSize)
+                                              : 32)
+                       : 1;
+
 template <
     turbo_gnn::sched::ScheduleKind SK, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t,
     FloatingNum accum_t = float>
-__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward_CSR_MH_v2_D( // no-format
+__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize, kGtFwdMinBlocksPerSM<N_PER_BLOCK>)
+    GraphAttentionForward_CSR_MH_v2_D( // no-format
     size_t N, size_t H,
     const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
     int64_t stride_q_n, int64_t stride_q_h,

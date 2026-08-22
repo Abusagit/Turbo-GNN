@@ -139,34 +139,56 @@ out of scope here -- but the `nodes` indirection array is exactly the hook it wo
   against `one_per_block` on the forward path, and matches to float-atomic tolerance on the
   backward. `tests/correctness/test_scheduler_policies.py` covers that.
 
-## The GT case: the persistent loop costs registers
+## The GT case: an occupancy cliff, and the fix
 
-GT is the one convolution that loses consistently on the forward pass (0.81-0.98x everywhere).
-`ncu` counters are unavailable on this machine (`ERR_NVGPUCTRPERM`), but register usage is
-static and `cuobjdump -res-usage` needs no permission. Averaged over all 288 instantiations of
-`GraphAttentionForward_CSR_MH_v2_D` per policy:
+GT was the one convolution that lost consistently on the forward pass (0.81-0.98x). `ncu`
+counters are unavailable on this machine (`ERR_NVGPUCTRPERM`), but register usage is static and
+`cuobjdump -res-usage` needs no permission at all.
 
-    policy           instantiations   mean REG   max
-    one_per_block              288       40.4     62
-    grid_stride                288       42.0     64
-    precomputed                288       42.6     64
-    dynamic                    288       48.6     64
+The mean over all 288 instantiations pointed the right way (40.4 for `one_per_block` versus
+42.0 / 42.6 / 48.6 for the persistent policies), but the *specific* instantiation the light
+bucket actually launches -- 4 warps, `D_CONST=128`, fp32, which handles ~99% of nodes -- is
+where it bites:
 
-Wrapping the body in a loop lengthens live ranges, and GT has register headroom at baseline
-(40 of a 64 cap) for that to consume. At 256 threads/block that is 6.3 blocks/SM at 40.4
-registers versus 5.2 at 48.6 -- roughly 15% less occupancy, which is the right size to explain
-the loss.
+    policy           REG   warps/SM   occupancy
+    one_per_block     32         64        100%
+    grid_stride       38         52         81%
+    precomputed       39         52         81%
+    dynamic           48         40         62%
+    dynamic (D=256)   56         36         56%
 
-The contrast confirms it: `GATv2Forward_Kernel` already sits at the 64-register cap for
-*every* policy (64 / 62-64 / 64 / 64), so the loop cannot cost it any occupancy -- and GATv2
-is the conv that holds up best, 1.02-1.08x on the same graphs.
+32 registers is *exactly* the budget for 2048 resident threads on an A100. The baseline sits
+precisely on the full-occupancy threshold, and lengthening live ranges by wrapping the body in
+the scheduler's loop pushes it over. Measured 0.81-0.98x against occupancy ratios of 0.62-0.81:
+the same numbers.
 
-The obvious lever is the second argument of `__launch_bounds__`
-(`minBlocksPerMultiprocessor`), which is absent everywhere in `csrc/` -- every kernel passes
-only the thread count, which constrains nothing about registers. Capping GT's registers back
-to ~40 would plausibly recover the loss. It is **not** done here: it can only reach parity for
-GT, and forcing the cap risks spilling to local memory in the GATv2 and reduction kernels that
-are currently healthy. It is the first thing to try if GT forward matters.
+The cliff is specific to this kernel, which is why only GT regressed. `reduction_aggr_forward_light_kernel_1d`
+goes 47.6 -> 48.2 across policies and `GATv2Forward_Kernel` goes 55.9 -> 54.5/58.2; neither is
+near a threshold, and neither conv loses.
+
+**The fix.** Every kernel in `csrc/` passed `__launch_bounds__` a thread count and nothing else,
+which constrains *nothing* about registers. Supplying the second argument
+(`minBlocksPerMultiprocessor`) does: asking for B blocks of T threads caps the compiler at
+65536/(B*T) registers per thread. `kGtFwdMinBlocksPerSM` targets 2048 resident threads, but only
+where that is reachable -- the 8-warp heavy instantiation needs 47 registers on its own, so
+demanding 32 there would trade an occupancy loss for a local-memory spill, and it is left
+unconstrained.
+
+Afterwards, on that same instantiation: `grid_stride` and `precomputed` drop to **30 registers
+with zero spill** -- below the baseline, so full occupancy -- and `dynamic` reaches 32 but
+spills 16 bytes, which is why it is no longer the policy that wins GT cells. The measured
+effect, best policy per cell:
+
+    cell                        before   after
+    ogbn-proteins d=128 fwd       0.81    0.92
+    city-roads-M  d=256 fwd       0.82    0.96
+    city-roads-M  d=128 fwd       0.86    0.97
+    ogbn-arxiv    d=128 fwd       0.98    1.03
+
+Baselines moved by under 2% across these, so the gain is on the persistent path rather than a
+shifted reference. It removes most of GT's regression without reaching a decisive win, and it
+is the clearest remaining evidence that what limits these kernels is occupancy and memory
+behaviour rather than scheduling policy.
 
 ## Results: 108 cells, forward and backward
 
@@ -181,7 +203,7 @@ backward timed separately; `min_aggr`, `gat_v2`, `gt`.
     python scripts/summarize_scheduler_bench.py results/full_*.json
 
 Choosing the best policy per cell -- an oracle, since no runtime can know which to pick --
-gives **geomean 1.02x with 64/108 cells at or above baseline**. As a single blanket default,
+gives **geomean 1.02x with 66/108 cells at or above baseline**, and every graph is at or above 1.01x. As a single blanket default,
 no persistent policy breaks even, which is why `DEFAULT_SCHEDULE` is now `one_per_block`.
 
 Where the persistent path genuinely pays:
@@ -192,7 +214,7 @@ Where the persistent path genuinely pays:
 
 Where it does not:
 
-    gt forward                               0.81-0.98x everywhere (registers, above)
+    gt forward                               0.87-1.03x after the occupancy fix, still the weakest
     ogbn-products                            1.00x -- big enough that launch overhead vanishes
 
 The shape is consistent with the headroom table: wins concentrate where per-node work is small

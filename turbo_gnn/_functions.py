@@ -34,9 +34,9 @@ SCHEDULES = {"one_per_block": 0, "grid_stride": 1, "precomputed": 2, "dynamic": 
 #: on idle GPUs -- no persistent policy is a safe blanket default:
 #:
 #:     policy                geomean   worst    best   >=1.0
-#:     grid_stride/bps1024      0.98    0.59    1.35   38/108
-#:     precomputed/bps1024      0.89    0.37    1.10   16/108
-#:     dynamic/bps256/c4        0.84    0.46    1.16   19/108
+#:     grid_stride/bps1024      0.98    0.58    1.35   41/108
+#:     precomputed/bps1024      0.90    0.37    1.10   16/108
+#:     dynamic/bps256/c4        0.83    0.46    1.16   19/108
 #:     dynamic/bps256/c1        0.77    0.22    1.08   23/108
 #:
 #: Picking the best policy per cell (an oracle no runtime can have) gives 1.02x. The reason
