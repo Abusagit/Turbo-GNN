@@ -208,7 +208,7 @@ if not SKIP_CUDA_BUILD:
         # parallelise inside nvcc too:
         # need nvcc >= 11.2; gate on CUDA 12+ so older toolchains are safe.
         _nvcc_flags = [
-            "-O3", "--use_fast_math", "--generate-line-info", "-std=c++20",
+            "-O3", "--use_fast_math", "-std=c++20",
         ] + UNDEFINE_FLAGS
         _nvcc_threads = os.getenv("TURBO_GNN_NVCC_THREADS", "4")
         if torch.version.cuda and parse(torch.version.cuda).major >= 12:
