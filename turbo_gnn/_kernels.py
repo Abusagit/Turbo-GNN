@@ -40,6 +40,7 @@ class ReductionAggrKernel(TunableKernel):
         self.forward_tiles_y = kwargs.get("tiles_y", 8)
 
     def _execute(self, graph, x, **kwargs):
+        chunk_offsets, total_chunks = graph.chunk_offsets(self.forward_edges_per_block_heavy_nodes)
         return ReductionAggrFunction.apply(
             graph.forward_indptr,
             graph.forward_indices,
@@ -47,6 +48,8 @@ class ReductionAggrKernel(TunableKernel):
             graph.light_nodes,
             graph.heavy_nodes,
             graph.max_degree,
+            chunk_offsets,
+            total_chunks,
             self.forward_warps_per_block,
             self.forward_edges_per_block_heavy_nodes,
             self.forward_use_2d_kernel,

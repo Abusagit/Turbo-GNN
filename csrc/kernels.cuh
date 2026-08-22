@@ -16,6 +16,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     at::Tensor light_nodes,
     at::Tensor heavy_nodes,
     int max_degree,
+    at::Tensor chunk_offsets,
+    int64_t total_chunks,
     int warps_per_block             = 8,
     int edges_per_block_heavy_nodes = 128,
     bool use_2d_kernel              = false,
