@@ -47,21 +47,26 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // Shared memory layout:
     //   li_sh:      D_CONST * sizeof(cuda_t)                       -- read-only
     //   ghi_sh:     D_CONST * sizeof(cuda_t)                       -- read-only
-    //   warp_grada: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
-    //   warp_gradl: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
+    //   warp_gradaA/lA: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t) each -- множители при alpha*p
+    //   warp_gradaB/lB: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t) each -- множители при alpha
     //   warp_G:     WARPS_PER_BLOCK * sizeof(accum_t)              -- per-warp G partial
     //   G_broadcast: sizeof(accum_t)                               -- broadcast slot
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *r_stage      = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *li_sh        = reinterpret_cast<cuda_t *>(sh_raw + Pipe::smem_bytes(WARPS_PER_BLOCK));
     cuda_t *ghi_sh       = li_sh + D_CONST;
-    accum_t *warp_grada  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
-    accum_t *warp_gradl  = warp_grada + WARPS_PER_BLOCK * D_CONST;
-    accum_t *warp_G      = warp_gradl + WARPS_PER_BLOCK * D_CONST;
+    // A -- слагаемые с alpha*p, B -- слагаемые с alpha: grad = A - G*B, см. эпилог
+    accum_t *warp_gradaA = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
+    accum_t *warp_gradlA = warp_gradaA + WARPS_PER_BLOCK * D_CONST;
+    accum_t *warp_gradaB = warp_gradlA + WARPS_PER_BLOCK * D_CONST;
+    accum_t *warp_gradlB = warp_gradaB + WARPS_PER_BLOCK * D_CONST;
+    accum_t *warp_G      = warp_gradlB + WARPS_PER_BLOCK * D_CONST;
     accum_t *G_broadcast = warp_G + WARPS_PER_BLOCK;
 
-    accum_t *my_grada = warp_grada + warp_id * D_CONST;
-    accum_t *my_gradl = warp_gradl + warp_id * D_CONST;
+    accum_t *my_gradaA = warp_gradaA + warp_id * D_CONST;
+    accum_t *my_gradlA = warp_gradlA + warp_id * D_CONST;
+    accum_t *my_gradaB = warp_gradaB + warp_id * D_CONST;
+    accum_t *my_gradlB = warp_gradlB + warp_id * D_CONST;
 
     cuda_t *grad_l_base = grad_l + ((int64_t)(node_i * H + head_h) * D_CONST);
     float *grad_a_base  = grad_a + ((int64_t)(node_i * H + head_h) * D_CONST);
@@ -93,11 +98,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // Zero per-warp accumulators and cooperatively load li, ghi
     {
         constexpr int f4_count_f = D_CONST / 4;
-        float4 *my_grada_f4      = reinterpret_cast<float4 *>(my_grada);
-        float4 *my_gradl_f4      = reinterpret_cast<float4 *>(my_gradl);
+        float4 *acc_f4[4] = {reinterpret_cast<float4 *>(my_gradaA), reinterpret_cast<float4 *>(my_gradlA),
+                             reinterpret_cast<float4 *>(my_gradaB), reinterpret_cast<float4 *>(my_gradlB)};
         for (int i = lane; i < f4_count_f; i += kWarpSize) {
-            my_grada_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
-            my_gradl_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                acc_f4[q][i] = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
         }
 
         constexpr int f4_count   = (D_CONST * (int)sizeof(cuda_t)) / 16;
@@ -161,6 +168,19 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 
         const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_partial              = AccumOps::fma(alpha_ij, p_ij, G_partial);
+
+        const accum_t ap = alpha_ij * p_ij;
+#pragma unroll
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            const int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                const vec_t lv   = Tile::read(li_sh, v);
+                const vec_t av   = Tile::read(a_base, v);
+                const int base_f = v * TW;
+                Tile::gatv2_accum_grad_al(&my_gradaA[base_f], &my_gradlA[base_f], ap, lv, rj_regs[t], av, negative_slope);
+                Tile::gatv2_accum_grad_al(&my_gradaB[base_f], &my_gradlB[base_f], alpha_ij, lv, rj_regs[t], av, negative_slope);
+            }
+        }
     }
 
     // Cross-warp reduction for G
@@ -170,63 +190,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     accum_t G_i_h{};
     if (warp_id == 0 && lane == 0) {
         for (int w = 0; w < WARPS_PER_BLOCK; ++w) G_i_h += warp_G[w];
-        *G_broadcast             = G_i_h;
+        *G_broadcast              = G_i_h;
         d_G[node_i * H + head_h] = G_i_h;
     }
     __syncthreads();
     G_i_h = *G_broadcast;
-
-    // pass 2: accumulate gradients (warp-strided)
-    Pipe pipe2(r_stage + warp_id * STAGES * D_CONST, lane, kWarpSize);
-#pragma unroll
-    for (size_t s = 0; s < STAGES; ++s) {
-        pipe2.prefetch(rj_row(warp_id + static_cast<int>(s) * WARPS_PER_BLOCK));
-    }
-
-    for (int k = warp_id, it = 0; k < num_neighbors; k += WARPS_PER_BLOCK, ++it) {
-        const cuda_t *rj_base = pipe2.consume();
-
-        vec_t rj_regs[TILES_PER_THREAD];
-#pragma unroll
-        for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            const int v = lane + kWarpSize * t;
-            if (v < TILES) {
-                rj_regs[t] = Tile::read(rj_base, v);
-            }
-        }
-        pipe2.release();
-        pipe2.prefetch(rj_row(warp_id + (it + static_cast<int>(STAGES)) * WARPS_PER_BLOCK));
-
-        accum_t e_lane{};
-        accum_t p_lane{};
-#pragma unroll
-        for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            const int v = lane + kWarpSize * t;
-            if (v < TILES) {
-                const vec_t lv  = Tile::read(li_sh, v);
-                const vec_t av  = Tile::read(a_base, v);
-                const vec_t ghv = Tile::read(ghi_sh, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rj_regs[t], av, negative_slope);
-                ghv.dot_product_(&p_lane, rj_regs[t]);
-            }
-        }
-        const accum_t e_ij = warp_reduce_sum(e_lane);
-        const accum_t p_ij = warp_reduce_sum(p_lane);
-
-        const accum_t alpha_ij  = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
-        const accum_t grad_e_ij = alpha_ij * (p_ij - G_i_h);
-
-#pragma unroll
-        for (int t = 0; t < TILES_PER_THREAD; ++t) {
-            const int v = lane + kWarpSize * t;
-            if (v < TILES) {
-                const vec_t lv   = Tile::read(li_sh, v);
-                const vec_t av   = Tile::read(a_base, v);
-                const int base_f = v * TW;
-                Tile::gatv2_accum_grad_al(&my_grada[base_f], &my_gradl[base_f], grad_e_ij, lv, rj_regs[t], av, negative_slope);
-            }
-        }
-    }
 
     // Cross-warp reduction: warp 0 sums all per-warp accumulators
     __syncthreads();
@@ -239,18 +207,29 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
                 const int base_f = v * TW;
                 accum_t ga_sum[TW];
                 accum_t gl_sum[TW];
+                accum_t ga_b[TW];
+                accum_t gl_b[TW];
 #pragma unroll
                 for (int ep = 0; ep < TW; ++ep) {
                     ga_sum[ep] = accum_t{};
                     gl_sum[ep] = accum_t{};
+                    ga_b[ep]   = accum_t{};
+                    gl_b[ep]   = accum_t{};
                 }
 #pragma unroll
                 for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
 #pragma unroll
                     for (int ep = 0; ep < TW; ++ep) {
-                        ga_sum[ep] += warp_grada[w * D_CONST + base_f + ep];
-                        gl_sum[ep] += warp_gradl[w * D_CONST + base_f + ep];
+                        ga_sum[ep] += warp_gradaA[w * D_CONST + base_f + ep];
+                        gl_sum[ep] += warp_gradlA[w * D_CONST + base_f + ep];
+                        ga_b[ep] += warp_gradaB[w * D_CONST + base_f + ep];
+                        gl_b[ep] += warp_gradlB[w * D_CONST + base_f + ep];
                     }
+                }
+#pragma unroll
+                for (int ep = 0; ep < TW; ++ep) {
+                    ga_sum[ep] -= G_i_h * ga_b[ep];
+                    gl_sum[ep] -= G_i_h * gl_b[ep];
                 }
                 Tile::write_convert_from_accum(&grad_l_base[base_f], gl_sum);
 

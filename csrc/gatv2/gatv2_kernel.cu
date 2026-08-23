@@ -366,7 +366,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     auto *grad_l_ptr = reinterpret_cast<cuda_t *>(grad_l.data_ptr<torch_t>());
 
                     // + staged neighbour rows (one row per stage per warp)
-                    size_t sh_al = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float) + Pipe::smem_bytes(W);
+                    size_t sh_al = 2 * DC * sizeof(cuda_t) + W * 4 * DC * sizeof(float) + (W + 1) * sizeof(float) + Pipe::smem_bytes(W);
 
                     dim3 blocks(num_nodes_bucket, H);
                     dim3 threads(W * kWarpSize);
