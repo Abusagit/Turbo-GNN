@@ -10,13 +10,11 @@ template <size_t STAGES, size_t ROW_ELEMS, FloatingNum num_type>
 class RowPipeline {
    public:
     static constexpr size_t kTileElems = SelectTW<ROW_ELEMS, num_type>::value;
-    static constexpr size_t kTileBytes = kTileElems * sizeof(num_type);
-    static constexpr bool kLaneLocal   = kTileBytes >= 4 && ROW_ELEMS % kTileElems == 0;
-
-    static constexpr size_t kCopyBytes = kLaneLocal ? kTileBytes : 16;
+    static constexpr size_t kCopyBytes = kTileElems * sizeof(num_type);
     static constexpr size_t kRowBytes  = ROW_ELEMS * sizeof(num_type);
 
-    static constexpr size_t kChunksPerRow = kRowBytes / kCopyBytes;
+    static_assert(ROW_ELEMS % kTileElems == 0, "row must split into whole tiles");
+    static constexpr size_t kChunksPerRow = ROW_ELEMS / kTileElems;
 
     static constexpr size_t smem_bytes(size_t workers) {
         return STAGES == 1 ? 0 : workers * STAGES * kRowBytes;
@@ -58,20 +56,12 @@ class RowPipeline {
             return direct_;
         } else {
             cuda::pipeline_consumer_wait_prior<STAGES - 1>(pipe_);
-            if constexpr (!kLaneLocal) {
-                __syncwarp();
-            }
             return stage_base_ + cons_idx_ * ROW_ELEMS;
         }
     }
 
     __device__ __forceinline__ void release() {
         if constexpr (STAGES > 1) {
-            // The next prefetch refills this slot, so with the 16-byte fallback a fast lane would
-            // overwrite bytes a slow lane is still reading.
-            if constexpr (!kLaneLocal) {
-                __syncwarp();
-            }
             pipe_.consumer_release();
             cons_idx_ = advance(cons_idx_);
         }
