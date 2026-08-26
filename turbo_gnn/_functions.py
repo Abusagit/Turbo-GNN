@@ -65,6 +65,44 @@ DEFAULT_BLOCKS_PER_SM = 1024
 #: at chunk 32 on ogbn-proteins). Hence a tunable rather than a constant.
 DEFAULT_SCHED_CHUNK = 4
 
+#: How the light and heavy node buckets are launched relative to each other.
+#:
+#: These convolutions split nodes by degree quantile and run a kernel per bucket. The two touch
+#: disjoint output rows and have no data dependence, but historically went out back to back on
+#: one stream, so the heavy launch could not begin until the light one had drained.
+#: ``concurrent`` puts them on separate streams, heavy issued first.
+#:
+#: Forward and backward are controlled separately, because they want different answers.
+#: Measured over 192 cells (16 graphs x 3 convs x head dims 128/256 x both passes):
+#:
+#:     head dim 128, forward     1.140      head dim 128, backward    0.921
+#:     head dim 256, forward     1.113      head dim 256, backward    0.988
+#:
+#: Concurrent on forward and sequential on backward is worth 1.061x overall against 1.037x for
+#: turning it on everywhere, and raises cells at or above baseline from 147/192 to 177/192.
+#: Making the two independent lets the autotuner find that split per graph rather than being
+#: forced into one answer for both.
+#:
+#: A third mode, "heavy_first" -- reordering the two launches on a single stream -- was
+#: implemented, measured at 0.964 geomean, and removed. Reordering cannot help when the second
+#: launch still waits for the first to drain; all of the gain is in the overlap.
+BUCKET_LAUNCHES = {"sequential": 0, "concurrent": 1}
+DEFAULT_BUCKET_LAUNCH = "sequential"
+
+
+def resolve_bucket_launch(bucket_launch) -> int:
+    """Accept either a name from :data:`BUCKET_LAUNCHES` or the raw int the kernel takes."""
+    if isinstance(bucket_launch, str):
+        try:
+            return BUCKET_LAUNCHES[bucket_launch]
+        except KeyError:
+            raise ValueError(
+                f"unknown bucket_launch {bucket_launch!r}; expected one of {', '.join(BUCKET_LAUNCHES)}"
+            ) from None
+    if bucket_launch not in BUCKET_LAUNCHES.values():
+        raise ValueError(f"bucket_launch must be one of {sorted(BUCKET_LAUNCHES.values())}, got {bucket_launch!r}")
+    return int(bucket_launch)
+
 
 def resolve_schedule(schedule) -> int:
     """Accept either the policy name or its raw int, and validate."""
@@ -121,6 +159,8 @@ class ReductionAggrFunction(torch.autograd.Function):
         schedule=DEFAULT_SCHEDULE,
         blocks_per_sm=DEFAULT_BLOCKS_PER_SM,
         sched_chunk=DEFAULT_SCHED_CHUNK,
+        forward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
+        backward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
@@ -159,6 +199,7 @@ class ReductionAggrFunction(torch.autograd.Function):
             resolve_schedule(schedule),
             blocks_per_sm,
             sched_chunk,
+            resolve_bucket_launch(forward_bucket_launch),
         )
         ctx.save_for_backward(arg_idx)
         ctx.num_src_nodes = X.size(0)
@@ -166,6 +207,9 @@ class ReductionAggrFunction(torch.autograd.Function):
         ctx.schedule = resolve_schedule(schedule)
         ctx.blocks_per_sm = blocks_per_sm
         ctx.sched_chunk = sched_chunk
+        # Backward gets its own value: concurrency helps the forward buckets and hurts the
+        # backward ones, so forcing one answer on both leaves most of the gain behind.
+        ctx.bucket_launch = resolve_bucket_launch(backward_bucket_launch)
         return out
 
     @staticmethod
@@ -174,9 +218,16 @@ class ReductionAggrFunction(torch.autograd.Function):
         (arg_idx,) = ctx.saved_tensors
         num_src_nodes = ctx.num_src_nodes
         grad_x = _C.reduction_aggr_backward(
-            grad_out, arg_idx, num_src_nodes, ctx.warps_per_block, ctx.schedule, ctx.blocks_per_sm, ctx.sched_chunk
+            grad_out,
+            arg_idx,
+            num_src_nodes,
+            ctx.warps_per_block,
+            ctx.schedule,
+            ctx.blocks_per_sm,
+            ctx.sched_chunk,
+            ctx.bucket_launch,
         )
-        return (None, None, grad_x) + (None,) * 12
+        return (None, None, grad_x) + (None,) * 14
 
 
 class gatv2_function(torch.autograd.Function):
@@ -219,6 +270,8 @@ class gatv2_function(torch.autograd.Function):
         schedule=DEFAULT_SCHEDULE,
         blocks_per_sm=DEFAULT_BLOCKS_PER_SM,
         sched_chunk=DEFAULT_SCHED_CHUNK,
+        forward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
+        backward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -238,10 +291,14 @@ class gatv2_function(torch.autograd.Function):
             schedule_id,
             blocks_per_sm,
             sched_chunk,
+            resolve_bucket_launch(forward_bucket_launch),
         )
         ctx.schedule = schedule_id
         ctx.blocks_per_sm = blocks_per_sm
         ctx.sched_chunk = sched_chunk
+        # Backward gets its own value: concurrency helps the forward buckets and hurts the
+        # backward ones, so forcing one answer on both leaves most of the gain behind.
+        ctx.bucket_launch = resolve_bucket_launch(backward_bucket_launch)
         ctx.negative_slope = negative_slope
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
         ctx.backward_light_warps = backward_light_warps
@@ -312,10 +369,11 @@ class gatv2_function(torch.autograd.Function):
             ctx.schedule,
             ctx.blocks_per_sm,
             ctx.sched_chunk,
+            ctx.bucket_launch,
         )
 
         # 4 CSR tensors + 3 gradients + 13 non-Variable args = 20 total
-        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 14
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 16
 
 
 class _FusedGraphAttention(torch.autograd.Function):
@@ -354,6 +412,8 @@ class _FusedGraphAttention(torch.autograd.Function):
         schedule=DEFAULT_SCHEDULE,
         blocks_per_sm=DEFAULT_BLOCKS_PER_SM,
         sched_chunk=DEFAULT_SCHED_CHUNK,
+        forward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
+        backward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
     ):
         scale = scale or 1 / (Q.shape[-1] ** 0.5)
         schedule_id = resolve_schedule(schedule)
@@ -371,11 +431,15 @@ class _FusedGraphAttention(torch.autograd.Function):
             schedule_id,
             blocks_per_sm,
             sched_chunk,
+            resolve_bucket_launch(forward_bucket_launch),
         )
 
         ctx.schedule = schedule_id
         ctx.blocks_per_sm = blocks_per_sm
         ctx.sched_chunk = sched_chunk
+        # Backward gets its own value: concurrency helps the forward buckets and hurts the
+        # backward ones, so forcing one answer on both leaves most of the gain behind.
+        ctx.bucket_launch = resolve_bucket_launch(backward_bucket_launch)
         ctx.scale = scale
         ctx.is_directed = is_directed
         ctx.num_heads = Q.shape[1]
@@ -429,9 +493,10 @@ class _FusedGraphAttention(torch.autograd.Function):
             ctx.schedule,
             ctx.blocks_per_sm,
             ctx.sched_chunk,
+            ctx.bucket_launch,
         )
 
-        return (None,) * 4 + (dQ, dK, dV) + (None,) * 13
+        return (None,) * 4 + (dQ, dK, dV) + (None,) * 15
 
 
 class _CudaSpMMConvFn(torch.autograd.Function):

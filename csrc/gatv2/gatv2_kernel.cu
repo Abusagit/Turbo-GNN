@@ -10,7 +10,7 @@ void GATv2Backward_CSR_Undirected_Impl(
     size_t N, size_t H, size_t D, const cuda_t *grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *d_l, int64_t stride_l_n,
     int64_t stride_l_h, const cuda_t *d_r, int64_t stride_r_n, int64_t stride_r_h, const index_t *d_row_ptr, const index_t *d_col_idx,
     const cuda_t *d_attn_vec, const float *d_logsumexp, float negative_slope, int grad_A_reduce_row_chunk_size, cudaStream_t stream,
-    cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced, int schedule, int blocks_per_sm, at::Tensor sched_counters, int sched_chunk
+    cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced, int schedule, int blocks_per_sm, at::Tensor sched_counters, int sched_chunk, int bucket_launch
 ) {
     namespace sched_ns                   = turbo_gnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
@@ -168,7 +168,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     int heavy_warps_per_block,
     int schedule,
     int blocks_per_sm,
-    int sched_chunk
+    int sched_chunk,
+    int bucket_launch
 ) {
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
     TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
@@ -223,7 +224,9 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor logsumexp = torch::empty({N, H}, torch::TensorOptions().dtype(torch::kFloat32).device(l.device()));
 
     float *d_logsumexp  = logsumexp.data_ptr<float>();
-    cudaStream_t stream = 0;
+    // The caller's stream, not the legacy default one: launching on stream 0 serialises
+    // against every other stream and makes concurrent bucket launches impossible.
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(l.device().index());
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GATv2 forward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
@@ -232,9 +235,12 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     at::Tensor sched_counters            = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/2, l.device());
     int bucket_id                        = 0;
 
-    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
+                             at::cuda::CUDAStream bucket_stream) {
         const int this_bucket = bucket_id++;
         if (num_nodes_bucket == 0) return;
+        at::cuda::CUDAStreamGuard guard(bucket_stream);
+        cudaStream_t stream = bucket_stream;
 
         const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
         at::Tensor offs;
@@ -276,8 +282,14 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
         );
     };
 
-    launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block));
-    launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
+    namespace stream_ns = turbo_gnn::streams;
+    stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), l.device());
+    buckets.record_all(l, r, row_ptr, col_idx, attn_vec, h_out, logsumexp, light_nodes, sched_counters);
+    stream_ns::run_buckets(
+        buckets,
+        [&](at::cuda::CUDAStream st) { launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
+        [&](at::cuda::CUDAStream st) { launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+    );
 
     CUDA_KERNEL_CHECK();
 
@@ -305,7 +317,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     bool is_directed,
     int schedule,
     int blocks_per_sm,
-    int sched_chunk
+    int sched_chunk,
+    int bucket_launch
 ) {
     TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
     TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
@@ -385,7 +398,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
     const float *d_logsumexp = logsumexp.data_ptr<float>();
     float *d_grad_a          = grad_a.data_ptr<float>();
-    cudaStream_t stream      = 0;
+    // See the forward entry point: the caller's stream, not the legacy default one.
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(l.device().index());
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GATv2 backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
@@ -403,9 +417,12 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
         // Lambda to launch AL kernel for a bucket
         int launch_al_bucket_id = 0;
-        auto launch_al_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+        auto launch_al_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
+                          at::cuda::CUDAStream bucket_stream) {
             const int this_bucket = launch_al_bucket_id++;
             if (num_nodes_bucket == 0) return;
+            at::cuda::CUDAStreamGuard guard(bucket_stream);
+            cudaStream_t stream = bucket_stream;
             const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
             at::Tensor offs;
             if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
@@ -449,9 +466,12 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
         // Lambda to launch R kernel for a bucket
         int launch_r_bucket_id = 2;
-        auto launch_r_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+        auto launch_r_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
+                          at::cuda::CUDAStream bucket_stream) {
             const int this_bucket = launch_r_bucket_id++;
             if (num_nodes_bucket == 0) return;
+            at::cuda::CUDAStreamGuard guard(bucket_stream);
+            cudaStream_t stream = bucket_stream;
             const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
             at::Tensor offs;
             if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
@@ -493,13 +513,31 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
             );
         };
 
+        namespace stream_ns = turbo_gnn::streams;
+        const auto bl_mode = stream_ns::bucket_launch_from_int(bucket_launch);
+
         // 1: AL kernel (forward CSR direction) - light + heavy
-        launch_al_bucket(fwd_light_nodes, fwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block));
-        launch_al_bucket(fwd_heavy_nodes, fwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
+        {
+            stream_ns::BucketStreams buckets(bl_mode, l.device());
+            buckets.record_all(grad_h, l, r, row_ptr, col_idx, attn_vec, logsumexp, fwd_light_nodes, sched_counters);
+            stream_ns::run_buckets(
+                buckets,
+                [&](at::cuda::CUDAStream st) { launch_al_bucket(fwd_light_nodes, fwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
+                [&](at::cuda::CUDAStream st) { launch_al_bucket(fwd_heavy_nodes, fwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+            );
+        }
 
         // 2: R kernel (backward CSR direction) - light + heavy
-        launch_r_bucket(bwd_light_nodes, bwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block));
-        launch_r_bucket(bwd_heavy_nodes, bwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
+        // 2: R kernel (transposed CSR direction) - light + heavy
+        {
+            stream_ns::BucketStreams buckets(bl_mode, l.device());
+            buckets.record_all(grad_h, l, r, row_ptr_T, col_idx_T, attn_vec, logsumexp, bwd_light_nodes, sched_counters);
+            stream_ns::run_buckets(
+                buckets,
+                [&](at::cuda::CUDAStream st) { launch_r_bucket(bwd_light_nodes, bwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
+                [&](at::cuda::CUDAStream st) { launch_r_bucket(bwd_heavy_nodes, bwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+            );
+        }
 
         // 3: ReduceGradA
         {
@@ -540,7 +578,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                     index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), attn_ptr, d_logsumexp, negative_slope,
                     grad_A_reduce_row_chunk_size, stream, grad_l_ptr, grad_r_ptr, d_grad_a, grad_a_reduced_ptr, schedule, blocks_per_sm,
-                    sched_counters, sched_chunk
+                    sched_counters, sched_chunk, bucket_launch
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),

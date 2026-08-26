@@ -240,6 +240,22 @@ _SCHEDULE_PARAMS = (
     ),
     KernelParam("blocks_per_sm", int, 1024, "Resident blocks per SM targeted by the persistent policies."),
     KernelParam("sched_chunk", int, 4, "Work items claimed per atomic (dynamic policy only)."),
+    KernelParam(
+        "forward_bucket_launch",
+        str,
+        "sequential",
+        "Forward light/heavy bucket launch: sequential (one stream) | concurrent (separate "
+        "streams, heavy issued first).",
+        choices=("sequential", "concurrent"),
+    ),
+    KernelParam(
+        "backward_bucket_launch",
+        str,
+        "sequential",
+        "Backward light/heavy bucket launch. Concurrency helps forward and hurts backward, so "
+        "the two are set independently.",
+        choices=("sequential", "concurrent"),
+    ),
 )
 
 _REDUCTION_PARAMS = (
@@ -507,6 +523,17 @@ NODE_ORDERS = ("natural", "degree", "locality")
 
 QUANTILE_KEYS = ("quantile", "forward_quantile", "backward_quantile")
 
+#: Kernel parameters that ``--sweep-kernel`` can vary *within a single process*, so a whole
+#: grid is measured against one loaded graph instead of one subprocess per point. Only
+#: parameters the op accepts at call time belong here.
+SWEEPABLE_KERNEL: dict[str, Callable[[str], Any]] = {
+    "schedule": str,
+    "forward_bucket_launch": str,
+    "backward_bucket_launch": str,
+    "blocks_per_sm": int,
+    "sched_chunk": int,
+}
+
 
 def parse_sweep(raw_args: Sequence[str] | None) -> dict[str, list[Any]]:
     """Parse ``--sweep name=v1,v2,...`` entries into candidate lists.
@@ -552,6 +579,38 @@ def parse_sweep(raw_args: Sequence[str] | None) -> dict[str, list[Any]]:
                 raise SystemExit(f"--sweep node_order has unknown value(s) {unknown}; valid: {', '.join(NODE_ORDERS)}")
         sweep[name] = values
     return sweep
+
+
+KERNEL_SWEEP_PREFIX = "kernel:"
+
+
+def parse_kernel_sweep(raw_args: Sequence[str] | None) -> dict[str, list[Any]]:
+    """Parse ``--sweep-kernel NAME=v1,v2`` entries.
+
+    Raises:
+        SystemExit: On a malformed entry or a parameter that cannot be set at call time.
+    """
+    out: dict[str, list[Any]] = {}
+    for item in raw_args or ():
+        name, sep, raw = item.partition("=")
+        name = name.strip()
+        if not sep:
+            raise SystemExit(f"--sweep-kernel entry {item!r} is not of the form name=v1,v2,...")
+        if name not in SWEEPABLE_KERNEL:
+            raise SystemExit(f"Unknown --sweep-kernel parameter {name!r}. Valid: {', '.join(SWEEPABLE_KERNEL)}")
+        parse = SWEEPABLE_KERNEL[name]
+        values = [parse(tok.strip()) for tok in raw.split(",") if tok.strip()]
+        if not values:
+            raise SystemExit(f"--sweep-kernel {name!r} lists no values.")
+        out[name] = values
+    return out
+
+
+def split_point(point: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Separate a sweep point into (graph parameters, kernel overrides)."""
+    graph_cfg = {k: v for k, v in point.items() if not k.startswith(KERNEL_SWEEP_PREFIX)}
+    kernel_cfg = {k[len(KERNEL_SWEEP_PREFIX) :]: v for k, v in point.items() if k.startswith(KERNEL_SWEEP_PREFIX)}
+    return graph_cfg, kernel_cfg
 
 
 def sweep_points(sweep: dict[str, list[Any]]) -> list[dict[str, Any]]:
@@ -1014,6 +1073,13 @@ def parse_args() -> argparse.Namespace:
         f"Valid names: {', '.join(SWEEPABLE)}.",
     )
     graph_group.add_argument(
+        "--sweep-kernel",
+        action="append",
+        metavar="NAME=V1,V2,...",
+        help="Sweep a kernel parameter inside one process, e.g. --sweep-kernel schedule=one_per_block,dynamic. "
+        "Combines with --sweep as one grid. Repeatable. Valid names: " + ", ".join(SWEEPABLE_KERNEL) + ".",
+    )
+    graph_group.add_argument(
         "--node-order",
         type=str,
         default="natural",
@@ -1084,6 +1150,15 @@ def parse_args() -> argparse.Namespace:
     )
     tune_group.add_argument("--autotune-warmup", type=int, default=10, help="Warmup iters per autotuning trial.")
     tune_group.add_argument("--autotune-iters", type=int, default=50, help="Timed iters per autotuning trial.")
+    tune_group.add_argument(
+        "--autotune-exclude",
+        type=str,
+        default=None,
+        metavar="NAME[,NAME...]",
+        help="Hold these tunable parameters fixed instead of searching them; they keep whatever "
+        "value -K gave them. This is what makes an ablation expressible -- 'autotune everything "
+        "except the scheduler' needs the scheduler pinned while the rest is searched.",
+    )
 
     p.add_argument(
         "-K",
@@ -1111,7 +1186,7 @@ class BenchTarget:
     conv_backend: str
     heads: int
     build_inputs: Callable[[InputContext], dict[str, torch.Tensor]]
-    make_forward: Callable[[BenchGraph, dict[str, torch.Tensor]], Callable[[], torch.Tensor]]
+    make_forward: Callable[..., Callable[[], torch.Tensor]]
     payload: dict[str, Any]
 
 
@@ -1166,7 +1241,19 @@ def prepare_target(args: argparse.Namespace, device: torch.device) -> BenchTarge
             raise SystemExit(f"Conv {args.conv!r} has no autotuning path. Autotunable convs: {tunable}.")
         call_kwargs = {
             "autotune": True,
-            "autotune_config": AutotuneConfig(warmup=args.autotune_warmup, iters=args.autotune_iters),
+            "autotune_config": AutotuneConfig(
+                warmup=args.autotune_warmup,
+                iters=args.autotune_iters,
+                # Without this the backward parameters are never searched, so a --mode backward
+                # run would report the *default* backward configuration under an "autotuned"
+                # label. Tie it to what is actually being timed.
+                # NOTE: the inline autotuner never reads this and never searches the backward
+                # parameters -- it optimises forward time only, whatever --mode says. Set here
+                # so the intent survives if that is ever fixed; see reports/ for what it means
+                # for the backward numbers.
+                tune_backward=args.mode in ("backward", "forward_backward"),
+                exclude=tuple(n.strip() for n in (args.autotune_exclude or "").split(",") if n.strip()),
+            ),
         }
 
     aggr_kwargs: dict[str, Any] = {"feature_dim": args.feature_dim}
@@ -1186,11 +1273,16 @@ def prepare_target(args: argparse.Namespace, device: torch.device) -> BenchTarge
         raise SystemExit(f"Backend {args.backend!r} rejected the arguments for conv {args.conv!r}: {exc}") from exc
     aggr = aggr.to(device)
 
-    def _make_forward(graph: BenchGraph, inputs: dict[str, torch.Tensor]) -> Callable[[], torch.Tensor]:
+    def _make_forward(
+        graph: BenchGraph, inputs: dict[str, torch.Tensor], overrides: dict[str, Any] | None = None
+    ) -> Callable[[], torch.Tensor]:
         ordered = [inputs[name] for name in family.arg_order]
+        # Call-time kwargs win over the ones the aggregation was constructed with, so a sweep
+        # can vary a kernel parameter without rebuilding the aggregation or reloading the graph.
+        merged = {**call_kwargs, **(overrides or {})}
 
         def _forward() -> torch.Tensor:
-            return aggr(*ordered, graph.repr, **call_kwargs)
+            return aggr(*ordered, graph.repr, **merged)
 
         return _forward
 
@@ -1305,7 +1397,11 @@ def main() -> int:
 
     timing = resolve_timing(args)
     sweep = parse_sweep(args.sweep)
-    points = sweep_points(sweep)
+    kernel_sweep = parse_kernel_sweep(args.sweep_kernel)
+    # One grid over both kinds. Kernel keys are prefixed so `repartition_for` and
+    # `apply_sweep_point`, which only understand graph parameters, cannot misread them.
+    combined = {**sweep, **{f"{KERNEL_SWEEP_PREFIX}{k}": v for k, v in kernel_sweep.items()}}
+    points = sweep_points(combined)
     trials: list[dict[str, Any]] = []
 
     with stdout_to_stderr():
@@ -1327,17 +1423,18 @@ def main() -> int:
         differentiable = [t for t in inputs.values() if t.requires_grad]
 
         for point in points:
-            if not point or set(point) == {"node_order"}:
+            graph_cfg, kernel_cfg = split_point(point)
+            if not graph_cfg or set(graph_cfg) == {"node_order"}:
                 graph = base_graph
             else:
-                graph = repartition_for(base_graph, point)  # type: ignore
+                graph = repartition_for(base_graph, graph_cfg)  # type: ignore
                 if graph is None:
-                    graph = load_graph(apply_sweep_point(args, point), device, target.conv_backend)  # type: ignore
+                    graph = load_graph(apply_sweep_point(args, graph_cfg), device, target.conv_backend)  # type: ignore
             # Applied last, so it composes with a swept quantile or index dtype: bucketing
             # decides bucket membership, ordering decides the walk within each bucket.
-            graph = reorder_nodes(graph, point.get("node_order", args.node_order))
+            graph = reorder_nodes(graph, graph_cfg.get("node_order", args.node_order))
 
-            _forward = target.make_forward(graph, inputs)
+            _forward = target.make_forward(graph, inputs, kernel_cfg)
             timed = build_timed_callable(_forward, args.mode, differentiable)
 
             if timing.exact:

@@ -4,7 +4,12 @@ import torch
 from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
-from turbo_gnn._functions import DEFAULT_BLOCKS_PER_SM, DEFAULT_SCHED_CHUNK, DEFAULT_SCHEDULE
+from turbo_gnn._functions import (
+    DEFAULT_BLOCKS_PER_SM,
+    DEFAULT_BUCKET_LAUNCH,
+    DEFAULT_SCHED_CHUNK,
+    DEFAULT_SCHEDULE,
+)
 
 from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
@@ -198,6 +203,8 @@ class _CudaSimpleAggr(BaseAggr):
             "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
             "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
             "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
+            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
         }
 
     def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
@@ -227,6 +234,8 @@ class _CudaGATv2Aggr(BaseAggr):
             "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
             "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
             "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
+            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
         }
 
     def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
@@ -261,6 +270,8 @@ class _CudaGTAggr(BaseAggr):
             "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
             "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
             "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
+            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
         }
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:

@@ -498,7 +498,8 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     int tiles_y,
     int schedule,
     int blocks_per_sm,
-    int sched_chunk
+    int sched_chunk,
+    int bucket_launch
 ) {
     using ROps = ReductionOps<Op>;
     namespace sched_ns             = turbo_gnn::sched;
@@ -526,9 +527,24 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     const int num_light = light_nodes.numel();
     // One counter row per bucket launch, so the light launch cannot leave dirt for the heavy one.
     at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, /*heads=*/1, /*num_launches=*/2, X.device());
-    auto stream               = at::cuda::getCurrentCUDAStream(X.device().index());
 
-    if (num_light > 0) {
+    const int num_heavy = heavy_nodes.numel();
+
+    namespace stream_ns = turbo_gnn::streams;
+    stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), X.device());
+    // The light bucket may run on a stream these were not allocated on; tell the caching
+    // allocator so it cannot hand their memory out again while that stream is still reading.
+    buckets.record_all(X, out, arg_idx, edge_ptr, edge_idx, light_nodes, sched_counters);
+
+    auto launch_light = [&]() {
+        if (num_light == 0) {
+            return;
+        }
+        // Guarded so the host-side prep below (the degree prefix sum for PrecomputedList)
+        // allocates and runs on the light bucket's stream rather than the caller's.
+        at::cuda::CUDAStreamGuard guard(buckets.light());
+        auto stream = buckets.light();
+
         const int light_grid_x = sched_ns::persistent_grid_x(SK_KIND, num_light, blocks_per_sm, /*grid_y=*/1, sched_chunk);
         at::Tensor light_offsets;
         if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
@@ -568,11 +584,14 @@ void reduction_aggr_forward_partitioned_cuda_impl(
             MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block),
             MakeIntVariant<0, 1, 2, 3>(schedule)
         );
-    }
+    };
 
-    const int num_heavy = heavy_nodes.numel();
+    auto launch_heavy = [&]() {
+        if (num_heavy == 0) {
+            return;
+        }
+        auto stream = buckets.heavy();
 
-    if (num_heavy > 0) {
         std::visit(
             [&](auto idxInfo, auto typeInfo, auto sched_const) {
                 using index_t     = typename decltype(idxInfo)::Type;
@@ -695,7 +714,18 @@ void reduction_aggr_forward_partitioned_cuda_impl(
             MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
             MakeIntVariant<0, 1, 2, 3>(schedule)
         );
+    };
+
+    // The heavy bucket is a handful of very expensive nodes, so it is the long pole; issuing it
+    // first lets the light bucket fill in around it instead of queueing behind it.
+    if (buckets.heavy_first()) {
+        launch_heavy();
+        launch_light();
+    } else {
+        launch_light();
+        launch_heavy();
     }
+    buckets.join();
     CUDA_KERNEL_CHECK();
 }
 
@@ -716,17 +746,18 @@ void reduction_aggr_forward_partitioned_cuda(
     const std::string& reduce,
     int schedule,
     int blocks_per_sm,
-    int sched_chunk
+    int sched_chunk,
+    int bucket_launch
 ) {
     if (reduce == "min") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MIN>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk
+            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch
         );
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk
+            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch
         );
     } else {
         TORCH_CHECK(false, "Unsupported reduce: " + reduce);
@@ -736,7 +767,8 @@ void reduction_aggr_forward_partitioned_cuda(
 void reduction_aggr_backward_cuda(
     const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8, int schedule = 3,
     int blocks_per_sm = 8,
-    int sched_chunk = 1
+    int sched_chunk = 1,
+    int bucket_launch = 0
 ) {
     namespace sched_ns                   = turbo_gnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);

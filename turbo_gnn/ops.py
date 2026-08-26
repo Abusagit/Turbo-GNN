@@ -13,6 +13,7 @@ import torch
 from turbo_gnn._autotune import with_autotune
 from turbo_gnn._functions import (
     DEFAULT_BLOCKS_PER_SM,
+    DEFAULT_BUCKET_LAUNCH,
     DEFAULT_SCHED_CHUNK,
     DEFAULT_SCHEDULE,
     ReductionAggrFunction,
@@ -42,6 +43,8 @@ def reduction_aggr(
     schedule: str = DEFAULT_SCHEDULE,
     blocks_per_sm: int = DEFAULT_BLOCKS_PER_SM,
     sched_chunk: int = DEFAULT_SCHED_CHUNK,
+    forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
+    backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
 ) -> torch.Tensor:
     """Element-wise min or max aggregation over incoming neighbors.
 
@@ -90,6 +93,8 @@ def reduction_aggr(
         schedule,
         blocks_per_sm,
         sched_chunk,
+        forward_bucket_launch,
+        backward_bucket_launch,
     )
 
 
@@ -108,6 +113,8 @@ def gatv2_aggr(
     schedule: str = DEFAULT_SCHEDULE,
     blocks_per_sm: int = DEFAULT_BLOCKS_PER_SM,
     sched_chunk: int = DEFAULT_SCHED_CHUNK,
+    forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
+    backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -161,6 +168,8 @@ def gatv2_aggr(
         schedule,
         blocks_per_sm,
         sched_chunk,
+        forward_bucket_launch,
+        backward_bucket_launch,
     )
 
 
@@ -179,6 +188,8 @@ def graph_transformer_aggr(
     schedule: str = DEFAULT_SCHEDULE,
     blocks_per_sm: int = DEFAULT_BLOCKS_PER_SM,
     sched_chunk: int = DEFAULT_SCHED_CHUNK,
+    forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
+    backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
@@ -231,6 +242,8 @@ def graph_transformer_aggr(
         schedule,
         blocks_per_sm,
         sched_chunk,
+        forward_bucket_launch,
+        backward_bucket_launch,
     )
 
 

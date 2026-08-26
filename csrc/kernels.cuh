@@ -24,11 +24,14 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     std::string reduce              = "min",
     int schedule                    = 3,
     int blocks_per_sm               = 8,
-    int sched_chunk                 = 1
+    int sched_chunk                 = 1,
+    /// 0 = light then heavy on one stream (historical), 1 = heavy then light,
+    /// 2 = heavy and light concurrently on separate streams.
+    int bucket_launch               = 0
 );
 
 at::Tensor reduction_aggr_backward_torch(
-    at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8, int schedule = 3, int blocks_per_sm = 8, int sched_chunk = 1
+    at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8, int schedule = 3, int blocks_per_sm = 8, int sched_chunk = 1, int bucket_launch = 0
 );
 
 // ============================================================================
@@ -48,7 +51,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     int heavy_warps_per_block = 8,
     int schedule              = 3,
     int blocks_per_sm         = 8,
-    int sched_chunk           = 1
+    int sched_chunk           = 1,
+    int bucket_launch         = 0
 );
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
@@ -72,7 +76,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     bool is_directed          = true,
     int schedule              = 3,
     int blocks_per_sm         = 8,
-    int sched_chunk           = 1
+    int sched_chunk           = 1,
+    int bucket_launch         = 0
 );
 
 // ============================================================================
@@ -92,7 +97,8 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     int heavy_warps_per_block = 8,
     int schedule              = 3,
     int blocks_per_sm         = 8,
-    int sched_chunk           = 1
+    int sched_chunk           = 1,
+    int bucket_launch         = 0
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward_csr_mh_cuda(
@@ -114,7 +120,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     bool is_directed          = true,
     int schedule              = 3,
     int blocks_per_sm         = 8,
-    int sched_chunk           = 1
+    int sched_chunk           = 1,
+    int bucket_launch         = 0
 );
 
 // ============================================================================

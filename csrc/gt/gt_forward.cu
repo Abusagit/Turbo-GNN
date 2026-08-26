@@ -223,6 +223,13 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize, kGtFwdMinBlocksPerSM<
             logsumexp[node_i * H + head_h] = AccumOps::max(global_max + AccumOps::log(global_sum), -INFINITY);
         }
 
+        // Lane 0 rewrote `neighbor_sum` in shared memory just above, and every lane of this
+        // warp reads it below. A shuffle converges the warp but is not a memory fence, so
+        // relying on it for that ordering is the classic warp-synchronous assumption that
+        // Volta's independent thread scheduling no longer honours. `__syncwarp()` provides
+        // both. `compute-sanitizer --tool racecheck` reported 169,312 hazards here without it.
+        __syncwarp();
+
         inv_sum = __shfl_sync(FULL_WARP_MASK, inv_sum, 0);
 
         // cross-neighbor output write (uses write_typed for vec2 stores)

@@ -15,18 +15,31 @@ import subprocess
 import sys
 
 
-def busy_uuids() -> set[str]:
+def busy_uuids(ignore_pids: set[int] | None = None) -> set[str]:
+    """UUIDs of GPUs running a compute process, excluding processes we started ourselves.
+
+    `ignore_pids` matters when polling *during* our own benchmark: the child is itself a compute
+    process on that GPU, so without excluding it every poll reports contention against us.
+    """
+    ignore = ignore_pids or set()
     out = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader"],
+        ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
-    return {line.strip() for line in out.splitlines() if line.strip()}
+    busy = set()
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        pid, uuid = (f.strip() for f in line.split(","))
+        if int(pid) not in ignore:
+            busy.add(uuid)
+    return busy
 
 
-def free_indices(max_mib: int) -> list[int]:
-    busy = busy_uuids()
+def free_indices(max_mib: int, ignore_pids: set[int] | None = None) -> list[int]:
+    busy = busy_uuids(ignore_pids)
     out = subprocess.run(
         ["nvidia-smi", "--query-gpu=index,uuid,memory.used", "--format=csv,noheader,nounits"],
         capture_output=True,
@@ -38,9 +51,32 @@ def free_indices(max_mib: int) -> list[int]:
         if not line.strip():
             continue
         idx, uuid, used = (f.strip() for f in line.split(","))
-        if uuid not in busy and int(used) <= max_mib:
+        # Memory held by a process we are ignoring should not count against us either.
+        if uuid not in busy and (int(used) <= max_mib or ignore_pids):
             free.append(int(idx))
     return free
+
+
+def is_free(index: int, max_mib: int = 64, ignore_pids: set[int] | None = None) -> bool:
+    """Is this specific GPU free of other tenants right now?
+
+    Checking once before a long run is not enough: a multi-hour benchmark can be invaded
+    halfway through, and the resulting numbers look like real regressions rather than noise.
+    Call this between runs, not just at launch.
+    """
+    return index in free_indices(max_mib, ignore_pids)
+
+
+def wait_until_free(index: int, timeout_s: float = 1800.0, poll_s: float = 30.0) -> bool:
+    """Block until `index` has no other compute process, or the timeout expires."""
+    import time as _time
+
+    deadline = _time.time() + timeout_s
+    while _time.time() < deadline:
+        if is_free(index):
+            return True
+        _time.sleep(poll_s)
+    return is_free(index)
 
 
 def main() -> int:

@@ -45,17 +45,38 @@ class AutotuneConfig:
     warmup: int = 10
     iters: int = 50
     tune_backward: bool = False
+    #: Parameter names to hold fixed instead of searching. The kernel keeps whatever value it
+    #: was constructed with, which is how an ablation pins one axis while tuning the rest --
+    #: "autotune everything except the scheduler" is otherwise not expressible.
+    exclude: tuple[str, ...] = ()
     cache_dir: str | None = None
     use_cache: bool = True
 
 
-def _build_combinations(params: list[TunableParam]) -> list[dict[str, Any]]:
-    """Build all combinations from a list of TunableParam."""
+def _build_combinations(
+    params: list[TunableParam], canonicalise: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Build the search grid from a list of TunableParam.
+
+    `canonicalise` lets a kernel collapse parameters that have no effect in a given
+    configuration -- a tile height that is only read by a kernel variant this configuration
+    does not use, say. Without it the grid contains many configurations that are *identical* in
+    behaviour, and the search does not merely waste time on them: it times each one separately
+    and takes the argmin, so pure measurement noise decides which duplicate "wins". Collapsing
+    them first makes the search both shorter and less prone to that.
+    """
     if not params:
         return [{}]
     names = [p.name for p in params]
     value_lists = [p.values for p in params]
-    return [dict(zip(names, combo)) for combo in itertools.product(*value_lists)]
+    combos = (dict(zip(names, combo)) for combo in itertools.product(*value_lists))
+    if canonicalise is None:
+        return list(combos)
+    seen: dict[tuple, dict[str, Any]] = {}
+    for combo in combos:
+        canon = canonicalise(combo)
+        seen.setdefault(tuple(sorted(canon.items())), canon)
+    return list(seen.values())
 
 
 class _InlineAutotuneCache:
@@ -78,25 +99,27 @@ class _InlineAutotuneCache:
         num_edges = graph_repr.forward_indices.numel()
         return (num_nodes, num_edges, feat_dim)
 
-    def lookup(self, graph_repr, feat_dim: int) -> dict | None:
+    def lookup(self, graph_repr, feat_dim: int, tune_backward: bool = False) -> dict | None:
         gid = id(graph_repr)
         tier1 = self._cache.get(gid)
         if tier1 is not None:
             csr_h = self._csr_hash(graph_repr)
             tier2 = tier1.get(csr_h)
             if tier2 is not None:
-                key = self._shape_key(graph_repr, feat_dim)
+                key = (*self._shape_key(graph_repr, feat_dim), tune_backward)
                 return tier2.get(key)
         return None
 
-    def store(self, graph_repr, feat_dim: int, result: dict) -> None:
+    def store(self, graph_repr, feat_dim: int, result: dict, tune_backward: bool = False) -> None:
         gid = id(graph_repr)
         if gid not in self._cache:
             self._cache[gid] = {}
         csr_h = self._csr_hash(graph_repr)
         if csr_h not in self._cache[gid]:
             self._cache[gid][csr_h] = {}
-        key = self._shape_key(graph_repr, feat_dim)
+        # The pass being tuned is part of the key: a configuration chosen by backward timing
+        # must not be served to a caller that only runs forward, or vice versa.
+        key = (*self._shape_key(graph_repr, feat_dim), tune_backward)
         self._cache[gid][csr_h][key] = result
 
 
@@ -128,20 +151,29 @@ class TunableKernel(ABC):
             extra_args = args[2:]
 
             feat_dim = x.shape[-1] if x.ndim > 1 else 1
-            cached = self._inline_cache.lookup(graph, feat_dim)
+            cfg = autotune_config or self._autotune_config
+            tune_bwd = bool(getattr(cfg, "tune_backward", False))
+            cached = self._inline_cache.lookup(graph, feat_dim, tune_bwd)
             if cached is not None:
                 if cached["kernel_config"]:
                     self.configure(**cached["kernel_config"])
                 return self._execute(cached["graph_repr"], x, *extra_args, **kwargs)
 
-            config = autotune_config or self._autotune_config
-            result = self._inline_autotune(x, graph, config, **kwargs)
-            self._inline_cache.store(graph, feat_dim, result)
+            result = self._inline_autotune(x, graph, cfg, **kwargs)
+            self._inline_cache.store(graph, feat_dim, result, tune_bwd)
             return self._execute(result["graph_repr"], x, *extra_args, **kwargs)
 
         return self._execute(*args, **kwargs)
 
     # ------ tunable param declarations ------
+
+    def canonicalise_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Collapse parameters that cannot affect this configuration's behaviour.
+
+        Override in a kernel whose parameters are conditional -- for example tile dimensions
+        read by only one kernel variant. The default is identity, which keeps the full grid.
+        """
+        return config
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return []
@@ -186,6 +218,25 @@ class TunableKernel(ABC):
 
         return _bench
 
+    def make_backward_only_bench_fn(self, x: torch.Tensor, graph_repr, **kwargs) -> Callable:
+        """Time the backward kernels alone, reusing one forward graph.
+
+        `make_backward_bench_fn` re-runs the forward pass every iteration, so it measures
+        forward+backward. That is the right objective when tuning for a training step, but the
+        wrong one when the thing being measured is the backward pass in isolation -- the search
+        would trade backward time away for forward time and still look like it won. This
+        mirrors what the benchmark harness does for `--mode backward`.
+        """
+        out = self.make_forward_bench_fn(x, graph_repr, **kwargs)()
+        if out is None or not isinstance(out, torch.Tensor):
+            raise RuntimeError(f"{type(self).__name__}._execute must return a tensor to tune the backward pass")
+        grad = torch.randn_like(out)
+
+        def _bench():
+            out.backward(grad, retain_graph=True)
+
+        return _bench
+
     # ------ inline autotuning ------
 
     def _inline_autotune(self, x, graph_repr, config=None, **kwargs):
@@ -193,13 +244,30 @@ class TunableKernel(ABC):
         from turbo_gnn._timer import time_callable
 
         config = config or self._autotune_config
-        kernel_params = self.get_tunable_forward_kernel_params()
-        graph_params = self.get_tunable_forward_graph_params()
+        excluded = set(getattr(config, "exclude", ()) or ())
+        tune_bwd = bool(getattr(config, "tune_backward", False))
+
+        if tune_bwd:
+            kernel_params = self.get_tunable_backward_kernel_params()
+            graph_params = self.get_tunable_backward_graph_params()
+            # The reduction kernel declares no backward kernel parameters, yet its backward
+            # kernel reads `warps_per_block`, which is declared as a *forward* parameter. Falling
+            # back to the forward set keeps that case tuned instead of silently searching nothing
+            # and reporting the default configuration as "autotuned".
+            if not kernel_params:
+                kernel_params = self.get_tunable_forward_kernel_params()
+        else:
+            kernel_params = self.get_tunable_forward_kernel_params()
+            graph_params = self.get_tunable_forward_graph_params()
+
+        kernel_params = [p for p in kernel_params if p.name not in excluded]
+        graph_params = [p for p in graph_params if p.name not in excluded]
+        make_bench = self.make_backward_only_bench_fn if tune_bwd else self.make_forward_bench_fn
         if not kernel_params and not graph_params:
             return {"kernel_config": {}, "graph_config": {}, "graph_repr": graph_repr, "ms_per_iter": None}
 
         graph_combos = _build_combinations(graph_params)
-        kernel_combos = _build_combinations(kernel_params)
+        kernel_combos = _build_combinations(kernel_params, self.canonicalise_config)
         best_ms = float("inf")
         best_result = {"kernel_config": {}, "graph_config": {}, "graph_repr": graph_repr, "ms_per_iter": None}
         self._is_autotuning = True
@@ -210,7 +278,7 @@ class TunableKernel(ABC):
                     if kernel_cfg:
                         self.configure(**kernel_cfg)
                     try:
-                        bench_fn = self.make_forward_bench_fn(x, current_graph, **kwargs)
+                        bench_fn = make_bench(x, current_graph, **kwargs)
                         ms = time_callable(
                             bench_fn,
                             warmup=config.warmup,

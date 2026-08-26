@@ -19,7 +19,8 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     int heavy_warps_per_block,
     int schedule,
     int blocks_per_sm,
-    int sched_chunk
+    int sched_chunk,
+    int bucket_launch
 ) {
     at::cuda::CUDAGuard device_guard(Q.device());
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(Q.device().index());
@@ -66,9 +67,13 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/2, Q.device());
     int bucket_id             = 0;
 
-    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
+                             at::cuda::CUDAStream bucket_stream) {
         const int this_bucket = bucket_id++;
         if (num_nodes_bucket == 0) return;
+        // Guarded so the host-side prep below allocates on this bucket's stream too.
+        at::cuda::CUDAStreamGuard guard(bucket_stream);
+        auto stream = bucket_stream;
 
         // Heads stay on gridDim.y, so the persistent target is divided by H to keep the
         // *total* block count near blocks_per_sm * SM_count.
@@ -126,11 +131,14 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
         );
     };
 
-    // Light nodes
-    launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block));
-
-    // Heavy nodes
-    launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
+    namespace stream_ns = turbo_gnn::streams;
+    stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), Q.device());
+    buckets.record_all(Q, K, V, O, lse, row_ptr, col_idx, light_nodes, sched_counters);
+    stream_ns::run_buckets(
+        buckets,
+        [&](at::cuda::CUDAStream st) { launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
+        [&](at::cuda::CUDAStream st) { launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+    );
 
     CUDA_KERNEL_CHECK();
 
@@ -156,7 +164,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     bool is_directed,
     int schedule,
     int blocks_per_sm,
-    int sched_chunk
+    int sched_chunk,
+    int bucket_launch
 ) {
     TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(), "Forward CSR indices must be CUDA");
     TORCH_CHECK(row_ptr_T.is_cuda() && col_idx_T.is_cuda(), "CSR^T indices must be CUDA");
@@ -289,9 +298,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     if (is_directed) {
         // Directed path: warp-parallel bucketed backward using CSR^T
         int bucket_id      = 1;  // rows 1 and 2 of the counter slab
-        auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
+        auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
+                                 at::cuda::CUDAStream bucket_stream) {
             const int this_bucket = bucket_id++;
             if (num_nodes_bucket == 0) return;
+            at::cuda::CUDAStreamGuard guard(bucket_stream);
+            auto cuda_stream = bucket_stream;
 
             const int gx = sched_ns::persistent_grid_x(SK_KIND, num_nodes_bucket, blocks_per_sm, static_cast<int>(H), sched_chunk);
             at::Tensor offs;
@@ -341,11 +353,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
             );
         };
 
-        // Light nodes
-        launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block));
-
-        // Heavy nodes
-        launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block));
+        namespace stream_ns = turbo_gnn::streams;
+        stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), Q.device());
+        buckets.record_all(Q, K, V, O, dO, logsumexp, row_ptr_T, col_idx_T, light_nodes, sched_counters);
+        stream_ns::run_buckets(
+            buckets,
+            [&](at::cuda::CUDAStream st) { launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
+            [&](at::cuda::CUDAStream st) { launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+        );
     } else {
         // Undirected path: forward CSR, no atomics, no bucketing
         std::visit(

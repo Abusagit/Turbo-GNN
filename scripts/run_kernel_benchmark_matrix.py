@@ -52,6 +52,7 @@ GRAPHS = [
 CONVS = ["min_aggr", "gat_v2", "gt"]
 SCHEDULES = ["one_per_block", "grid_stride", "precomputed", "dynamic"]
 ORDERS = "natural,degree,locality"
+BUCKET_LAUNCHES = ["sequential"]
 
 
 def free_gpus(count: int) -> list[int]:
@@ -67,9 +68,9 @@ def free_gpus(count: int) -> list[int]:
 
 
 def run_one(
-    gpu: int, graph: str, cfg: str, conv: str, dim: int, mode: str, sched: str, out_dir: Path, args
+    gpu: int, graph: str, cfg: str, conv: str, dim: int, mode: str, sched: str, bl: str, out_dir: Path, args
 ) -> tuple[str, bool, str]:
-    tag = f"{graph}__{conv}__d{dim}__{mode}__{sched}"
+    tag = f"{graph}__{conv}__d{dim}__{mode}__{sched}__{bl}"
     dest = out_dir / f"{tag}.json"
     if dest.exists() and not args.force:
         return tag, True, "cached"
@@ -93,6 +94,10 @@ def run_one(
         f"node_order={ORDERS}",
         "-K",
         f"schedule={sched}",
+        "-K",
+        f"forward_bucket_launch={bl}",
+        "-K",
+        f"backward_bucket_launch={bl}",
         "--iters",
         str(args.iters),
         "--warmup",
@@ -120,6 +125,14 @@ def main() -> int:
     p.add_argument("--iters", type=int, default=100, help="timed budget in ms (benchmark_kernels default)")
     p.add_argument("--warmup", type=int, default=20, help="warmup budget in ms")
     p.add_argument("--timeout", type=int, default=3600, help="per-run timeout in seconds")
+    p.add_argument("--schedules", nargs="+", default=SCHEDULES, help="node->block policies to try")
+    p.add_argument(
+        "--bucket-launch",
+        nargs="+",
+        default=BUCKET_LAUNCHES,
+        choices=["sequential", "concurrent"],
+        help="how the light/heavy bucket kernels are launched relative to each other",
+    )
     p.add_argument("--force", action="store_true", help="re-run configurations already on disk")
     args = p.parse_args()
 
@@ -137,8 +150,9 @@ def main() -> int:
         for conv in args.conv:
             for dim in args.head_dims:
                 for mode in args.modes:
-                    for sched in SCHEDULES:
-                        jobs[gpu].append((graph, by_graph[graph], conv, dim, mode, sched))
+                    for sched in args.schedules:
+                        for bl in args.bucket_launch:
+                            jobs[gpu].append((graph, by_graph[graph], conv, dim, mode, sched, bl))
 
     total = sum(len(v) for v in jobs.values())
     print(f"{total} runs ({len(ORDERS.split(','))} node orders swept inside each)", flush=True)
@@ -146,11 +160,11 @@ def main() -> int:
 
     def worker(gpu: int) -> None:
         nonlocal done, failed
-        for graph, cfg, conv, dim, mode, sched in jobs[gpu]:
+        for graph, cfg, conv, dim, mode, sched, bl in jobs[gpu]:
             try:
-                tag, ok, note = run_one(gpu, graph, cfg, conv, dim, mode, sched, out_dir, args)
+                tag, ok, note = run_one(gpu, graph, cfg, conv, dim, mode, sched, bl, out_dir, args)
             except subprocess.TimeoutExpired:
-                tag, ok, note = f"{graph}__{conv}__d{dim}__{mode}__{sched}", False, "timeout"
+                tag, ok, note = f"{graph}__{conv}__d{dim}__{mode}__{sched}__{bl}", False, "timeout"
             done += 1
             if not ok:
                 failed += 1
