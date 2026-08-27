@@ -95,8 +95,17 @@ def parse_args() -> argparse.Namespace:
         "--pipeline-stages",
         type=int,
         default=0,
-        help="Async-copy pipeline stage count for CUDA GATv2 (0 disables the pipeline).",
+        help="Async-copy pipeline stage count for CUDA GATv2 (0 disables the pipeline). "
+        "Ignored when --autotune is set.",
     )
+    p.add_argument(
+        "--autotune",
+        action="store_true",
+        help="Autotune kernel/graph params (incl. pipeline_stages) via grid search "
+        "instead of using --pipeline-stages manually.",
+    )
+    p.add_argument("--autotune-warmup", type=int, default=5, help="Warmup iters for each autotune grid-search trial.")
+    p.add_argument("--autotune-iters", type=int, default=15, help="Timed iters for each autotune grid-search trial.")
     return p.parse_args()
 
 
@@ -177,8 +186,23 @@ def main() -> int:
         conv = backend.create_conv(args.layer, feature_dim=args.feature_dim, heads=args.heads)
 
     conv = conv.to(device)
+    autotuned_config: dict = {}
     if args.layer == "gat_v2" and args.backend == "cuda":
-        conv.configure(forward_pipeline_stages=args.pipeline_stages)
+        if args.autotune:
+            from turbo_gnn._autotune import AutotuneConfig
+
+            tune_cfg = AutotuneConfig(
+                warmup=args.autotune_warmup,
+                iters=args.autotune_iters,
+                tune_backward=(args.mode == "backward"),
+                cache_dir=None,
+            )
+            autotuned_config = conv.autotune(x, sample, config=tune_cfg)
+            # graph_repr may have been rebuilt if a graph param (e.g. the light/heavy
+            # partition threshold) was retuned -- re-fetch after autotune().
+            graph = sample.graph_repr
+        else:
+            conv.configure(forward_pipeline_stages=args.pipeline_stages)
 
     # measure function
     amp_dtype = None
@@ -226,7 +250,9 @@ def main() -> int:
         "head_dim": head_dim,
         "amp": args.amp,
         "mode": args.mode,
-        "pipeline_stages": args.pipeline_stages,
+        "autotuned": args.autotune,
+        "autotuned_config": autotuned_config,
+        "pipeline_stages": autotuned_config.get("forward_pipeline_stages", args.pipeline_stages),
         "kernel_params": _collect_kernel_params(conv),
         "iters": res.iters,
         "ms_per_iter": res.ms_per_iter,

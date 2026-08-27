@@ -229,8 +229,12 @@ def _grid_search(
                     logger.debug("Trial %d/%d: %s -> %.3f ms (cached)", trial, total_trials, combined_cfg, ms)
 
             if ms is None:
-                bench_fn = make_bench_fn(target, x, graph_repr)
-                result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
+                try:
+                    bench_fn = make_bench_fn(target, x, graph_repr)
+                    result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
+                except RuntimeError as exc:
+                    logger.debug("Trial %d/%d: %s -> invalid config (%s)", trial, total_trials, combined_cfg, exc)
+                    continue
                 ms = result.ms_per_iter
                 logger.debug("Trial %d/%d: %s -> %.3f ms", trial, total_trials, combined_cfg, ms)
 

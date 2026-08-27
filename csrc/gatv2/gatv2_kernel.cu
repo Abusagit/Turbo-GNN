@@ -211,6 +211,27 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 // l_sh + r_dbuf (STAGES == 0 makes this term vanish) + W * D float + 2 * W float
                 size_t shmem = DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
+                // Above the 48 KiB static default, the kernel must opt in to a larger
+                // dynamic shared memory allocation (large heavy_warps combined with a
+                // deep pipeline can exceed it, e.g. W=32, STAGES=4, D=128 needs ~81 KiB).
+                constexpr size_t kStaticShmemLimit = 48 * 1024;
+                if (shmem > kStaticShmemLimit) {
+                    int device = 0;
+                    CUDA_CHECK(cudaGetDevice(&device));
+                    int max_shmem_optin = 0;
+                    CUDA_CHECK(cudaDeviceGetAttribute(&max_shmem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+                    TORCH_CHECK(
+                        shmem <= static_cast<size_t>(max_shmem_optin),
+                        "GATv2 forward: requested shared memory (", shmem, " bytes) exceeds this GPU's max "
+                        "opt-in shared memory per block (", max_shmem_optin, " bytes) for warps_per_block=", W,
+                        ", pipeline_stages=", STAGES, ", head_dim=", DC, ". Reduce warps_per_block or pipeline_stages."
+                    );
+                    CUDA_CHECK(cudaFuncSetAttribute(
+                        GATv2Forward_Kernel<W, DC, cuda_t, index_t, float, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(shmem)
+                    ));
+                }
+
                 dim3 blocks(num_nodes_bucket, H);
                 dim3 threads(W * kWarpSize);
 
