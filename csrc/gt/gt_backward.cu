@@ -492,3 +492,246 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
         process_node(static_cast<int>(sched.node(work)));
     }
 }
+
+// ================================================================================================
+// Split-K heavy path for the directed backward.
+//
+// One block per fixed-size slice of one destination node's incoming edge list, mirroring the
+// forward split in csrc/gt/gt_forward.cu. The backward is simpler to split than the forward:
+// `alpha` is recomputed from the saved logsumexp rather than tracked online, so a slice's dQ and
+// dV contributions are plain sums over its own edges and the merge is elementwise addition --
+// no rescaling, no max to reconcile.
+//
+// dK needs nothing at all. It is already scattered with atomicAdd to arbitrary source nodes, so
+// splitting the destination's edge list across blocks changes only which block issues which
+// atomic, which the accumulation is indifferent to.
+// ================================================================================================
+
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_slice_kernel_D(
+    int64_t N, int64_t H,
+    index_t const *const __restrict__ row_ptr_T,
+    index_t const *const __restrict__ col_idx_T,
+    index_t const *const __restrict__ heavy_nodes,
+    int const *const __restrict__ chunk_node,
+    int const *const __restrict__ chunk_start,
+    int slice_size, int num_slices,
+    cuda_t const *const __restrict__ Q,
+    cuda_t const *const __restrict__ K,
+    cuda_t const *const __restrict__ V,
+    int64_t stride_q_n, int64_t stride_q_h, int64_t stride_k_n, int64_t stride_k_h, int64_t stride_v_n, int64_t stride_v_h,
+    cuda_t const *const __restrict__ dO,
+    accum_t const *const __restrict__ logsumexp,
+    accum_t const *const __restrict__ Delta,
+    accum_t scale,
+    accum_t *const __restrict__ part_gq,
+    accum_t *const __restrict__ part_gv,
+    accum_t *const __restrict__ dK
+) {
+    static_assert(D_CONST % 4 == 0, "D_CONST must be divisible by 4");
+
+    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
+    constexpr int TW    = TW_SELECTOR::value;
+    constexpr int TILES = (D_CONST + TW - 1) / TW;
+
+    using AccumOps = AdOps<accum_t>;
+    using Tile     = TileOps<TW, cuda_t, accum_t>;
+
+    const int slice_id = blockIdx.x;
+    const int head_h   = blockIdx.y;
+    if (slice_id >= num_slices || head_h >= H) [[unlikely]] {
+        return;
+    }
+
+    const int warp_id = threadIdx.x / kWarpSize;
+    const int lane    = threadIdx.x % kWarpSize;
+
+    const int slot   = chunk_node[slice_id];
+    const int node_j = static_cast<int>(heavy_nodes[slot]);
+    if (node_j >= N) [[unlikely]] {
+        return;
+    }
+
+    const index_t edge_start = row_ptr_T[node_j];
+    const int num_incoming   = static_cast<int>(row_ptr_T[node_j + 1] - edge_start);
+
+    const int local_start = chunk_start[slice_id];
+    const int local_end   = min(local_start + slice_size, num_incoming);
+
+    const size_t part_off = (static_cast<size_t>(slice_id) * H + head_h) * D_CONST;
+
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *qj_shared = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *vj_shared = qj_shared + D_CONST;
+    accum_t *warp_gq  = reinterpret_cast<accum_t *>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
+    accum_t *warp_gv  = warp_gq + WARPS_PER_BLOCK * D_CONST;
+    accum_t *my_gq    = warp_gq + warp_id * D_CONST;
+    accum_t *my_gv    = warp_gv + warp_id * D_CONST;
+
+    if (local_start >= local_end) [[unlikely]] {
+        if (warp_id == 0) {
+            for (int f = lane; f < D_CONST; f += kWarpSize) {
+                part_gq[part_off + f] = accum_t{};
+                part_gv[part_off + f] = accum_t{};
+            }
+        }
+        return;
+    }
+
+    {
+        constexpr int ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);
+        constexpr int NUM_LOADS    = D_CONST / ELEMS_PER_F4;
+        float4 const *const qj_src = reinterpret_cast<const float4 *>(Q + node_j * stride_q_n + head_h * stride_q_h);
+        float4 const *const vj_src = reinterpret_cast<const float4 *>(V + node_j * stride_v_n + head_h * stride_v_h);
+        float4 *const qj_sh_f4     = reinterpret_cast<float4 *>(qj_shared);
+        float4 *const vj_sh_f4     = reinterpret_cast<float4 *>(vj_shared);
+        for (int i = threadIdx.x; i < NUM_LOADS; i += WARPS_PER_BLOCK * kWarpSize) {
+            qj_sh_f4[i] = qj_src[i];
+            vj_sh_f4[i] = vj_src[i];
+        }
+    }
+    {
+        constexpr int NUM_F4   = D_CONST / 4;
+        float4 *const my_gq_f4 = reinterpret_cast<float4 *>(my_gq);
+        float4 *const my_gv_f4 = reinterpret_cast<float4 *>(my_gv);
+        for (int i = lane; i < NUM_F4; i += kWarpSize) {
+            my_gq_f4[i] = {0.0f, 0.0f, 0.0f, 0.0f};
+            my_gv_f4[i] = {0.0f, 0.0f, 0.0f, 0.0f};
+        }
+    }
+    __syncthreads();
+
+    // Warps stride over this slice's incoming edges only.
+    for (int e = local_start + warp_id; e < local_end; e += WARPS_PER_BLOCK) {
+        index_t node_i = 0;
+        if (lane == 0) {
+            node_i = __ldg(&col_idx_T[edge_start + e]);
+        }
+        node_i = __shfl_sync(FULL_WARP_MASK, node_i, 0);
+        if (node_i >= N) [[unlikely]] {
+            continue;
+        }
+
+        cuda_t const *ki_base  = K + node_i * stride_k_n + head_h * stride_k_h;
+        const size_t out_ih    = static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
+        cuda_t const *dOi_base = dO + out_ih;
+
+        accum_t dot_kq{};
+        accum_t dP_ij{};
+        for (int fv = lane; fv < TILES; fv += kWarpSize) {
+            const typename Tile::vec_t ki  = Tile::read(ki_base, fv);
+            const typename Tile::vec_t qj  = Tile::read(qj_shared, fv);
+            const typename Tile::vec_t vj  = Tile::read(vj_shared, fv);
+            const typename Tile::vec_t dOi = Tile::read(dOi_base, fv);
+            ki.dot_product_(&dot_kq, qj);
+            dOi.dot_product_(&dP_ij, vj);
+        }
+        dot_kq = warp_reduce_sum(dot_kq);
+        dP_ij  = warp_reduce_sum(dP_ij);
+
+        const accum_t score = dot_kq * scale;
+
+        accum_t L_i{}, Delta_i{};
+        if (lane == 0) {
+            const size_t idx_ih = static_cast<size_t>(node_i) * static_cast<size_t>(H) + static_cast<size_t>(head_h);
+            L_i                 = __ldg(&logsumexp[idx_ih]);
+            Delta_i             = __ldg(&Delta[idx_ih]);
+        }
+        L_i     = __shfl_sync(FULL_WARP_MASK, L_i, 0);
+        Delta_i = __shfl_sync(FULL_WARP_MASK, Delta_i, 0);
+
+        const accum_t alpha     = AccumOps::exp(score - L_i);
+        const accum_t dS        = alpha * (dP_ij - Delta_i);
+        const accum_t dS_scaled = dS * scale;
+
+        accum_t *const dK_i_base = dK + out_ih;
+        for (int fv = lane; fv < TILES; fv += kWarpSize) {
+            const int base_f               = fv * TW;
+            const typename Tile::vec_t ki  = Tile::read(ki_base, fv);
+            const typename Tile::vec_t dOi = Tile::read(dOi_base, fv);
+            const typename Tile::vec_t qj  = Tile::read(qj_shared, fv);
+
+            dOi.weighted_accum_(&my_gv[base_f], alpha);
+            ki.weighted_accum_(&my_gq[base_f], dS_scaled);
+            Tile::atomic_add_scaled_f32(dK_i_base, base_f, dS_scaled, qj);
+        }
+    }
+
+    __syncthreads();
+
+    // Cross-warp sum into this slice's partial. Plain addition -- no softmax state to reconcile.
+    if (warp_id == 0) {
+        for (int f = lane; f < D_CONST; f += kWarpSize) {
+            accum_t gq{}, gv{};
+#pragma unroll
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
+                gq += warp_gq[w * D_CONST + f];
+                gv += warp_gv[w * D_CONST + f];
+            }
+            part_gq[part_off + f] = gq;
+            part_gv[part_off + f] = gv;
+        }
+    }
+}
+
+/// Sum every slice's dQ/dV partials into one heavy node's gradient rows.
+/// Grid (num_heavy, H), one warp per block.
+template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(kWarpSize) graph_attn_backward_merge_slices_D(
+    int64_t H,
+    index_t const *const __restrict__ row_ptr_T,
+    index_t const *const __restrict__ heavy_nodes,
+    int const *const __restrict__ node_chunk_offset,
+    accum_t const *const __restrict__ part_gq,
+    accum_t const *const __restrict__ part_gv,
+    cuda_t *const __restrict__ dQ,
+    cuda_t *const __restrict__ dV,
+    int num_heavy
+) {
+    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
+    constexpr int TW    = TW_SELECTOR::value;
+    constexpr int TILES = (D_CONST + TW - 1) / TW;
+    using Tile          = TileOps<TW, cuda_t, accum_t>;
+
+    const int slot   = blockIdx.x;
+    const int head_h = blockIdx.y;
+    if (slot >= num_heavy || head_h >= H) [[unlikely]] {
+        return;
+    }
+
+    const int lane      = threadIdx.x;
+    const int node_j    = static_cast<int>(heavy_nodes[slot]);
+    const size_t out_jh = (static_cast<size_t>(node_j) * H + head_h) * D_CONST;
+
+    // Isolated nodes take the same path as the in-place kernel: zeroed dQ and dV rows.
+    if (row_ptr_T[node_j + 1] == row_ptr_T[node_j]) [[unlikely]] {
+        for (int fv = lane; fv < TILES; fv += kWarpSize) {
+            Tile::write_zero(dQ + out_jh, fv);
+            Tile::write_zero(dV + out_jh, fv);
+        }
+        return;
+    }
+
+    const int lo = node_chunk_offset[slot];
+    const int hi = node_chunk_offset[slot + 1];
+
+    for (int fv = lane; fv < TILES; fv += kWarpSize) {
+        accum_t gq[TW];
+        accum_t gv[TW];
+#pragma unroll
+        for (int ep = 0; ep < TW; ++ep) {
+            gq[ep] = accum_t{};
+            gv[ep] = accum_t{};
+        }
+        for (int s = lo; s < hi; ++s) {
+            const size_t off = (static_cast<size_t>(s) * H + head_h) * D_CONST + fv * TW;
+#pragma unroll
+            for (int ep = 0; ep < TW; ++ep) {
+                gq[ep] += part_gq[off + ep];
+                gv[ep] += part_gv[off + ep];
+            }
+        }
+        Tile::write_convert_from_accum(&dQ[out_jh + fv * TW], gq);
+        Tile::write_convert_from_accum(&dV[out_jh + fv * TW], gv);
+    }
+}

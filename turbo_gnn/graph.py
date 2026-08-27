@@ -8,6 +8,16 @@ from typing import Optional
 import torch
 
 
+@dataclass(frozen=True)
+class EdgeSliceTable:
+    """One thread block per slice of one heavy node's edge list. See `heavy_edge_slices`."""
+
+    chunk_node: torch.Tensor  # [num_slices] int32, heavy-bucket slot (compacted, not node id)
+    chunk_start: torch.Tensor  # [num_slices] int32, edge offset within that node's CSR row
+    node_chunk_offset: torch.Tensor  # [num_heavy + 1] int32, prefix sum of slices per node
+    num_slices: int
+
+
 def _bucket_nodes_by_degree(
     degree_counts: torch.Tensor,
     quantile: float,
@@ -121,6 +131,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         ]:
             assert t.dtype == idx_dtype, f"{name} dtype {t.dtype} doesn't match forward_indptr dtype {idx_dtype}"
         self.index_dtype = idx_dtype
+        self._edge_slice_cache: dict[tuple[str, int], EdgeSliceTable] = {}
 
         indptr = self._to_signed_view(self.forward_indptr)
         degrees = indptr[1:] - indptr[:-1]
@@ -159,6 +170,65 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     @property
     def device(self) -> torch.device:
         return self._device
+
+    def heavy_edge_slices(self, direction: str, slice_size: int) -> EdgeSliceTable:
+        """Map each thread block to one slice of one heavy node's edge list.
+
+        The heavy bucket is assigned one block per node today, so a graph with 1,715 heavy nodes
+        launches 1,715 blocks whose runtimes differ by the degree spread -- tiny grid, extreme
+        imbalance. Splitting the bucket's edges into fixed-size slices instead gives a block per
+        slice: balanced, and as many blocks as the work actually warrants.
+
+        A slice never spans two nodes, so a node whose degree is not a multiple of `slice_size`
+        simply ends with one short slice, and the per-slice partial results stay independently
+        mergeable. Nodes with no edges keep exactly one (empty) slice so the merge still sees
+        them and writes their identity result.
+
+        Returns `chunk_node` (heavy-bucket slot per slice, i.e. the compacted position used to
+        index partial buffers -- not the node id), `chunk_start` (edge offset within that node's
+        CSR row) and `node_chunk_offset` (prefix sum over slices per node, so the merge kernel
+        can find one node's slices).
+
+        Cached per (direction, slice_size): building it costs a device->host sync for the total
+        slice count, which must not be paid on every launch.
+        """
+        key = (direction, int(slice_size))
+        cached = self._edge_slice_cache.get(key)
+        if cached is not None:
+            return cached
+        if slice_size <= 0:
+            raise ValueError(f"slice_size must be positive, got {slice_size}")
+
+        indptr = self._to_signed_view(getattr(self, f"{direction}_indptr"))
+        heavy = getattr(self, f"{direction}_heavy_nodes")
+        dev = indptr.device
+        num_heavy = int(heavy.numel())
+
+        if num_heavy == 0:
+            empty = torch.empty(0, dtype=torch.int32, device=dev)
+            table = EdgeSliceTable(empty, empty, torch.zeros(1, dtype=torch.int32, device=dev), 0)
+            self._edge_slice_cache[key] = table
+            return table
+
+        deg = (indptr[1:] - indptr[:-1]).index_select(0, heavy.to(torch.int64))
+        # clamp so a degree-0 heavy node still gets one empty slice rather than vanishing
+        counts = torch.div(deg + slice_size - 1, slice_size, rounding_mode="floor").clamp(min=1)
+
+        offset = torch.zeros(num_heavy + 1, dtype=torch.int64, device=dev)
+        torch.cumsum(counts, 0, out=offset[1:])
+        num_slices = int(offset[-1])  # the one sync; cached with the table
+
+        chunk_node = torch.repeat_interleave(torch.arange(num_heavy, dtype=torch.int64, device=dev), counts)
+        chunk_start = (torch.arange(num_slices, dtype=torch.int64, device=dev) - offset[chunk_node]) * slice_size
+
+        table = EdgeSliceTable(
+            chunk_node.to(torch.int32).contiguous(),
+            chunk_start.to(torch.int32).contiguous(),
+            offset.to(torch.int32).contiguous(),
+            num_slices,
+        )
+        self._edge_slice_cache[key] = table
+        return table
 
     def sorted_by_degree(self) -> AdjacencyForwardBackwardWithNodeBuckets:
         """New instance whose light/heavy buckets are ordered by descending degree.
@@ -296,6 +366,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         )
 
     def to(self, device) -> AdjacencyForwardBackwardWithNodeBuckets:
+        self._edge_slice_cache = {}
         self.forward_indptr = self.forward_indptr.to(device)
         self.forward_indices = self.forward_indices.to(device)
         if self.is_directed:

@@ -229,6 +229,117 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     }
 }
 
+// Edge-sliced heavy kernel: one block per fixed-size run of one heavy node's edges.
+//
+// The kernel above launches a rectangular (num_heavy, ceil(max_degree / EDGES_PER_BLOCK)) grid,
+// sizing every node's chunk count from the *global* maximum degree. On a graph whose hub has
+// degree 17,482, a degree-40 node still gets ~136 blocks, all of which start, read row_ptr and
+// immediately return. That waste is issue (c) in KERNEL_ISSUES.md.
+//
+// Here the host precomputes a slice table, so the grid is exactly the number of non-empty
+// slices and every block has work. The slice size is a runtime value rather than a template
+// parameter -- the bounds come from the table, so it never appears in the kernel and costs no
+// extra instantiations.
+//
+// The merge is unchanged: partial results still fold into `packed` through the same 64-bit
+// atomicMin/atomicMax, which is order-independent, so slicing the edge list differently cannot
+// change the answer.
+template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_slice_kernel(
+    index_t const *const __restrict__ heavy_nodes_indices,
+    index_t const *const __restrict__ edge_ptr,
+    index_t const *const __restrict__ edge_idx,
+    cuda_t const *const __restrict__ X,
+    int const *const __restrict__ chunk_node,
+    int const *const __restrict__ chunk_start,
+    int slice_size,
+    int num_slices,
+    uint64_t *const __restrict__ packed,
+    size_t d
+) {
+    static_assert(sizeof(index_t) <= 4, "Packed heavy kernel only supports 32-bit index types");
+    using ROps     = ReductionOps<Op>;
+    using Sentinel = IndexSentinel<index_t>;
+    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
+    using Tile          = TileOps<TW, cuda_t>;
+
+    const int slice_id = blockIdx.x;
+    if (slice_id >= num_slices) [[unlikely]] {
+        return;
+    }
+
+    const size_t node_idx = static_cast<size_t>(chunk_node[slice_id]);
+    const index_t v       = heavy_nodes_indices[node_idx];
+
+    const index_t row_start = edge_ptr[v];
+    const index_t row_end   = edge_ptr[v + 1];
+
+    const index_t chunk_start_abs = row_start + static_cast<index_t>(chunk_start[slice_id]);
+    const index_t chunk_end_cand  = chunk_start_abs + static_cast<index_t>(slice_size);
+    const index_t chunk_end       = (chunk_end_cand < row_end) ? chunk_end_cand : row_end;
+    if (chunk_start_abs >= chunk_end) [[unlikely]] {
+        return;
+    }
+
+    const size_t tid           = threadIdx.x;
+    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
+    const cuda_t identity_val  = static_cast<cuda_t>(ROps::IDENTITY);
+    const size_t d_vec         = d / TW;
+
+    for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
+        const size_t base_f = fv * TW;
+
+        cuda_t best_vals[TW];
+        index_t best_srcs[TW];
+#pragma unroll
+        for (size_t e = 0; e < TW; ++e) {
+            best_vals[e] = identity_val;
+            best_srcs[e] = Sentinel::INVALID;
+        }
+
+        for (index_t eid = chunk_start_abs; eid < chunk_end; ++eid) {
+            const index_t src              = edge_idx[eid];
+            const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+#pragma unroll
+            for (size_t e = 0; e < TW; ++e) {
+                const cuda_t v_e = val[e];
+                if (ROps::is_better(v_e, best_vals[e])) {
+                    best_vals[e] = v_e;
+                    best_srcs[e] = src;
+                }
+            }
+        }
+
+#pragma unroll
+        for (size_t e = 0; e < TW; ++e) {
+            if (Sentinel::is_valid(best_srcs[e])) {
+                const uint64_t new_val = pack_val_idx(static_cast<accum_t>(best_vals[e]), static_cast<size_t>(best_srcs[e]));
+                ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
+            }
+        }
+    }
+
+    // Scalar tail for d % TW != 0 (compiles away for TW == 1)
+    if (d % TW != 0 && tid == 0) {
+        for (size_t f = d_vec * TW; f < d; ++f) {
+            cuda_t local_best = identity_val;
+            index_t local_arg = Sentinel::INVALID;
+            for (index_t eid = chunk_start_abs; eid < chunk_end; ++eid) {
+                const index_t src = edge_idx[eid];
+                const cuda_t val  = X[static_cast<size_t>(src) * d + f];
+                if (ROps::is_better(val, local_best)) {
+                    local_best = val;
+                    local_arg  = src;
+                }
+            }
+            if (Sentinel::is_valid(local_arg)) {
+                const uint64_t new_val = pack_val_idx(static_cast<accum_t>(local_best), static_cast<size_t>(local_arg));
+                ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
+            }
+        }
+    }
+}
+
 // unpack results back to separate arrays (32-bit indices only, pairs with heavy kernel)
 template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_kernel(
@@ -499,7 +610,10 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     int schedule,
     int blocks_per_sm,
     int sched_chunk,
-    int bucket_launch
+    int bucket_launch,
+    const at::Tensor& chunk_node,
+    const at::Tensor& chunk_start,
+    int heavy_edge_slice
 ) {
     using ROps = ReductionOps<Op>;
     namespace sched_ns             = turbo_gnn::sched;
@@ -639,6 +753,33 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             {num_heavy, d}, static_cast<int64_t>(PACKED_INIT), at::TensorOptions().dtype(torch::kInt64).device(X.device())
                         );
 
+                        if (heavy_edge_slice > 0) {
+                            // Flat grid: one block per non-empty slice, from the host-side table.
+                            const int num_slices = static_cast<int>(chunk_node.numel());
+                            if (num_slices > 0) {
+                                std::visit(
+                                    [&](auto warps_const) {
+                                        constexpr int WARPS_PER_BLOCK   = warps_const.value;
+                                        constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+                                        reduction_aggr_forward_heavy_slice_kernel<WARPS_PER_BLOCK, cuda_t, Op, index_t>
+                                            <<<num_slices, THREADS_PER_BLOCK>>>(
+                                                index_ptr<index_t>(heavy_nodes),
+                                                index_ptr<index_t>(edge_ptr),
+                                                index_ptr<index_t>(edge_idx),
+                                                X_ptr,
+                                                chunk_node.data_ptr<int>(),
+                                                chunk_start.data_ptr<int>(),
+                                                heavy_edge_slice,
+                                                num_slices,
+                                                reinterpret_cast<uint64_t *>(packed.template data_ptr<int64_t>()),
+                                                d
+                                            );
+                                    },
+                                    MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+                                );
+                            }
+                        } else {
                         std::visit(
                             [&](auto edges_const, auto warps_const) {
                                 constexpr int EDGES_PER_BLOCK   = edges_const.value;
@@ -660,6 +801,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
                             MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
                         );
+                        }
 
                         std::visit(
                             [&](auto warps_const) {
@@ -747,17 +889,22 @@ void reduction_aggr_forward_partitioned_cuda(
     int schedule,
     int blocks_per_sm,
     int sched_chunk,
-    int bucket_launch
+    int bucket_launch,
+    const at::Tensor& chunk_node,
+    const at::Tensor& chunk_start,
+    int heavy_edge_slice
 ) {
     if (reduce == "min") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MIN>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch
+            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch, chunk_node,
+            chunk_start, heavy_edge_slice
         );
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch
+            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch, chunk_node,
+            chunk_start, heavy_edge_slice
         );
     } else {
         TORCH_CHECK(false, "Unsupported reduce: " + reduce);

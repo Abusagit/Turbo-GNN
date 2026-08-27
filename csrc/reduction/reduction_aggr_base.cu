@@ -23,7 +23,10 @@ void reduction_aggr_forward_partitioned_cuda(
     int schedule                    = 3,
     int blocks_per_sm               = 8,
     int sched_chunk                 = 1,
-    int bucket_launch               = 0
+    int bucket_launch               = 0,
+    const at::Tensor& chunk_node    = at::Tensor(),
+    const at::Tensor& chunk_start   = at::Tensor(),
+    int heavy_edge_slice            = 0
 );
 
 at::Tensor reduction_aggr_backward_torch(
@@ -64,7 +67,10 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int schedule                    = 3,
     int blocks_per_sm               = 8,
     int sched_chunk                 = 1,
-    int bucket_launch               = 0
+    int bucket_launch               = 0,
+    at::Tensor chunk_node           = at::Tensor(),
+    at::Tensor chunk_start          = at::Tensor(),
+    int heavy_edge_slice            = 0
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
@@ -112,7 +118,10 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
         schedule,
         blocks_per_sm,
         sched_chunk,
-        bucket_launch
+        bucket_launch,
+        chunk_node,
+        chunk_start,
+        heavy_edge_slice
     );
     return {out, arg_idx};
 }

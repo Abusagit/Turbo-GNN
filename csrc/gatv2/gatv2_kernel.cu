@@ -169,7 +169,11 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     int schedule,
     int blocks_per_sm,
     int sched_chunk,
-    int bucket_launch
+    int bucket_launch,
+    torch::Tensor chunk_node,
+    torch::Tensor chunk_start,
+    torch::Tensor node_chunk_offset,
+    int heavy_edge_slice
 ) {
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
     TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
@@ -285,10 +289,64 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     namespace stream_ns = turbo_gnn::streams;
     stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), l.device());
     buckets.record_all(l, r, row_ptr, col_idx, attn_vec, h_out, logsumexp, light_nodes, sched_counters);
+
+    // Edge-parallel heavy path; see csrc/gt/graph_transformer.cu for the rationale.
+    // heavy_edge_slice == 0 keeps the node-per-block path above.
+    torch::Tensor part_o, part_ml;
+    auto launch_heavy_split = [&](at::cuda::CUDAStream bucket_stream) {
+        const int num_heavy  = static_cast<int>(heavy_nodes.numel());
+        const int num_slices = static_cast<int>(chunk_node.numel());
+        if (num_heavy == 0 || num_slices == 0) return;
+        at::cuda::CUDAStreamGuard guard(bucket_stream);
+        cudaStream_t stream = bucket_stream;
+
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(l.device());
+        part_o   = torch::empty({num_slices, (int64_t)H, (int64_t)D}, f32);
+        part_ml  = torch::empty({num_slices, (int64_t)H, 2}, f32);
+        buckets.record_all(part_o, part_ml, chunk_node, chunk_start, node_chunk_offset, heavy_nodes);
+
+        std::visit(
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+                using index_t    = typename decltype(idxInfo)::Type;
+                using torch_t    = typename decltype(typeInfo)::TorchType;
+                using cuda_t     = typename decltype(typeInfo)::CudaType;
+                constexpr int DC = decltype(d_c)::value;
+                constexpr int W  = decltype(warp_c)::value;
+
+                auto *l_ptr     = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
+                auto *r_ptr     = reinterpret_cast<const cuda_t *>(r.data_ptr<torch_t>());
+                auto *attn_ptr  = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
+                auto *h_out_ptr = reinterpret_cast<cuda_t *>(h_out.data_ptr<torch_t>());
+
+                size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+
+                GATv2ForwardSlice_Kernel<W, DC, cuda_t, index_t><<<dim3(num_slices, H), dim3(W * kWarpSize), shmem, stream>>>(
+                    N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
+                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(heavy_nodes),
+                    chunk_node.data_ptr<int>(), chunk_start.data_ptr<int>(), heavy_edge_slice, num_slices,
+                    attn_ptr, part_o.data_ptr<float>(), part_ml.data_ptr<float>(), negative_slope
+                );
+
+                GATv2MergeSlices_Kernel<DC, cuda_t, index_t><<<dim3(num_heavy, H), kWarpSize, 0, stream>>>(
+                    H, index_ptr<index_t>(row_ptr), index_ptr<index_t>(heavy_nodes), node_chunk_offset.data_ptr<int>(),
+                    part_o.data_ptr<float>(), part_ml.data_ptr<float>(), h_out_ptr, d_logsumexp, num_heavy
+                );
+            },
+            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
+            MakeIntVariant<32, 64, 128, 256>((int)D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block)
+        );
+    };
+
     stream_ns::run_buckets(
         buckets,
         [&](at::cuda::CUDAStream st) { launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
-        [&](at::cuda::CUDAStream st) { launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+        [&](at::cuda::CUDAStream st) {
+            if (heavy_edge_slice > 0) {
+                launch_heavy_split(st);
+            } else {
+                launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st);
+            }
+        }
     );
 
     CUDA_KERNEL_CHECK();

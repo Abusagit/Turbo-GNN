@@ -261,6 +261,12 @@ _SCHEDULE_PARAMS = (
 _REDUCTION_PARAMS = (
     KernelParam("warps_per_block", int, 8, "Warps per block for the light-node atomic kernel."),
     KernelParam("edges_per_block_heavy_nodes", int, 128, "Edges per block for the heavy-node tiled kernel."),
+    KernelParam(
+        "forward_heavy_edge_slice",
+        int,
+        0,
+        "Flat edge-slice size for the heavy bucket; 0 keeps the rectangular tiled grid.",
+    ),
     KernelParam("use_2d_kernel", _parse_bool, False, "Use the 2-D tiled heavy-node kernel variant."),
     KernelParam("features_per_block", int, 32, "Feature tile size (2-D kernel only)."),
     KernelParam("tiles_y", int, 8, "Row tile count (2-D kernel only)."),
@@ -278,6 +284,12 @@ _GATV2_PARAMS = (
     KernelParam("forward_heavy_warps", int, 8, "Warps per block, forward heavy-node kernel."),
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),
     KernelParam("backward_heavy_warps", int, 8, "Warps per block, backward heavy-node kernel."),
+    KernelParam(
+        "forward_heavy_edge_slice",
+        int,
+        0,
+        "Edges per block in the forward heavy bucket; 0 keeps one block per heavy node.",
+    ),
 ) + _SCHEDULE_PARAMS
 
 _GT_PARAMS = (
@@ -286,6 +298,18 @@ _GT_PARAMS = (
     KernelParam("forward_heavy_warps", int, 8, "Warps per block, forward heavy-node kernel."),
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),
     KernelParam("backward_heavy_warps", int, 8, "Warps per block, backward heavy-node kernel."),
+    KernelParam(
+        "forward_heavy_edge_slice",
+        int,
+        0,
+        "Edges per block in the forward heavy bucket; 0 keeps one block per heavy node.",
+    ),
+    KernelParam(
+        "backward_heavy_edge_slice",
+        int,
+        0,
+        "Edges per block in the backward heavy bucket; 0 keeps one block per heavy node.",
+    ),
 ) + _SCHEDULE_PARAMS
 
 CUDA_CONV_PARAMS: dict[str, tuple[KernelParam, ...]] = {

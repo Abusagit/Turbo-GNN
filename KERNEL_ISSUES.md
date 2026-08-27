@@ -5,9 +5,10 @@ for the templated scheduler. All pre-date that work; this file records them so t
 work does not get blamed for pre-existing behaviour, and so they can be triaged on their own
 merits.
 
-**(a) has since been fixed** — it stopped being latent the moment the persistent loop landed
-and became a hard deadlock, so it had to be. **(b) through (e) are documented only, not
-fixed.**
+**(a), (d) and (f) have since been fixed** — (a) stopped being latent the moment the persistent loop
+landed and became a hard deadlock; (d) became load-bearing when the light and heavy buckets
+started launching on separate streams; (f) was a one-line fence with no performance cost.
+**(b), (c) and (e) are documented only, not fixed.**
 
 Branch: `scheduler`, at `5a883d2`. Verified on an A100-SXM4-80GB, CUDA 13.2, PyTorch 2.13.
 
@@ -134,7 +135,7 @@ than it is.
 
 ---
 
-## (d) Two GATv2 entry points ignore the current CUDA stream — confirmed by inspection
+## (d) Two GATv2 entry points ignore the current CUDA stream — REAL, and now FIXED
 
 **Where:** `csrc/gatv2/gatv2_kernel.cu:189` and `:331`.
 
@@ -158,6 +159,11 @@ at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(Q.device().index())
 Benign while everything runs on the default stream; incorrect under a non-default stream,
 and a hazard for CUDA-graph capture or multi-stream overlap.
 
+**Fixed**, because the concurrent light/heavy bucket work made it load-bearing rather than
+theoretical: launching on stream 0 serialises against every other stream, so overlapping the
+two bucket kernels would have been a silent no-op for GATv2 while appearing to work. Both entry
+points now take `at::cuda::getCurrentCUDAStream(l.device().index())`.
+
 ---
 
 ## (e) Dead `GATv2Backward_CSR_Impl_UNUSED` has stale template arguments — confirmed by inspection
@@ -175,9 +181,148 @@ copying its call shape will write code that does not compile. Either delete it o
 
 ---
 
+## (f) Warp-synchronous shared-memory hazard in GT forward — REAL, and now FIXED
+
+**Where:** `csrc/gt/gt_forward.cu`, the cross-warp reduction at `:204-246`.
+
+Inside `if (block_neighbor_id == 0)` (warp 0 only), lane 0 rewrites the shared `neighbor_sum`
+array in place:
+
+```cpp
+if (lane_id == 0) {
+    for (size_t w = 0; w < neighbor_block_size; ++w) {
+        neighbor_sum[w] = AccumOps::exp(neighbor_max[w] - global_max);   // :217
+    }
+    ...
+}
+inv_sum = __shfl_sync(FULL_WARP_MASK, inv_sum, 0);
+...
+combined[ep] = AccumOps::fma(neighbor_sum[w], neighbor_out[...], combined[ep]);   // :240, all lanes
+```
+
+All 32 lanes then read `neighbor_sum` at `:240`. The only thing between the write and the reads
+is the `__shfl_sync`, so the code is relying on a shuffle for *memory* ordering rather than on
+`__syncwarp()`. Under Volta's independent thread scheduling that is the classic
+warp-synchronous-programming assumption the CUDA memory model no longer guarantees.
+
+`compute-sanitizer --tool racecheck` reports it: **7 errors, 39 warnings, 169,312 hazards** on a
+25-iteration GT forward workload, pointing at `gt_forward.cu:240`.
+
+**It is pre-existing, and unrelated to the scheduler or the stream work.** The reported
+instantiation is `ScheduleKind = 0` (`one_per_block`, the historical launch); `git diff
+d3033b4..HEAD -- csrc/gt/gt_forward.cu` shows none of the barrier or `neighbor_sum` logic was
+touched by either change; and the hazard is inside a single block's shared memory, which
+concurrent bucket streams cannot affect since shared memory is per-block.
+
+It has presumably been benign in practice — the results are correct on every test — because the
+write and the reads are all in warp 0 and nvcc has been keeping the lanes converged. That is the
+same kind of accident that hid finding (a) until an unrelated change removed it. The fix is one
+line: `__syncwarp()` after the `lane_id == 0` block, before the reads at `:240`.
+
+**Fixed.** `__syncwarp()` after the `lane_id == 0` block, before the reads. racecheck goes from
+169,312 hazards to **0**, register allocation is byte-identical so occupancy is unaffected, and
+768 matched GT configurations re-measured before and after show a **median of 1.0003x** — no
+performance change either way. Details in `reports/gt-syncwarp/REPORT.md`.
+
+---
+
+## (g) One unreproduced illegal memory access in the GT backward path — open
+
+**Where:** unknown. Seen once, on `ogbn-arxiv` / `gt` / head dim 128 / backward, during a
+24-configuration sweep (4 schedules x 2 bucket launches x 3 node orders) inside a single
+process:
+
+```
+CUDA warning: an illegal memory access was encountered (function ~CUDAEvent)
+```
+
+**It has not reproduced.** Re-running the identical command completed cleanly; all eight
+(schedule, bucket_launch) combinations pass individually with the same replayed kernel
+parameters; `compute-sanitizer --tool memcheck` over the whole 24-point sweep reports **0
+errors**; and 13 further cells of the same matrix have run without recurrence.
+
+Recorded rather than dismissed because an illegal access is never noise. Two candidate
+explanations, neither confirmed:
+
+* something stateful across sweep points -- each point builds a new reordered/repartitioned
+  graph while the previous point's retained autograd graph may still reference the old one;
+* a rare race in the backward path, of the same family as (f) but not yet located. (f) was
+  itself invisible to normal runs and only showed up under `racecheck`, so a second one is
+  plausible.
+
+Worth a targeted hunt if it recurs: run the sweep repeatedly under `memcheck` with
+`CUDA_LAUNCH_BLOCKING=1`, which turns an asynchronous report into one attributable to a
+specific launch.
+
+---
+
+## (h) Every convolution serialises two DRAM round-trips per edge — measured, unfixed
+
+Counter-measured profiling (`reports/roofline/`, hardware counters via `sudo ncu`) puts these
+kernels at **24% of peak HBM bandwidth forward and 29% backward**; 4 of 192 configurations reach
+90%. They are not bandwidth-bound.
+
+The cause is visible in the source. A neighbour's feature row cannot be addressed until its
+index has arrived:
+
+```cpp
+const index_t src = edge_idx[eid];                            // DRAM round-trip 1
+const auto val    = Tile::read(&X[static_cast<size_t>(src) * d], fv);  // round-trip 2, depends on src
+```
+
+`reduction_aggr.cu:56`, and the same shape at `gt_forward.cu:143-147`, where GT and GATv2
+additionally interpose a `warp_reduce_sum` shuffle chain and an online-softmax update *between*
+the two loads. Only one neighbour is ever in flight per warp.
+
+Three things this is **not**: load width is already optimal (`SelectTW`, `tile.cuh:66`, picks
+128-bit loads at both D=128 and D=256); feature rows are contiguous so coalescing is fine; and
+capacity is adequate — Little's law puts the requirement at ~10 KB in flight per SM to sustain
+1.75 TB/s at ~600 ns, which ~32 resident warps × 512 B already clears. The shortfall is **duty
+cycle**: warps spend most cycles with no request outstanding, blocked behind the index load, the
+shuffle, and barriers. That predicts ~25% of peak, and 24% is measured.
+
+A batched prefetch was written and reverted unmeasured (no free GPU at the time). It fetches a
+run of contiguous indices, then issues that batch's feature loads back-to-back so several
+overlap; comparison order is preserved within and across batches, so argmin tie-breaking stays
+bit-identical. It compiles clean. Static register cost from `nvcc --resource-usage` over the 672
+recoverable `reduction_aggr_forward_light_kernel_1d` instantiations:
+
+| prefetch depth | median REG | mean REG | mean occupancy |
+| ---: | ---: | ---: | ---: |
+| 1 (today) | 48 | 47.8 | 69.4% |
+| 2 | 48 | 49.2 | 67.2% |
+| **4** | **50** | **50.1** | **66.0%** |
+| 8 | 52 | 51.7 | 63.9% |
+
+Depth 4 buys 4x memory-level parallelism for 3.4 points of mean occupancy; depth 8 starts
+costing real occupancy. **Never benchmarked** — the trade needs measuring, not assuming.
+
+The larger follow-up is `cp.async` / `__pipeline_memcpy_async` double-buffering. `sm_80` is
+already the build target (`setup.py:189`) and async copy appears **nowhere** in `csrc/`. It
+supplies the same memory-level parallelism without consuming registers, which is the constraint
+that otherwise caps the prefetch approach — registers bind occupancy in 96% of instantiations
+(`reports/occupancy/REPORT.md`).
+
+---
+
+## (i) One-warp blocks cap occupancy at 50% structurally — confirmed by inspection
+
+The light-bucket kernels launch 32-thread blocks: `ncu` reports `GATv2Forward_Kernel` at block
+`(32,1,1)` across 167,628 blocks on ogbn-arxiv. On A100 an SM hosts at most 32 blocks, so
+32 blocks x 1 warp = **32 of 64 warps, a hard 50% ceiling** that no register tuning can lift.
+This is consistent with the occupancy audit's median of 50%, and it compounds (h): fewer
+resident warps means fewer loads in flight.
+
+Raising it requires more warps per block doing useful work. For small `d` the feature dimension
+does not supply enough parallelism for a second warp (at D=128 with TW=4 there are only 32
+vector elements), so the warps would have to come from processing **several nodes per block** —
+which the persistent scheduler already makes expressible.
+
 ## Note on evidence
 
 (a) is reproduced, understood and fixed; the write-up above keeps the wrong first assessment
 on the record because the way it was wrong is the useful part. (b) is reproduced from Python
 and fails deterministically. (c), (d) and (e) are plain readings of the source with the call
-sites enumerated.
+sites enumerated. (h) rests on counter-measured DRAM traffic plus static register counts;
+its proposed fix is explicitly unmeasured and labelled as such. (i) is read off an `ncu`
+launch record and the A100 blocks-per-SM limit.

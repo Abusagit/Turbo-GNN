@@ -67,16 +67,16 @@ def is_free(index: int, max_mib: int = 64, ignore_pids: set[int] | None = None) 
     return index in free_indices(max_mib, ignore_pids)
 
 
-def wait_until_free(index: int, timeout_s: float = 1800.0, poll_s: float = 30.0) -> bool:
+def wait_until_free(index: int, timeout_s: float = 1800.0, poll_s: float = 30.0, max_mib: int = 64) -> bool:
     """Block until `index` has no other compute process, or the timeout expires."""
     import time as _time
 
     deadline = _time.time() + timeout_s
     while _time.time() < deadline:
-        if is_free(index):
+        if is_free(index, max_mib=max_mib):
             return True
         _time.sleep(poll_s)
-    return is_free(index)
+    return is_free(index, max_mib=max_mib)
 
 
 def main() -> int:

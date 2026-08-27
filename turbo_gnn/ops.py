@@ -45,6 +45,7 @@ def reduction_aggr(
     sched_chunk: int = DEFAULT_SCHED_CHUNK,
     forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
+    forward_heavy_edge_slice: int = 0,
 ) -> torch.Tensor:
     """Element-wise min or max aggregation over incoming neighbors.
 
@@ -77,6 +78,8 @@ def reduction_aggr(
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
         receive zeros (infinities are clamped internally).
     """
+    table = graph.heavy_edge_slices("forward", forward_heavy_edge_slice) if forward_heavy_edge_slice > 0 else None
+
     return ReductionAggrFunction.apply(
         graph.forward_indptr,
         graph.forward_indices,
@@ -95,6 +98,9 @@ def reduction_aggr(
         sched_chunk,
         forward_bucket_launch,
         backward_bucket_launch,
+        forward_heavy_edge_slice,
+        table.chunk_node if table is not None else None,
+        table.chunk_start if table is not None else None,
     )
 
 
@@ -115,6 +121,7 @@ def gatv2_aggr(
     sched_chunk: int = DEFAULT_SCHED_CHUNK,
     forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
+    forward_heavy_edge_slice: int = 0,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -146,6 +153,8 @@ def gatv2_aggr(
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
     """
+    table = graph.heavy_edge_slices("forward", forward_heavy_edge_slice) if forward_heavy_edge_slice > 0 else None
+
     return gatv2_function.apply(
         graph.forward_indptr,
         graph.forward_indices,
@@ -170,6 +179,10 @@ def gatv2_aggr(
         sched_chunk,
         forward_bucket_launch,
         backward_bucket_launch,
+        forward_heavy_edge_slice,
+        table.chunk_node if table is not None else None,
+        table.chunk_start if table is not None else None,
+        table.node_chunk_offset if table is not None else None,
     )
 
 
@@ -190,6 +203,8 @@ def graph_transformer_aggr(
     sched_chunk: int = DEFAULT_SCHED_CHUNK,
     forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
+    forward_heavy_edge_slice: int = 0,
+    backward_heavy_edge_slice: int = 0,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
@@ -217,10 +232,19 @@ def graph_transformer_aggr(
             what balances heavy-tailed degree distributions.
         blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
             by ``"one_per_block"``.
+        forward_heavy_edge_slice: Edges per block in the forward heavy bucket. ``0`` keeps
+            one block per heavy node; a positive value splits each heavy node's edge list
+            into slices of that size, one block each, merged by a second kernel. Balances
+            the heavy bucket and sizes its grid by edge count rather than node count.
 
     Returns:
         Attended features, shape ``[N, H, D]``.
     """
+    table = graph.heavy_edge_slices("forward", forward_heavy_edge_slice) if forward_heavy_edge_slice > 0 else None
+    bwd_table = (
+        graph.heavy_edge_slices("backward", backward_heavy_edge_slice) if backward_heavy_edge_slice > 0 else None
+    )
+
     return _FusedGraphAttention.apply(
         graph.forward_indptr,
         graph.forward_indices,
@@ -244,6 +268,14 @@ def graph_transformer_aggr(
         sched_chunk,
         forward_bucket_launch,
         backward_bucket_launch,
+        forward_heavy_edge_slice,
+        table.chunk_node if table is not None else None,
+        table.chunk_start if table is not None else None,
+        table.node_chunk_offset if table is not None else None,
+        backward_heavy_edge_slice,
+        bwd_table.chunk_node if bwd_table is not None else None,
+        bwd_table.chunk_start if bwd_table is not None else None,
+        bwd_table.node_chunk_offset if bwd_table is not None else None,
     )
 
 

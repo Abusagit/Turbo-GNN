@@ -161,6 +161,9 @@ class ReductionAggrFunction(torch.autograd.Function):
         sched_chunk=DEFAULT_SCHED_CHUNK,
         forward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
         backward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
+        forward_heavy_edge_slice=0,
+        fwd_chunk_node=None,
+        fwd_chunk_start=None,
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
@@ -200,6 +203,9 @@ class ReductionAggrFunction(torch.autograd.Function):
             blocks_per_sm,
             sched_chunk,
             resolve_bucket_launch(forward_bucket_launch),
+            fwd_chunk_node if fwd_chunk_node is not None else _empty_i32(X.device),
+            fwd_chunk_start if fwd_chunk_start is not None else _empty_i32(X.device),
+            forward_heavy_edge_slice,
         )
         ctx.save_for_backward(arg_idx)
         ctx.num_src_nodes = X.size(0)
@@ -227,7 +233,8 @@ class ReductionAggrFunction(torch.autograd.Function):
             ctx.sched_chunk,
             ctx.bucket_launch,
         )
-        return (None, None, grad_x) + (None,) * 14
+        # 14 trailing forward args, plus the 3 carrying the heavy-node edge-slice table.
+        return (None, None, grad_x) + (None,) * 17
 
 
 class gatv2_function(torch.autograd.Function):
@@ -272,6 +279,10 @@ class gatv2_function(torch.autograd.Function):
         sched_chunk=DEFAULT_SCHED_CHUNK,
         forward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
         backward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
+        forward_heavy_edge_slice=0,
+        fwd_chunk_node=None,
+        fwd_chunk_start=None,
+        fwd_node_chunk_offset=None,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -292,6 +303,10 @@ class gatv2_function(torch.autograd.Function):
             blocks_per_sm,
             sched_chunk,
             resolve_bucket_launch(forward_bucket_launch),
+            fwd_chunk_node if fwd_chunk_node is not None else _empty_i32(x_left.device),
+            fwd_chunk_start if fwd_chunk_start is not None else _empty_i32(x_left.device),
+            fwd_node_chunk_offset if fwd_node_chunk_offset is not None else _empty_i32(x_left.device),
+            forward_heavy_edge_slice,
         )
         ctx.schedule = schedule_id
         ctx.blocks_per_sm = blocks_per_sm
@@ -373,7 +388,25 @@ class gatv2_function(torch.autograd.Function):
         )
 
         # 4 CSR tensors + 3 gradients + 13 non-Variable args = 20 total
-        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 16
+        # 16 trailing forward args, plus the 4 carrying the heavy-node edge-slice table.
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 20
+
+
+_EMPTY_I32: dict[torch.device, torch.Tensor] = {}
+
+
+def _empty_i32(device: torch.device) -> torch.Tensor:
+    """Placeholder for an unused slice table.
+
+    The C++ side takes the table by value, and `None` does not convert to a `torch::Tensor`, so
+    the node-per-block path still has to hand over something. Cached per device because it would
+    otherwise be a fresh allocation on every call.
+    """
+    t = _EMPTY_I32.get(device)
+    if t is None:
+        t = torch.empty(0, dtype=torch.int32, device=device)
+        _EMPTY_I32[device] = t
+    return t
 
 
 class _FusedGraphAttention(torch.autograd.Function):
@@ -414,9 +447,18 @@ class _FusedGraphAttention(torch.autograd.Function):
         sched_chunk=DEFAULT_SCHED_CHUNK,
         forward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
         backward_bucket_launch=DEFAULT_BUCKET_LAUNCH,
+        forward_heavy_edge_slice=0,
+        fwd_chunk_node=None,
+        fwd_chunk_start=None,
+        fwd_node_chunk_offset=None,
+        backward_heavy_edge_slice=0,
+        bwd_chunk_node=None,
+        bwd_chunk_start=None,
+        bwd_node_chunk_offset=None,
     ):
         scale = scale or 1 / (Q.shape[-1] ** 0.5)
         schedule_id = resolve_schedule(schedule)
+        empty = _empty_i32(Q.device)
         out, logsumexp = _C.gt_forward_csr_mh(
             edge_ptr,
             edge_idx,
@@ -432,6 +474,10 @@ class _FusedGraphAttention(torch.autograd.Function):
             blocks_per_sm,
             sched_chunk,
             resolve_bucket_launch(forward_bucket_launch),
+            fwd_chunk_node if fwd_chunk_node is not None else empty,
+            fwd_chunk_start if fwd_chunk_start is not None else empty,
+            fwd_node_chunk_offset if fwd_node_chunk_offset is not None else empty,
+            forward_heavy_edge_slice,
         )
 
         ctx.schedule = schedule_id
@@ -446,6 +492,11 @@ class _FusedGraphAttention(torch.autograd.Function):
         ctx.head_dim = Q.shape[2]
         ctx.backward_light_warps = backward_light_warps
         ctx.backward_heavy_warps = backward_heavy_warps
+        # The backward bucket has its own table: it slices the transpose CSR, not the forward one.
+        ctx.backward_heavy_edge_slice = backward_heavy_edge_slice
+        ctx.bwd_chunk_node = bwd_chunk_node if bwd_chunk_node is not None else empty
+        ctx.bwd_chunk_start = bwd_chunk_start if bwd_chunk_start is not None else empty
+        ctx.bwd_node_chunk_offset = bwd_node_chunk_offset if bwd_node_chunk_offset is not None else empty
         ctx.save_for_backward(
             edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp, bwd_light_nodes, bwd_heavy_nodes
         )
@@ -494,9 +545,14 @@ class _FusedGraphAttention(torch.autograd.Function):
             ctx.blocks_per_sm,
             ctx.sched_chunk,
             ctx.bucket_launch,
+            ctx.bwd_chunk_node,
+            ctx.bwd_chunk_start,
+            ctx.bwd_node_chunk_offset,
+            ctx.backward_heavy_edge_slice,
         )
 
-        return (None,) * 4 + (dQ, dK, dV) + (None,) * 15
+        # 15 trailing forward args, plus the 4 forward-table and 4 backward-table arguments.
+        return (None,) * 4 + (dQ, dK, dV) + (None,) * 23
 
 
 class _CudaSpMMConvFn(torch.autograd.Function):
