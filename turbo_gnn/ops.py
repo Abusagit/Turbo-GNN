@@ -46,6 +46,7 @@ def reduction_aggr(
     forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     forward_heavy_edge_slice: int = 0,
+    forward_heavy_slice_blocks_per_sm: float = 0.0,
 ) -> torch.Tensor:
     """Element-wise min or max aggregation over incoming neighbors.
 
@@ -78,6 +79,10 @@ def reduction_aggr(
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
         receive zeros (infinities are clamped internally).
     """
+    # An explicit edge count wins; otherwise derive it from the heavy-degree threshold.
+    forward_heavy_edge_slice = forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+        "forward", forward_heavy_slice_blocks_per_sm
+    )
     table = graph.heavy_edge_slices("forward", forward_heavy_edge_slice) if forward_heavy_edge_slice > 0 else None
 
     return ReductionAggrFunction.apply(
@@ -122,6 +127,9 @@ def gatv2_aggr(
     forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     forward_heavy_edge_slice: int = 0,
+    forward_heavy_slice_blocks_per_sm: float = 0.0,
+    backward_heavy_edge_slice: int = 0,
+    backward_heavy_slice_blocks_per_sm: float = 0.0,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -153,7 +161,16 @@ def gatv2_aggr(
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
     """
+    # An explicit edge count wins; otherwise derive it from the heavy-degree threshold.
+    forward_heavy_edge_slice = forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+        "forward", forward_heavy_slice_blocks_per_sm
+    )
     table = graph.heavy_edge_slices("forward", forward_heavy_edge_slice) if forward_heavy_edge_slice > 0 else None
+    # The undirected backward walks the forward CSR, so it slices the forward buckets too.
+    backward_heavy_edge_slice = backward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+        "forward", backward_heavy_slice_blocks_per_sm
+    )
+    bwd_table = graph.heavy_edge_slices("forward", backward_heavy_edge_slice) if backward_heavy_edge_slice > 0 else None
 
     return gatv2_function.apply(
         graph.forward_indptr,
@@ -183,6 +200,10 @@ def gatv2_aggr(
         table.chunk_node if table is not None else None,
         table.chunk_start if table is not None else None,
         table.node_chunk_offset if table is not None else None,
+        backward_heavy_edge_slice,
+        bwd_table.chunk_node if bwd_table is not None else None,
+        bwd_table.chunk_start if bwd_table is not None else None,
+        bwd_table.node_chunk_offset if bwd_table is not None else None,
     )
 
 
@@ -204,7 +225,9 @@ def graph_transformer_aggr(
     forward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     forward_heavy_edge_slice: int = 0,
+    forward_heavy_slice_blocks_per_sm: float = 0.0,
     backward_heavy_edge_slice: int = 0,
+    backward_heavy_slice_blocks_per_sm: float = 0.0,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
@@ -240,7 +263,14 @@ def graph_transformer_aggr(
     Returns:
         Attended features, shape ``[N, H, D]``.
     """
+    # An explicit edge count wins; otherwise derive it from the heavy-degree threshold.
+    forward_heavy_edge_slice = forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+        "forward", forward_heavy_slice_blocks_per_sm
+    )
     table = graph.heavy_edge_slices("forward", forward_heavy_edge_slice) if forward_heavy_edge_slice > 0 else None
+    backward_heavy_edge_slice = backward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+        "backward", backward_heavy_slice_blocks_per_sm
+    )
     bwd_table = (
         graph.heavy_edge_slices("backward", backward_heavy_edge_slice) if backward_heavy_edge_slice > 0 else None
     )

@@ -84,7 +84,11 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     int schedule              = 3,
     int blocks_per_sm         = 8,
     int sched_chunk           = 1,
-    int bucket_launch         = 0
+    int bucket_launch         = 0,
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int backward_heavy_edge_slice   = 0
 );
 
 // ============================================================================

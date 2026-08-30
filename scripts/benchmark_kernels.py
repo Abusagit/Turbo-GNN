@@ -262,6 +262,12 @@ _REDUCTION_PARAMS = (
     KernelParam("warps_per_block", int, 8, "Warps per block for the light-node atomic kernel."),
     KernelParam("edges_per_block_heavy_nodes", int, 128, "Edges per block for the heavy-node tiled kernel."),
     KernelParam(
+        "forward_heavy_slice_blocks_per_sm",
+        float,
+        0.0,
+        "Heavy slice as min_heavy_degree/divisor; 0 disables. Overridden by forward_heavy_edge_slice.",
+    ),
+    KernelParam(
         "forward_heavy_edge_slice",
         int,
         0,
@@ -285,6 +291,12 @@ _GATV2_PARAMS = (
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),
     KernelParam("backward_heavy_warps", int, 8, "Warps per block, backward heavy-node kernel."),
     KernelParam(
+        "forward_heavy_slice_blocks_per_sm",
+        float,
+        0.0,
+        "Heavy slice as min_heavy_degree/divisor; 0 disables. Overridden by forward_heavy_edge_slice.",
+    ),
+    KernelParam(
         "forward_heavy_edge_slice",
         int,
         0,
@@ -299,10 +311,22 @@ _GT_PARAMS = (
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),
     KernelParam("backward_heavy_warps", int, 8, "Warps per block, backward heavy-node kernel."),
     KernelParam(
+        "forward_heavy_slice_blocks_per_sm",
+        float,
+        0.0,
+        "Heavy slice as min_heavy_degree/divisor; 0 disables. Overridden by forward_heavy_edge_slice.",
+    ),
+    KernelParam(
         "forward_heavy_edge_slice",
         int,
         0,
         "Edges per block in the forward heavy bucket; 0 keeps one block per heavy node.",
+    ),
+    KernelParam(
+        "backward_heavy_slice_blocks_per_sm",
+        float,
+        0.0,
+        "Heavy slice as min_heavy_degree/divisor; 0 disables. Overridden by backward_heavy_edge_slice.",
     ),
     KernelParam(
         "backward_heavy_edge_slice",
@@ -556,6 +580,10 @@ SWEEPABLE_KERNEL: dict[str, Callable[[str], Any]] = {
     "backward_bucket_launch": str,
     "blocks_per_sm": int,
     "sched_chunk": int,
+    # Absolute heavy-slice sizes, so the raw-edge-count form can be compared head to head
+    # against the device-relative blocks-per-SM form under identical pins.
+    "forward_heavy_edge_slice": int,
+    "backward_heavy_edge_slice": int,
 }
 
 

@@ -67,12 +67,17 @@ class ReductionAggrKernel(TunableKernel):
         self.forward_warps_per_block = kwargs.get("warps_per_block", 8)
         self.forward_edges_per_block_heavy_nodes = kwargs.get("edges_per_block_heavy_nodes", 128)
         self.forward_heavy_edge_slice = kwargs.get("forward_heavy_edge_slice", 0)
+        self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
         self.forward_use_2d_kernel = kwargs.get("use_2d_kernel", False)
         self.forward_features_per_block = kwargs.get("features_per_block", 32)
         self.forward_tiles_y = kwargs.get("tiles_y", 8)
 
     def _execute(self, graph, x, **kwargs):
-        slice_size = self.forward_heavy_edge_slice
+        # An explicit edge count wins; otherwise size the slice from the heavy-degree
+        # threshold, so the parameter means the same thing on graphs of different density.
+        slice_size = self.forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+            "forward", self.forward_heavy_slice_blocks_per_sm
+        )
         table = graph.heavy_edge_slices("forward", slice_size) if slice_size > 0 else None
 
         return ReductionAggrFunction.apply(
@@ -136,7 +141,10 @@ class ReductionAggrKernel(TunableKernel):
             # Flat edge-slice grid for the heavy bucket, replacing the rectangular
             # (num_heavy, ceil(max_degree / EPB)) one, which over-launches badly when a single
             # hub dominates the degree spread. 0 keeps the rectangular path.
-            TunableParam("forward_heavy_edge_slice", [0, 256, 1024], default=0),
+            # Slice sized to fill the device with N blocks per SM, from the heavy bucket's
+            # edge count. Degree statistics do not predict the optimum (1125x spread for the
+            # bucketing threshold); block count does (7x). 0 disables slicing.
+            TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
             TunableParam("forward_use_2d_kernel", [True, False], default=False),
             TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
             TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
@@ -178,10 +186,18 @@ class GATv2AggrKernel(TunableKernel):
         self.backward_light_warps = kwargs.get("backward_light_warps", 1)
         self.backward_heavy_warps = kwargs.get("backward_heavy_warps", 8)
         self.forward_heavy_edge_slice = kwargs.get("forward_heavy_edge_slice", 0)
+        self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
+        self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
 
     def _execute(self, graph, x, *, x_neighbors=None, attention_weights=None, negative_slope=None, **kwargs):
-        slice_size = self.forward_heavy_edge_slice
+        # An explicit edge count wins; otherwise size the slice from the heavy-degree
+        # threshold, so the parameter means the same thing on graphs of different density.
+        slice_size = self.forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+            "forward", self.forward_heavy_slice_blocks_per_sm
+        )
         table = graph.heavy_edge_slices("forward", slice_size) if slice_size > 0 else None
+        bwd_slice = graph.heavy_slice_for_blocks_per_sm("forward", self.backward_heavy_slice_blocks_per_sm)
+        bwd_table = graph.heavy_edge_slices("forward", bwd_slice) if bwd_slice > 0 else None
 
         return gatv2_function.apply(
             graph.forward_indptr,
@@ -211,6 +227,10 @@ class GATv2AggrKernel(TunableKernel):
             table.chunk_node if table is not None else None,
             table.chunk_start if table is not None else None,
             table.node_chunk_offset if table is not None else None,
+            bwd_slice,
+            bwd_table.chunk_node if bwd_table is not None else None,
+            bwd_table.chunk_start if bwd_table is not None else None,
+            bwd_table.node_chunk_offset if bwd_table is not None else None,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -231,7 +251,10 @@ class GATv2AggrKernel(TunableKernel):
             TunableParam("forward_heavy_warps", [8, 16, 32], default=8),
             # Edge-slice size for the heavy bucket; 0 keeps one block per heavy node, so the
             # old and new decompositions are compared inside a single search axis.
-            TunableParam("forward_heavy_edge_slice", [0, 256, 1024], default=0),
+            # Slice sized to fill the device with N blocks per SM, from the heavy bucket's
+            # edge count. Degree statistics do not predict the optimum (1125x spread for the
+            # bucketing threshold); block count does (7x). 0 disables slicing.
+            TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -256,6 +279,9 @@ class GATv2AggrKernel(TunableKernel):
             TunableParam("backward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
             TunableParam("backward_light_warps", [1, 2, 4], default=1),
             TunableParam("backward_heavy_warps", [8, 16, 32], default=8),
+            # The undirected backward's heavy bucket is ~81% of that pass at ~7% occupancy;
+            # slicing it is the point of this axis. 0 keeps one block per heavy node.
+            TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:
@@ -304,15 +330,23 @@ class GraphTransformerAggrKernel(TunableKernel):
         self.backward_light_warps = kwargs.get("backward_light_warps", 1)
         self.backward_heavy_warps = kwargs.get("backward_heavy_warps", 8)
         self.forward_heavy_edge_slice = kwargs.get("forward_heavy_edge_slice", 0)
+        self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
         self.backward_heavy_edge_slice = kwargs.get("backward_heavy_edge_slice", 0)
+        self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
 
     def _execute(self, graph, x, *, Q=None, K=None, V=None, scale=None, **kwargs):
         # A positive slice size switches the heavy bucket from one block per node to one block
         # per fixed-size run of edges. The table is cached on the graph, so it is built once per
         # (direction, slice size) rather than per call.
-        slice_size = self.forward_heavy_edge_slice
+        # An explicit edge count wins; otherwise size the slice from the heavy-degree
+        # threshold, so the parameter means the same thing on graphs of different density.
+        slice_size = self.forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+            "forward", self.forward_heavy_slice_blocks_per_sm
+        )
         table = graph.heavy_edge_slices("forward", slice_size) if slice_size > 0 else None
-        bwd_slice = self.backward_heavy_edge_slice
+        bwd_slice = self.backward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+            "backward", self.backward_heavy_slice_blocks_per_sm
+        )
         bwd_table = graph.heavy_edge_slices("backward", bwd_slice) if bwd_slice > 0 else None
 
         return _FusedGraphAttention.apply(
@@ -367,7 +401,10 @@ class GraphTransformerAggrKernel(TunableKernel):
             # Edge-slice size for the heavy bucket. 0 keeps one block per heavy node, so the old
             # and new decompositions are compared inside a single search axis rather than behind
             # a separate flag. Larger slices mean fewer, longer blocks and less scratch memory.
-            TunableParam("forward_heavy_edge_slice", [0, 256, 1024], default=0),
+            # Slice sized to fill the device with N blocks per SM, from the heavy bucket's
+            # edge count. Degree statistics do not predict the optimum (1125x spread for the
+            # bucketing threshold); block count does (7x). 0 disables slicing.
+            TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -393,7 +430,7 @@ class GraphTransformerAggrKernel(TunableKernel):
             TunableParam("backward_heavy_warps", [8, 16, 32], default=8),
             # Backward slices the transpose CSR, so it gets its own size. 0 keeps the
             # node-per-block heavy path.
-            TunableParam("backward_heavy_edge_slice", [0, 256, 1024], default=0),
+            TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:

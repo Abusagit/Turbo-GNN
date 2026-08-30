@@ -283,6 +283,10 @@ class gatv2_function(torch.autograd.Function):
         fwd_chunk_node=None,
         fwd_chunk_start=None,
         fwd_node_chunk_offset=None,
+        backward_heavy_edge_slice=0,
+        bwd_chunk_node=None,
+        bwd_chunk_start=None,
+        bwd_node_chunk_offset=None,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -314,6 +318,12 @@ class gatv2_function(torch.autograd.Function):
         # Backward gets its own value: concurrency helps the forward buckets and hurts the
         # backward ones, so forcing one answer on both leaves most of the gain behind.
         ctx.bucket_launch = resolve_bucket_launch(backward_bucket_launch)
+        # The undirected backward slices the *forward* CSR, since that is the adjacency it walks.
+        empty = _empty_i32(x_left.device)
+        ctx.backward_heavy_edge_slice = backward_heavy_edge_slice
+        ctx.bwd_chunk_node = bwd_chunk_node if bwd_chunk_node is not None else empty
+        ctx.bwd_chunk_start = bwd_chunk_start if bwd_chunk_start is not None else empty
+        ctx.bwd_node_chunk_offset = bwd_node_chunk_offset if bwd_node_chunk_offset is not None else empty
         ctx.negative_slope = negative_slope
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
         ctx.backward_light_warps = backward_light_warps
@@ -385,11 +395,15 @@ class gatv2_function(torch.autograd.Function):
             ctx.blocks_per_sm,
             ctx.sched_chunk,
             ctx.bucket_launch,
+            ctx.bwd_chunk_node,
+            ctx.bwd_chunk_start,
+            ctx.bwd_node_chunk_offset,
+            ctx.backward_heavy_edge_slice,
         )
 
         # 4 CSR tensors + 3 gradients + 13 non-Variable args = 20 total
         # 16 trailing forward args, plus the 4 carrying the heavy-node edge-slice table.
-        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 20
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 24
 
 
 _EMPTY_I32: dict[torch.device, torch.Tensor] = {}

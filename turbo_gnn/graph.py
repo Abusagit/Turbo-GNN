@@ -132,6 +132,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             assert t.dtype == idx_dtype, f"{name} dtype {t.dtype} doesn't match forward_indptr dtype {idx_dtype}"
         self.index_dtype = idx_dtype
         self._edge_slice_cache: dict[tuple[str, int], EdgeSliceTable] = {}
+        self._min_heavy_degree_cache: dict[str, int] = {}
+        self._heavy_edge_count_cache: dict[str, int] = {}
 
         indptr = self._to_signed_view(self.forward_indptr)
         degrees = indptr[1:] - indptr[:-1]
@@ -170,6 +172,80 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     @property
     def device(self) -> torch.device:
         return self._device
+
+    def min_heavy_degree(self, direction: str) -> int:
+        """Degree of the *smallest* node still in the heavy bucket, i.e. the bucketing threshold.
+
+        This is the natural scale for sizing an edge slice. A fixed slice of 256 edges means very
+        different things on two graphs: on ogbn-arxiv the smallest heavy node has 88 neighbours, so
+        256 covers it whole and the split does nothing for most of the bucket, while on
+        hm-categories the threshold is 6,330 and 256 cuts every heavy row into dozens of pieces.
+        Expressing the slice as a fraction of this threshold makes the parameter mean the same
+        thing across graphs, which a raw edge count cannot.
+
+        The threshold is a good scale only when the heavy bucket is reasonably tight. On
+        web-fraud it spans 45 to 228,991, so a slice sized from the minimum is far too small for
+        the hubs that dominate that bucket's runtime -- reaching a useful slice there needs a
+        divisor well below 1. Graphs whose heavy degrees cluster (ogbn-proteins, hm-categories)
+        do not have this problem.
+
+        Returns 0 when the heavy bucket is empty.
+        """
+        cached = self._min_heavy_degree_cache.get(direction)
+        if cached is not None:
+            return cached
+        heavy = getattr(self, f"{direction}_heavy_nodes")
+        if heavy.numel() == 0:
+            self._min_heavy_degree_cache[direction] = 0
+            return 0
+        indptr = self._to_signed_view(getattr(self, f"{direction}_indptr"))
+        deg = (indptr[1:] - indptr[:-1]).index_select(0, heavy.to(torch.int64))
+        val = int(deg.min())
+        self._min_heavy_degree_cache[direction] = val
+        return val
+
+    def heavy_edge_count(self, direction: str) -> int:
+        """Total edges owned by the heavy bucket. Cached; this is the scale that matters."""
+        cached = self._heavy_edge_count_cache.get(direction)
+        if cached is not None:
+            return cached
+        heavy = getattr(self, f"{direction}_heavy_nodes")
+        if heavy.numel() == 0:
+            self._heavy_edge_count_cache[direction] = 0
+            return 0
+        indptr = self._to_signed_view(getattr(self, f"{direction}_indptr"))
+        deg = (indptr[1:] - indptr[:-1]).index_select(0, heavy.to(torch.int64))
+        val = int(deg.sum())
+        self._heavy_edge_count_cache[direction] = val
+        return val
+
+    def heavy_slice_for_blocks_per_sm(self, direction: str, blocks_per_sm: float) -> int:
+        """Slice size that fills the device with `blocks_per_sm` blocks per SM.
+
+        Sizing the slice from a degree statistic does not work. Measured against the true optimum
+        on eight graphs, the implied constant for `min_heavy_degree` spans 1125x and for the
+        edge-weighted median 222x -- hm-categories (heavy degrees ~6,330) and web-fraud (~45) want
+        similar slices because they have similar *edge counts*, not similar degrees.
+
+        Block count predicts it: over the graphs where the choice matters, the optimum sits at
+        1,300-9,300 blocks, a 7x spread. So size the slice to hit a target block count, which is
+        also device-relative rather than tied to one GPU's SM count.
+
+        The curve is broad -- the plateau runs from roughly 64 to 2,048 edges on most graphs -- so
+        this does not need to be exact. It does need to avoid the ends: a slice of 32 edges is
+        *slower* than not slicing at all on twitch-views (0.60x) and ogbn-proteins (0.34x), where
+        the merge and launch overhead swamp the gain.
+
+        `blocks_per_sm <= 0` disables slicing and returns 0.
+        """
+        if blocks_per_sm <= 0:
+            return 0
+        e = self.heavy_edge_count(direction)
+        if e <= 0:
+            return 0
+        dev = getattr(self, f"{direction}_indptr").device
+        sm = torch.cuda.get_device_properties(dev).multi_processor_count if dev.type == "cuda" else 1
+        return max(1, int(round(e / (blocks_per_sm * sm))))
 
     def heavy_edge_slices(self, direction: str, slice_size: int) -> EdgeSliceTable:
         """Map each thread block to one slice of one heavy node's edge list.
@@ -367,6 +443,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
 
     def to(self, device) -> AdjacencyForwardBackwardWithNodeBuckets:
         self._edge_slice_cache = {}
+        self._min_heavy_degree_cache = {}
+        self._heavy_edge_count_cache = {}
         self.forward_indptr = self.forward_indptr.to(device)
         self.forward_indices = self.forward_indices.to(device)
         if self.is_directed:
@@ -380,6 +458,9 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         self.forward_heavy_nodes = self.forward_heavy_nodes.to(device)
         self.backward_light_nodes = self.backward_light_nodes.to(device)
         self.backward_heavy_nodes = self.backward_heavy_nodes.to(device)
+        # `_device` backs the `device` property; without this it keeps reporting the device the
+        # graph was built on, however many times the tensors have been moved since.
+        self._device = self.forward_indptr.device
         torch.cuda.empty_cache()
         return self
 
