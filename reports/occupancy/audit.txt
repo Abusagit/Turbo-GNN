@@ -1,0 +1,29 @@
+At each instantiation's own compiled block size (6,780 of 8,152 resolvable):
+  median occupancy 50%   mean 60%   below 50%: 314   at 100%: 647
+  binding resource: {'registers': 6512, 'warps/blocks': 268}
+
+turbo_gnn/_C.cpython-313-x86_64-linux-gnu.so   8,152 instantiations across 18 kernels
+Register-limited occupancy on an A100. 'spill' counts instantiations with a stack frame.
+
+  kernel                                             n  REG med REG max  spill   occ@32  occ@128  occ@256  occ@512
+  GATv2Backward_ALR_Undirected                     192       57      79      0      50%      50%      50%      50%
+  GATv2Backward_AL                                1152       64      80    185      50%      50%      50%      50%
+  graph_attn_backward_fwd_csr_undirected_kernel_D   192       64      90      5      50%      50%      50%      50%
+  GATv2Forward_Kernel                             1152       56      80    149      50%      56%      50%      50%
+  reduction_aggr_forward_heavy_kernel_2d            96       56      70      0      50%      56%      50%      50%
+  GATv2Backward_G_Kernel                           192       42      64      0      50%      62%      62%      50%
+  GATv2Backward_R                                 1152       48      72    151      50%      62%      62%      50%
+  graph_attn_backward_csrT_kernel_D               1152       48      80    209      50%      62%      62%      50%
+  compute_D_mh_kernel_D                             48       48      64      0      50%      62%      62%      50%
+  reduction_aggr_forward_heavy_kernel              588       42      57    168      50%      62%      62%      50%
+  reduction_aggr_forward_light_kernel_1d           672       48      72    128      50%      62%      62%      50%
+  GraphAttentionForward_CSR_MH_v2_D               1152       40      96    111      50%      75%      75%      75%
+  _ZN3cub16_V_300200_SM_8006detail11EmptyKernelIvEEvv     5        4       4      0      50%     100%     100%     100%
+  ReduceGradAKernel                                 21       20      20      0      50%     100%     100%     100%
+  unpack_results_kernel                             42       16      18      0      50%     100%     100%     100%
+  reduction_aggr_backward_typed                    336       24      28      0      50%     100%     100%     100%
+  compute_edge_weights_kernel                        4       20      21      0      50%     100%     100%     100%
+  compute_degrees_kernel                             4       16      16      0      50%     100%     100%     100%
+
+  * median occupancy below 50% at a 128-thread block -- the first place to look.
+  Occupancy here is the register ceiling only; dynamic shared memory can lower it further.

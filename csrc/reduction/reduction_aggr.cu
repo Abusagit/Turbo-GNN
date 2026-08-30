@@ -2,9 +2,11 @@
 
 #include "common.cuh"
 
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
+template <
+    turbo_gnn::sched::ScheduleKind SK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t,
+    FloatingNum accum_t = float>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
-    index_t const *const __restrict__ light_nodes_indices,
+    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     index_t const *const __restrict__ edge_ptr,
     index_t const *const __restrict__ edge_idx,
     cuda_t const *const __restrict__ X,
@@ -18,21 +20,27 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
-    const size_t i = blockIdx.x;
-    index_t v      = light_nodes_indices[i];
+    // The body touches no shared memory, so no inter-iteration fence is needed.
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/false>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
 
-    const index_t row_start = edge_ptr[v];
-    const index_t row_end   = edge_ptr[v + 1];
-
+    // Node-independent, hoisted out of the loop.
     const size_t tid           = threadIdx.x;
     constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
-
-    const size_t node_stride = static_cast<size_t>(v) * d;
 
     const cuda_t identity_val = static_cast<cuda_t>(ROps::IDENTITY);
     constexpr cuda_t zero_val{};
 
     const size_t d_vec = d / TW;
+
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+    index_t v = sched.node(work);
+
+    const index_t row_start = edge_ptr[v];
+    const index_t row_end   = edge_ptr[v + 1];
+
+    const size_t node_stride = static_cast<size_t>(v) * d;
 
     for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
         const size_t base_f = fv * TW;
@@ -84,6 +92,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             arg_idx[node_stride + f] = best_src;
         }
     }
+    }  // scheduler loop
 }
 
 __device__ __forceinline__ uint32_t float_to_ordered_uint(float x) {
@@ -220,6 +229,117 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     }
 }
 
+// Edge-sliced heavy kernel: one block per fixed-size run of one heavy node's edges.
+//
+// The kernel above launches a rectangular (num_heavy, ceil(max_degree / EDGES_PER_BLOCK)) grid,
+// sizing every node's chunk count from the *global* maximum degree. On a graph whose hub has
+// degree 17,482, a degree-40 node still gets ~136 blocks, all of which start, read row_ptr and
+// immediately return. That waste is issue (c) in KERNEL_ISSUES.md.
+//
+// Here the host precomputes a slice table, so the grid is exactly the number of non-empty
+// slices and every block has work. The slice size is a runtime value rather than a template
+// parameter -- the bounds come from the table, so it never appears in the kernel and costs no
+// extra instantiations.
+//
+// The merge is unchanged: partial results still fold into `packed` through the same 64-bit
+// atomicMin/atomicMax, which is order-independent, so slicing the edge list differently cannot
+// change the answer.
+template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_slice_kernel(
+    index_t const *const __restrict__ heavy_nodes_indices,
+    index_t const *const __restrict__ edge_ptr,
+    index_t const *const __restrict__ edge_idx,
+    cuda_t const *const __restrict__ X,
+    int const *const __restrict__ chunk_node,
+    int const *const __restrict__ chunk_start,
+    int slice_size,
+    int num_slices,
+    uint64_t *const __restrict__ packed,
+    size_t d
+) {
+    static_assert(sizeof(index_t) <= 4, "Packed heavy kernel only supports 32-bit index types");
+    using ROps     = ReductionOps<Op>;
+    using Sentinel = IndexSentinel<index_t>;
+    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
+    using Tile          = TileOps<TW, cuda_t>;
+
+    const int slice_id = blockIdx.x;
+    if (slice_id >= num_slices) [[unlikely]] {
+        return;
+    }
+
+    const size_t node_idx = static_cast<size_t>(chunk_node[slice_id]);
+    const index_t v       = heavy_nodes_indices[node_idx];
+
+    const index_t row_start = edge_ptr[v];
+    const index_t row_end   = edge_ptr[v + 1];
+
+    const index_t chunk_start_abs = row_start + static_cast<index_t>(chunk_start[slice_id]);
+    const index_t chunk_end_cand  = chunk_start_abs + static_cast<index_t>(slice_size);
+    const index_t chunk_end       = (chunk_end_cand < row_end) ? chunk_end_cand : row_end;
+    if (chunk_start_abs >= chunk_end) [[unlikely]] {
+        return;
+    }
+
+    const size_t tid           = threadIdx.x;
+    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
+    const cuda_t identity_val  = static_cast<cuda_t>(ROps::IDENTITY);
+    const size_t d_vec         = d / TW;
+
+    for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
+        const size_t base_f = fv * TW;
+
+        cuda_t best_vals[TW];
+        index_t best_srcs[TW];
+#pragma unroll
+        for (size_t e = 0; e < TW; ++e) {
+            best_vals[e] = identity_val;
+            best_srcs[e] = Sentinel::INVALID;
+        }
+
+        for (index_t eid = chunk_start_abs; eid < chunk_end; ++eid) {
+            const index_t src              = edge_idx[eid];
+            const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+#pragma unroll
+            for (size_t e = 0; e < TW; ++e) {
+                const cuda_t v_e = val[e];
+                if (ROps::is_better(v_e, best_vals[e])) {
+                    best_vals[e] = v_e;
+                    best_srcs[e] = src;
+                }
+            }
+        }
+
+#pragma unroll
+        for (size_t e = 0; e < TW; ++e) {
+            if (Sentinel::is_valid(best_srcs[e])) {
+                const uint64_t new_val = pack_val_idx(static_cast<accum_t>(best_vals[e]), static_cast<size_t>(best_srcs[e]));
+                ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
+            }
+        }
+    }
+
+    // Scalar tail for d % TW != 0 (compiles away for TW == 1)
+    if (d % TW != 0 && tid == 0) {
+        for (size_t f = d_vec * TW; f < d; ++f) {
+            cuda_t local_best = identity_val;
+            index_t local_arg = Sentinel::INVALID;
+            for (index_t eid = chunk_start_abs; eid < chunk_end; ++eid) {
+                const index_t src = edge_idx[eid];
+                const cuda_t val  = X[static_cast<size_t>(src) * d + f];
+                if (ROps::is_better(val, local_best)) {
+                    local_best = val;
+                    local_arg  = src;
+                }
+            }
+            if (Sentinel::is_valid(local_arg)) {
+                const uint64_t new_val = pack_val_idx(static_cast<accum_t>(local_best), static_cast<size_t>(local_arg));
+                ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
+            }
+        }
+    }
+}
+
 // unpack results back to separate arrays (32-bit indices only, pairs with heavy kernel)
 template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_kernel(
@@ -251,9 +371,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_ker
 // 2D kernel: blockIdx.x = node, threadIdx.x = feature, threadIdx.y = edge tile
 // uses shared memory tree reduction across tiles instead of packed atomicMin/Max
 // Works with all index sizes (no packing constraint)
-template <FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
+template <turbo_gnn::sched::ScheduleKind SK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
 __global__ void reduction_aggr_forward_heavy_kernel_2d(
-    const index_t *__restrict__ nodes,
+    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     const index_t *__restrict__ edge_ptr,
     const index_t *__restrict__ edge_idx,
     const cuda_t *__restrict__ X,
@@ -267,8 +387,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
 
-    size_t i  = blockIdx.x;
-    index_t v = nodes[i];
+    // Body in a lambda: its `return`s become per-node `continue` semantics.
+    auto process_node = [&](const index_t v) {
 
     index_t row_start   = edge_ptr[v];
     index_t row_end     = edge_ptr[v + 1];
@@ -297,7 +417,16 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     size_t node_stride = static_cast<size_t>(v) * d;
     const size_t d_vec = d / TW;
 
-    for (size_t fv = fid; fv < d_vec; fv += F_BLOCK) {
+    // Trip count is block-uniform on purpose. Written as `fv = fid; fv < d_vec; fv += F_BLOCK`
+    // the count depends on threadIdx.x, so when d_vec is not a multiple of F_BLOCK the threads
+    // of a block execute different numbers of the __syncthreads() below -- undefined behaviour
+    // that nvcc used to paper over, and that deadlocks once this body runs inside the
+    // scheduler's outer loop. Iterate a uniform number of times and predicate instead.
+    const size_t n_feature_iters = (d_vec + F_BLOCK - 1) / F_BLOCK;
+
+    for (size_t it = 0; it < n_feature_iters; ++it) {
+        const size_t fv     = fid + it * F_BLOCK;
+        const bool active   = fv < d_vec;
         const size_t base_f = fv * TW;
 
         cuda_t best_vals[TW];
@@ -308,7 +437,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
             best_srcs[e] = Sentinel::INVALID;
         }
 
-        for (index_t eid = start; eid < end; ++eid) {
+        for (index_t eid = active ? start : end; eid < end; ++eid) {
             index_t src                    = edge_idx[eid];
             const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
 #pragma unroll
@@ -324,6 +453,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 // Write to shmem (convert to float for cross-tile reduction)
 #pragma unroll
         for (size_t e = 0; e < TW; ++e) {
+            // Inactive lanes still publish (identity, INVALID) so the tree reduction never
+            // reads uninitialised shared memory.
             shmem_val[tid * SHMEM_STRIDE + fid * TW + e] = static_cast<accum_t>(best_vals[e]);
             shmem_idx[tid * SHMEM_STRIDE + fid * TW + e] = best_srcs[e];
         }
@@ -353,8 +484,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
             __syncthreads();
         }
 
-        // Vectorized final write
-        if (tid == 0) {
+        // Vectorized final write. Inactive lanes must not write: their fv is past d_vec.
+        if (tid == 0 && active) {
             cuda_t result[TW];
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
@@ -418,27 +549,45 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
             arg_idx[node_stride + tail_f] = best_idx;
         }
     }
+    };  // process_node
+
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+        process_node(static_cast<int>(sched.node(work)));
+    }
 }
 
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
+
+template <turbo_gnn::sched::ScheduleKind SK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_backward_typed(
-    const cuda_t *__restrict__ grad_out, const index_t *__restrict__ arg_idx, cuda_t *__restrict__ grad_x, size_t num_nodes, size_t d
+    turbo_gnn::sched::SchedulerParams<index_t> sched_params, const cuda_t *__restrict__ grad_out,
+    const index_t *__restrict__ arg_idx, cuda_t *__restrict__ grad_x, size_t num_nodes, size_t d
 ) {
     using Sentinel = IndexSentinel<index_t>;
 
-    size_t block_idx = blockIdx.x;
-    if (block_idx >= num_nodes) {
-        return;
-    }
+    // No shared memory in the body -> no inter-iteration fence.
+    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/false>;
+    __shared__ typename Sched::SharedStorage sched_smem;
+    Sched sched(sched_params, sched_smem);
 
     size_t tid                 = threadIdx.x;
     constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
-    const size_t base_offset   = block_idx * d;
 
-    for (size_t f = tid; f < d; f += BLOCK_DIM) {
-        index_t src = arg_idx[base_offset + f];
-        if (Sentinel::is_valid(src)) {
-            atomicAdd(&grad_x[static_cast<size_t>(src) * d + f], grad_out[base_offset + f]);
+    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+        // `nodes` is null here: the work item is the destination node itself.
+        const size_t block_idx = static_cast<size_t>(sched.node(work));
+        if (block_idx >= num_nodes) {
+            continue;
+        }
+        const size_t base_offset = block_idx * d;
+
+        for (size_t f = tid; f < d; f += BLOCK_DIM) {
+            index_t src = arg_idx[base_offset + f];
+            if (Sentinel::is_valid(src)) {
+                atomicAdd(&grad_x[static_cast<size_t>(src) * d + f], grad_out[base_offset + f]);
+            }
         }
     }
 }
@@ -457,9 +606,18 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     int edges_per_block_heavy_nodes,
     bool use_2d_kernel,
     int features_per_block,
-    int tiles_y
+    int tiles_y,
+    int schedule,
+    int blocks_per_sm,
+    int sched_chunk,
+    int bucket_launch,
+    const at::Tensor& chunk_node,
+    const at::Tensor& chunk_start,
+    int heavy_edge_slice
 ) {
     using ROps = ReductionOps<Op>;
+    namespace sched_ns             = turbo_gnn::sched;
+    const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
 
     const int d             = X.size(1);
     const int num_out_nodes = out.size(0);
@@ -481,43 +639,79 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     TORCH_CHECK(out.scalar_type() == X.scalar_type(), "out must have same dtype as X");
 
     const int num_light = light_nodes.numel();
-    if (num_light > 0) {
+    // One counter row per bucket launch, so the light launch cannot leave dirt for the heavy one.
+    at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, /*heads=*/1, /*num_launches=*/2, X.device());
+
+    const int num_heavy = heavy_nodes.numel();
+
+    namespace stream_ns = turbo_gnn::streams;
+    stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), X.device());
+    // The light bucket may run on a stream these were not allocated on; tell the caching
+    // allocator so it cannot hand their memory out again while that stream is still reading.
+    buckets.record_all(X, out, arg_idx, edge_ptr, edge_idx, light_nodes, sched_counters);
+
+    auto launch_light = [&]() {
+        if (num_light == 0) {
+            return;
+        }
+        // Guarded so the host-side prep below (the degree prefix sum for PrecomputedList)
+        // allocates and runs on the light bucket's stream rather than the caller's.
+        at::cuda::CUDAStreamGuard guard(buckets.light());
+        auto stream = buckets.light();
+
+        const int light_grid_x = sched_ns::persistent_grid_x(SK_KIND, num_light, blocks_per_sm, /*grid_y=*/1, sched_chunk);
+        at::Tensor light_offsets;
+        if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+            light_offsets = sched_ns::degree_balanced_block_offsets(edge_ptr, light_nodes, num_light, light_grid_x);
+        }
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto warps_const) {
+            [&](auto idxInfo, auto typeInfo, auto warps_const, auto sched_const) {
                 using index_t = typename decltype(idxInfo)::Type;
                 using torch_t = typename decltype(typeInfo)::TorchType;
                 using cuda_t  = typename decltype(typeInfo)::CudaType;
 
                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+                constexpr auto SK               = static_cast<sched_ns::ScheduleKind>(decltype(sched_const)::value);
 
                 cuda_t const *X_ptr   = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
                 cuda_t *out_ptr = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
 
-                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t><<<num_light, THREADS_PER_BLOCK>>>(
-                    index_ptr<index_t>(light_nodes),
-                    index_ptr<index_t>(edge_ptr),
-                    index_ptr<index_t>(edge_idx),
-                    X_ptr,
-                    out_ptr,
-                    index_ptr_mut<index_t>(arg_idx),
-                    d
+                auto sp = sched_ns::make_params<index_t>(
+                    SK_KIND, index_ptr<index_t>(light_nodes), num_light, sched_counters, /*heads=*/1,
+                    /*launch_index=*/0, light_offsets, sched_chunk
                 );
+
+                reduction_aggr_forward_light_kernel_1d<SK, WARPS_PER_BLOCK, cuda_t, Op, index_t>
+                    <<<light_grid_x, THREADS_PER_BLOCK, 0, stream>>>(
+                        sp,
+                        index_ptr<index_t>(edge_ptr),
+                        index_ptr<index_t>(edge_idx),
+                        X_ptr,
+                        out_ptr,
+                        index_ptr_mut<index_t>(arg_idx),
+                        d
+                    );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
             MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
-            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block),
+            MakeIntVariant<0, 1, 2, 3>(schedule)
         );
-    }
+    };
 
-    const int num_heavy = heavy_nodes.numel();
+    auto launch_heavy = [&]() {
+        if (num_heavy == 0) {
+            return;
+        }
+        auto stream = buckets.heavy();
 
-    if (num_heavy > 0) {
         std::visit(
-            [&](auto idxInfo, auto typeInfo) {
-                using index_t = typename decltype(idxInfo)::Type;
-                using torch_t = typename decltype(typeInfo)::TorchType;
-                using cuda_t  = typename decltype(typeInfo)::CudaType;
+            [&](auto idxInfo, auto typeInfo, auto sched_const) {
+                using index_t     = typename decltype(idxInfo)::Type;
+                using torch_t     = typename decltype(typeInfo)::TorchType;
+                using cuda_t      = typename decltype(typeInfo)::CudaType;
+                constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_const)::value);
 
                 cuda_t const *X_ptr   = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
                 cuda_t *out_ptr = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
@@ -528,13 +722,23 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
                         constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
-                        dim3 grid(num_heavy);
+                        const int hgx = sched_ns::persistent_grid_x(SK_KIND, num_heavy, blocks_per_sm, /*grid_y=*/1, sched_chunk);
+                        dim3 grid(hgx);
                         dim3 block(features_per_block, tiles_y);
 
                         size_t shmem_size = (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
 
-                        reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
-                            index_ptr<index_t>(heavy_nodes),
+                        at::Tensor hoff;
+                        if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+                            hoff = sched_ns::degree_balanced_block_offsets(edge_ptr, heavy_nodes, num_heavy, hgx);
+                        }
+                        auto hsp = sched_ns::make_params<index_t>(
+                            SK_KIND, index_ptr<index_t>(heavy_nodes), num_heavy, sched_counters, /*heads=*/1,
+                            /*launch_index=*/1, hoff, sched_chunk
+                        );
+
+                        reduction_aggr_forward_heavy_kernel_2d<SK, cuda_t, Op, index_t><<<grid, block, shmem_size, stream>>>(
+                            hsp,
                             index_ptr<index_t>(edge_ptr),
                             index_ptr<index_t>(edge_idx),
                             X_ptr,
@@ -549,6 +753,33 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             {num_heavy, d}, static_cast<int64_t>(PACKED_INIT), at::TensorOptions().dtype(torch::kInt64).device(X.device())
                         );
 
+                        if (heavy_edge_slice > 0) {
+                            // Flat grid: one block per non-empty slice, from the host-side table.
+                            const int num_slices = static_cast<int>(chunk_node.numel());
+                            if (num_slices > 0) {
+                                std::visit(
+                                    [&](auto warps_const) {
+                                        constexpr int WARPS_PER_BLOCK   = warps_const.value;
+                                        constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+
+                                        reduction_aggr_forward_heavy_slice_kernel<WARPS_PER_BLOCK, cuda_t, Op, index_t>
+                                            <<<num_slices, THREADS_PER_BLOCK>>>(
+                                                index_ptr<index_t>(heavy_nodes),
+                                                index_ptr<index_t>(edge_ptr),
+                                                index_ptr<index_t>(edge_idx),
+                                                X_ptr,
+                                                chunk_node.data_ptr<int>(),
+                                                chunk_start.data_ptr<int>(),
+                                                heavy_edge_slice,
+                                                num_slices,
+                                                reinterpret_cast<uint64_t *>(packed.template data_ptr<int64_t>()),
+                                                d
+                                            );
+                                    },
+                                    MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+                                );
+                            }
+                        } else {
                         std::visit(
                             [&](auto edges_const, auto warps_const) {
                                 constexpr int EDGES_PER_BLOCK   = edges_const.value;
@@ -570,6 +801,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
                             MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
                         );
+                        }
 
                         std::visit(
                             [&](auto warps_const) {
@@ -594,13 +826,23 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
                     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
-                    dim3 grid(num_heavy);
+                    const int hgx = sched_ns::persistent_grid_x(SK_KIND, num_heavy, blocks_per_sm, /*grid_y=*/1, sched_chunk);
+                    dim3 grid(hgx);
                     dim3 block(features_per_block, tiles_y);
 
                     size_t shmem_size = (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
 
-                    reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
-                        index_ptr<index_t>(heavy_nodes),
+                    at::Tensor hoff;
+                    if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+                        hoff = sched_ns::degree_balanced_block_offsets(edge_ptr, heavy_nodes, num_heavy, hgx);
+                    }
+                    auto hsp = sched_ns::make_params<index_t>(
+                        SK_KIND, index_ptr<index_t>(heavy_nodes), num_heavy, sched_counters, /*heads=*/1,
+                        /*launch_index=*/1, hoff, sched_chunk
+                    );
+
+                    reduction_aggr_forward_heavy_kernel_2d<SK, cuda_t, Op, index_t><<<grid, block, shmem_size, stream>>>(
+                        hsp,
                         index_ptr<index_t>(edge_ptr),
                         index_ptr<index_t>(edge_idx),
                         X_ptr,
@@ -611,9 +853,21 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 }
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type())
+            MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
+            MakeIntVariant<0, 1, 2, 3>(schedule)
         );
+    };
+
+    // The heavy bucket is a handful of very expensive nodes, so it is the long pole; issuing it
+    // first lets the light bucket fill in around it instead of queueing behind it.
+    if (buckets.heavy_first()) {
+        launch_heavy();
+        launch_light();
+    } else {
+        launch_light();
+        launch_heavy();
     }
+    buckets.join();
     CUDA_KERNEL_CHECK();
 }
 
@@ -631,32 +885,58 @@ void reduction_aggr_forward_partitioned_cuda(
     bool use_2d_kernel,
     int features_per_block,
     int tiles_y,
-    const std::string& reduce
+    const std::string& reduce,
+    int schedule,
+    int blocks_per_sm,
+    int sched_chunk,
+    int bucket_launch,
+    const at::Tensor& chunk_node,
+    const at::Tensor& chunk_start,
+    int heavy_edge_slice
 ) {
     if (reduce == "min") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MIN>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y
+            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch, chunk_node,
+            chunk_start, heavy_edge_slice
         );
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y
+            use_2d_kernel, features_per_block, tiles_y, schedule, blocks_per_sm, sched_chunk, bucket_launch, chunk_node,
+            chunk_start, heavy_edge_slice
         );
     } else {
         TORCH_CHECK(false, "Unsupported reduce: " + reduce);
     }
 }
 
-void reduction_aggr_backward_cuda(const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8) {
+void reduction_aggr_backward_cuda(
+    const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8, int schedule = 3,
+    int blocks_per_sm = 8,
+    int sched_chunk = 1,
+    int bucket_launch = 0
+) {
+    namespace sched_ns                   = turbo_gnn::sched;
+    const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
+
     const int num_nodes = grad_out.size(0);
     const int d         = grad_out.size(1);
-    const dim3 blocks(num_nodes);
+    const dim3 blocks(sched_ns::persistent_grid_x(SK_KIND, num_nodes, blocks_per_sm, /*grid_y=*/1, sched_chunk));
 
-    auto idx_dtype = arg_idx.scalar_type();
+    auto idx_dtype            = arg_idx.scalar_type();
+    at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, /*heads=*/1, /*num_launches=*/1, grad_out.device());
+    auto stream               = at::cuda::getCurrentCUDAStream(grad_out.device().index());
+    at::Tensor bwd_offsets;
+    if (SK_KIND == sched_ns::ScheduleKind::PrecomputedList) {
+        // Even split, not degree-balanced: this entry point receives only grad_out/arg_idx, so
+        // no CSR is in scope to weigh the nodes by. The scatter is over arg_idx rather than an
+        // adjacency, so per-node cost is uniform here anyway.
+        bwd_offsets = sched_ns::default_block_offsets(num_nodes, static_cast<int>(blocks.x), grad_out.device());
+    }
 
     std::visit(
-        [&](auto idxInfo, auto typeInfo, auto warps_const) {
+        [&](auto idxInfo, auto typeInfo, auto warps_const, auto sched_const) {
             using index_t                   = typename decltype(idxInfo)::Type;
             using torch_t                   = typename decltype(typeInfo)::TorchType;
             using cuda_t                    = typename decltype(typeInfo)::CudaType;
@@ -667,13 +947,21 @@ void reduction_aggr_backward_cuda(const at::Tensor& grad_out, const at::Tensor& 
             cuda_t *grad_x_ptr   = reinterpret_cast<cuda_t *>(grad_x.data_ptr<torch_t>());
 
             const dim3 threads(THREADS_PER_BLOCK);
+            constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_const)::value);
 
-            reduction_aggr_backward_typed<WARPS_PER_BLOCK, cuda_t, index_t>
-                <<<blocks, threads>>>(grad_out_ptr, index_ptr<index_t>(arg_idx), grad_x_ptr, num_nodes, d);
+            // No indirection array: the work item is the destination node itself.
+            auto sp = sched_ns::make_params<index_t>(
+                SK_KIND, /*nodes=*/nullptr, num_nodes, sched_counters, /*heads=*/1, /*launch_index=*/0, bwd_offsets, sched_chunk
+            );
+
+            reduction_aggr_backward_typed<SK, WARPS_PER_BLOCK, cuda_t, index_t><<<blocks, threads, 0, stream>>>(
+                sp, grad_out_ptr, index_ptr<index_t>(arg_idx), grad_x_ptr, num_nodes, d
+            );
         },
         MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
         MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
-        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+        MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block),
+        MakeIntVariant<0, 1, 2, 3>(schedule)
     );
 
     CUDA_KERNEL_CHECK();

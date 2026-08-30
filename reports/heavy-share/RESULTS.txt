@@ -1,0 +1,15 @@
+graph             E_heavy/E  heavy nodes  mean deg   time share (heavy) by conv
+/home/fvelikon/projects/Turbo-GNN/.venv/lib/python3.13/site-packages/torch/utils/_device.py:122: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:213.)
+  return func(*args, **kwargs)
+ogbn-arxiv            35.1%        1,715       273   gat/for 69%  gt/for 75%  min/for 36%  gat/bac 56%  gt/bac 7%  min/bac 0%
+ogbn-products         13.2%       24,593       675   gat/for 11%  gt/for 14%  min/for 17%  gat/bac 0%  gt/bac 0%  min/bac 0%
+ogbn-proteins          5.7%        1,329      3403   gat/for 7%  gt/for 10%  min/for 6%  gat/bac 0%  gt/bac 0%  min/bac 0%
+avazu-ctr             24.8%          842      6489   gat/for 50%  gt/for 66%  min/for 25%  gat/bac 0%  gt/bac 0%  min/bac 0%
+city-reviews          19.9%        1,500       329   gat/for 43%  gt/for 54%  min/for 22%  gat/bac 0%  gt/bac 0%  min/bac 0%
+city-roads-M          12.4%        4,705         5   gat/for 25%  gt/for 21%  min/for 23%  gat/bac 18%  gt/bac 11%  min/bac 0%
+hm-categories         22.1%          466     10186   gat/for 37%  gt/for 48%  min/for 20%  gat/bac 0%  gt/bac 0%  min/bac 0%
+tolokers-2            12.6%          118      1120   gat/for 26%  gt/for 42%  min/for 15%  gat/bac 0%  gt/bac 0%  min/bac 0%
+twitch-views          23.2%        1,685      1898   gat/for 48%  gt/for 62%  min/for 28%  gat/bac 0%  gt/bac 0%  min/bac 0%
+artnet-exp            13.8%          507       166   gat/for 11%  gt/for 15%  min/for 23%  gat/bac 0%  gt/bac 0%  min/bac 0%
+city-roads-L           5.8%        4,899         5   gat/for 12%  gt/for 10%  min/for 11%  gat/bac 9%  gt/bac 5%  min/bac 0%
+pokec-regions          9.4%       16,670       183   gat/for 13%  gt/for 16%  min/for 19%  gat/bac 11%  gt/bac 9%  min/bac 0%

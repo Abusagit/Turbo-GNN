@@ -1,6 +1,9 @@
 #include "common.cuh"
 
-void reduction_aggr_backward_cuda(const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8);
+void reduction_aggr_backward_cuda(
+    const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8, int schedule = 3,
+    int blocks_per_sm = 8, int sched_chunk = 1, int bucket_launch = 0
+);
 
 void reduction_aggr_forward_partitioned_cuda(
     const at::Tensor& edge_ptr,
@@ -16,10 +19,19 @@ void reduction_aggr_forward_partitioned_cuda(
     bool use_2d_kernel              = false,
     int features_per_block          = 32,
     int tiles_y                     = 8,
-    const std::string& reduce       = "min"
+    const std::string& reduce       = "min",
+    int schedule                    = 3,
+    int blocks_per_sm               = 8,
+    int sched_chunk                 = 1,
+    int bucket_launch               = 0,
+    const at::Tensor& chunk_node    = at::Tensor(),
+    const at::Tensor& chunk_start   = at::Tensor(),
+    int heavy_edge_slice            = 0
 );
 
-at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8) {
+at::Tensor reduction_aggr_backward_torch(
+    at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8, int schedule = 3, int blocks_per_sm = 8, int sched_chunk = 1, int bucket_launch = 0
+) {
     TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
     TORCH_CHECK(arg_idx.is_cuda(), "arg_idx must be CUDA");
     TORCH_CHECK(
@@ -35,7 +47,7 @@ at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx
 
     auto grad_x = torch::zeros({num_src_nodes, d}, grad_out.options());
 
-    reduction_aggr_backward_cuda(grad_out, arg_idx, grad_x, warps_per_block);
+    reduction_aggr_backward_cuda(grad_out, arg_idx, grad_x, warps_per_block, schedule, blocks_per_sm, sched_chunk, bucket_launch);
     return grad_x;
 }
 
@@ -51,7 +63,14 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     bool use_2d_kernel              = false,
     int features_per_block          = 32,
     int tiles_y                     = 8,
-    std::string reduce              = "min"
+    std::string reduce              = "min",
+    int schedule                    = 3,
+    int blocks_per_sm               = 8,
+    int sched_chunk                 = 1,
+    int bucket_launch               = 0,
+    at::Tensor chunk_node           = at::Tensor(),
+    at::Tensor chunk_start          = at::Tensor(),
+    int heavy_edge_slice            = 0
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
@@ -95,7 +114,14 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
         use_2d_kernel,
         features_per_block,
         tiles_y,
-        reduce
+        reduce,
+        schedule,
+        blocks_per_sm,
+        sched_chunk,
+        bucket_launch,
+        chunk_node,
+        chunk_start,
+        heavy_edge_slice
     );
     return {out, arg_idx};
 }

@@ -639,14 +639,36 @@ def load_ogbn(
 
     @ensure_cpu_device
     def _load_oggn_cpu():
-        return NodePropPredDataset(name=name, root=root)
+        # OGB calls torch.load() on its own preprocessed cache, which is a pickled dict rather
+        # than a state dict. PyTorch >= 2.6 defaults `weights_only=True` and refuses it, so
+        # every ogbn-* dataset fails to load. The file is OGB's own, written locally during
+        # its preprocessing step, so opt out -- but only for the duration of this call, rather
+        # than globally where it would also cover genuinely untrusted checkpoints.
+        original_load = torch.load
+
+        def _trusted_load(*args: Any, **kwargs: Any):
+            kwargs["weights_only"] = False
+            return original_load(*args, **kwargs)
+
+        torch.load = _trusted_load
+        try:
+            return NodePropPredDataset(name=name, root=root)
+        finally:
+            torch.load = original_load
 
     dset = _load_oggn_cpu()
     split_idx = dset.get_idx_split()
     graph, labels = dset[0]
 
     edge_index = torch.as_tensor(graph["edge_index"], dtype=torch.long)
-    x = torch.as_tensor(graph["node_feat"], dtype=torch.float32)
+    if graph["node_feat"] is None:
+        # Some OGB graphs carry no node features at all -- ogbn-proteins puts its features on
+        # edges. Represent that as a zero-width matrix rather than fabricating values: the
+        # node count stays correct for masks and graph construction, and anything that
+        # actually needs features gets an obvious [N, 0] instead of plausible-looking noise.
+        x = torch.zeros(graph["num_nodes"], 0, dtype=torch.float32)
+    else:
+        x = torch.as_tensor(graph["node_feat"], dtype=torch.float32)
     y = torch.as_tensor(labels, dtype=torch.long)
 
     if y.ndim > 1 and y.size(-1) == 1:

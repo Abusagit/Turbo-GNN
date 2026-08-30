@@ -4,6 +4,12 @@ import torch
 from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
+from turbo_gnn._functions import (
+    DEFAULT_BLOCKS_PER_SM,
+    DEFAULT_BUCKET_LAUNCH,
+    DEFAULT_SCHED_CHUNK,
+    DEFAULT_SCHEDULE,
+)
 
 from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
@@ -175,51 +181,114 @@ class _CudaSpMMConv(BaseConvolution):
 
 
 class _CudaSimpleAggr(BaseAggr):
-    """Aggregation-only min/max via turbo_gnn."""
+    """Aggregation-only min/max via turbo_gnn.
+
+    Kernel tuning parameters are accepted here and forwarded to the kernel, so
+    an aggregation-only benchmark can drive them exactly like a direct call.
+    Defaults match ``reduction_aggr``.
+    """
 
     def __init__(self, reduce: str = "min", **kwargs: Any) -> None:
-        super().__init__(conv_type=f"{reduce}_aggr", **kwargs)
+        super().__init__(conv_type=f"{reduce}_aggr")
         self.reduce = reduce
+        self.kernel_kwargs = {
+            "warps_per_block": kwargs.get("warps_per_block", 8),
+            "edges_per_block_heavy_nodes": kwargs.get("edges_per_block_heavy_nodes", 128),
+            "use_2d_kernel": kwargs.get("use_2d_kernel", False),
+            "features_per_block": kwargs.get("features_per_block", 32),
+            "tiles_y": kwargs.get("tiles_y", 8),
+            # Node->block scheduling. Forwarded like any other kernel parameter so an
+            # aggregation-only benchmark can drive the scheduler exactly as a direct call
+            # does; defaults match the turbo_gnn op.
+            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
+            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
+            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
+            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+        }
 
     def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
-        return reduction_aggr(graph, x, reduce=self.reduce)
+        return reduction_aggr(graph, x, reduce=self.reduce, **{**self.kernel_kwargs, **kwargs})
 
 
 class _CudaGATv2Aggr(BaseAggr):
     """Aggregation-only GATv2 attention via turbo_gnn (no linear projections)."""
 
     def __init__(self, heads: int, head_dim: int, negative_slope: float = 0.2, **kwargs: Any) -> None:
-        super().__init__(conv_type="gat_v2", **kwargs)
+        super().__init__(conv_type="gat_v2")
         self.heads = heads
         self.head_dim = head_dim
         self.negative_slope = negative_slope
         self.attn_weights = nn.Parameter(torch.empty(heads, head_dim))
         nn.init.xavier_normal_(self.attn_weights, gain=nn.init.calculate_gain("relu"))
+        # Forwarded to the kernel; defaults match gatv2_aggr.
+        self.kernel_kwargs = {
+            "grad_A_reduce_row_chunk_size": kwargs.get("grad_A_reduce_row_chunk_size", 512),
+            "forward_light_warps": kwargs.get("forward_light_warps", 1),
+            "forward_heavy_warps": kwargs.get("forward_heavy_warps", 8),
+            "backward_light_warps": kwargs.get("backward_light_warps", 1),
+            "backward_heavy_warps": kwargs.get("backward_heavy_warps", 8),
+            # Node->block scheduling. Forwarded like any other kernel parameter so an
+            # aggregation-only benchmark can drive the scheduler exactly as a direct call
+            # does; defaults match the turbo_gnn op.
+            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
+            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
+            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
+            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+        }
 
     def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
-        return gatv2_aggr(graph, x_left, x_right, self.attn_weights.data, self.negative_slope)
+        return gatv2_aggr(
+            graph,
+            x_left,
+            x_right,
+            self.attn_weights.data,
+            self.negative_slope,
+            **{**self.kernel_kwargs, **kwargs},
+        )
 
 
 class _CudaGTAggr(BaseAggr):
     """Aggregation-only graph transformer attention via turbo_gnn (no QKV projection)."""
 
     def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
-        super().__init__(conv_type="gt", **kwargs)
+        super().__init__(conv_type="gt")
         self.heads = heads
         self.head_dim = head_dim
-        self.scale = head_dim**-0.5
+        scale = kwargs.get("scale")
+        self.scale = head_dim**-0.5 if scale is None else scale
+        # Forwarded to the kernel; defaults match graph_transformer_aggr.
+        self.kernel_kwargs = {
+            "forward_light_warps": kwargs.get("forward_light_warps", 4),
+            "forward_heavy_warps": kwargs.get("forward_heavy_warps", 8),
+            "backward_light_warps": kwargs.get("backward_light_warps", 1),
+            "backward_heavy_warps": kwargs.get("backward_heavy_warps", 8),
+            # Node->block scheduling. Forwarded like any other kernel parameter so an
+            # aggregation-only benchmark can drive the scheduler exactly as a direct call
+            # does; defaults match the turbo_gnn op.
+            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
+            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
+            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
+            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
+        }
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        # A view, not a copy: the kernel ignores it and only its trailing dim is read.
         x_dummy = Q.view(Q.shape[0], -1)
-        return graph_transformer_aggr(graph, x_dummy, Q, K, V, self.scale)
+        return graph_transformer_aggr(graph, x_dummy, Q, K, V, self.scale, **{**self.kernel_kwargs, **kwargs})
 
 
 class _CudaSpMMAggr(BaseAggr):
     """Aggregation-only SpMM via turbo_gnn."""
 
     def __init__(self, norm_type: str = "none", **kwargs: Any) -> None:
-        super().__init__(conv_type=f"spmm_{norm_type}", **kwargs)
+        super().__init__(conv_type=f"spmm_{norm_type}")
         self.norm_type = norm_type
+        # Forwarded to the kernel; defaults match spmm_aggr.
+        self.cu_sparse_algorithm_id = kwargs.get("cu_sparse_algorithm_id", -1)
+        self.block_dim = kwargs.get("block_dim", 256)
 
     def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
         return spmm_aggr(
@@ -227,8 +296,8 @@ class _CudaSpMMAggr(BaseAggr):
             graph.forward_indptr.int(),
             graph.forward_indices.int(),
             self.norm_type,
-            -1,
-            256,
+            self.cu_sparse_algorithm_id,
+            self.block_dim,
         )
 
 
@@ -301,6 +370,11 @@ class CUDABackend(BaseBackend):
         return conv
 
     def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        """Build a projection-free aggregation.
+
+        Remaining kwargs are kernel tuning parameters and are forwarded to the
+        aggregation, which passes them on to the turbo_gnn kernel.
+        """
         feature_dim = kwargs.pop("feature_dim", None)
         ct = conv_type.lower()
         match ct:
@@ -312,14 +386,14 @@ class CUDABackend(BaseBackend):
                 head_dim = feature_dim // heads
                 return _CudaGTAggr(heads=heads, head_dim=head_dim, **kwargs)
             case "min_aggr":
-                return _CudaSimpleAggr(reduce="min")
+                return _CudaSimpleAggr(reduce="min", **kwargs)
             case "max_aggr":
-                return _CudaSimpleAggr(reduce="max")
+                return _CudaSimpleAggr(reduce="max", **kwargs)
             case "sum_aggr":
-                return _CudaSpMMAggr(norm_type="none")
+                return _CudaSpMMAggr(norm_type="none", **kwargs)
             case "mean_aggr":
-                return _CudaSpMMAggr(norm_type="right")
+                return _CudaSpMMAggr(norm_type="right", **kwargs)
             case "gcn":
-                return _CudaSpMMAggr(norm_type="both")
+                return _CudaSpMMAggr(norm_type="both", **kwargs)
             case _:
                 raise KeyError(f"Unsupported conv_type for CUDA aggr: {conv_type}")

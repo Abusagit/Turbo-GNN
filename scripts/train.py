@@ -316,9 +316,9 @@ def main() -> int:
         comet_config = merged_cfg["comet_ml"]
         comet_config["ExperimentConfig"]["tags"].extend(
             [
-                f'dataset: {params_for_comet["dataset"]}',
-                f'conv_type: {params_for_comet["conv_type"]}',
-                f'backend: {params_for_comet["backend"]}',
+                f"dataset: {params_for_comet['dataset']}",
+                f"conv_type: {params_for_comet['conv_type']}",
+                f"backend: {params_for_comet['backend']}",
             ]
         )
 

@@ -21,10 +21,21 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     bool use_2d_kernel              = false,
     int features_per_block          = 32,
     int tiles_y                     = 8,
-    std::string reduce              = "min"
+    std::string reduce              = "min",
+    int schedule                    = 3,
+    int blocks_per_sm               = 8,
+    int sched_chunk                 = 1,
+    /// 0 = light then heavy on one stream (historical), 1 = heavy then light,
+    /// 2 = heavy and light concurrently on separate streams.
+    int bucket_launch               = 0,
+    at::Tensor chunk_node           = at::Tensor(),
+    at::Tensor chunk_start          = at::Tensor(),
+    int heavy_edge_slice            = 0
 );
 
-at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);
+at::Tensor reduction_aggr_backward_torch(
+    at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8, int schedule = 3, int blocks_per_sm = 8, int sched_chunk = 1, int bucket_launch = 0
+);
 
 // ============================================================================
 // GATv2 aggregation
@@ -39,8 +50,16 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     float negative_slope,
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
-    int light_warps_per_block = 1,
-    int heavy_warps_per_block = 8
+    int light_warps_per_block       = 1,
+    int heavy_warps_per_block       = 8,
+    int schedule                    = 3,
+    int blocks_per_sm               = 8,
+    int sched_chunk                 = 1,
+    int bucket_launch               = 0,
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int heavy_edge_slice            = 0
 );
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
@@ -61,7 +80,15 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor bwd_heavy_nodes,
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
-    bool is_directed          = true
+    bool is_directed          = true,
+    int schedule              = 3,
+    int blocks_per_sm         = 8,
+    int sched_chunk           = 1,
+    int bucket_launch         = 0,
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int backward_heavy_edge_slice   = 0
 );
 
 // ============================================================================
@@ -78,7 +105,17 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 4,
-    int heavy_warps_per_block = 8
+    int heavy_warps_per_block = 8,
+    int schedule              = 3,
+    int blocks_per_sm         = 8,
+    int sched_chunk           = 1,
+    int bucket_launch         = 0,
+    // Edge-slice table for the heavy bucket; see AdjacencyForwardBackwardWithNodeBuckets
+    // .heavy_edge_slices(). heavy_edge_slice == 0 selects the node-per-block heavy path.
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int heavy_edge_slice            = 0
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward_csr_mh_cuda(
@@ -97,7 +134,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
-    bool is_directed          = true
+    bool is_directed          = true,
+    int schedule              = 3,
+    int blocks_per_sm         = 8,
+    int sched_chunk           = 1,
+    int bucket_launch               = 0,
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int heavy_edge_slice            = 0
 );
 
 // ============================================================================
