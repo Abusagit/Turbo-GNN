@@ -32,3 +32,22 @@ out
 # The written report, the summary and the distilled per-cell grid next to them are tracked.
 reports/*/*.json
 !reports/kernel-benchmarks/grid.json
+
+# Benchmark artifacts. Per-cell JSON, logs and generated HTML are bulk machine output -- the
+# sweeps under reports/ run to thousands of files -- and are reproducible from the scripts.
+# Only the written summaries (REPORT.md / *.txt) are tracked, so the findings stay in the repo
+# without the raw data.
+reports/**/*.json
+reports/**/*.log
+reports/**/*.html
+reports/**/*.csv
+reports/**/*.ncu-rep
+!reports/kernel-benchmarks/grid.json
+# Runs parked for provenance rather than use (superseded, contaminated, or incomplete).
+reports/_stale-*/
+reports/*-CONTAMINATED/
+reports/*-CONTENDED/
+reports/*-STALE-*/
+# Generated report pages written at the repo root by earlier report scripts.
+/scheduler-report.html
+/scheduler-full-report.html

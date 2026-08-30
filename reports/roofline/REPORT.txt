@@ -1,0 +1,88 @@
+device NVIDIA A100-SXM4-80GB   measured peak 1.747 TB/s   192 cells
+traffic measured with hardware counters; the compulsory model is shown for comparison
+
+================================================================================
+Q1  ARE WE SATURATING MEMORY BANDWIDTH?   -- no, and not close
+================================================================================
+
+  conv      mode         n   modelled   MEASURED    tuned    achieved
+  min_aggr  forward     32        96%        27%      58%       463 GB/s
+  min_aggr  backward    32        16%        41%      42%       709 GB/s
+  gat_v2    forward     32        79%        21%      42%       359 GB/s
+  gat_v2    backward    32        25%        20%      26%       347 GB/s
+  gt        forward     32       105%        36%      64%       622 GB/s
+  gt        backward    32        42%        27%      28%       480 GB/s
+
+  forward   median  24% of peak   max 100%   at or above 90%: 4/96
+
+  backward  median  29% of peak   max  88%   at or above 90%: 0/96
+
+  Across all 192 configurations, 4 reach 90% of peak.
+  The kernels are not bandwidth-bound. Whatever limits them, it is not the bus.
+
+================================================================================
+Q2  IS MESSAGE PASSING SLOWER THAN READING THE NEIGHBOUR?   -- yes, everywhere
+================================================================================
+
+  Per-edge time divided by the time to fetch that edge's measured DRAM traffic at peak.
+
+  conv      mode         n  vs modelled  vs MEASURED  DRAM B/edge  compulsory
+  min_aggr  forward     32         1.13         3.80         363B        772B
+  min_aggr  backward     0   no per-edge traversal (node x feature kernel)
+  gat_v2    forward     32         1.54         4.86         404B        772B
+  gat_v2    backward    32         4.49         5.07        2054B       1544B
+  gt        forward     32         0.99         2.81         666B       1540B
+  gt        backward    32         2.99         3.64        2258B       2308B
+
+  All 160 edge-traversing configurations exceed 1.0x; median 4.10x.
+  Even the forward pass, which the compulsory model put near break-even, is 2.8-4.9x.
+
+================================================================================
+Q3  WHAT THE MODEL GOT WRONG   -- measured traffic / compulsory traffic
+================================================================================
+
+  conv      mode         n    ratio    reuse   reading
+  min_aggr  forward     32     0.36    2.81x   reuse: fetched less than compulsory
+  min_aggr  backward    32     2.10    0.48x   amplification: fetched MORE
+  gat_v2    forward     32     0.39    2.58x   reuse: fetched less than compulsory
+  gat_v2    backward    32     1.19    0.84x   amplification: fetched MORE
+  gt        forward     32     0.47    2.13x   reuse: fetched less than compulsory
+  gt        backward    32     0.97    1.03x   matches compulsory
+
+  Forward kernels fetch 36-47% of compulsory: the caches serve most neighbour reads,
+  so modelled 'apparent bandwidth' overstated real utilisation by roughly 2.5x.
+  min_aggr's backward fetches 2.10x compulsory: it scatters one atomic per
+  (node, feature) through arg_idx, so 4-byte writes drag whole 32-byte sectors.
+
+================================================================================
+Q4  DOES TUNING CHANGE SATURATION?
+================================================================================
+
+  mode         n   default    tuned   speedup
+  forward     96       24%      48%     1.39x
+  backward    96       29%      35%     1.03x
+
+  Tuning roughly doubles forward utilisation and leaves backward where it was.
+  Both remain far from peak, so bandwidth is not what caps either one.
+
+================================================================================
+PER GRAPH   (median over convolutions and head dims, measured traffic)
+================================================================================
+
+  graph                nodes       edges  fwd %pk  bwd %pk  fwd reuse  fwd edge  bwd edge
+  artnet-exp          50,405     611,101      36%      40%      3.42x      2.78      2.49
+  avazu-ctr           76,269  22,044,423       4%       8%     37.14x     24.54     18.75
+  citeseer             3,327      12,431       6%       4%      2.84x     18.37     33.43
+  city-reviews       148,801   2,479,631      41%      26%      2.02x      2.41      4.29
+  city-roads-L       142,257     421,318      45%      72%      1.69x      2.22      1.43
+  city-roads-M        57,073     189,643      38%      57%      1.90x      2.66      1.77
+  cora                 2,708      13,264       5%       3%      3.22x     21.13     43.15
+  hm-categories       46,563  21,508,553       4%      13%     44.36x     25.53     12.53
+  ogbn-arxiv         169,343   1,335,586      37%      60%      1.35x      2.79      1.99
+  ogbn-products    2,449,029 126,167,309      91%      82%      1.06x      1.10      1.16
+  ogbn-proteins      132,534  79,255,038      16%      42%     13.12x      6.20      2.93
+  pokec-regions    1,632,803  32,255,367      84%      70%      1.22x      1.19      1.42
+  pubmed              19,717     108,365      28%      22%      2.57x      3.53      4.91
+  tolokers-2          11,758   1,049,758       4%       6%     25.59x     27.97     30.84
+  twitch-views       168,114  13,763,228      43%      26%      2.11x      2.33      4.28
+  web-fraud        2,890,331  15,785,700      13%      19%      1.76x      7.78      6.70

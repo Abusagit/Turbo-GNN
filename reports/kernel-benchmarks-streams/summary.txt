@@ -1,0 +1,51 @@
+192 cells from 1152 runs in reports/kernel-benchmarks-streams
+Each strategy is given its own best (schedule x node order); speedups are vs 'sequential' at *its* best.
+
+  strategy        geomean   worst    best  cells won  faster than ref
+  sequential       1.0000   1.000   1.000      40/192            0/192
+  heavy_first      0.9642   0.320   2.182      39/192           46/192
+  concurrent       1.0365   0.336   2.008     113/192          103/192
+
+  by pass and head dim (geomean vs sequential)
+     dim pass        heavy_first    concurrent
+     128 forward          0.9501        1.1402
+     128 backward         0.9602        0.9212
+     256 forward          0.9673        1.1126
+     256 backward         0.9793        0.9877
+
+  per graph (geomean vs sequential)
+    graph            avg deg   heavy_first    concurrent   best cell for concurrent
+    city-reviews        16.7        0.8843        1.2254   2.01x gat_v2/128/for
+    avazu-ctr          289.0        1.0025        1.1762   1.71x gat_v2/256/for
+    hm-categories      461.9        1.0037        1.1175   1.47x gat_v2/128/for
+    twitch-views        81.9        0.9989        1.1124   1.56x gat_v2/128/for
+    tolokers-2          89.3        0.9735        1.1061   1.41x gt/128/for
+    cora                 4.9        0.9155        1.0664   1.39x gat_v2/256/for
+    ogbn-arxiv           7.9        1.0016        1.0590   1.19x gt/256/for
+    web-fraud            5.5        1.0079        1.0513   1.15x gt/128/for
+    artnet-exp          12.1        1.0053        1.0383   1.12x min_aggr/128/for
+    pubmed               5.5        0.9866        1.0312   1.24x gat_v2/256/for
+    ogbn-proteins      598.0        1.0043        1.0217   1.10x min_aggr/128/for
+    city-roads-L         3.0        0.9720        1.0006   1.79x gat_v2/256/for
+    citeseer             3.7        0.7668        0.9306   1.40x gat_v2/256/for
+    pokec-regions       19.8        1.0198        0.9177   1.12x min_aggr/256/bac
+    city-roads-M         3.3        0.9753        0.9093   1.02x gt/256/for
+    ogbn-products       51.5        0.9445        0.8874   1.05x gt/128/for
+
+  largest concurrent wins
+    city-reviews   gat_v2    128 forward      2.7547 ->    1.3717 ms  x2.008  [one_per_block+degree]
+    city-roads-L   gat_v2    256 forward      0.6301 ->    0.3522 ms  x1.789  [one_per_block+natural]
+    city-reviews   min_aggr  256 forward      2.7047 ->    1.5772 ms  x1.715  [one_per_block+natural]
+    avazu-ctr      gat_v2    256 forward      9.6638 ->    5.6510 ms  x1.710  [one_per_block+degree]
+    avazu-ctr      gat_v2    128 forward      6.8086 ->    4.1668 ms  x1.634  [grid_stride+degree]
+    city-reviews   min_aggr  256 backward     2.1159 ->    1.3290 ms  x1.592  [one_per_block+natural]
+    twitch-views   gat_v2    128 forward      5.3993 ->    3.4615 ms  x1.560  [grid_stride+degree]
+    avazu-ctr      gt        256 forward     12.9513 ->    8.3269 ms  x1.555  [grid_stride+degree]
+  largest concurrent losses
+    city-roads-L   gat_v2    128 backward     1.0621 ->    2.4304 ms  x0.437  [grid_stride+locality]
+    ogbn-products  gt        256 backward   391.7742 ->  901.4487 ms  x0.435  [grid_stride+locality]
+    city-roads-M   gat_v2    128 backward     0.5171 ->    1.3504 ms  x0.383  [grid_stride+degree]
+    pokec-regions  gat_v2    128 backward    49.7613 ->  133.2122 ms  x0.374  [one_per_block+natural]
+    citeseer       min_aggr  128 backward     0.0204 ->    0.0607 ms  x0.336  [one_per_block+degree]
+
+wrote reports/kernel-benchmarks-streams/grid.json
