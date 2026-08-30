@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward_CSR_MH_v2_D( // no-format
     size_t N, size_t H,
     const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
@@ -45,9 +45,15 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     const index_t edge_end     = row_ptr[node_i + 1];
     const size_t num_neighbors = static_cast<int>(edge_end - edge_start);
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE     = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES        = PIPELINE_STAGES;
+    constexpr int NUM_PREFETCH_ROWS = 2;  // Q[j], V[j]
+
     // Shared memory layout. Ordered so that every array written through a vector
     // (VecFloat<N>/float4) store starts on a 16-byte boundary; the scalar-only arrays go last:
     // k_shared[D_CONST] as cuda_t                                    -- float4 loads, needs 16B
+    // qv_dbuf[N_PER_BLOCK * 2 * NUM_STAGES * D_CONST] as cuda_t      -- ping-pong for Q[j]/V[j], only when USE_PIPELINE
     // neighbor_out[neighbor_block_size * D_CONST] as accum_t         -- VecFloat<compact_N> stores, needs up to 16B
     // warp_sum_storage[2 * neighbor_block_size * neighbor_warp_cnt] as accum_t -- scalar, double-buffered on (r & 1)
     // neighbor_max[neighbor_block_size] as accum_t                   -- scalar
@@ -57,8 +63,11 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     // so neighbor_out lands 16B-aligned; putting the scalar arrays first would offset
     // it by a single accum_t and misalign the wide stores below.
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *const k_shared      = reinterpret_cast<cuda_t *>(sh_raw);  // Loading K_i into shared memory, because it's the same in one block
-    accum_t *const neighbor_out = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t));  // Outs for each neighbor in one block
+    cuda_t *const k_shared = reinterpret_cast<cuda_t *>(sh_raw);  // Loading K_i into shared memory, because it's the same in one block
+    cuda_t *const qv_dbuf  = k_shared + D_CONST;                  // only meaningful when USE_PIPELINE
+
+    constexpr size_t qv_dbuf_bytes = USE_PIPELINE ? N_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    accum_t *const neighbor_out    = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t) + qv_dbuf_bytes);
     accum_t *const warp_sum_storage =
         neighbor_out + neighbor_block_size * D_CONST;  // Space to store warp sums to agregate them later (2 round buffers)
     accum_t *const neighbor_max = warp_sum_storage + 2 * neighbor_block_size;  // Space to store local neighbor maximums of scores
@@ -100,16 +109,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     accum_t o_acc[ACCS_PER_THREAD] = {0};
 
     // neighbor loop
-    const size_t rounds = (num_neighbors + neighbor_block_size - 1) / neighbor_block_size;
-    for (size_t r = 0; r < rounds; ++r) {
-        const size_t neighbor_id = r * neighbor_block_size + block_neighbor_id;
-        if (neighbor_id >= num_neighbors) [[unlikely]] {
-            break;
-        }
-        const index_t j = col_idx[edge_start + neighbor_id];
-
-        const cuda_t *q_base = Q + j * stride_q_n + head_h * stride_q_h;
-        const cuda_t *v_base = V + j * stride_v_n + head_h * stride_v_h;
+    auto consume = [&](index_t /*j*/, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+        const cuda_t *q_base = rows[0];
+        const cuda_t *v_base = rows[1];
 
         accum_t s_partial{};
 
@@ -138,6 +140,30 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
                 const typename Tile::vec_t vv = Tile::read(v_base, vi);
                 vv.template weighted_accum_<accum_t>(&o_acc[t * TW], w);
             }
+        }
+    };
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {Q, V};
+        int64_t const row_stride_n[NUM_PREFETCH_ROWS]     = {stride_q_n, stride_v_n};
+        int64_t const row_stride_h[NUM_PREFETCH_ROWS]     = {stride_q_h, stride_v_h};
+        cuda_t *warp_dbuf = qv_dbuf + block_neighbor_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
+        pipelined_neighbor_row_loop<static_cast<int>(N_PER_BLOCK), static_cast<int>(D_CONST), NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            static_cast<int>(block_neighbor_id), static_cast<int>(lane_id), static_cast<int>(num_neighbors), edge_start, col_idx, row_bases,
+            row_stride_n, row_stride_h, static_cast<int>(head_h), warp_dbuf, consume
+        );
+    } else {
+        const size_t rounds = (num_neighbors + neighbor_block_size - 1) / neighbor_block_size;
+        for (size_t r = 0; r < rounds; ++r) {
+            const size_t neighbor_id = r * neighbor_block_size + block_neighbor_id;
+            if (neighbor_id >= num_neighbors) [[unlikely]] {
+                break;
+            }
+            const index_t j       = col_idx[edge_start + neighbor_id];
+            const cuda_t *q_base  = Q + j * stride_q_n + head_h * stride_q_h;
+            const cuda_t *v_base  = V + j * stride_v_n + head_h * stride_v_h;
+            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {q_base, v_base};
+            consume(j, rows);
         }
     }
 

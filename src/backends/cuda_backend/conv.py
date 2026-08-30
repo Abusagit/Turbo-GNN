@@ -38,7 +38,7 @@ class _CudaSimpleAggrConv(BaseConvolution):
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        return reduction_aggr(graph, x, reduce=self.aggr_type)
+        return self.kernel(graph, x)
 
 
 class _CUDAGATv2Conv(BaseConvolution):
@@ -130,13 +130,13 @@ class _CudaGraphTransformerConv(BaseConvolution):
         k = k.view(-1, self.num_heads, self.head_dim)
         v = v.view(-1, self.num_heads, self.head_dim)
 
-        return graph_transformer_aggr(
+        return self.kernel(
             graph,
             x,
-            q,
-            k,
-            v,
-            self.attn_scores_multiplier,
+            Q=q,
+            K=k,
+            V=v,
+            scale=self.attn_scores_multiplier,
         ).view(-1, self.feature_dim)
 
 

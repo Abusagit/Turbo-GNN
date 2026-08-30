@@ -47,7 +47,9 @@ def make_graph_repr(indptr, indices, light, heavy):
     )
 
 
-def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min", use_2d=False, fpb=32, tiles=8):
+def run_forward(
+    indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min", use_2d=False, fpb=32, tiles=8, pipeline_stages=0
+):
     out, arg_idx = reduction_aggr_forward_partitioned(
         indptr,
         indices,
@@ -60,12 +62,15 @@ def run_forward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min"
         features_per_block=fpb,
         tiles_y=tiles,
         reduce=reduce,
+        pipeline_stages=pipeline_stages,
     )
     out = zero_inf(out)
     return out, arg_idx
 
 
-def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min", use_2d=False, fpb=32, tiles=8):
+def run_backward(
+    indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min", use_2d=False, fpb=32, tiles=8, pipeline_stages=0
+):
     graph = make_graph_repr(indptr, indices, light, heavy)
     out = reduction_aggr(
         graph,
@@ -76,6 +81,7 @@ def run_backward(indptr, indices, x, light, heavy, warps=8, epb=128, reduce="min
         features_per_block=fpb,
         tiles_y=tiles,
         reduce=reduce,
+        pipeline_stages=pipeline_stages,
     )
     out = zero_inf(out)
 
@@ -356,4 +362,80 @@ def test_forward_block_sizes_vs_fp32_reference(warps, dtype, reduce, use_2d_kern
         atol=atol,
         rtol=rtol,
         msg=f"Forward mismatch vs fp32 ref for warps={warps}, dtype={dtype}, reduce={reduce}, kernel={kernel_type}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline correctness: pipeline_stages > 0 vs pipeline_stages == 0 (baseline)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("pipeline_stages", [1])
+def test_forward_pipeline_vs_baseline(dtype, reduce, pipeline_stages):
+    """Forward: pipeline (any stage count) must match the pipeline_stages=0 baseline,
+    for both the light (atomic) and packed-atomics heavy kernels."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    N, E, F = 256, 3000, 64
+    indptr, indices = create_simple_graph(device, N, E)
+    # low threshold guarantees a non-empty heavy bucket given ~12 avg degree
+    light, heavy = partition_nodes(indptr, threshold=10)
+    assert heavy.numel() > 0, "test graph must produce a non-empty heavy bucket"
+
+    x = torch.randn(N, F, device=device, dtype=dtype)
+
+    out_baseline, _ = run_forward(indptr, indices, x, light, heavy, reduce=reduce, pipeline_stages=0)
+    out_pipeline, _ = run_forward(indptr, indices, x, light, heavy, reduce=reduce, pipeline_stages=pipeline_stages)
+
+    assert not out_pipeline.isnan().any(), "Pipeline output contains NaN"
+
+    atol, rtol = (1e-5, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(
+        out_pipeline,
+        out_baseline,
+        atol=atol,
+        rtol=rtol,
+        msg=f"Pipeline(stages={pipeline_stages}) forward mismatch vs baseline for {dtype}, reduce={reduce}",
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("pipeline_stages", [1])
+def test_backward_pipeline_vs_baseline(dtype, reduce, pipeline_stages):
+    """Backward: scattered gradients must match between pipeline and the
+    pipeline_stages=0 baseline (backward itself has no pipeline; this
+    guards the forward-saved arg_idx contract under the new param)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    N, E, F = 256, 3000, 64
+    indptr, indices = create_simple_graph(device, N, E)
+    light, heavy = partition_nodes(indptr, threshold=10)
+    assert heavy.numel() > 0, "test graph must produce a non-empty heavy bucket"
+
+    x_base = torch.randn(N, F, device=device, dtype=dtype, requires_grad=True)
+    x_pipe = x_base.detach().clone().requires_grad_(True)
+
+    grad_base = run_backward(indptr, indices, x_base, light, heavy, reduce=reduce, pipeline_stages=0)
+    grad_pipe = run_backward(indptr, indices, x_pipe, light, heavy, reduce=reduce, pipeline_stages=pipeline_stages)
+
+    assert not grad_pipe.isnan().any(), "Pipeline grad contains NaN"
+
+    atol, rtol = (1e-4, 1e-3) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(
+        grad_pipe,
+        grad_base,
+        atol=atol,
+        rtol=rtol,
+        msg=f"Pipeline(stages={pipeline_stages}) backward mismatch vs baseline for {dtype}, reduce={reduce}",
     )

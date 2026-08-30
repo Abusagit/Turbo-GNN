@@ -76,6 +76,63 @@ def build_cuda_graph(edge_index: torch.Tensor, num_nodes: int):
     )
 
 
+def make_hub_graph(N: int, num_hubs: int = 8, hub_degree: int = 200, device: str = "cuda"):
+    """Directed graph with a few high-degree hubs (asymmetric hub edges):
+    guarantees a non-empty heavy bucket and exercises the directed backward
+    kernel (graph_attn_backward_csrT_kernel_D), unlike make_undirected_graph."""
+    src_bg = torch.randint(0, N, (N * 3,), device=device)
+    dst_bg = torch.randint(0, N, (N * 3,), device=device)
+    hubs = torch.arange(num_hubs, device=device)
+    src_hub = torch.randint(0, N, (num_hubs * hub_degree,), device=device)
+    dst_hub = hubs.repeat_interleave(hub_degree)
+    src_all = torch.cat([src_bg, dst_bg, src_hub, torch.arange(N, device=device)])
+    dst_all = torch.cat([dst_bg, src_bg, dst_hub, torch.arange(N, device=device)])
+    edge_index = torch.stack([src_all, dst_all], dim=0)
+    flat = torch.unique(edge_index[0] * N + edge_index[1])
+    return torch.stack([flat // N, flat % N], dim=0)
+
+
+def build_cuda_graph_bucketed(edge_index: torch.Tensor, num_nodes: int, heavy_degree_threshold: int | None = None):
+    """Like build_cuda_graph, but optionally buckets high-degree nodes into
+    the heavy partition (exercises W=8/16/32 kernel instantiations)."""
+    fwd_indptr, fwd_indices, _, _ = build_csr_as_is(
+        edge_index,
+        edge_weight=None,
+        num_nodes=num_nodes,
+        do_transpose=True,
+    )
+    bwd_indptr, bwd_indices, _, _ = build_csr_as_is(
+        edge_index,
+        edge_weight=None,
+        num_nodes=num_nodes,
+        do_transpose=False,
+    )
+    device = edge_index.device
+
+    def _split(indptr: torch.Tensor):
+        all_nodes = torch.arange(num_nodes, device=device, dtype=torch.int32)
+        if heavy_degree_threshold is None:
+            empty = torch.tensor([], dtype=torch.int32, device=device)
+            return all_nodes, empty
+        degrees = indptr[1:] - indptr[:-1]
+        heavy_mask = degrees > heavy_degree_threshold
+        return all_nodes[~heavy_mask], all_nodes[heavy_mask]
+
+    fwd_light, fwd_heavy = _split(fwd_indptr)
+    bwd_light, bwd_heavy = _split(bwd_indptr)
+
+    return AdjacencyForwardBackwardWithNodeBuckets(
+        forward_indptr=fwd_indptr.int(),
+        forward_indices=fwd_indices.int(),
+        backward_indptr=bwd_indptr.int(),
+        backward_indices=bwd_indices.int(),
+        forward_light_nodes=fwd_light,
+        forward_heavy_nodes=fwd_heavy,
+        backward_light_nodes=bwd_light,
+        backward_heavy_nodes=bwd_heavy,
+    )
+
+
 def build_wsb_graph(edge_index: torch.Tensor, num_nodes: int):
     """Build WSBFormat graph for Triton backend."""
     adj_sparse = normalize_adj(
@@ -362,4 +419,102 @@ def test_gt_low_precision_backward(backend, dtype, num_nodes, feature_dim, heads
         f"Low-precision CUDA backward mismatch ({dtype}): "
         f"max|diff|={(x_cuda.grad.float() - x_cuda_full_precision.grad.float()).abs().max().item():.3e}, "
         f"mean|diff|={(x_cuda.grad.float() - x_cuda_full_precision.grad.float()).abs().mean().item():.3e}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline correctness: pipeline_stages > 0 vs pipeline_stages == 0 (baseline)
+# ---------------------------------------------------------------------------
+
+_GT_PIPE_TOL = {
+    torch.float32: {"rtol": 1e-5, "atol": 1e-5},
+    torch.float16: {"rtol": 1e-3, "atol": 1e-3},
+    torch.bfloat16: {"rtol": 1e-2, "atol": 1e-2},
+}
+
+# "light_only" is undirected (make_undirected_graph): exercises the
+# undirected backward kernel and the W<=4 light-bucket forward path.
+# "with_heavy" is directed (make_hub_graph): exercises the directed AL/R-like
+# backward kernel and the W=8/16/32 heavy-bucket forward path.
+_GT_PIPE_GRAPHS = ["light_only", "with_heavy"]
+
+
+def _make_gt_pipeline_graph(kind: str, num_nodes: int, device: str = "cuda"):
+    if kind == "light_only":
+        edge_index = make_undirected_graph(num_nodes, num_nodes * 5, device=device)
+        return build_cuda_graph_bucketed(edge_index, num_nodes)
+    edge_index = make_hub_graph(num_nodes, device=device)
+    return build_cuda_graph_bucketed(edge_index, num_nodes, heavy_degree_threshold=32)
+
+
+@pytest.mark.parametrize("graph_kind", _GT_PIPE_GRAPHS)
+@pytest.mark.parametrize("pipeline_stages", [1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gt_pipeline_vs_baseline_forward(graph_kind, pipeline_stages, dtype):
+    """Forward: pipeline (any stage count) must match the pipeline_stages=0 baseline."""
+    device = "cuda"
+    torch.manual_seed(42)
+    num_nodes = 1000
+    feature_dim = 256
+    heads = 4
+
+    cuda_graph = _make_gt_pipeline_graph(graph_kind, num_nodes, device)
+    cuda_backend = BackendRegistry.get_backend("cuda")
+
+    layer = cuda_backend.create_conv("gt", feature_dim=feature_dim, heads=heads).to(device).to(dtype)
+
+    x = torch.randn(num_nodes, feature_dim, device=device, dtype=dtype)
+
+    layer.configure(forward_pipeline_stages=0)
+    out_baseline = layer(x, cuda_graph)
+
+    layer.configure(forward_pipeline_stages=pipeline_stages)
+    out_pipeline = layer(x, cuda_graph)
+
+    assert not out_pipeline.isnan().any(), "Pipeline output contains NaN"
+    assert torch.allclose(out_pipeline, out_baseline, **_GT_PIPE_TOL[dtype]), (
+        f"GT pipeline(stages={pipeline_stages}, {graph_kind}) forward mismatch ({dtype}): "
+        f"max|diff|={(out_pipeline - out_baseline).abs().max().item():.3e}, "
+        f"mean|diff|={(out_pipeline - out_baseline).abs().mean().item():.3e}"
+    )
+
+
+@pytest.mark.parametrize("graph_kind", _GT_PIPE_GRAPHS)
+@pytest.mark.parametrize("pipeline_stages", [1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_gt_backward_pipeline_vs_baseline(graph_kind, pipeline_stages, dtype):
+    """Backward kernels' own pipeline: gradients must match between
+    backward_pipeline_stages > 0 and the backward_pipeline_stages=0 baseline.
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+    num_nodes = 1000
+    feature_dim = 256
+    heads = 4
+
+    cuda_graph = _make_gt_pipeline_graph(graph_kind, num_nodes, device)
+    cuda_backend = BackendRegistry.get_backend("cuda")
+
+    layer = cuda_backend.create_conv("gt", feature_dim=feature_dim, heads=heads).to(device).to(dtype)
+
+    x_base = torch.randn(num_nodes, feature_dim, device=device, dtype=dtype, requires_grad=True)
+    x_pipe = x_base.detach().clone().requires_grad_(True)
+
+    layer.configure(backward_pipeline_stages=0)
+    out_base = layer(x_base, cuda_graph)
+    out_base.sum().backward()
+
+    layer.configure(backward_pipeline_stages=pipeline_stages)
+    out_pipe = layer(x_pipe, cuda_graph)
+    out_pipe.sum().backward()
+
+    assert x_base.grad is not None and x_pipe.grad is not None
+    assert not x_pipe.grad.isnan().any(), "Pipeline grad contains NaN"
+    assert torch.allclose(out_pipe, out_base, **_GT_PIPE_TOL[dtype]), (
+        f"GT backward pipeline(stages={pipeline_stages}, {graph_kind}) forward mismatch ({dtype}): "
+        f"max|diff|={(out_pipe - out_base).abs().max().item():.3e}"
+    )
+    assert torch.allclose(x_pipe.grad, x_base.grad, **_GT_PIPE_TOL[dtype]), (
+        f"GT backward pipeline(stages={pipeline_stages}, {graph_kind}) grad mismatch ({dtype}): "
+        f"max|diff|={(x_pipe.grad - x_base.grad).abs().max().item():.3e}"
     )

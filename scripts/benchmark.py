@@ -9,6 +9,19 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Some dataset loaders (e.g. ogb's NodePropPredDataset) call torch.load() on
+# their own locally-cached preprocessed files without weights_only=False;
+# PyTorch >=2.6 defaults weights_only=True, which breaks loading those trusted local caches.
+_orig_torch_load = torch.load
+
+
+def _torch_load_weights_only_false(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+
+
+torch.load = _torch_load_weights_only_false
+
 from src.backends.registry import BackendRegistry
 from src.benchmarking.microbench import MicrobenchResult, get_gpu_info, time_callable
 from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
@@ -95,7 +108,14 @@ def parse_args() -> argparse.Namespace:
         "--pipeline-stages",
         type=int,
         default=0,
-        help="Async-copy pipeline stage count for CUDA GATv2 (0 disables the pipeline). "
+        help="Forward async-copy pipeline stage count for CUDA convs (0 disables the pipeline). "
+        "Ignored when --autotune is set.",
+    )
+    p.add_argument(
+        "--backward-pipeline-stages",
+        type=int,
+        default=0,
+        help="Backward async-copy pipeline stage count for CUDA convs (0 disables the pipeline). "
         "Ignored when --autotune is set.",
     )
     p.add_argument(
@@ -187,7 +207,7 @@ def main() -> int:
 
     conv = conv.to(device)
     autotuned_config: dict = {}
-    if args.layer == "gat_v2" and args.backend == "cuda":
+    if args.backend == "cuda":
         if args.autotune:
             from turbo_gnn._autotune import AutotuneConfig
 
@@ -198,11 +218,12 @@ def main() -> int:
                 cache_dir=None,
             )
             autotuned_config = conv.autotune(x, sample, config=tune_cfg)
-            # graph_repr may have been rebuilt if a graph param (e.g. the light/heavy
-            # partition threshold) was retuned -- re-fetch after autotune().
             graph = sample.graph_repr
         else:
-            conv.configure(forward_pipeline_stages=args.pipeline_stages)
+            conv.configure(
+                forward_pipeline_stages=args.pipeline_stages,
+                backward_pipeline_stages=args.backward_pipeline_stages,
+            )
 
     # measure function
     amp_dtype = None
@@ -252,7 +273,15 @@ def main() -> int:
         "mode": args.mode,
         "autotuned": args.autotune,
         "autotuned_config": autotuned_config,
-        "pipeline_stages": autotuned_config.get("forward_pipeline_stages", args.pipeline_stages),
+        "forward_pipeline_stages": autotuned_config.get("forward_pipeline_stages", args.pipeline_stages),
+        "backward_pipeline_stages": autotuned_config.get("backward_pipeline_stages", args.backward_pipeline_stages),
+        # The stage count actually swept for this run's --mode (what plot_pipeline_results.py
+        # groups by): forward stages in forward mode, backward stages in backward mode.
+        "pipeline_stages": (
+            autotuned_config.get("forward_pipeline_stages", args.pipeline_stages)
+            if args.mode == "forward"
+            else autotuned_config.get("backward_pipeline_stages", args.backward_pipeline_stages)
+        ),
         "kernel_params": _collect_kernel_params(conv),
         "iters": res.iters,
         "ms_per_iter": res.ms_per_iter,

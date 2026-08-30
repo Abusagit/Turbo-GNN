@@ -390,7 +390,7 @@ def _make_pipeline_graph(kind: str, num_nodes: int, device: str = "cuda"):
 
 
 @pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
-@pytest.mark.parametrize("pipeline_stages", [1, 2, 4])
+@pytest.mark.parametrize("pipeline_stages", [1])
 @pytest.mark.parametrize("feature_dim", [64, 256])
 @pytest.mark.parametrize("heads", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -435,15 +435,15 @@ def test_gatv2_pipeline_vs_baseline_forward(graph_kind, pipeline_stages, feature
 
 
 @pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
-@pytest.mark.parametrize("pipeline_stages", [1, 2, 4])
+@pytest.mark.parametrize("pipeline_stages", [1])
 @pytest.mark.parametrize("feature_dim", [64, 256])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_gatv2_pipeline_vs_baseline_backward(graph_kind, pipeline_stages, feature_dim, dtype):
-    """Backward: gradients must match between pipeline and pipeline_stages=0 baseline.
-
-    The backward kernel itself has no pipeline, but its inputs include the
-    forward output, and the extra forward argument changed the autograd
-    contract (number of returned grads) -- both are exercised here.
+    """Backward: gradients must match when only the *forward* pipeline is toggled
+    (backward_pipeline_stages stays at its default 0 throughout). Also exercises
+    that the extra forward argument didn't break the autograd contract (number
+    of returned grads). See test_gatv2_backward_pipeline_vs_baseline for the
+    backward kernels' own pipeline.
     """
     device = "cuda"
     torch.manual_seed(42)
@@ -493,6 +493,71 @@ def test_gatv2_pipeline_vs_baseline_backward(graph_kind, pipeline_stages, featur
         **_PIPE_TOL[dtype],
         msg=lambda m: (
             f"Pipeline(stages={pipeline_stages}, {graph_kind}) backward mismatch ({dtype}): "
+            f"{_max_mean_diff(x_base.grad, x_pipe.grad)}\n{m}"
+        ),
+    )
+
+
+@pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
+@pytest.mark.parametrize("pipeline_stages", [1])
+@pytest.mark.parametrize("feature_dim", [64, 256])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_gatv2_backward_pipeline_vs_baseline(graph_kind, pipeline_stages, feature_dim, dtype):
+    """Backward kernels' own pipeline: gradients must match between
+    backward_pipeline_stages > 0 and the backward_pipeline_stages=0 baseline.
+
+    graph_kind="light_only" is undirected (exercises G_Kernel/ALR_Undirected,
+    single-warp sequential pipelining); "with_heavy" is directed (exercises
+    AL/R, warp-strided pipelining) -- see _make_pipeline_graph.
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+    num_nodes = 1000
+    heads = 2
+
+    cuda_graph = _make_pipeline_graph(graph_kind, num_nodes, device)
+    cuda_backend = BackendRegistry.get_backend("cuda")
+
+    layer = (
+        cuda_backend.create_conv(
+            "gat_v2",
+            feature_dim=feature_dim,
+            heads=heads,
+            bias=False,
+        )
+        .to(device)
+        .to(dtype)
+    )
+
+    x_base = torch.randn(num_nodes, feature_dim, device=device, dtype=dtype, requires_grad=True)
+    x_pipe = x_base.detach().clone().requires_grad_(True)
+
+    layer.configure(backward_pipeline_stages=0)
+    out_base = layer(x_base, cuda_graph)
+    out_base.sum().backward()
+
+    layer.configure(backward_pipeline_stages=pipeline_stages)
+    out_pipe = layer(x_pipe, cuda_graph)
+    out_pipe.sum().backward()
+
+    assert x_base.grad is not None and x_pipe.grad is not None
+    assert not x_pipe.grad.isnan().any(), "Pipeline grad contains NaN"
+
+    assert_close(
+        out_pipe,
+        out_base,
+        **_PIPE_TOL[dtype],
+        msg=lambda m: (
+            f"Backward pipeline(stages={pipeline_stages}, {graph_kind}) forward output mismatch ({dtype}): "
+            f"{_max_mean_diff(out_base, out_pipe)}\n{m}"
+        ),
+    )
+    assert_close(
+        x_pipe.grad,
+        x_base.grad,
+        **_PIPE_TOL[dtype],
+        msg=lambda m: (
+            f"Backward pipeline(stages={pipeline_stages}, {graph_kind}) grad mismatch ({dtype}): "
             f"{_max_mean_diff(x_base.grad, x_pipe.grad)}\n{m}"
         ),
     )

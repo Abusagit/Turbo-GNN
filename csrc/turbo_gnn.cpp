@@ -9,7 +9,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "reduction_aggr_forward_partitioned", &reduction_aggr_forward_partitioned_torch, "Reduction aggregation forward (partitioned)",
         py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("X"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("max_degree"),
         py::arg("warps_per_block") = 8, py::arg("edges_per_block_heavy_nodes") = 128, py::arg("use_2d_kernel") = false,
-        py::arg("features_per_block") = 32, py::arg("tiles_y") = 8, py::arg("reduce") = "min"
+        py::arg("features_per_block") = 32, py::arg("tiles_y") = 8, py::arg("reduce") = "min", py::arg("pipeline_stages") = 0
     );
 
     m.def(
@@ -29,21 +29,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("attn_vec"), py::arg("logsumexp"),
         py::arg("negative_slope") = 0.2f, py::arg("grad_A_reduce_row_chunk_size") = 512, py::arg("fwd_light_nodes"), py::arg("fwd_heavy_nodes"),
         py::arg("bwd_light_nodes"), py::arg("bwd_heavy_nodes"), py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8,
-        py::arg("is_directed") = true
+        py::arg("is_directed") = true, py::arg("pipeline_stages") = 0
     );
 
     // Graph Transformer aggregation
     m.def(
         "gt_forward_csr_mh", &graph_attention_forward_csr_mh_cuda, "Graph Transformer forward (CSR, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 8
+        py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 8, py::arg("pipeline_stages") = 0
     );
 
     m.def(
         "gt_backward_csr_mh", &graph_attention_backward_csr_mh_cuda, "Graph Transformer backward (CSR + CSR^T, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("dO"),
         py::arg("logsumexp"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("light_warps_per_block") = 1,
-        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true
+        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("pipeline_stages") = 0
     );
 
     // SpMM

@@ -9,8 +9,8 @@ template <int D_CONST, typename cuda_t, typename index_t>
 void GATv2Backward_CSR_Undirected_Impl(
     size_t N, size_t H, size_t D, const cuda_t *grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *d_l, int64_t stride_l_n,
     int64_t stride_l_h, const cuda_t *d_r, int64_t stride_r_n, int64_t stride_r_h, const index_t *d_row_ptr, const index_t *d_col_idx,
-    const cuda_t *d_attn_vec, const float *d_logsumexp, float negative_slope, int grad_A_reduce_row_chunk_size, cudaStream_t stream,
-    cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced
+    const cuda_t *d_attn_vec, const float *d_logsumexp, float negative_slope, int grad_A_reduce_row_chunk_size, int pipeline_stages,
+    cudaStream_t stream, cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced
 ) {
     dim3 nThreads(kWarpSize);
     dim3 nBlocks(N, H);
@@ -19,21 +19,30 @@ void GATv2Backward_CSR_Undirected_Impl(
     float *d_G;
     CUDA_CHECK(cudaMalloc(&d_G, N * H * sizeof(float)));
 
-    // G kernel shared: li (cuda_t) + ghi (cuda_t)
-    size_t sh_g = 2 * D_CONST * sizeof(cuda_t);
+    std::visit(
+        [&](auto stages_c) {
+            constexpr int STAGES        = decltype(stages_c)::value;
+            constexpr bool USE_PIPELINE = STAGES > 0;
 
-    GATv2Backward_G_Kernel<D_CONST, cuda_t, index_t><<<nBlocks, nThreads, sh_g, stream>>>(
-        N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx, d_attn_vec,
-        d_logsumexp, negative_slope, d_G
-    );
+            // G kernel shared: li (cuda_t) + ghi (cuda_t) + r_dbuf (STAGES == 0 makes this term vanish)
+            size_t sh_g = 2 * D_CONST * sizeof(cuda_t) + (USE_PIPELINE ? STAGES * D_CONST * sizeof(cuda_t) : 0);
 
-    // 2) Fused ALR kernel: grad_a, grad_l, grad_r using forward CSR only
-    // Shared: li + ri + ghi (cuda_t) + grada + gradli + gradri (float)
-    size_t sh_alr = 3 * D_CONST * sizeof(cuda_t) + 3 * D_CONST * sizeof(float);
+            GATv2Backward_G_Kernel<D_CONST, cuda_t, index_t, float, STAGES><<<nBlocks, nThreads, sh_g, stream>>>(
+                N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx,
+                d_attn_vec, d_logsumexp, negative_slope, d_G
+            );
 
-    GATv2Backward_ALR_Undirected<D_CONST, cuda_t, index_t><<<nBlocks, nThreads, sh_alr, stream>>>(
-        N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx, d_attn_vec,
-        d_logsumexp, d_G, negative_slope, grad_a, grad_l, grad_r
+            // 2) Fused ALR kernel: grad_a, grad_l, grad_r using forward CSR only
+            // Shared: li + ri + ghi (cuda_t) + rlghj_dbuf (STAGES == 0 makes this term vanish) + grada + gradli + gradri (float)
+            size_t sh_alr =
+                3 * D_CONST * sizeof(cuda_t) + (USE_PIPELINE ? 3 * STAGES * D_CONST * sizeof(cuda_t) : 0) + 3 * D_CONST * sizeof(float);
+
+            GATv2Backward_ALR_Undirected<D_CONST, cuda_t, index_t, float, STAGES><<<nBlocks, nThreads, sh_alr, stream>>>(
+                N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx,
+                d_attn_vec, d_logsumexp, d_G, negative_slope, grad_a, grad_l, grad_r
+            );
+        },
+        MakeIntVariant<0, 1>(pipeline_stages)
     );
 
     // 3) Reduce grad_a [N, H, D] -> [H, D]
@@ -211,26 +220,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 // l_sh + r_dbuf (STAGES == 0 makes this term vanish) + W * D float + 2 * W float
                 size_t shmem = DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
-                // Above the 48 KiB static default, the kernel must opt in to a larger
-                // dynamic shared memory allocation (large heavy_warps combined with a
-                // deep pipeline can exceed it, e.g. W=32, STAGES=4, D=128 needs ~81 KiB).
-                constexpr size_t kStaticShmemLimit = 48 * 1024;
-                if (shmem > kStaticShmemLimit) {
-                    int device = 0;
-                    CUDA_CHECK(cudaGetDevice(&device));
-                    int max_shmem_optin = 0;
-                    CUDA_CHECK(cudaDeviceGetAttribute(&max_shmem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-                    TORCH_CHECK(
-                        shmem <= static_cast<size_t>(max_shmem_optin),
-                        "GATv2 forward: requested shared memory (", shmem, " bytes) exceeds this GPU's max "
-                        "opt-in shared memory per block (", max_shmem_optin, " bytes) for warps_per_block=", W,
-                        ", pipeline_stages=", STAGES, ", head_dim=", DC, ". Reduce warps_per_block or pipeline_stages."
-                    );
-                    CUDA_CHECK(cudaFuncSetAttribute(
-                        GATv2Forward_Kernel<W, DC, cuda_t, index_t, float, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        static_cast<int>(shmem)
-                    ));
-                }
+                ensure_dynamic_shmem(GATv2Forward_Kernel<W, DC, cuda_t, index_t, float, STAGES>, shmem, "GATv2 forward");
 
                 dim3 blocks(num_nodes_bucket, H);
                 dim3 threads(W * kWarpSize);
@@ -241,7 +231,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1, 2, 4>(pipeline_stages)
+            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1>(pipeline_stages)
         );
     };
 
@@ -271,7 +261,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor bwd_heavy_nodes,
     int light_warps_per_block,
     int heavy_warps_per_block,
-    bool is_directed
+    bool is_directed,
+    int pipeline_stages
 ) {
     TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
     TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
@@ -366,12 +357,13 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         auto launch_al_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
             if (num_nodes_bucket == 0) return;
             std::visit(
-                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                    using index_t    = typename decltype(idxInfo)::Type;
-                    using torch_t    = typename decltype(typeInfo)::TorchType;
-                    using cuda_t     = typename decltype(typeInfo)::CudaType;
-                    constexpr int DC = decltype(d_c)::value;
-                    constexpr int W  = decltype(warp_c)::value;
+                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto stages_c) {
+                    using index_t        = typename decltype(idxInfo)::Type;
+                    using torch_t        = typename decltype(typeInfo)::TorchType;
+                    using cuda_t         = typename decltype(typeInfo)::CudaType;
+                    constexpr int DC     = decltype(d_c)::value;
+                    constexpr int W      = decltype(warp_c)::value;
+                    constexpr int STAGES = decltype(stages_c)::value;
 
                     auto *grad_h_ptr = reinterpret_cast<const cuda_t *>(grad_h.data_ptr<torch_t>());
                     auto *l_ptr      = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
@@ -379,19 +371,23 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     auto *attn_ptr   = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                     auto *grad_l_ptr = reinterpret_cast<cuda_t *>(grad_l.data_ptr<torch_t>());
 
-                    size_t sh_al = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
+                    // li_sh + ghi_sh + r_dbuf (STAGES == 0 makes this term vanish) + warp_grada + warp_gradl + warp_G + G_broadcast
+                    size_t sh_al = 2 * DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
+
+                    ensure_dynamic_shmem(GATv2Backward_AL<W, DC, cuda_t, index_t, float, STAGES>, sh_al, "GATv2 backward AL");
 
                     dim3 blocks(num_nodes_bucket, H);
                     dim3 threads(W * kWarpSize);
 
-                    GATv2Backward_AL<W, DC, cuda_t, index_t><<<blocks, threads, sh_al, stream>>>(
+                    GATv2Backward_AL<W, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, sh_al, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                         index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(node_indices), attn_ptr, d_logsumexp,
                         negative_slope, d_grad_a, grad_l_ptr, d_G
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant
+                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0, 1>(pipeline_stages)
             );
         };
 
@@ -399,12 +395,13 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         auto launch_r_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant) {
             if (num_nodes_bucket == 0) return;
             std::visit(
-                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                    using index_t    = typename decltype(idxInfo)::Type;
-                    using torch_t    = typename decltype(typeInfo)::TorchType;
-                    using cuda_t     = typename decltype(typeInfo)::CudaType;
-                    constexpr int DC = decltype(d_c)::value;
-                    constexpr int W  = decltype(warp_c)::value;
+                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto stages_c) {
+                    using index_t        = typename decltype(idxInfo)::Type;
+                    using torch_t        = typename decltype(typeInfo)::TorchType;
+                    using cuda_t         = typename decltype(typeInfo)::CudaType;
+                    constexpr int DC     = decltype(d_c)::value;
+                    constexpr int W      = decltype(warp_c)::value;
+                    constexpr int STAGES = decltype(stages_c)::value;
 
                     auto *grad_h_ptr = reinterpret_cast<const cuda_t *>(grad_h.data_ptr<torch_t>());
                     auto *l_ptr      = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
@@ -412,19 +409,23 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     auto *attn_ptr   = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                     auto *grad_r_ptr = reinterpret_cast<cuda_t *>(grad_r.data_ptr<torch_t>());
 
-                    size_t sh_r = DC * sizeof(cuda_t) + W * DC * sizeof(float);
+                    // rj_sh + li_ghi_dbuf (2 rows, STAGES == 0 makes this term vanish) + warp_gradr
+                    size_t sh_r = DC * sizeof(cuda_t) + W * 2 * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float);
+
+                    ensure_dynamic_shmem(GATv2Backward_R<W, DC, cuda_t, index_t, float, STAGES>, sh_r, "GATv2 backward R");
 
                     dim3 blocks(num_nodes_bucket, H);
                     dim3 threads(W * kWarpSize);
 
-                    GATv2Backward_R<W, DC, cuda_t, index_t><<<blocks, threads, sh_r, stream>>>(
+                    GATv2Backward_R<W, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, sh_r, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                         index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), index_ptr<index_t>(node_indices), attn_ptr, d_logsumexp,
                         d_G, negative_slope, grad_r_ptr
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant
+                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0, 1>(pipeline_stages)
             );
         };
 
@@ -474,7 +475,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 GATv2Backward_CSR_Undirected_Impl<DC, cuda_t, index_t>(
                     N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                     index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), attn_ptr, d_logsumexp, negative_slope,
-                    grad_A_reduce_row_chunk_size, stream, grad_l_ptr, grad_r_ptr, d_grad_a, grad_a_reduced_ptr
+                    grad_A_reduce_row_chunk_size, pipeline_stages, stream, grad_l_ptr, grad_r_ptr, d_grad_a, grad_a_reduced_ptr
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),

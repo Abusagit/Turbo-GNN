@@ -56,6 +56,7 @@ class ReductionAggrFunction(torch.autograd.Function):
         features_per_block=32,
         tiles_y=8,
         reduce="min",
+        pipeline_stages=0,
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
@@ -91,6 +92,7 @@ class ReductionAggrFunction(torch.autograd.Function):
             features_per_block,
             tiles_y,
             reduce,
+            pipeline_stages,
         )
         ctx.save_for_backward(arg_idx)
         ctx.num_src_nodes = X.size(0)
@@ -103,7 +105,7 @@ class ReductionAggrFunction(torch.autograd.Function):
         (arg_idx,) = ctx.saved_tensors
         num_src_nodes = ctx.num_src_nodes
         grad_x = _C.reduction_aggr_backward(grad_out, arg_idx, num_src_nodes, ctx.warps_per_block)
-        return None, None, grad_x, None, None, None, None, None, None, None, None, None
+        return None, None, grad_x, None, None, None, None, None, None, None, None, None, None
 
 
 class gatv2_function(torch.autograd.Function):
@@ -144,6 +146,7 @@ class gatv2_function(torch.autograd.Function):
         backward_heavy_warps,
         is_directed,
         pipeline_stages=0,
+        backward_pipeline_stages=0,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -165,6 +168,7 @@ class gatv2_function(torch.autograd.Function):
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
         ctx.backward_light_warps = backward_light_warps
         ctx.backward_heavy_warps = backward_heavy_warps
+        ctx.backward_pipeline_stages = backward_pipeline_stages
         ctx.is_directed = is_directed
         ctx.heads = x_left.shape[1]
         ctx.head_dim = x_left.shape[2]
@@ -228,10 +232,11 @@ class gatv2_function(torch.autograd.Function):
             ctx.backward_light_warps,
             ctx.backward_heavy_warps,
             ctx.is_directed,
+            ctx.backward_pipeline_stages,
         )
 
-        # 4 CSR tensors + 3 gradients + 12 non-Variable args = 18 total
-        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 12
+        # 4 CSR tensors + 3 gradients + 13 non-Variable args = 20 total
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 13
 
 
 class _FusedGraphAttention(torch.autograd.Function):
@@ -267,6 +272,8 @@ class _FusedGraphAttention(torch.autograd.Function):
         backward_light_warps,
         backward_heavy_warps,
         is_directed,
+        pipeline_stages=0,
+        backward_pipeline_stages=0,
     ):
         scale = scale or 1 / (Q.shape[-1] ** 0.5)
         out, logsumexp = _C.gt_forward_csr_mh(
@@ -280,6 +287,7 @@ class _FusedGraphAttention(torch.autograd.Function):
             fwd_heavy_nodes,
             forward_light_warps,
             forward_heavy_warps,
+            pipeline_stages,
         )
 
         ctx.scale = scale
@@ -288,6 +296,7 @@ class _FusedGraphAttention(torch.autograd.Function):
         ctx.head_dim = Q.shape[2]
         ctx.backward_light_warps = backward_light_warps
         ctx.backward_heavy_warps = backward_heavy_warps
+        ctx.backward_pipeline_stages = backward_pipeline_stages
         ctx.save_for_backward(
             edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp, bwd_light_nodes, bwd_heavy_nodes
         )
@@ -313,7 +322,7 @@ class _FusedGraphAttention(torch.autograd.Function):
         scale = ctx.scale
         num_heads = ctx.num_heads
         head_dim = ctx.head_dim
-        grad_output = grad_output.view(-1, num_heads, head_dim)
+        grad_output = grad_output.reshape(-1, num_heads, head_dim).contiguous()
 
         dQ, dK, dV = _C.gt_backward_csr_mh(
             edge_ptr,
@@ -332,9 +341,10 @@ class _FusedGraphAttention(torch.autograd.Function):
             ctx.backward_light_warps,
             ctx.backward_heavy_warps,
             ctx.is_directed,
+            ctx.backward_pipeline_stages,
         )
 
-        return (None,) * 4 + (dQ, dK, dV) + (None,) * 10
+        return (None,) * 4 + (dQ, dK, dV) + (None,) * 12
 
 
 class _CudaSpMMConvFn(torch.autograd.Function):

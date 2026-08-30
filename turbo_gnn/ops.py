@@ -36,6 +36,7 @@ def reduction_aggr(
     features_per_block: int = 32,
     tiles_y: int = 8,
     reduce: str = "min",
+    pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """Element-wise min or max aggregation over incoming neighbors.
 
@@ -56,6 +57,9 @@ def reduction_aggr(
         features_per_block: Feature-dimension tile size (2-D kernel only).
         tiles_y: Number of row tiles (2-D kernel only).
         reduce: ``"min"`` or ``"max"``.
+        pipeline_stages: Number of async-copy pipeline stages for the light-node
+            and packed-atomics heavy-node kernels' per-thread neighbor scan. 0
+            disables the pipeline. Ignored when ``use_2d_kernel=True``.
 
     Returns:
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
@@ -74,6 +78,7 @@ def reduction_aggr(
         features_per_block,
         tiles_y,
         reduce,
+        pipeline_stages,
     )
 
 
@@ -90,6 +95,7 @@ def gatv2_aggr(
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
     pipeline_stages: int = 0,
+    backward_pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -112,6 +118,9 @@ def gatv2_aggr(
             reduction. Larger values use more shared memory but fewer kernel launches.
         pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
             r[j] prefetch. 0 disables the pipeline (plain warp-strided loop).
+        backward_pipeline_stages: Number of async-copy pipeline stages for the backward
+            kernels' neighbor-row prefetch (AL/R when directed, G/ALR when undirected).
+            0 disables the pipeline.
 
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
@@ -136,6 +145,7 @@ def gatv2_aggr(
         backward_heavy_warps,
         graph.is_directed,
         pipeline_stages,
+        backward_pipeline_stages,
     )
 
 
@@ -151,6 +161,8 @@ def graph_transformer_aggr(
     forward_heavy_warps: int = 8,
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
+    pipeline_stages: int = 0,
+    backward_pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
@@ -171,6 +183,10 @@ def graph_transformer_aggr(
         K: Key tensor, shape ``[N, H, D]``.
         V: Value tensor, shape ``[N, H, D]``.
         scale: Scaling factor, typically ``1 / sqrt(D)``.
+        pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
+            Q[j]/V[j] prefetch. 0 disables the pipeline.
+        backward_pipeline_stages: Number of async-copy pipeline stages for the backward
+            kernels' neighbor-row prefetch. 0 disables the pipeline.
 
     Returns:
         Attended features, shape ``[N, H, D]``.
@@ -193,6 +209,8 @@ def graph_transformer_aggr(
         backward_light_warps,
         backward_heavy_warps,
         graph.is_directed,
+        pipeline_stages,
+        backward_pipeline_stages,
     )
 
 
