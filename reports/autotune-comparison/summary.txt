@@ -1,0 +1,57 @@
+192 cells from 400 runs in reports/autotune-comparison
+baseline = one_per_block, both bucket launches sequential, no autotuning
+
+  overall   geomean 1.3246x   167/192 at or above baseline   worst 0.713  best 9.092
+  d=128  forward   geomean 1.5712x   45/48
+  d=128  backward  geomean 1.1796x   34/48
+  d=256  forward   geomean 1.4921x   47/48
+  d=256  backward  geomean 1.1133x   41/48
+  gat_v2    geomean 1.4446x   56/64
+  gt        geomean 1.2408x   52/64
+  min_aggr  geomean 1.2967x   59/64
+
+  what the search chose for bucket_launch
+    forward   concurrent 59/96 (61%)
+    backward  concurrent 45/96 (47%)
+    forward   chose concurrent  -> geomean 1.715x over 59 cells
+    forward   chose sequential  -> geomean 1.277x over 37 cells
+    backward  chose concurrent  -> geomean 1.166x over 45 cells
+    backward  chose sequential  -> geomean 1.128x over 51 cells
+
+  per graph
+    graph                nodes  avg deg  overall  forward  backward   best cell
+    web-fraud        2,890,331      5.5    2.558    4.465     1.466   9.09x min_aggr/128/for
+    ogbn-arxiv         169,343      7.9    1.599    2.090     1.223   3.00x gt/128/for
+    pubmed              19,717      5.5    1.466    1.363     1.577   5.63x gat_v2/128/bac
+    tolokers-2          11,758     89.3    1.439    1.986     1.043   2.67x gat_v2/128/for
+    citeseer             3,327      3.7    1.327    1.248     1.412   2.55x gat_v2/128/bac
+    avazu-ctr           76,269    289.0    1.326    1.768     0.995   2.50x gat_v2/128/for
+    cora                 2,708      4.9    1.289    1.067     1.558   2.99x gat_v2/256/bac
+    city-reviews       148,801     16.7    1.289    1.630     1.019   2.00x gat_v2/128/for
+    city-roads-M        57,073      3.3    1.271    1.526     1.059   1.99x min_aggr/256/for
+    twitch-views       168,114     81.9    1.260    1.580     1.004   2.01x gat_v2/128/for
+    artnet-exp          50,405     12.1    1.240    1.325     1.161   1.73x gat_v2/128/bac
+    hm-categories       46,563    461.9    1.224    1.491     1.004   1.93x gat_v2/128/for
+    city-roads-L       142,257      3.0    1.215    1.415     1.043   1.81x min_aggr/256/for
+    pokec-regions    1,632,803     19.8    1.090    1.143     1.039   1.31x gat_v2/128/for
+    ogbn-proteins      132,534    598.0    1.074    1.155     0.999   1.39x gat_v2/128/for
+    ogbn-products    2,449,029     51.5    1.029    1.057     1.002   1.17x gat_v2/128/for
+
+  largest gains
+    web-fraud      min_aggr  128 forward     44.6264 ->    4.9085 ms  x9.09  bl=concurrent
+    web-fraud      min_aggr  256 forward     57.0890 ->    8.7405 ms  x6.53  bl=concurrent
+    pubmed         gat_v2    128 backward     2.6376 ->    0.4682 ms  x5.63  bl=sequential
+    web-fraud      gt        128 forward     47.0415 ->   13.1155 ms  x3.59  bl=concurrent
+    web-fraud      gat_v2    256 forward     38.5475 ->   11.1759 ms  x3.45  bl=concurrent
+    web-fraud      gat_v2    128 forward     28.8324 ->    8.6240 ms  x3.34  bl=concurrent
+    web-fraud      gt        256 forward     52.1288 ->   16.1618 ms  x3.23  bl=concurrent
+    ogbn-arxiv     gt        128 forward      2.7572 ->    0.9193 ms  x3.00  bl=concurrent
+  largest losses
+    citeseer       gat_v2    128 forward      0.0322 ->    0.0342 ms  x0.94  bl=sequential
+    city-reviews   gat_v2    128 backward    10.6696 ->   11.3538 ms  x0.94  bl=concurrent
+    cora           gt        128 forward      0.0451 ->    0.0482 ms  x0.94  bl=sequential
+    hm-categories  gat_v2    256 backward    64.3031 ->   72.3272 ms  x0.89  bl=concurrent
+    cora           gat_v2    128 forward      0.0387 ->    0.0478 ms  x0.81  bl=sequential
+    tolokers-2     min_aggr  128 backward     0.0664 ->    0.0932 ms  x0.71  bl=sequential
+
+wrote reports/autotune-comparison/grid.json

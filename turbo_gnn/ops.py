@@ -47,6 +47,7 @@ def reduction_aggr(
     backward_bucket_launch: str = DEFAULT_BUCKET_LAUNCH,
     forward_heavy_edge_slice: int = 0,
     forward_heavy_slice_blocks_per_sm: float = 0.0,
+    pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """Element-wise min or max aggregation over incoming neighbors.
 
@@ -74,6 +75,9 @@ def reduction_aggr(
             what balances heavy-tailed degree distributions.
         blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
             by ``"one_per_block"``.
+        pipeline_stages: Number of async-copy pipeline stages for the light-node
+            and packed-atomics heavy-node kernels' per-thread neighbor scan. 0
+            disables the pipeline. Ignored when ``use_2d_kernel=True``.
 
     Returns:
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
@@ -106,6 +110,7 @@ def reduction_aggr(
         forward_heavy_edge_slice,
         table.chunk_node if table is not None else None,
         table.chunk_start if table is not None else None,
+        pipeline_stages,
     )
 
 
@@ -130,6 +135,8 @@ def gatv2_aggr(
     forward_heavy_slice_blocks_per_sm: float = 0.0,
     backward_heavy_edge_slice: int = 0,
     backward_heavy_slice_blocks_per_sm: float = 0.0,
+    pipeline_stages: int = 0,
+    backward_pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -157,6 +164,11 @@ def gatv2_aggr(
             what balances heavy-tailed degree distributions.
         blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
             by ``"one_per_block"``.
+        pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
+            r[j] prefetch. 0 disables the pipeline (plain warp-strided loop).
+        backward_pipeline_stages: Number of async-copy pipeline stages for the backward
+            kernels' neighbor-row prefetch (AL/R when directed, G/ALR when undirected).
+            0 disables the pipeline.
 
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
@@ -204,6 +216,8 @@ def gatv2_aggr(
         bwd_table.chunk_node if bwd_table is not None else None,
         bwd_table.chunk_start if bwd_table is not None else None,
         bwd_table.node_chunk_offset if bwd_table is not None else None,
+        pipeline_stages,
+        backward_pipeline_stages,
     )
 
 
@@ -228,6 +242,8 @@ def graph_transformer_aggr(
     forward_heavy_slice_blocks_per_sm: float = 0.0,
     backward_heavy_edge_slice: int = 0,
     backward_heavy_slice_blocks_per_sm: float = 0.0,
+    pipeline_stages: int = 0,
+    backward_pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
@@ -259,6 +275,10 @@ def graph_transformer_aggr(
             one block per heavy node; a positive value splits each heavy node's edge list
             into slices of that size, one block each, merged by a second kernel. Balances
             the heavy bucket and sizes its grid by edge count rather than node count.
+        pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
+            Q[j]/V[j] prefetch. 0 disables the pipeline.
+        backward_pipeline_stages: Number of async-copy pipeline stages for the backward
+            kernels' neighbor-row prefetch. 0 disables the pipeline.
 
     Returns:
         Attended features, shape ``[N, H, D]``.
@@ -306,6 +326,8 @@ def graph_transformer_aggr(
         bwd_table.chunk_node if bwd_table is not None else None,
         bwd_table.chunk_start if bwd_table is not None else None,
         bwd_table.node_chunk_offset if bwd_table is not None else None,
+        pipeline_stages,
+        backward_pipeline_stages,
     )
 
 

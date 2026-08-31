@@ -9,14 +9,14 @@
 // =============================================================================
 template <
     turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
-    FloatingNum accum_t = float>
+    FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
     turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     const cuda_t *__restrict__ d_attn_vec,     // [H, D]
-    const float *__restrict__ d_logsumexp,     // [N, H]
+    const float *__restrict__ d_logsumexp,     // [N, H],
     float negative_slope,
     float *__restrict__ grad_a,   // [N, H, D] always float32
     cuda_t *__restrict__ grad_l,  // [N, H, D]
@@ -47,20 +47,28 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     index_t edge_end   = d_row_ptr[node_i + 1];
     int num_neighbors  = static_cast<int>(edge_end - edge_start);
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES;
+
     // Shared memory layout:
     //   li_sh:      D_CONST * sizeof(cuda_t)                       -- read-only
     //   ghi_sh:     D_CONST * sizeof(cuda_t)                       -- read-only
+    //   r_dbuf:     WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) -- per-warp ping-pong for r[j], only when USE_PIPELINE
     //   warp_grada: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
     //   warp_gradl: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
     //   warp_G:     WARPS_PER_BLOCK * sizeof(accum_t)              -- per-warp G partial
     //   G_broadcast: sizeof(accum_t)                               -- broadcast slot
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *li_sh        = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *ghi_sh       = li_sh + D_CONST;
-    accum_t *warp_grada  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
-    accum_t *warp_gradl  = warp_grada + WARPS_PER_BLOCK * D_CONST;
-    accum_t *warp_G      = warp_gradl + WARPS_PER_BLOCK * D_CONST;
-    accum_t *G_broadcast = warp_G + WARPS_PER_BLOCK;
+    cuda_t *li_sh  = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *ghi_sh = li_sh + D_CONST;
+    cuda_t *r_dbuf = ghi_sh + D_CONST;  // only meaningful when USE_PIPELINE
+
+    constexpr size_t r_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    accum_t *warp_grada           = reinterpret_cast<accum_t *>(ghi_sh + D_CONST + r_dbuf_bytes / sizeof(cuda_t));
+    accum_t *warp_gradl           = warp_grada + WARPS_PER_BLOCK * D_CONST;
+    accum_t *warp_G               = warp_gradl + WARPS_PER_BLOCK * D_CONST;
+    accum_t *G_broadcast          = warp_G + WARPS_PER_BLOCK;
 
     accum_t *my_grada = warp_grada + warp_id * D_CONST;
     accum_t *my_gradl = warp_gradl + warp_id * D_CONST;
@@ -117,9 +125,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // pass 1: compute G_{i,h} = sum_j alpha_ij * <grad_h_i, r_j> (warp-strided)
     accum_t G_partial{};
 
-    for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
-        index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
-        const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+    auto pass1_consume = [&](index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]) {
+        const cuda_t *rj_base = rows[0];
 
         accum_t e_lane{};
         accum_t p_lane{};
@@ -140,6 +147,23 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 
         const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_partial              = AccumOps::fma(alpha_ij, p_ij, G_partial);
+    };
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const r_bases[1]  = {d_r};
+        int64_t const r_stride_n[1]     = {stride_r_n};
+        int64_t const r_stride_h[1]     = {stride_r_h};
+        cuda_t *warp_r_dbuf             = r_dbuf + warp_id * NUM_STAGES * D_CONST;
+        pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, 1, cuda_t, index_t>(
+            warp_id, lane, num_neighbors, edge_start, d_col_idx, r_bases, r_stride_n, r_stride_h, head_h, warp_r_dbuf, pass1_consume
+        );
+    } else {
+        for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
+            index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
+            const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+            cuda_t const *const rows[1] = {rj_base};
+            pass1_consume(neighbor_j, rows);
+        }
     }
 
     // Cross-warp reduction for G
@@ -156,9 +180,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     G_i_h = *G_broadcast;
 
     // pass 2: accumulate gradients (warp-strided)
-    for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
-        index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
-        const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+    auto pass2_consume = [&](index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]) {
+        const cuda_t *rj_base = rows[0];
 
         accum_t e_lane{};
         accum_t p_lane{};
@@ -190,6 +213,23 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
                 const int base_f = v * TW;
                 Tile::gatv2_accum_grad_al(&my_grada[base_f], &my_gradl[base_f], grad_e_ij, lv, rv, av, negative_slope);
             }
+        }
+    };
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const r_bases[1] = {d_r};
+        int64_t const r_stride_n[1]    = {stride_r_n};
+        int64_t const r_stride_h[1]    = {stride_r_h};
+        cuda_t *warp_r_dbuf            = r_dbuf + warp_id * NUM_STAGES * D_CONST;
+        pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, 1, cuda_t, index_t>(
+            warp_id, lane, num_neighbors, edge_start, d_col_idx, r_bases, r_stride_n, r_stride_h, head_h, warp_r_dbuf, pass2_consume
+        );
+    } else {
+        for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
+            index_t neighbor_j          = d_col_idx[edge_start + static_cast<index_t>(k)];
+            const cuda_t *rj_base       = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+            cuda_t const *const rows[1] = {rj_base};
+            pass2_consume(neighbor_j, rows);
         }
     }
 
@@ -246,15 +286,15 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 // =============================================================================
 template <
     turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
-    FloatingNum accum_t = float>
+    FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr_T, const index_t *__restrict__ d_col_idx_T,
     turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     const cuda_t *__restrict__ d_attn_vec,     // [H, D]
-    const float *__restrict__ d_logsumexp,     // [N, H]
-    const float *__restrict__ d_G,             // [N, H]
+    const float *__restrict__ d_logsumexp,     // [N, H],
+    const float *__restrict__ d_G,             // [N, H],
     float negative_slope,
     cuda_t *__restrict__ grad_r  // [N, H, D]
 ) {
@@ -283,12 +323,21 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     index_t edge_end   = d_row_ptr_T[node_j + 1];
     int num_incoming   = static_cast<int>(edge_end - edge_start);
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES;
+    constexpr int NUM_PREFETCH_ROWS = 2;  // li[i], ghi[i]
+
     // Shared memory layout:
     //   rj_sh:       D_CONST * sizeof(cuda_t)                      -- read-only
+    //   li_ghi_dbuf: WARPS_PER_BLOCK * 2 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- per-warp ping-pong for li[i]/ghi[i], only when USE_PIPELINE
     //   warp_gradr:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)   -- per-warp
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *rj_sh       = reinterpret_cast<cuda_t *>(sh_raw);
-    accum_t *warp_gradr = reinterpret_cast<accum_t *>(rj_sh + D_CONST);
+    cuda_t *li_ghi_dbuf = rj_sh + D_CONST;  // only meaningful when USE_PIPELINE
+
+    constexpr size_t li_ghi_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    accum_t *warp_gradr                = reinterpret_cast<accum_t *>(rj_sh + D_CONST + li_ghi_dbuf_bytes / sizeof(cuda_t));
 
     accum_t *my_gradr = warp_gradr + warp_id * D_CONST;
 
@@ -325,10 +374,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     __syncthreads();
 
     // Warp-strided edge loop
-    for (int idx = warp_id; idx < num_incoming; idx += WARPS_PER_BLOCK) {
-        index_t node_i         = d_col_idx_T[edge_start + static_cast<index_t>(idx)];
-        const cuda_t *li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
-        const cuda_t *ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
+    auto r_consume = [&](index_t node_i, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+        const cuda_t *li_base  = rows[0];
+        const cuda_t *ghi_base = rows[1];
 
         const accum_t L_i_h = d_logsumexp[node_i * H + head_h];
         const accum_t G_i_h = d_G[node_i * H + head_h];
@@ -364,6 +412,24 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
                 const int base_f = v * TW;
                 Tile::gatv2_accum_grad_r(&my_gradr[base_f], alpha_ij, ghv, grad_e_ij, lv, rv, av, negative_slope);
             }
+        }
+    };
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {d_l, grad_h};
+        int64_t const row_stride_n[NUM_PREFETCH_ROWS]     = {stride_l_n, stride_gh_n};
+        int64_t const row_stride_h[NUM_PREFETCH_ROWS]     = {stride_l_h, stride_gh_h};
+        cuda_t *warp_dbuf = li_ghi_dbuf + warp_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
+        pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            warp_id, lane, num_incoming, edge_start, d_col_idx_T, row_bases, row_stride_n, row_stride_h, head_h, warp_dbuf, r_consume
+        );
+    } else {
+        for (int idx = warp_id; idx < num_incoming; idx += WARPS_PER_BLOCK) {
+            index_t node_i        = d_col_idx_T[edge_start + static_cast<index_t>(idx)];
+            const cuda_t *li_base = d_l + node_i * stride_l_n + head_h * stride_l_h;
+            const cuda_t *ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
+            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {li_base, ghi_base};
+            r_consume(node_i, rows);
         }
     }
 
@@ -407,7 +473,7 @@ template <int grad_A_reduce_row_chunk_size, typename cuda_t>
 __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
     size_t N, size_t H, size_t D,
 
-    const float *__restrict__ grad_a,         // [N, H, D] always float32
+    const float *__restrict__ grad_a,         // [N, H, D] always float32,
     float *__restrict__ d_grad_a_reduced_out  // [H, D] output in float32
 ) {
     // head inbex
@@ -468,13 +534,13 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
 // =============================================================================
 // Undirected GATv2 backward: G computation kernel (extracts pass 1 of AL)
 // =============================================================================
-template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     turbo_gnn::sched::SchedulerParams<index_t> sched_params, size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
     const cuda_t *__restrict__ d_attn_vec,  // [H, D]
-    const float *__restrict__ d_logsumexp,  // [N, H]
+    const float *__restrict__ d_logsumexp,  // [N, H],
     float negative_slope,
     float *__restrict__ d_G  // [N, H] output
 ) {
@@ -508,10 +574,15 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 
     const accum_t L_i = d_logsumexp[node_i * H + head_h];
 
-    // Shared memory: li_sh + ghi_sh
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES;
+
+    // Shared memory: li_sh + ghi_sh + r_dbuf (only when USE_PIPELINE)
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *li_sh  = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *ghi_sh = li_sh + D_CONST;
+    cuda_t *r_dbuf = ghi_sh + D_CONST;  // only meaningful when USE_PIPELINE
 
     const cuda_t *li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
@@ -532,9 +603,9 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     __syncthreads();
 
     accum_t G_i_h{};
-    for (int k = 0; k < num_neighbors; ++k) {
-        index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
-        const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+
+    auto g_consume = [&](index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]) {
+        const cuda_t *rj_base = rows[0];
 
         accum_t e_lane{};
         accum_t p_lane{};
@@ -555,6 +626,22 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 
         const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_i_h                  = AccumOps::fma(alpha_ij, p_ij, G_i_h);
+    };
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const r_bases[1] = {d_r};
+        int64_t const r_stride_n[1]    = {stride_r_n};
+        int64_t const r_stride_h[1]    = {stride_r_h};
+        pipelined_neighbor_row_loop<1, D_CONST, NUM_STAGES, 1, cuda_t, index_t>(
+            /*warp_id=*/0, lane, num_neighbors, edge_start, d_col_idx, r_bases, r_stride_n, r_stride_h, head_h, r_dbuf, g_consume
+        );
+    } else {
+        for (int k = 0; k < num_neighbors; ++k) {
+            index_t neighbor_j          = d_col_idx[edge_start + static_cast<index_t>(k)];
+            const cuda_t *rj_base       = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+            cuda_t const *const rows[1] = {rj_base};
+            g_consume(neighbor_j, rows);
+        }
     }
 
     if (lane == 0) {
@@ -577,13 +664,13 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 // direction) in a single pass over forward CSR neighbors.
 // Requires G[j] to be pre-computed globally.
 // =============================================================================
-template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     turbo_gnn::sched::SchedulerParams<index_t> sched_params, size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
     const cuda_t *__restrict__ d_attn_vec,  // [H, D]
-    const float *__restrict__ d_logsumexp,  // [N, H]
+    const float *__restrict__ d_logsumexp,  // [N, H],
     const float *__restrict__ d_G,          // [N, H] (pre-computed)
     float negative_slope,
     float *__restrict__ grad_a,   // [N, H, D] always float32
@@ -613,20 +700,29 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     index_t edge_end   = d_row_ptr[node_i + 1];
     int num_neighbors  = static_cast<int>(edge_end - edge_start);
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE      = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES         = PIPELINE_STAGES;
+    constexpr int NUM_PREFETCH_ROWS  = 3;  // r[j], l[j], grad_h[j]
+
     // Shared memory layout:
     //   li_sh:      D_CONST * sizeof(cuda_t)   -- l[i]
     //   ri_sh:      D_CONST * sizeof(cuda_t)   -- r[i]
     //   ghi_sh:     D_CONST * sizeof(cuda_t)   -- grad_h[i]
+    //   rlghj_dbuf: 3 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- ping-pong for r[j]/l[j]/grad_h[j], only when USE_PIPELINE
     //   grada_sh:   D_CONST * sizeof(accum_t)  -- accumulator for grad_a[i]
     //   gradli_sh:  D_CONST * sizeof(accum_t)  -- accumulator for grad_l[i]
     //   gradri_sh:  D_CONST * sizeof(accum_t)  -- accumulator for grad_r[i]
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *li_sh      = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *ri_sh      = li_sh + D_CONST;
-    cuda_t *ghi_sh     = ri_sh + D_CONST;
-    accum_t *grada_sh  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
-    accum_t *gradli_sh = grada_sh + D_CONST;
-    accum_t *gradri_sh = gradli_sh + D_CONST;
+    cuda_t *li_sh       = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *ri_sh       = li_sh + D_CONST;
+    cuda_t *ghi_sh      = ri_sh + D_CONST;
+    cuda_t *rlghj_dbuf  = ghi_sh + D_CONST;  // only meaningful when USE_PIPELINE
+
+    constexpr size_t rlghj_dbuf_bytes = USE_PIPELINE ? NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    accum_t *grada_sh                 = reinterpret_cast<accum_t *>(ghi_sh + D_CONST + rlghj_dbuf_bytes / sizeof(cuda_t));
+    accum_t *gradli_sh                = grada_sh + D_CONST;
+    accum_t *gradri_sh                = gradli_sh + D_CONST;
 
     cuda_t *grad_l_base = grad_l + (static_cast<int64_t>(node_i * H + head_h) * D_CONST);
     cuda_t *grad_r_base = grad_r + (static_cast<int64_t>(node_i * H + head_h) * D_CONST);
@@ -681,12 +777,10 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     }
     __syncthreads();
 
-    for (int k = 0; k < num_neighbors; ++k) {
-        index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
-
-        const cuda_t *rj_base  = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
-        const cuda_t *lj_base  = d_l + neighbor_j * stride_l_n + head_h * stride_l_h;
-        const cuda_t *ghj_base = grad_h + neighbor_j * stride_gh_n + head_h * stride_gh_h;
+    auto alr_consume = [&](index_t neighbor_j, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+        const cuda_t *rj_base  = rows[0];
+        const cuda_t *lj_base  = rows[1];
+        const cuda_t *ghj_base = rows[2];
 
         // ── Forward direction: score(i,j) = a^T . LeakyReLU(l[i] + r[j]) ──
         accum_t e_fwd_lane{};
@@ -753,6 +847,24 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
                 Tile::gatv2_accum_grad_r(&gradri_sh[base_f], alpha_rev, ghjv, grad_e_rev, ljv, riv, av, negative_slope);
             }
         }
+    };
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {d_r, d_l, grad_h};
+        int64_t const row_stride_n[NUM_PREFETCH_ROWS]     = {stride_r_n, stride_l_n, stride_gh_n};
+        int64_t const row_stride_h[NUM_PREFETCH_ROWS]     = {stride_r_h, stride_l_h, stride_gh_h};
+        pipelined_neighbor_row_loop<1, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            /*warp_id=*/0, lane, num_neighbors, edge_start, d_col_idx, row_bases, row_stride_n, row_stride_h, head_h, rlghj_dbuf, alr_consume
+        );
+    } else {
+        for (int k = 0; k < num_neighbors; ++k) {
+            index_t neighbor_j     = d_col_idx[edge_start + static_cast<index_t>(k)];
+            const cuda_t *rj_base  = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+            const cuda_t *lj_base  = d_l + neighbor_j * stride_l_n + head_h * stride_l_h;
+            const cuda_t *ghj_base = grad_h + neighbor_j * stride_gh_n + head_h * stride_gh_h;
+            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {rj_base, lj_base, ghj_base};
+            alr_consume(neighbor_j, rows);
+        }
     }
 
     __syncthreads();
@@ -804,7 +916,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
 // is shaped. Slicing removes the straggler tail below that ceiling; it cannot lift the ceiling.
 // ================================================================================================
 
-template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_SliceKernel(
     size_t N, size_t H, size_t D,
     const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h,
@@ -853,9 +965,15 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_SliceKernel(
 
     const accum_t L_i = d_logsumexp[node_i * H + head_h];
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES;
+
+    // Layout: li_sh | ghi_sh | r_dbuf (only when USE_PIPELINE)
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *li_sh  = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *ghi_sh = li_sh + D_CONST;
+    cuda_t *r_dbuf = ghi_sh + D_CONST;  // only meaningful when USE_PIPELINE
 
     const cuda_t *li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
     const cuda_t *ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
@@ -874,9 +992,8 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_SliceKernel(
     __syncthreads();
 
     accum_t G_partial{};
-    for (int k = local_start; k < local_end; ++k) {
-        index_t neighbor_j    = d_col_idx[edge_start + static_cast<index_t>(k)];
-        const cuda_t *rj_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
+    auto consume = [&](index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]) {
+        const cuda_t *rj_base = rows[0];
 
         accum_t e_lane{};
         accum_t p_lane{};
@@ -896,6 +1013,26 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_SliceKernel(
         const accum_t p_ij     = warp_reduce_sum(p_lane);
         const accum_t alpha_ij = OnlineSoftmaxState::recompute_alpha(e_ij, L_i);
         G_partial              = AccumOps::fma(alpha_ij, p_ij, G_partial);
+    };
+
+    // Single warp per slice, so the helper is driven with WARPS_PER_BLOCK = 1 and warp 0; the
+    // slice's range enters as a shifted edge base plus a length.
+    const index_t slice_edge_start = edge_start + static_cast<index_t>(local_start);
+    const int slice_len            = local_end - local_start;
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const r_bases[1] = {d_r};
+        int64_t const r_stride_n[1]    = {stride_r_n};
+        int64_t const r_stride_h[1]    = {stride_r_h};
+        pipelined_neighbor_row_loop<1, D_CONST, NUM_STAGES, 1, cuda_t, index_t>(
+            0, lane, slice_len, slice_edge_start, d_col_idx, r_bases, r_stride_n, r_stride_h, head_h, r_dbuf, consume
+        );
+    } else {
+        for (int k = 0; k < slice_len; ++k) {
+            index_t neighbor_j          = d_col_idx[slice_edge_start + static_cast<index_t>(k)];
+            cuda_t const *const rows[1] = {d_r + neighbor_j * stride_r_n + head_h * stride_r_h};
+            consume(neighbor_j, rows);
+        }
     }
 
     if (lane == 0) {
@@ -927,7 +1064,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_MergeKernel(
     d_G[node_i * H + head_h] = g;
 }
 
-template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_SliceKernel(
     size_t N, size_t H, size_t D,
     const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h,
@@ -968,11 +1105,20 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_SliceKernel(
 
     const int64_t part_off = (static_cast<int64_t>(slice_id) * H + head_h) * D_CONST;
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE     = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES        = PIPELINE_STAGES;
+    constexpr int NUM_PREFETCH_ROWS = 3;  // r[j], l[j], grad_h[j] -- same rows as ALR_Undirected
+
+    // li_sh | ri_sh | ghi_sh | rlghj_dbuf (only when USE_PIPELINE) | grada_sh | gradli_sh | gradri_sh
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *li_sh      = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *ri_sh      = li_sh + D_CONST;
-    cuda_t *ghi_sh     = ri_sh + D_CONST;
-    accum_t *grada_sh  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST);
+    cuda_t *li_sh       = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *ri_sh       = li_sh + D_CONST;
+    cuda_t *ghi_sh      = ri_sh + D_CONST;
+    cuda_t *rlghj_dbuf  = ghi_sh + D_CONST;  // only meaningful when USE_PIPELINE
+
+    constexpr size_t rlghj_dbuf_elems = USE_PIPELINE ? NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST : 0;
+    accum_t *grada_sh  = reinterpret_cast<accum_t *>(ghi_sh + D_CONST + rlghj_dbuf_elems);
     accum_t *gradli_sh = grada_sh + D_CONST;
     accum_t *gradri_sh = gradli_sh + D_CONST;
 
@@ -1017,12 +1163,10 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_SliceKernel(
     }
     __syncthreads();
 
-    for (int k = local_start; k < local_end; ++k) {
-        index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
-
-        const cuda_t *rj_base  = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
-        const cuda_t *lj_base  = d_l + neighbor_j * stride_l_n + head_h * stride_l_h;
-        const cuda_t *ghj_base = grad_h + neighbor_j * stride_gh_n + head_h * stride_gh_h;
+    auto consume = [&](index_t neighbor_j, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+        const cuda_t *rj_base  = rows[0];
+        const cuda_t *lj_base  = rows[1];
+        const cuda_t *ghj_base = rows[2];
 
         accum_t e_fwd_lane{}, p_fwd_lane{}, e_rev_lane{}, p_rev_lane{};
 #pragma unroll
@@ -1070,6 +1214,30 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_SliceKernel(
                 const vec_t ghjv = Tile::read(ghj_base, v);
                 Tile::gatv2_accum_grad_r(&gradri_sh[base_f], alpha_rev, ghjv, grad_e_rev, ljv, riv, av, negative_slope);
             }
+        }
+    };
+
+    // Single warp per slice: drive the helper with WARPS_PER_BLOCK = 1 and warp 0, over this
+    // slice's range expressed as a shifted edge base plus a length.
+    const index_t slice_edge_start = edge_start + static_cast<index_t>(local_start);
+    const int slice_len            = local_end - local_start;
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {d_r, d_l, grad_h};
+        int64_t const row_stride_n[NUM_PREFETCH_ROWS]    = {stride_r_n, stride_l_n, stride_gh_n};
+        int64_t const row_stride_h[NUM_PREFETCH_ROWS]    = {stride_r_h, stride_l_h, stride_gh_h};
+        pipelined_neighbor_row_loop<1, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            0, lane, slice_len, slice_edge_start, d_col_idx, row_bases, row_stride_n, row_stride_h, head_h, rlghj_dbuf, consume
+        );
+    } else {
+        for (int k = 0; k < slice_len; ++k) {
+            const index_t neighbor_j = d_col_idx[slice_edge_start + static_cast<index_t>(k)];
+            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {
+                d_r + neighbor_j * stride_r_n + head_h * stride_r_h,
+                d_l + neighbor_j * stride_l_n + head_h * stride_l_h,
+                grad_h + neighbor_j * stride_gh_n + head_h * stride_gh_h,
+            };
+            consume(neighbor_j, rows);
         }
     }
     __syncthreads();

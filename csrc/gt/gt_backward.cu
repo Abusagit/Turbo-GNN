@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
 template <
     turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
-    FloatingNum accum_t = float>
+    FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr_T,     // [N+1], CSR^T row pointers
@@ -131,16 +131,25 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
         return;
     }
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE     = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES        = PIPELINE_STAGES;
+    constexpr int NUM_PREFETCH_ROWS = 2;  // K[i], dO[i]
+
     // Shared memory layout:
     // qj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
     // vj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
+    // ki_dOi_dbuf: WARPS_PER_BLOCK * 2 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- ping-pong for K[i]/dO[i], only when USE_PIPELINE
     // warp_gq:   WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)       -- per-warp dQ accumulators
     // warp_gv:   WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)       -- per-warp dV accumulators
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *qj_shared = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *vj_shared = qj_shared + D_CONST;
-    accum_t *warp_gq  = reinterpret_cast<accum_t *>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
-    accum_t *warp_gv  = warp_gq + WARPS_PER_BLOCK * D_CONST;
+    cuda_t *qj_shared  = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *vj_shared  = qj_shared + D_CONST;
+    cuda_t *ki_dOi_dbuf = vj_shared + D_CONST;  // only meaningful when USE_PIPELINE
+
+    constexpr size_t ki_dOi_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    accum_t *warp_gq = reinterpret_cast<accum_t *>(sh_raw + 2 * D_CONST * sizeof(cuda_t) + ki_dOi_dbuf_bytes);
+    accum_t *warp_gv = warp_gq + WARPS_PER_BLOCK * D_CONST;
 
     // Per-warp accumulator pointers
     accum_t *my_gq = warp_gq + warp_id * D_CONST;
@@ -173,20 +182,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     __syncthreads();
 
     // Warp-strided edge loop
-    for (int e = warp_id; e < num_incoming; e += WARPS_PER_BLOCK) {
-        index_t node_i = 0;
-        if (lane == 0) {
-            node_i = __ldg(&col_idx_T[edge_start + e]);
-        }
-        node_i = __shfl_sync(FULL_WARP_MASK, node_i, 0);
-
+    auto edge_consume = [&](index_t node_i, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
         if (node_i >= N) [[unlikely]] {
-            continue;
+            return;
         }
 
-        cuda_t const *ki_base  = K + node_i * stride_k_n + head_h * stride_k_h;
+        cuda_t const *ki_base  = rows[0];
         const size_t out_ih    = static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
-        cuda_t const *dOi_base = dO + out_ih;
+        cuda_t const *dOi_base = rows[1];
 
         // 1) dot(k_i, q_j) and dP_ij = <dO_i, v_j>
         accum_t dot_kq{};
@@ -233,6 +236,33 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
             ki.weighted_accum_(&my_gq[base_f], dS_scaled);
             Tile::atomic_add_scaled_f32(dK_i_base, base_f, dS_scaled, qj);
         }
+    };
+
+    if constexpr (USE_PIPELINE) {
+        // dO is always contiguous [N, H, D]: stride_n = H*D_CONST, stride_h = D_CONST.
+        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {K, dO};
+        int64_t const row_stride_n[NUM_PREFETCH_ROWS]     = {stride_k_n, static_cast<int64_t>(H) * D_CONST};
+        int64_t const row_stride_h[NUM_PREFETCH_ROWS]     = {stride_k_h, D_CONST};
+        cuda_t *warp_dbuf = ki_dOi_dbuf + warp_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
+        pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            warp_id, lane, num_incoming, edge_start, col_idx_T, row_bases, row_stride_n, row_stride_h, head_h, warp_dbuf, edge_consume
+        );
+    } else {
+        for (int e = warp_id; e < num_incoming; e += WARPS_PER_BLOCK) {
+            index_t node_i = 0;
+            if (lane == 0) {
+                node_i = __ldg(&col_idx_T[edge_start + e]);
+            }
+            node_i = __shfl_sync(FULL_WARP_MASK, node_i, 0);
+            if (node_i >= N) [[unlikely]] {
+                continue;
+            }
+
+            cuda_t const *ki_base                       = K + node_i * stride_k_n + head_h * stride_k_h;
+            cuda_t const *dOi_base                       = dO + (static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST);
+            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {ki_base, dOi_base};
+            edge_consume(node_i, rows);
+        }
     }
 
     // 3) Cross-warp reduction: warp 0 sums all per-warp accumulators and writes output
@@ -275,7 +305,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 //   Forward direction: dK[d] (local)
 //   Reverse direction: dQ[d], dV[d] (local, exploiting symmetric adjacency)
 // =============================================================================
-template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, typename cuda_t, typename index_t, FloatingNum accum_t = float>
+template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, typename cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirected_kernel_D(
     turbo_gnn::sched::SchedulerParams<index_t> sched_params,
     int64_t N, int64_t H,
@@ -330,20 +360,29 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
         return;
     }
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE     = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES        = PIPELINE_STAGES;
+    constexpr int NUM_PREFETCH_ROWS = 4;  // Q[s], K[s], V[s], dO[s]
+
     // Shared memory layout:
-    //   kd_shared:  D_CONST * sizeof(cuda_t)   -- K[d]
-    //   qd_shared:  D_CONST * sizeof(cuda_t)   -- Q[d]
-    //   vd_shared:  D_CONST * sizeof(cuda_t)   -- V[d]
-    //   gk_shared:  D_CONST * sizeof(accum_t)  -- float32 accumulator for dK[d]
-    //   gq_shared:  D_CONST * sizeof(accum_t)  -- float32 accumulator for dQ[d]
-    //   gv_shared:  D_CONST * sizeof(accum_t)  -- float32 accumulator for dV[d]
+    //   kd_shared:   D_CONST * sizeof(cuda_t)   -- K[d]
+    //   qd_shared:   D_CONST * sizeof(cuda_t)   -- Q[d]
+    //   vd_shared:   D_CONST * sizeof(cuda_t)   -- V[d]
+    //   qkvOs_dbuf:  4 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- ping-pong for Q[s]/K[s]/V[s]/dO[s], only when USE_PIPELINE
+    //   gk_shared:   D_CONST * sizeof(accum_t)  -- float32 accumulator for dK[d]
+    //   gq_shared:   D_CONST * sizeof(accum_t)  -- float32 accumulator for dQ[d]
+    //   gv_shared:   D_CONST * sizeof(accum_t)  -- float32 accumulator for dV[d]
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *const kd_shared  = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *const qd_shared  = kd_shared + D_CONST;
-    cuda_t *const vd_shared  = qd_shared + D_CONST;
-    accum_t *const gk_shared = reinterpret_cast<accum_t *>(sh_raw + 3 * D_CONST * sizeof(cuda_t));
-    accum_t *const gq_shared = gk_shared + D_CONST;
-    accum_t *const gv_shared = gq_shared + D_CONST;
+    cuda_t *const kd_shared = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *const qd_shared = kd_shared + D_CONST;
+    cuda_t *const vd_shared = qd_shared + D_CONST;
+    cuda_t *const qkvOs_dbuf = vd_shared + D_CONST;  // only meaningful when USE_PIPELINE
+
+    constexpr size_t qkvOs_dbuf_bytes = USE_PIPELINE ? NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    accum_t *const gk_shared          = reinterpret_cast<accum_t *>(sh_raw + 3 * D_CONST * sizeof(cuda_t) + qkvOs_dbuf_bytes);
+    accum_t *const gq_shared          = gk_shared + D_CONST;
+    accum_t *const gv_shared          = gq_shared + D_CONST;
 
     // Load K[d], Q[d], V[d] via 128-bit transactions
     {
@@ -391,24 +430,15 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     // dO[d] base pointer (contiguous)
     const cuda_t *dOd_base = dO + out_dh;
 
-    for (int e = 0; e < num_neighbors; ++e) {
-        index_t node_s = 0;
-        if (lane == 0) {
-            node_s = __ldg(&col_idx[edge_start + e]);
-        }
-        node_s = __shfl_sync(FULL_WARP_MASK, node_s, 0);
-
+    auto neighbor_consume = [&](index_t node_s, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
         if (node_s >= N) [[unlikely]] {
-            continue;
+            return;
         }
 
-        // Column node pointers (strided)
-        cuda_t const *const qs_base = Q + node_s * stride_q_n + head_h * stride_q_h;
-        cuda_t const *const ks_base = K + node_s * stride_k_n + head_h * stride_k_h;
-        cuda_t const *const vs_base = V + node_s * stride_v_n + head_h * stride_v_h;
-        // dO[s] is contiguous
-        const size_t out_sh          = static_cast<size_t>(node_s) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
-        cuda_t const *const dOs_base = dO + out_sh;
+        cuda_t const *const qs_base  = rows[0];
+        cuda_t const *const ks_base  = rows[1];
+        cuda_t const *const vs_base  = rows[2];
+        cuda_t const *const dOs_base = rows[3];
 
         // 1) Compute dot products for both directions
         accum_t dot_kd_qs{};  // K[d] . Q[s]  -> forward score
@@ -470,6 +500,35 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
             ks.weighted_accum_(&gq_shared[base_f], dS_rev_scaled); // dQ[d] += dS_rev * K[s]
             dOs.weighted_accum_(&gv_shared[base_f], alpha_rev); // dV[d] += P_rev * dO[s]
         }
+    };
+
+    if constexpr (USE_PIPELINE) {
+        // dO is always contiguous [N, H, D]: stride_n = H*D_CONST, stride_h = D_CONST.
+        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {Q, K, V, dO};
+        int64_t const row_stride_n[NUM_PREFETCH_ROWS]     = {stride_q_n, stride_k_n, stride_v_n, static_cast<int64_t>(H) * D_CONST};
+        int64_t const row_stride_h[NUM_PREFETCH_ROWS]     = {stride_q_h, stride_k_h, stride_v_h, D_CONST};
+        pipelined_neighbor_row_loop<1, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            /*warp_id=*/0, lane, num_neighbors, edge_start, col_idx, row_bases, row_stride_n, row_stride_h, head_h, qkvOs_dbuf, neighbor_consume
+        );
+    } else {
+        for (int e = 0; e < num_neighbors; ++e) {
+            index_t node_s = 0;
+            if (lane == 0) {
+                node_s = __ldg(&col_idx[edge_start + e]);
+            }
+            node_s = __shfl_sync(FULL_WARP_MASK, node_s, 0);
+            if (node_s >= N) [[unlikely]] {
+                continue;
+            }
+
+            cuda_t const *const qs_base = Q + node_s * stride_q_n + head_h * stride_q_h;
+            cuda_t const *const ks_base = K + node_s * stride_k_n + head_h * stride_k_h;
+            cuda_t const *const vs_base = V + node_s * stride_v_n + head_h * stride_v_h;
+            const size_t out_sh          = static_cast<size_t>(node_s) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
+            cuda_t const *const dOs_base = dO + out_sh;
+            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {qs_base, ks_base, vs_base, dOs_base};
+            neighbor_consume(node_s, rows);
+        }
     }
 
     // Write all three gradients: convert float32 accumulators to cuda_t
@@ -507,7 +566,7 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
 // atomic, which the accumulation is indifferent to.
 // ================================================================================================
 
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_slice_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr_T,
@@ -560,10 +619,19 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 
     const size_t part_off = (static_cast<size_t>(slice_id) * H + head_h) * D_CONST;
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE     = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES        = PIPELINE_STAGES;
+    constexpr int NUM_PREFETCH_ROWS = 2;  // K[i] and dO[i], as in the in-place csrT kernel
+
+    // qj_shared | vj_shared | ki_dOi_dbuf (only when USE_PIPELINE) | warp_gq | warp_gv
     extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *qj_shared = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *vj_shared = qj_shared + D_CONST;
-    accum_t *warp_gq  = reinterpret_cast<accum_t *>(sh_raw + 2 * D_CONST * sizeof(cuda_t));
+    cuda_t *qj_shared   = reinterpret_cast<cuda_t *>(sh_raw);
+    cuda_t *vj_shared   = qj_shared + D_CONST;
+    cuda_t *ki_dOi_dbuf = vj_shared + D_CONST;  // only meaningful when USE_PIPELINE
+
+    constexpr size_t ki_dOi_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    accum_t *warp_gq = reinterpret_cast<accum_t *>(sh_raw + 2 * D_CONST * sizeof(cuda_t) + ki_dOi_dbuf_bytes);
     accum_t *warp_gv  = warp_gq + WARPS_PER_BLOCK * D_CONST;
     accum_t *my_gq    = warp_gq + warp_id * D_CONST;
     accum_t *my_gv    = warp_gv + warp_id * D_CONST;
@@ -601,20 +669,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     }
     __syncthreads();
 
-    // Warps stride over this slice's incoming edges only.
-    for (int e = local_start + warp_id; e < local_end; e += WARPS_PER_BLOCK) {
-        index_t node_i = 0;
-        if (lane == 0) {
-            node_i = __ldg(&col_idx_T[edge_start + e]);
-        }
-        node_i = __shfl_sync(FULL_WARP_MASK, node_i, 0);
+    // One body for both drivers. The out-of-range guard lives inside, exactly as the in-place
+    // csrT kernel does it, so the two paths reject the same edges at the same point.
+    auto edge_consume = [&](index_t node_i, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
         if (node_i >= N) [[unlikely]] {
-            continue;
+            return;
         }
 
-        cuda_t const *ki_base  = K + node_i * stride_k_n + head_h * stride_k_h;
+        cuda_t const *ki_base  = rows[0];
+        cuda_t const *dOi_base = rows[1];
         const size_t out_ih    = static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST;
-        cuda_t const *dOi_base = dO + out_ih;
 
         accum_t dot_kq{};
         accum_t dP_ij{};
@@ -654,6 +718,32 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
             dOi.weighted_accum_(&my_gv[base_f], alpha);
             ki.weighted_accum_(&my_gq[base_f], dS_scaled);
             Tile::atomic_add_scaled_f32(dK_i_base, base_f, dS_scaled, qj);
+        }
+    };
+
+    const index_t slice_edge_start = edge_start + static_cast<index_t>(local_start);
+    const int slice_len            = local_end - local_start;
+
+    if constexpr (USE_PIPELINE) {
+        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {K, dO};
+        int64_t const row_stride_n[NUM_PREFETCH_ROWS]    = {stride_k_n, static_cast<int64_t>(H) * D_CONST};
+        int64_t const row_stride_h[NUM_PREFETCH_ROWS]    = {stride_k_h, D_CONST};
+        cuda_t *warp_dbuf = ki_dOi_dbuf + warp_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
+        pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            warp_id, lane, slice_len, slice_edge_start, col_idx_T, row_bases, row_stride_n, row_stride_h, head_h, warp_dbuf, edge_consume
+        );
+    } else {
+        for (int e = warp_id; e < slice_len; e += WARPS_PER_BLOCK) {
+            index_t node_i = 0;
+            if (lane == 0) {
+                node_i = __ldg(&col_idx_T[slice_edge_start + e]);
+            }
+            node_i = __shfl_sync(FULL_WARP_MASK, node_i, 0);
+            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {
+                K + node_i * stride_k_n + head_h * stride_k_h,
+                dO + static_cast<size_t>(node_i) * H * D_CONST + static_cast<size_t>(head_h) * D_CONST,
+            };
+            edge_consume(node_i, rows);
         }
     }
 

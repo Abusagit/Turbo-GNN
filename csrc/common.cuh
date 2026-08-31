@@ -5,3 +5,4 @@
 #include "common/scheduler.cuh"
 #include "common/traits.cuh"
 #include "common/tile.cuh"
+#include "common/pipeline.cuh"

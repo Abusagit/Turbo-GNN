@@ -12,7 +12,8 @@ void GATv2Backward_CSR_Undirected_Impl(
     const cuda_t *d_attn_vec, const float *d_logsumexp, float negative_slope, int grad_A_reduce_row_chunk_size, cudaStream_t stream,
     cuda_t *grad_l, cuda_t *grad_r, float *grad_a, float *d_grad_a_reduced, int schedule, int blocks_per_sm, at::Tensor sched_counters, int sched_chunk, int bucket_launch,
     const index_t *light_nodes, int num_light, const index_t *heavy_nodes, int num_heavy, at::Device device,
-    const int *chunk_node, const int *chunk_start, const int *node_chunk_offset, int num_slices, int heavy_edge_slice
+    const int *chunk_node, const int *chunk_start, const int *node_chunk_offset, int num_slices, int heavy_edge_slice,
+    int pipeline_stages
 ) {
     namespace sched_ns                   = turbo_gnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
@@ -90,10 +91,19 @@ void GATv2Backward_CSR_Undirected_Impl(
 
     auto launch_g_slice = [&](cudaStream_t st) {
         part_G = at::empty({num_slices, static_cast<int64_t>(H)}, f32);
-        GATv2Backward_G_SliceKernel<D_CONST, cuda_t, index_t><<<dim3(num_slices, H), dim3(kWarpSize), sh_g, st>>>(
-            N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h,
-            d_row_ptr, d_col_idx, heavy_nodes, chunk_node, chunk_start, heavy_edge_slice, num_slices,
-            d_attn_vec, d_logsumexp, negative_slope, part_G.data_ptr<float>()
+        std::visit(
+            [&](auto stages_c) {
+                constexpr int STAGES = decltype(stages_c)::value;
+                // li + ghi + r_dbuf (one warp, one prefetched row); STAGES == 0 drops the term.
+                const size_t sh_g_p = sh_g + STAGES * D_CONST * sizeof(cuda_t);
+                GATv2Backward_G_SliceKernel<D_CONST, cuda_t, index_t, float, STAGES>
+                    <<<dim3(num_slices, H), dim3(kWarpSize), sh_g_p, st>>>(
+                        N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h,
+                        d_row_ptr, d_col_idx, heavy_nodes, chunk_node, chunk_start, heavy_edge_slice, num_slices,
+                        d_attn_vec, d_logsumexp, negative_slope, part_G.data_ptr<float>()
+                    );
+            },
+            MakeIntVariant<0, 2, 3>(pipeline_stages)
         );
         GATv2Backward_G_MergeKernel<cuda_t, index_t><<<dim3(num_heavy, H), dim3(kWarpSize), 0, st>>>(
             H, d_row_ptr, heavy_nodes, node_chunk_offset, part_G.data_ptr<float>(), d_G, num_heavy
@@ -104,11 +114,20 @@ void GATv2Backward_CSR_Undirected_Impl(
         part_a = at::empty({num_slices, static_cast<int64_t>(H), static_cast<int64_t>(D_CONST)}, f32);
         part_l = at::empty({num_slices, static_cast<int64_t>(H), static_cast<int64_t>(D_CONST)}, f32);
         part_r = at::empty({num_slices, static_cast<int64_t>(H), static_cast<int64_t>(D_CONST)}, f32);
-        GATv2Backward_ALR_SliceKernel<D_CONST, cuda_t, index_t><<<dim3(num_slices, H), dim3(kWarpSize), sh_alr, st>>>(
+        std::visit(
+            [&](auto stages_c) {
+                constexpr int STAGES = decltype(stages_c)::value;
+                // + rlghj_dbuf: one warp, three prefetched rows (r[j], l[j], grad_h[j]).
+                const size_t sh_alr_p = sh_alr + 3 * STAGES * D_CONST * sizeof(cuda_t);
+                GATv2Backward_ALR_SliceKernel<D_CONST, cuda_t, index_t, float, STAGES>
+                    <<<dim3(num_slices, H), dim3(kWarpSize), sh_alr_p, st>>>(
             N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h,
             d_row_ptr, d_col_idx, heavy_nodes, chunk_node, chunk_start, heavy_edge_slice, num_slices,
             d_attn_vec, d_logsumexp, d_G, negative_slope,
             part_a.data_ptr<float>(), part_l.data_ptr<float>(), part_r.data_ptr<float>()
+                    );
+            },
+            MakeIntVariant<0, 2, 3>(pipeline_stages)
         );
         GATv2Backward_ALR_MergeKernel<D_CONST, cuda_t, index_t><<<dim3(num_heavy, H), dim3(kWarpSize), 0, st>>>(
             H, d_row_ptr, heavy_nodes, node_chunk_offset,
@@ -186,13 +205,13 @@ void GATv2Backward_CSR_Impl_UNUSED(
     const cuda_t *d_r, int64_t stride_r_n, int64_t stride_r_h,
 
     const index_t *d_row_ptr, const index_t *d_col_idx, const index_t *d_row_ptr_T, const index_t *d_col_idx_T, const cuda_t *d_attn_vec,
-    const float *d_logsumexp,  // [N, H]
+    const float *d_logsumexp,  // [N, H],
     float negative_slope, int grad_A_reduce_row_chunk_size, cudaStream_t stream,
 
     // outputs
     cuda_t *grad_l,          // [N, H, D]
     cuda_t *grad_r,          // [N, H, D]
-    float *grad_a,           // [N, H, D] always float32
+    float *grad_a,           // [N, H, D] always float32,
     float *d_grad_a_reduced  // [H, D] output in float32
 ) {
     dim3 nThreads(kWarpSize);
@@ -238,11 +257,11 @@ void GATv2Backward_CSR_Impl_UNUSED(
 }
 
 std::vector<torch::Tensor> gatv2_forward_cuda(
-    torch::Tensor l,         // [N, H, D] - left features
-    torch::Tensor r,         // [N, H, D] - right features
-    torch::Tensor row_ptr,   // [N+1] - CSR row pointers
-    torch::Tensor col_idx,   // [E] - CSR column indices
-    torch::Tensor attn_vec,  // [H, D] - contiguous attention vector
+    torch::Tensor l,         // [N, H, D] - left features,
+    torch::Tensor r,         // [N, H, D] - right features,
+    torch::Tensor row_ptr,   // [N+1] - CSR row pointers,
+    torch::Tensor col_idx,   // [E] - CSR column indices,
+    torch::Tensor attn_vec,  // [H, D] - contiguous attention vector,
     float negative_slope,
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
@@ -255,7 +274,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor chunk_node,
     torch::Tensor chunk_start,
     torch::Tensor node_chunk_offset,
-    int heavy_edge_slice
+    int heavy_edge_slice,
+    int pipeline_stages
 ) {
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
     TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
@@ -335,21 +355,22 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
         }
 
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c, auto stages_c) {
                 using index_t     = typename decltype(idxInfo)::Type;
                 using torch_t     = typename decltype(typeInfo)::TorchType;
                 using cuda_t      = typename decltype(typeInfo)::CudaType;
                 constexpr int DC  = decltype(d_c)::value;
                 constexpr int W   = decltype(warp_c)::value;
                 constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+                constexpr int STAGES = decltype(stages_c)::value;
 
                 auto *l_ptr     = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
                 auto *r_ptr     = reinterpret_cast<const cuda_t *>(r.data_ptr<torch_t>());
                 auto *attn_ptr  = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                 auto *h_out_ptr = reinterpret_cast<cuda_t *>(h_out.data_ptr<torch_t>());
 
-                // l_sh + W * D float + 2 * W float
-                size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+                // l_sh + r_dbuf (STAGES == 0 makes this term vanish) + W * D float + 2 * W float
+                size_t shmem = DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
                 dim3 blocks(gx, H);
                 dim3 threads(W * kWarpSize);
@@ -358,13 +379,16 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                     SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs, sched_chunk
                 );
 
-                GATv2Forward_Kernel<SK, W, DC, cuda_t, index_t><<<blocks, threads, shmem, stream>>>(
+                ensure_dynamic_shmem(GATv2Forward_Kernel<SK, W, DC, cuda_t, index_t, float, STAGES>, shmem, "GATv2 forward");
+
+                GATv2Forward_Kernel<SK, W, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h, index_ptr<index_t>(row_ptr),
                     index_ptr<index_t>(col_idx), sp, attn_ptr, h_out_ptr, d_logsumexp, negative_slope
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1, 2, 3>(schedule)
+            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1, 2, 3>(schedule),
+            MakeIntVariant<0, 2, 3>(pipeline_stages)
         );
     };
 
@@ -388,21 +412,28 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
         buckets.record_all(part_o, part_ml, chunk_node, chunk_start, node_chunk_offset, heavy_nodes);
 
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
-                using index_t    = typename decltype(idxInfo)::Type;
-                using torch_t    = typename decltype(typeInfo)::TorchType;
-                using cuda_t     = typename decltype(typeInfo)::CudaType;
-                constexpr int DC = decltype(d_c)::value;
-                constexpr int W  = decltype(warp_c)::value;
+            [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto stages_c) {
+                using index_t         = typename decltype(idxInfo)::Type;
+                using torch_t         = typename decltype(typeInfo)::TorchType;
+                using cuda_t          = typename decltype(typeInfo)::CudaType;
+                constexpr int DC      = decltype(d_c)::value;
+                constexpr int W       = decltype(warp_c)::value;
+                constexpr int STAGES  = decltype(stages_c)::value;
 
                 auto *l_ptr     = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
                 auto *r_ptr     = reinterpret_cast<const cuda_t *>(r.data_ptr<torch_t>());
                 auto *attn_ptr  = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                 auto *h_out_ptr = reinterpret_cast<cuda_t *>(h_out.data_ptr<torch_t>());
 
-                size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+                // l_sh + r_dbuf (STAGES == 0 makes this term vanish) + W * D float + 2 * W float
+                size_t shmem = DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
 
-                GATv2ForwardSlice_Kernel<W, DC, cuda_t, index_t><<<dim3(num_slices, H), dim3(W * kWarpSize), shmem, stream>>>(
+                ensure_dynamic_shmem(
+                    GATv2ForwardSlice_Kernel<W, DC, cuda_t, index_t, float, STAGES>, shmem, "GATv2 forward (slice)"
+                );
+
+                GATv2ForwardSlice_Kernel<W, DC, cuda_t, index_t, float, STAGES>
+                    <<<dim3(num_slices, H), dim3(W * kWarpSize), shmem, stream>>>(
                     N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
                     index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(heavy_nodes),
                     chunk_node.data_ptr<int>(), chunk_start.data_ptr<int>(), heavy_edge_slice, num_slices,
@@ -415,7 +446,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block)
+            MakeIntVariant<32, 64, 128, 256>((int)D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block),
+            MakeIntVariant<0, 2, 3>(pipeline_stages)
         );
     };
 
@@ -437,13 +469,13 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
 }
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
-    torch::Tensor grad_h,     // [N, H, D] - gradient from output
+    torch::Tensor grad_h,     // [N, H, D] - gradient from output,
     torch::Tensor l,          // [N, H, D] - left features (saved)
     torch::Tensor r,          // [N, H, D] - right features (saved)
-    torch::Tensor row_ptr,    // [N+1] - CSR row pointers
-    torch::Tensor col_idx,    // [E] - CSR column indices
-    torch::Tensor row_ptr_T,  // [N+1] - CSR^T row pointers
-    torch::Tensor col_idx_T,  // [E] - CSR^T column indices
+    torch::Tensor row_ptr,    // [N+1] - CSR row pointers,
+    torch::Tensor col_idx,    // [E] - CSR column indices,
+    torch::Tensor row_ptr_T,  // [N+1] - CSR^T row pointers,
+    torch::Tensor col_idx_T,  // [E] - CSR^T column indices,
     torch::Tensor attn_vec,   // [H, D] - attention vector (saved)
     torch::Tensor logsumexp,  // [N, H] - logsumexp (saved)
     float negative_slope,
@@ -463,7 +495,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor chunk_node,
     torch::Tensor chunk_start,
     torch::Tensor node_chunk_offset,
-    int backward_heavy_edge_slice
+    int backward_heavy_edge_slice,
+    int pipeline_stages
 ) {
     TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
     TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
@@ -574,13 +607,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 offs = sched_ns::degree_balanced_block_offsets(row_ptr, node_indices, num_nodes_bucket, gx);
             }
             std::visit(
-                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
+                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c, auto stages_c) {
                     using index_t     = typename decltype(idxInfo)::Type;
                     using torch_t     = typename decltype(typeInfo)::TorchType;
                     using cuda_t      = typename decltype(typeInfo)::CudaType;
                     constexpr int DC  = decltype(d_c)::value;
                     constexpr int W   = decltype(warp_c)::value;
                     constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+                    constexpr int STAGES = decltype(stages_c)::value;
 
                     auto *grad_h_ptr = reinterpret_cast<const cuda_t *>(grad_h.data_ptr<torch_t>());
                     auto *l_ptr      = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
@@ -588,7 +622,10 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     auto *attn_ptr   = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                     auto *grad_l_ptr = reinterpret_cast<cuda_t *>(grad_l.data_ptr<torch_t>());
 
-                    size_t sh_al = 2 * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
+                    // li_sh + ghi_sh + r_dbuf (STAGES == 0 makes this term vanish) + warp_grada + warp_gradl + warp_G + G_broadcast
+                    size_t sh_al = 2 * DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
+
+                    ensure_dynamic_shmem(GATv2Backward_AL<SK, W, DC, cuda_t, index_t, float, STAGES>, sh_al, "GATv2 backward AL");
 
                     dim3 blocks(gx, H);
                     dim3 threads(W * kWarpSize);
@@ -597,7 +634,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                         SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs, sched_chunk
                     );
 
-                    GATv2Backward_AL<SK, W, DC, cuda_t, index_t><<<blocks, threads, sh_al, stream>>>(
+                    GATv2Backward_AL<SK, W, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, sh_al, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                         index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), sp, attn_ptr, d_logsumexp,
                         negative_slope, d_grad_a, grad_l_ptr, d_G
@@ -605,7 +642,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
                 MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
-                MakeIntVariant<0, 1, 2, 3>(schedule)
+                MakeIntVariant<0, 1, 2, 3>(schedule),
+                MakeIntVariant<0, 2, 3>(pipeline_stages)
             );
         };
 
@@ -623,13 +661,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 offs = sched_ns::degree_balanced_block_offsets(row_ptr_T, node_indices, num_nodes_bucket, gx);
             }
             std::visit(
-                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c) {
+                [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c, auto stages_c) {
                     using index_t     = typename decltype(idxInfo)::Type;
                     using torch_t     = typename decltype(typeInfo)::TorchType;
                     using cuda_t      = typename decltype(typeInfo)::CudaType;
                     constexpr int DC  = decltype(d_c)::value;
                     constexpr int W   = decltype(warp_c)::value;
                     constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+                    constexpr int STAGES = decltype(stages_c)::value;
 
                     auto *grad_h_ptr = reinterpret_cast<const cuda_t *>(grad_h.data_ptr<torch_t>());
                     auto *l_ptr      = reinterpret_cast<const cuda_t *>(l.data_ptr<torch_t>());
@@ -637,7 +676,10 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     auto *attn_ptr   = reinterpret_cast<const cuda_t *>(attn_vec.data_ptr<torch_t>());
                     auto *grad_r_ptr = reinterpret_cast<cuda_t *>(grad_r.data_ptr<torch_t>());
 
-                    size_t sh_r = DC * sizeof(cuda_t) + W * DC * sizeof(float);
+                    // rj_sh + li_ghi_dbuf (2 rows, STAGES == 0 makes this term vanish) + warp_gradr
+                    size_t sh_r = DC * sizeof(cuda_t) + W * 2 * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float);
+
+                    ensure_dynamic_shmem(GATv2Backward_R<SK, W, DC, cuda_t, index_t, float, STAGES>, sh_r, "GATv2 backward R");
 
                     dim3 blocks(gx, H);
                     dim3 threads(W * kWarpSize);
@@ -646,7 +688,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                         SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs, sched_chunk
                     );
 
-                    GATv2Backward_R<SK, W, DC, cuda_t, index_t><<<blocks, threads, sh_r, stream>>>(
+                    GATv2Backward_R<SK, W, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, sh_r, stream>>>(
                         N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                         index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), sp, attn_ptr, d_logsumexp,
                         d_G, negative_slope, grad_r_ptr
@@ -654,7 +696,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
                 MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
-                MakeIntVariant<0, 1, 2, 3>(schedule)
+                MakeIntVariant<0, 1, 2, 3>(schedule),
+                MakeIntVariant<0, 2, 3>(pipeline_stages)
             );
         };
 
@@ -731,7 +774,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     chunk_node.numel() ? chunk_node.data_ptr<int>() : nullptr,
                     chunk_start.numel() ? chunk_start.data_ptr<int>() : nullptr,
                     node_chunk_offset.numel() ? node_chunk_offset.data_ptr<int>() : nullptr,
-                    static_cast<int>(chunk_node.numel()), backward_heavy_edge_slice
+                    static_cast<int>(chunk_node.numel()), backward_heavy_edge_slice, pipeline_stages
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),

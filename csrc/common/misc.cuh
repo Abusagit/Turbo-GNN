@@ -77,6 +77,25 @@ inline bool is_supported_index_type(at::ScalarType type) {
     return type == at::kInt || type == at::kLong || type == c10::ScalarType::UInt32 || type == c10::ScalarType::UInt64;
 }
 
+// Raises the kernel's dynamic-shmem limit above the 48 KiB default when needed
+// (large warps_per_block x pipeline_stages). Pass the kernel function itself, not a pointer.
+template <typename KernelFn>
+inline void ensure_dynamic_shmem(KernelFn kernel, size_t shmem, const char *context = "kernel launch") {
+    constexpr size_t kStaticShmemLimit = 48 * 1024;
+    if (shmem <= kStaticShmemLimit) return;
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    int max_shmem_optin = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&max_shmem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    TORCH_CHECK(
+        shmem <= static_cast<size_t>(max_shmem_optin), context, ": requested shared memory (", shmem,
+        " bytes) exceeds this GPU's max opt-in shared memory per block (", max_shmem_optin,
+        " bytes). Reduce warps_per_block or pipeline_stages."
+    );
+    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem)));
+}
+
 // Warp reductions
 
 template <typename T>

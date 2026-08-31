@@ -30,7 +30,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int bucket_launch               = 0,
     at::Tensor chunk_node           = at::Tensor(),
     at::Tensor chunk_start          = at::Tensor(),
-    int heavy_edge_slice            = 0
+    int heavy_edge_slice            = 0,
+    int pipeline_stages              = 0
 );
 
 at::Tensor reduction_aggr_backward_torch(
@@ -59,7 +60,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor chunk_node        = torch::Tensor(),
     torch::Tensor chunk_start       = torch::Tensor(),
     torch::Tensor node_chunk_offset = torch::Tensor(),
-    int heavy_edge_slice            = 0
+    int heavy_edge_slice            = 0,
+    int pipeline_stages = 0
 );
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
@@ -88,7 +90,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor chunk_node        = torch::Tensor(),
     torch::Tensor chunk_start       = torch::Tensor(),
     torch::Tensor node_chunk_offset = torch::Tensor(),
-    int backward_heavy_edge_slice   = 0
+    int backward_heavy_edge_slice   = 0,
+    int pipeline_stages       = 0
 );
 
 // ============================================================================
@@ -115,14 +118,15 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     torch::Tensor chunk_node        = torch::Tensor(),
     torch::Tensor chunk_start       = torch::Tensor(),
     torch::Tensor node_chunk_offset = torch::Tensor(),
-    int heavy_edge_slice            = 0
+    int heavy_edge_slice            = 0,
+    int pipeline_stages       = 0
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward_csr_mh_cuda(
-    torch::Tensor row_ptr,    // forward CSR [N+1]
-    torch::Tensor col_idx,    // forward CSR [E]
-    torch::Tensor row_ptr_T,  // backward CSR^T [N+1]
-    torch::Tensor col_idx_T,  // backward CSR^T [E]
+    torch::Tensor row_ptr,    // forward CSR [N+1],
+    torch::Tensor col_idx,    // forward CSR [E],
+    torch::Tensor row_ptr_T,  // backward CSR^T [N+1],
+    torch::Tensor col_idx_T,  // backward CSR^T [E],
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -142,7 +146,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     torch::Tensor chunk_node        = torch::Tensor(),
     torch::Tensor chunk_start       = torch::Tensor(),
     torch::Tensor node_chunk_offset = torch::Tensor(),
-    int heavy_edge_slice            = 0
+    int heavy_edge_slice            = 0,
+    int pipeline_stages       = 0
 );
 
 // ============================================================================

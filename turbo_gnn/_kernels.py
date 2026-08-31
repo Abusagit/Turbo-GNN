@@ -47,6 +47,18 @@ class ReductionAggrKernel(TunableKernel):
       for heavy nodes (tiles over both edges and features).
     - ``forward_features_per_block``, ``forward_tiles_y``: tile dimensions
       for the 2-D kernel.
+    - ``forward_pipeline_stages``: async-copy pipeline stage count for the
+      light-node and packed-atomics heavy-node kernels' per-thread neighbor
+      scan (0 disables the pipeline; ignored by the 2-D tiled heavy kernel,
+      which already hides latency via shared-memory tree reduction).
+      MEASURED REGRESSION: as of this writing, stages=1 makes these kernels
+      strictly slower on H100 (0/27 and 1/27 swept configs improved; see
+      results/bench_min_aggr_forward/, results/bench_max_aggr_forward/,
+      results/ncu_min_aggr/) -- each block here is a single warp copying a
+      tiny (<=16B) per-thread slice, so there's no other warp to hide the
+      async-copy latency behind, and the pipeline's own sync overhead just
+      adds cost. Kept as a tunable (default 0, off) only so autotune can
+      revisit it if the kernel shape changes.
 
     Tunable graph parameter:
 
@@ -71,6 +83,7 @@ class ReductionAggrKernel(TunableKernel):
         self.forward_use_2d_kernel = kwargs.get("use_2d_kernel", False)
         self.forward_features_per_block = kwargs.get("features_per_block", 32)
         self.forward_tiles_y = kwargs.get("tiles_y", 8)
+        self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
 
     def _execute(self, graph, x, **kwargs):
         # An explicit edge count wins; otherwise size the slice from the heavy-degree
@@ -101,6 +114,7 @@ class ReductionAggrKernel(TunableKernel):
             slice_size,
             table.chunk_node if table is not None else None,
             table.chunk_start if table is not None else None,
+            self.forward_pipeline_stages,
         )
 
     def canonicalise_config(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -148,6 +162,7 @@ class ReductionAggrKernel(TunableKernel):
             TunableParam("forward_use_2d_kernel", [True, False], default=False),
             TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
             TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
+            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -164,6 +179,9 @@ class GATv2AggrKernel(TunableKernel):
     - ``backward_grad_A_reduce_row_chunk_size``: number of destination-node
       rows reduced per shared-memory pass when computing attention gradients.
       Larger chunks reduce kernel launches but increase shared memory usage.
+    - ``backward_pipeline_stages``: async-copy pipeline stage count for the
+      backward AL/R (directed) and G/ALR (undirected) kernels, mirroring
+      ``forward_pipeline_stages`` (0 disables the pipeline).
 
     Tunable graph parameters (forward and backward):
 
@@ -188,6 +206,8 @@ class GATv2AggrKernel(TunableKernel):
         self.forward_heavy_edge_slice = kwargs.get("forward_heavy_edge_slice", 0)
         self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
         self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
+        self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
+        self.backward_pipeline_stages = kwargs.get("backward_pipeline_stages", 0)
 
     def _execute(self, graph, x, *, x_neighbors=None, attention_weights=None, negative_slope=None, **kwargs):
         # An explicit edge count wins; otherwise size the slice from the heavy-degree
@@ -231,6 +251,8 @@ class GATv2AggrKernel(TunableKernel):
             bwd_table.chunk_node if bwd_table is not None else None,
             bwd_table.chunk_start if bwd_table is not None else None,
             bwd_table.node_chunk_offset if bwd_table is not None else None,
+            self.forward_pipeline_stages,
+            self.backward_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -255,6 +277,7 @@ class GATv2AggrKernel(TunableKernel):
             # edge count. Degree statistics do not predict the optimum (1125x spread for the
             # bucketing threshold); block count does (7x). 0 disables slicing.
             TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -282,6 +305,7 @@ class GATv2AggrKernel(TunableKernel):
             # The undirected backward's heavy bucket is ~81% of that pass at ~7% occupancy;
             # slicing it is the point of this axis. 0 keeps one block per heavy node.
             TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("backward_pipeline_stages", [0, 2, 3], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:
@@ -309,8 +333,15 @@ class GATv2AggrKernel(TunableKernel):
 class GraphTransformerAggrKernel(TunableKernel):
     """Tunable kernel for fused multi-head graph transformer attention.
 
-    No tunable kernel parameters (the kernel is fully fused).  Only graph
-    partitioning can be tuned:
+    Tunable kernel parameters:
+
+    - ``forward_pipeline_stages``: async-copy pipeline stage count for the
+      forward kernel's Q[j]/V[j] prefetch. 0 disables the pipeline.
+    - ``backward_pipeline_stages``: async-copy pipeline stage count for the
+      backward kernels' neighbor-row prefetch (directed: K[i]/dO[i]; undirected:
+      Q[s]/K[s]/V[s]/dO[s]). 0 disables the pipeline.
+
+    Tunable graph partitioning:
 
     - ``forward_huge_degree_threshold_quantile``: light/heavy partition for
       the forward CSR.
@@ -333,6 +364,8 @@ class GraphTransformerAggrKernel(TunableKernel):
         self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
         self.backward_heavy_edge_slice = kwargs.get("backward_heavy_edge_slice", 0)
         self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
+        self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
+        self.backward_pipeline_stages = kwargs.get("backward_pipeline_stages", 0)
 
     def _execute(self, graph, x, *, Q=None, K=None, V=None, scale=None, **kwargs):
         # A positive slice size switches the heavy bucket from one block per node to one block
@@ -380,6 +413,8 @@ class GraphTransformerAggrKernel(TunableKernel):
             bwd_table.chunk_node if bwd_table is not None else None,
             bwd_table.chunk_start if bwd_table is not None else None,
             bwd_table.node_chunk_offset if bwd_table is not None else None,
+            self.forward_pipeline_stages,
+            self.backward_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -405,6 +440,7 @@ class GraphTransformerAggrKernel(TunableKernel):
             # edge count. Degree statistics do not predict the optimum (1125x spread for the
             # bucketing threshold); block count does (7x). 0 disables slicing.
             TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -431,6 +467,7 @@ class GraphTransformerAggrKernel(TunableKernel):
             # Backward slices the transpose CSR, so it gets its own size. 0 keeps the
             # node-per-block heavy path.
             TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("backward_pipeline_stages", [0, 2, 3], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:

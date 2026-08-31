@@ -33,7 +33,7 @@ struct AdOps {
         } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, float> && is_device_pass) {
             return fminf(a, b);
         } else {
-            return cuda::std::min(a, b);
+            return b < a ? b : a;
         }
     }
 
@@ -43,7 +43,7 @@ struct AdOps {
         } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, float> && is_device_pass) {
             return fmaxf(a, b);
         } else {
-            return cuda::std::max(a, b);
+            return a < b ? b : a;
         }
     }
 
@@ -93,7 +93,7 @@ struct AdOpsPacked : AdOps<T> {
         } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, float> && is_device_pass) {
             return {fminf(a.x, b.x), fminf(a.y, b.y)};
         } else {
-            return {cuda::std::min(a.x, b.x), cuda::std::min(a.y, b.y)};
+            return {b.x < a.x ? b.x : a.x, b.y < a.y ? b.y : a.y};
         }
     }
 
@@ -103,7 +103,7 @@ struct AdOpsPacked : AdOps<T> {
         } else if constexpr (std::is_same_v<std::remove_cvref_t<T>, float> && is_device_pass) {
             return {fmaxf(a.x, b.x), fmaxf(a.y, b.y)};
         } else {
-            return {cuda::std::max(a.x, b.x), cuda::std::max(a.y, b.y)};
+            return {a.x < b.x ? b.x : a.x, a.y < b.y ? b.y : a.y};
         }
     }
 

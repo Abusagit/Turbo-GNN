@@ -20,6 +20,7 @@ def reduction_aggr_forward_partitioned(
     features_per_block=32,
     tiles_y=8,
     reduce="min",
+    pipeline_stages=0,
 ):
     return reduction_aggr_cuda.reduction_aggr_forward_partitioned(
         edge_ptr,
@@ -34,4 +35,5 @@ def reduction_aggr_forward_partitioned(
         features_per_block,
         tiles_y,
         reduce,
+        pipeline_stages,
     )

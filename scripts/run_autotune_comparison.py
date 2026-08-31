@@ -195,6 +195,169 @@ SETUPS = {
         "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile,"
         "forward_heavy_slice_blocks_per_sm,backward_heavy_slice_blocks_per_sm",
     ],
+    # --- slicing pinned OFF: isolates pipelining's effect on the non-sliced path, which is the
+    # only path it reached before the slice kernels gained PIPELINE_STAGES. ---------------------
+    "noslice-pipe-off": [
+        "-K",
+        "schedule=one_per_block",
+        "-K",
+        "forward_bucket_launch=concurrent",
+        "-K",
+        "backward_bucket_launch=concurrent",
+        "--quantile",
+        "0.99",
+        "--sweep",
+        "node_order=degree,locality",
+        "-K",
+        "forward_heavy_edge_slice=0",
+        "-K",
+        "backward_heavy_edge_slice=0",
+        "-K",
+        "forward_heavy_slice_blocks_per_sm=0",
+        "-K",
+        "backward_heavy_slice_blocks_per_sm=0",
+        "-K",
+        "pipeline_stages=0",
+        "-K",
+        "backward_pipeline_stages=0",
+        "--autotune",
+        "--autotune-exclude",
+        "schedule,forward_bucket_launch,backward_bucket_launch,"
+        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
+        "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
+        "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
+        "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile,"
+        "forward_heavy_slice_blocks_per_sm,backward_heavy_slice_blocks_per_sm,"
+        "forward_heavy_edge_slice,backward_heavy_edge_slice" + ",forward_pipeline_stages,backward_pipeline_stages",
+    ],
+    "noslice-pipe-on": [
+        "-K",
+        "schedule=one_per_block",
+        "-K",
+        "forward_bucket_launch=concurrent",
+        "-K",
+        "backward_bucket_launch=concurrent",
+        "--quantile",
+        "0.99",
+        "--sweep",
+        "node_order=degree,locality",
+        "-K",
+        "forward_heavy_edge_slice=0",
+        "-K",
+        "backward_heavy_edge_slice=0",
+        "-K",
+        "forward_heavy_slice_blocks_per_sm=0",
+        "-K",
+        "backward_heavy_slice_blocks_per_sm=0",
+        "-K",
+        "pipeline_stages=2",
+        "-K",
+        "backward_pipeline_stages=2",
+        "--autotune",
+        "--autotune-exclude",
+        "schedule,forward_bucket_launch,backward_bucket_launch,"
+        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
+        "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
+        "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
+        "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile,"
+        "forward_heavy_slice_blocks_per_sm,backward_heavy_slice_blocks_per_sm,"
+        "forward_heavy_edge_slice,backward_heavy_edge_slice" + ",forward_pipeline_stages,backward_pipeline_stages",
+    ],
+    # --- pipelining arms (PR #40 merged into the scheduler branch) -------------------
+    # Same fully-tuned stack in all three; the ONLY difference is what pipeline_stages may be.
+    # pipe-off is the reference, so the comparison isolates async loads rather than re-tuning.
+    "pipe-off": [
+        "-K",
+        "schedule=one_per_block",
+        "-K",
+        "forward_bucket_launch=concurrent",
+        "-K",
+        "backward_bucket_launch=concurrent",
+        "--quantile",
+        "0.99",
+        "--sweep",
+        "node_order=degree,locality",
+        "-K",
+        "pipeline_stages=0",
+        "-K",
+        "backward_pipeline_stages=0",
+        "--autotune",
+        "--autotune-exclude",
+        "schedule,forward_bucket_launch,backward_bucket_launch,"
+        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
+        "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
+        "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
+        "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile"
+        + ",forward_pipeline_stages,backward_pipeline_stages",
+    ],
+    "pipe-on": [
+        "-K",
+        "schedule=one_per_block",
+        "-K",
+        "forward_bucket_launch=concurrent",
+        "-K",
+        "backward_bucket_launch=concurrent",
+        "--quantile",
+        "0.99",
+        "--sweep",
+        "node_order=degree,locality",
+        "-K",
+        "pipeline_stages=2",
+        "-K",
+        "backward_pipeline_stages=2",
+        "--autotune",
+        "--autotune-exclude",
+        "schedule,forward_bucket_launch,backward_bucket_launch,"
+        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
+        "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
+        "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
+        "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile"
+        + ",forward_pipeline_stages,backward_pipeline_stages",
+    ],
+    "pipe-deep": [
+        "-K",
+        "schedule=one_per_block",
+        "-K",
+        "forward_bucket_launch=concurrent",
+        "-K",
+        "backward_bucket_launch=concurrent",
+        "--quantile",
+        "0.99",
+        "--sweep",
+        "node_order=degree,locality",
+        "-K",
+        "pipeline_stages=3",
+        "-K",
+        "backward_pipeline_stages=3",
+        "--autotune",
+        "--autotune-exclude",
+        "schedule,forward_bucket_launch,backward_bucket_launch,"
+        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
+        "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
+        "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
+        "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile"
+        + ",forward_pipeline_stages,backward_pipeline_stages",
+    ],
+    # Lets the search decide per cell -- the arm we would actually ship.
+    "pipe-tuned": [
+        "-K",
+        "schedule=one_per_block",
+        "-K",
+        "forward_bucket_launch=concurrent",
+        "-K",
+        "backward_bucket_launch=concurrent",
+        "--quantile",
+        "0.99",
+        "--sweep",
+        "node_order=degree,locality",
+        "--autotune",
+        "--autotune-exclude",
+        "schedule,forward_bucket_launch,backward_bucket_launch,"
+        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
+        "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
+        "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
+        "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile",
+    ],
     "autotuned-concurrent": [
         "-K",
         "forward_bucket_launch=concurrent",

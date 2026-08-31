@@ -1,0 +1,2 @@
+TCGNN is not found!
+Unknown kernel argument 'forward_pipeline_stages' for conv 'gt'. Valid names: scale, forward_light_warps, forward_heavy_warps, backward_light_warps, backward_heavy_warps, forward_heavy_slice_blocks_per_sm, forward_heavy_edge_slice, backward_heavy_slice_blocks_per_sm, backward_heavy_edge_slice, schedule, blocks_per_sm, sched_chunk, forward_bucket_launch, backward_bucket_launch

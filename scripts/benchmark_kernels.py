@@ -276,6 +276,12 @@ _REDUCTION_PARAMS = (
     KernelParam("use_2d_kernel", _parse_bool, False, "Use the 2-D tiled heavy-node kernel variant."),
     KernelParam("features_per_block", int, 32, "Feature tile size (2-D kernel only)."),
     KernelParam("tiles_y", int, 8, "Row tile count (2-D kernel only)."),
+    KernelParam(
+        "pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the forward neighbour scan; 0 disables the pipeline.",
+    ),
 ) + _SCHEDULE_PARAMS
 
 _SPMM_PARAMS = (
@@ -301,6 +307,18 @@ _GATV2_PARAMS = (
         int,
         0,
         "Edges per block in the forward heavy bucket; 0 keeps one block per heavy node.",
+    ),
+    KernelParam(
+        "pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the forward neighbour scan; 0 disables the pipeline.",
+    ),
+    KernelParam(
+        "backward_pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the backward neighbour scan; 0 disables the pipeline.",
     ),
 ) + _SCHEDULE_PARAMS
 
@@ -333,6 +351,18 @@ _GT_PARAMS = (
         int,
         0,
         "Edges per block in the backward heavy bucket; 0 keeps one block per heavy node.",
+    ),
+    KernelParam(
+        "pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the forward neighbour scan; 0 disables the pipeline.",
+    ),
+    KernelParam(
+        "backward_pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the backward neighbour scan; 0 disables the pipeline.",
     ),
 ) + _SCHEDULE_PARAMS
 
