@@ -69,8 +69,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     accum_t *my_grada = warp_grada + warp_id * D_CONST;
     accum_t *my_gradl = warp_gradl + warp_id * D_CONST;
 
-    cuda_t *grad_l_base = grad_l + ((int64_t)(node_i * H + head_h) * D_CONST);
-    float *grad_a_base  = grad_a + ((int64_t)(node_i * H + head_h) * D_CONST);
+    cuda_t *grad_l_base = grad_l + (static_cast<int64_t>(node_i * H + head_h) * D_CONST);
+    float *grad_a_base  = grad_a + (static_cast<int64_t>(node_i * H + head_h) * D_CONST);
 
     // handle isolated nodes
     if (num_neighbors == 0) {
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
             my_gradl_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
 
-        constexpr int f4_count   = (D_CONST * (int)sizeof(cuda_t)) / 16;
+        constexpr int f4_count   = (D_CONST * static_cast<int>(sizeof(cuda_t))) / 16;
         const float4 *li_src_f4  = reinterpret_cast<const float4 *>(li_base);
         const float4 *ghi_src_f4 = reinterpret_cast<const float4 *>(ghi_base);
         float4 *li_sh_f4         = reinterpret_cast<float4 *>(li_sh);
@@ -121,7 +121,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // pass 1: compute G_{i,h} = sum_j alpha_ij * <grad_h_i, r_j> (warp-strided)
     accum_t G_partial{};
 
-    auto pass1_consume = [&](index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]) {
+    auto pass1_consume = [lane, li_sh, a_base, ghi_sh, negative_slope, L_i, &G_partial](
+                              index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]
+                          ) {
         const cuda_t *rj_base = rows[0];
 
         accum_t e_lane{};
@@ -176,7 +178,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     G_i_h = *G_broadcast;
 
     // pass 2: accumulate gradients (warp-strided)
-    auto pass2_consume = [&](index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]) {
+    auto pass2_consume = [lane, li_sh, a_base, ghi_sh, negative_slope, L_i, G_i_h, my_grada, my_gradl](
+                              index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]
+                          ) {
         const cuda_t *rj_base = rows[0];
 
         accum_t e_lane{};
@@ -324,7 +328,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
 
     accum_t *my_gradr = warp_gradr + warp_id * D_CONST;
 
-    cuda_t *grad_r_base = grad_r + ((int64_t)(node_j * H + head_h) * D_CONST);
+    cuda_t *grad_r_base = grad_r + (static_cast<int64_t>(node_j * H + head_h) * D_CONST);
 
     // Handle isolated nodes
     if (num_incoming == 0) {
@@ -347,7 +351,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
             my_gradr_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
 
-        constexpr int f4_count  = (D_CONST * (int)sizeof(cuda_t)) / 16;
+        constexpr int f4_count  = (D_CONST * static_cast<int>(sizeof(cuda_t))) / 16;
         const float4 *rj_src_f4 = reinterpret_cast<const float4 *>(rj_base);
         float4 *rj_sh_f4        = reinterpret_cast<float4 *>(rj_sh);
         for (int i = threadIdx.x; i < f4_count; i += WARPS_PER_BLOCK * kWarpSize) {
@@ -357,7 +361,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     __syncthreads();
 
     // Warp-strided edge loop
-    auto r_consume = [&](index_t node_i, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+    auto r_consume = [H, head_h, d_logsumexp, d_G, lane, rj_sh, a_base, negative_slope, my_gradr](
+                          index_t node_i, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]
+                      ) {
         const cuda_t *li_base  = rows[0];
         const cuda_t *ghi_base = rows[1];
 
@@ -469,13 +475,13 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
     float accum = 0.0f;
 
     // looped logic across row chunks:
-    const int row_chunk_end = min(static_cast<int>(N), (int)(row_chunk_start + grad_A_reduce_row_chunk_size));
+    const int row_chunk_end = min(static_cast<int>(N), static_cast<int>(row_chunk_start + grad_A_reduce_row_chunk_size));
     for (int base_row_offset = row_chunk_start; base_row_offset < row_chunk_end; base_row_offset += blockDim.y) {
         int row_to_load = base_row_offset + ty;  // node index
-        if (row_to_load < static_cast<int>(N) && fx < (int)D && head_h < static_cast<int>(H)) {
+        if (row_to_load < static_cast<int>(N) && fx < static_cast<int>(D) && head_h < static_cast<int>(H)) {
             // grad_a layout: [N, H, D] contiguous
             // idx = (n * H + h) * D + d
-            size_t idx = ((size_t)row_to_load * H + (size_t)head_h) * D + (size_t)fx;
+            size_t idx = (static_cast<size_t>(row_to_load) * H + static_cast<size_t>(head_h)) * D + static_cast<size_t>(fx);
 
             tile_reduce[tx][ty] = grad_a[idx];
         } else {
@@ -498,9 +504,9 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
     // now  threads with ty==0 and tx selecting feature within chunk
     // write out the final reduced result
 
-    if (ty == 0 && fx < (int)D && head_h < static_cast<int>(H)) {
+    if (ty == 0 && fx < static_cast<int>(D) && head_h < static_cast<int>(H)) {
         // output layout: [H, D] contiguous
-        size_t out_idx = (size_t)head_h * D + (size_t)fx;
+        size_t out_idx = static_cast<size_t>(head_h) * D + static_cast<size_t>(fx);
         atomicAdd(d_grad_a_reduced_out + out_idx, result_accum[tx]);
     }
 }
@@ -563,7 +569,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 
     // Load li, ghi via 128-bit transactions
     {
-        constexpr int f4_count   = (D_CONST * (int)sizeof(cuda_t)) / 16;
+        constexpr int f4_count   = (D_CONST * static_cast<int>(sizeof(cuda_t))) / 16;
         const float4 *li_src_f4  = reinterpret_cast<const float4 *>(li_base);
         const float4 *ghi_src_f4 = reinterpret_cast<const float4 *>(ghi_base);
         float4 *li_sh_f4         = reinterpret_cast<float4 *>(li_sh);
@@ -577,7 +583,9 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 
     accum_t G_i_h{};
 
-    auto g_consume = [&](index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]) {
+    auto g_consume = [lane, li_sh, a_base, ghi_sh, negative_slope, L_i, &G_i_h](
+                          index_t /*neighbor_j*/, cuda_t const *const (&rows)[1]
+                      ) {
         const cuda_t *rj_base = rows[0];
 
         accum_t e_lane{};
@@ -687,9 +695,9 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     accum_t *gradli_sh                = grada_sh + D_CONST;
     accum_t *gradri_sh                = gradli_sh + D_CONST;
 
-    cuda_t *grad_l_base = grad_l + ((int64_t)(node_i * H + head_h) * D_CONST);
-    cuda_t *grad_r_base = grad_r + ((int64_t)(node_i * H + head_h) * D_CONST);
-    float *grad_a_base  = grad_a + ((int64_t)(node_i * H + head_h) * D_CONST);
+    cuda_t *grad_l_base = grad_l + (static_cast<int64_t>(node_i * H + head_h) * D_CONST);
+    cuda_t *grad_r_base = grad_r + (static_cast<int64_t>(node_i * H + head_h) * D_CONST);
+    float *grad_a_base  = grad_a + (static_cast<int64_t>(node_i * H + head_h) * D_CONST);
 
     // Handle isolated nodes: write zeros
     if (num_neighbors == 0) {
@@ -725,7 +733,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
             gradri_f4[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
 
-        constexpr int f4_count   = (D_CONST * (int)sizeof(cuda_t)) / 16;
+        constexpr int f4_count   = (D_CONST * static_cast<int>(sizeof(cuda_t))) / 16;
         const float4 *li_src_f4  = reinterpret_cast<const float4 *>(li_base);
         const float4 *ri_src_f4  = reinterpret_cast<const float4 *>(ri_base);
         const float4 *ghi_src_f4 = reinterpret_cast<const float4 *>(ghi_base);
@@ -740,7 +748,8 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     }
     __syncthreads();
 
-    auto alr_consume = [&](index_t neighbor_j, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+    auto alr_consume = [li_sh, a_base, ghi_sh, negative_slope, L_i, ri_sh, lane, H, head_h, d_logsumexp, d_G, G_i_h, grada_sh, gradli_sh,
+                         gradri_sh](index_t neighbor_j, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
         const cuda_t *rj_base  = rows[0];
         const cuda_t *lj_base  = rows[1];
         const cuda_t *ghj_base = rows[2];

@@ -166,7 +166,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     __syncthreads();
 
     // Warp-strided edge loop
-    auto edge_consume = [&](index_t node_i, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+    auto edge_consume = [N, lane, qj_shared, vj_shared, H, head_h, logsumexp, Delta, scale, dK, my_gv, my_gq](
+                             index_t node_i, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]
+                         ) {
         if (node_i >= N) [[unlikely]] {
             return;
         }
@@ -402,7 +404,8 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     // dO[d] base pointer (contiguous)
     const cuda_t *dOd_base = dO + out_dh;
 
-    auto neighbor_consume = [&](index_t node_s, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+    auto neighbor_consume = [N, lane, kd_shared, qd_shared, vd_shared, dOd_base, H, head_h, logsumexp, Delta, scale, L_d, Delta_d, gk_shared,
+                              gq_shared, gv_shared](index_t node_s, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
         if (node_s >= N) [[unlikely]] {
             return;
         }

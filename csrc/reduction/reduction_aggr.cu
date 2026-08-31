@@ -12,24 +12,26 @@
 //
 // visit(src, val): val is the prefetched slice, valid only inside the call.
 // dbuf: this thread's scratch, NUM_STAGES * TW elements.
-template <int TW, int NUM_STAGES, FloatingNum cuda_t, typename index_t, typename VisitFn>
+template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, typename index_t, typename VisitFn>
 __device__ __forceinline__ void pipelined_thread_edge_scan(
     index_t start, index_t end, index_t const *__restrict__ edge_idx, cuda_t const *__restrict__ X, size_t d, size_t base_f, cuda_t *dbuf,
     VisitFn &&visit
 ) {
-    if (end <= start) return;
+    if (end <= start) {
+        return;
+    }
     const index_t num_edges = end - start;
 
     cuda_t *slots[NUM_STAGES];
 #pragma unroll
-    for (int s = 0; s < NUM_STAGES; ++s) {
+    for (size_t s = 0; s < NUM_STAGES; ++s) {
         slots[s] = dbuf + s * TW;
     }
     index_t src_buf[NUM_STAGES];
 
     cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-    auto prefetch = [&](index_t it) {
+    auto prefetch = [&pipe, num_edges, start, edge_idx, &src_buf, X, d, base_f, &slots](index_t it) {
         pipe.producer_acquire();
         if (it < num_edges) {
             const index_t eid                 = start + it;
@@ -42,7 +44,7 @@ __device__ __forceinline__ void pipelined_thread_edge_scan(
     };
 
 #pragma unroll
-    for (int s = 0; s < NUM_STAGES; ++s) {
+    for (size_t s = 0; s < NUM_STAGES; ++s) {
         prefetch(s);
     }
 
@@ -106,7 +108,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             best_srcs[e] = Sentinel::INVALID;
         }
 
-        auto visit = [&](index_t src, cuda_t const *val) {
+        auto visit = [&best_vals, &best_srcs](index_t src, cuda_t const *val) {
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 const cuda_t v_e = val[e];
@@ -255,7 +257,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             best_srcs[e] = Sentinel::INVALID;
         }
 
-        auto visit = [&](index_t src, cuda_t const *val) {
+        auto visit = [&best_vals, &best_srcs](index_t src, cuda_t const *val) {
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 cuda_t v_e = val[e];

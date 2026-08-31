@@ -231,7 +231,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1>(pipeline_stages)
+            MakeIntVariant<32, 64, 128, 256>(static_cast<int>(D)), warp_variant, MakeIntVariant<0, 1>(pipeline_stages)
         );
     };
 
@@ -386,7 +386,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(D)), warp_variant,
                 MakeIntVariant<0, 1>(pipeline_stages)
             );
         };
@@ -424,7 +424,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(D)), warp_variant,
                 MakeIntVariant<0, 1>(pipeline_stages)
             );
         };
@@ -479,7 +479,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D)
+            MakeIntVariant<32, 64, 128, 256>(static_cast<int>(D))
         );
     }
 

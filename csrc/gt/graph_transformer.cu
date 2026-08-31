@@ -281,7 +281,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(D)), warp_variant,
                 MakeIntVariant<0, 1>(pipeline_stages)
             );
         };

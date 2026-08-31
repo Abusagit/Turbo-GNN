@@ -109,7 +109,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     accum_t o_acc[ACCS_PER_THREAD] = {0};
 
     // neighbor loop
-    auto consume = [&](index_t /*j*/, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]) {
+    auto consume = [lane_id, k_shared, scale, &softmax_state, &o_acc](
+                        index_t /*j*/, cuda_t const *const (&rows)[NUM_PREFETCH_ROWS]
+                    ) {
         const cuda_t *q_base = rows[0];
         const cuda_t *v_base = rows[1];
 
@@ -148,9 +150,8 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
         int64_t const row_stride_n[NUM_PREFETCH_ROWS]     = {stride_q_n, stride_v_n};
         int64_t const row_stride_h[NUM_PREFETCH_ROWS]     = {stride_q_h, stride_v_h};
         cuda_t *warp_dbuf = qv_dbuf + block_neighbor_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
-        pipelined_neighbor_row_loop<static_cast<int>(N_PER_BLOCK), static_cast<int>(D_CONST), NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
-            static_cast<int>(block_neighbor_id), static_cast<int>(lane_id), static_cast<int>(num_neighbors), edge_start, col_idx, row_bases,
-            row_stride_n, row_stride_h, static_cast<int>(head_h), warp_dbuf, consume
+        pipelined_neighbor_row_loop<N_PER_BLOCK, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
+            block_neighbor_id, lane_id, num_neighbors, edge_start, col_idx, row_bases, row_stride_n, row_stride_h, head_h, warp_dbuf, consume
         );
     } else {
         const size_t rounds = (num_neighbors + neighbor_block_size - 1) / neighbor_block_size;
