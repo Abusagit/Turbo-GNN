@@ -9,6 +9,19 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Some dataset loaders (e.g. ogb's NodePropPredDataset) call torch.load() on
+# their own locally-cached preprocessed files without weights_only=False;
+# PyTorch >=2.6 defaults weights_only=True, which breaks loading those trusted local caches.
+_orig_torch_load = torch.load
+
+
+def _torch_load_weights_only_false(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+
+
+torch.load = _torch_load_weights_only_false
+
 from src.backends.registry import BackendRegistry
 from src.benchmarking.microbench import MicrobenchResult, get_gpu_info, time_callable
 from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
@@ -39,6 +52,24 @@ def _make_random_graph(
     dst = torch.randint(0, num_nodes, (E,), device=device, dtype=torch.long)
     edge_index = torch.stack([src, dst], dim=0)
     return edge_index, None
+
+
+def _collect_kernel_params(conv) -> dict:
+    kernel = getattr(conv, "kernel", conv)
+
+    params = {}
+    for getter in (
+        "get_tunable_forward_kernel_params",
+        "get_tunable_backward_kernel_params",
+        "get_tunable_forward_graph_params",
+        "get_tunable_backward_graph_params",
+    ):
+        fn = getattr(kernel, getter, None)
+        if fn is None:
+            continue
+        for p in fn():
+            params[p.name] = getattr(kernel, p.name, None)
+    return params
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,6 +104,28 @@ def parse_args() -> argparse.Namespace:
         "a kernel profiler such as ncu to keep the launch count small and deterministic.",
     )
     p.add_argument("--json-out", type=str, default=None, help="Optional path to write JSON result.")
+    p.add_argument(
+        "--pipeline-stages",
+        type=int,
+        default=0,
+        help="Forward async-copy pipeline stage count for CUDA convs (0 disables the pipeline). "
+        "Ignored when --autotune is set.",
+    )
+    p.add_argument(
+        "--backward-pipeline-stages",
+        type=int,
+        default=0,
+        help="Backward async-copy pipeline stage count for CUDA convs (0 disables the pipeline). "
+        "Ignored when --autotune is set.",
+    )
+    p.add_argument(
+        "--autotune",
+        action="store_true",
+        help="Autotune kernel/graph params (incl. pipeline_stages) via grid search "
+        "instead of using --pipeline-stages manually.",
+    )
+    p.add_argument("--autotune-warmup", type=int, default=5, help="Warmup iters for each autotune grid-search trial.")
+    p.add_argument("--autotune-iters", type=int, default=15, help="Timed iters for each autotune grid-search trial.")
     return p.parse_args()
 
 
@@ -88,30 +141,62 @@ def main() -> int:
 
     # graph + features
     if args.dataset is None:
-        edge_index, edge_weight = _make_random_graph(args.num_nodes, args.avg_degree, device=device)
-        x = torch.randn(args.num_nodes, args.feature_dim, requires_grad=True).to(device)
+        edge_index, edge_weight = _make_random_graph(
+            args.num_nodes,
+            args.avg_degree,
+            device=device,
+        )
 
-        graph = GraphSample(
+        x = torch.randn(
+            args.num_nodes,
+            args.feature_dim,
+            device=device,
+            requires_grad=True,
+        )
+
+        sample = GraphSample(
             backend=MODEL_BACKEND_TO_GRAPH_REPR[args.backend],
             x=x,
-            y=torch.zeros(len(x)),
+            y=torch.zeros(args.num_nodes, device=device),
             edge_index=edge_index,
             edge_weight=edge_weight,
         )
+
+        dataset_name = "random"
+
     else:
         with open(args.dataset, encoding="utf-8") as f:
             dataset_cfg_top_level = yaml.safe_load(f)
-            dataset_cfg = dataset_cfg_top_level["dataset"]
-            graph = load_single_graph(
-                DatasetConfig(
-                    source=dataset_cfg["source"],
-                    name=dataset_cfg["name"],
-                    root=dataset_cfg["root"],
-                    conv_backend=args.backend,
-                )
+
+        dataset_cfg = dataset_cfg_top_level["dataset"]
+
+        sample = load_single_graph(
+            DatasetConfig(
+                source=dataset_cfg["source"],
+                name=dataset_cfg["name"],
+                root=dataset_cfg.get("root", "data"),
+                conv_backend=args.backend,
+                allow_random_split=dataset_cfg.get("allow_random_split", False),
+                kernel_related_kwargs=dataset_cfg.get(
+                    "kernel_related_kwargs",
+                    {},
+                ),
             )
-        x = torch.randn(graph.num_nodes, args.feature_dim, requires_grad=True).to(device)
-    graph = graph.graph_repr
+        )
+
+        x = torch.randn(
+            sample.num_nodes,
+            args.feature_dim,
+            device=device,
+            requires_grad=True,
+        )
+
+        dataset_name = dataset_cfg["name"]
+
+    graph = sample.graph_repr
+    num_nodes = sample.num_nodes
+    num_edges = sample.num_edges
+    head_dim = args.feature_dim
 
     # conv
     backend = BackendRegistry.get_backend(args.backend)
@@ -121,6 +206,24 @@ def main() -> int:
         conv = backend.create_conv(args.layer, feature_dim=args.feature_dim, heads=args.heads)
 
     conv = conv.to(device)
+    autotuned_config: dict = {}
+    if args.backend == "cuda":
+        if args.autotune:
+            from turbo_gnn._autotune import AutotuneConfig
+
+            tune_cfg = AutotuneConfig(
+                warmup=args.autotune_warmup,
+                iters=args.autotune_iters,
+                tune_backward=(args.mode == "backward"),
+                cache_dir=None,
+            )
+            autotuned_config = conv.autotune(x, sample, config=tune_cfg)
+            graph = sample.graph_repr
+        else:
+            conv.configure(
+                forward_pipeline_stages=args.pipeline_stages,
+                backward_pipeline_stages=args.backward_pipeline_stages,
+            )
 
     # measure function
     amp_dtype = None
@@ -159,14 +262,32 @@ def main() -> int:
     base_dict = {
         "backend": args.backend,
         "conv_type": args.layer,
+        "dataset": dataset_name,
+        "dataset_config": args.dataset,
+        "num_nodes": num_nodes,
+        "num_edges": num_edges,
         "feature_dim": args.feature_dim,
         "heads": args.heads,
-        # "dataset": args.dataset,
+        "head_dim": head_dim,
+        "amp": args.amp,
+        "mode": args.mode,
+        "autotuned": args.autotune,
+        "autotuned_config": autotuned_config,
+        "forward_pipeline_stages": autotuned_config.get("forward_pipeline_stages", args.pipeline_stages),
+        "backward_pipeline_stages": autotuned_config.get("backward_pipeline_stages", args.backward_pipeline_stages),
+        # The stage count actually swept for this run's --mode (what plot_pipeline_results.py
+        # groups by): forward stages in forward mode, backward stages in backward mode.
+        "pipeline_stages": (
+            autotuned_config.get("forward_pipeline_stages", args.pipeline_stages)
+            if args.mode == "forward"
+            else autotuned_config.get("backward_pipeline_stages", args.backward_pipeline_stages)
+        ),
+        "kernel_params": _collect_kernel_params(conv),
         "iters": res.iters,
         "ms_per_iter": res.ms_per_iter,
         "device": res.device,
         "memory": res.memory_allocated,
-    } | get_gpu_info(device)  # NOTE added GPU info to the dump
+    } | get_gpu_info(device)
 
     print(json.dumps(base_dict, indent=4))
 
