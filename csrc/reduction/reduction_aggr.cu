@@ -2,7 +2,62 @@
 
 #include "common.cuh"
 
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
+// Per-thread pipelined scan over edges [start, end): each edge contributes the
+// TW-wide slice X[edge_idx[eid]*d + base_f : +TW]. Per-thread (not per-warp)
+// parallelism, so each thread prefetches its own <=16B slice.
+//
+// NOTE: benchmarks show PIPELINE_STAGES>0 regresses min/max_aggr -- visit() is
+// a few compares, too little compute to hide the cp.async latency, while the
+// pipeline serializes edges the compiler could otherwise overlap. Keep at 0.
+//
+// visit(src, val): val is the prefetched slice, valid only inside the call.
+// dbuf: this thread's scratch, NUM_STAGES * TW elements.
+template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, typename index_t, typename VisitFn>
+__device__ __forceinline__ void pipelined_thread_edge_scan(
+    index_t start, index_t end, index_t const *__restrict__ edge_idx, cuda_t const *__restrict__ X, size_t d, size_t base_f, cuda_t *dbuf,
+    VisitFn &&visit
+) {
+    if (end <= start) {
+        return;
+    }
+    const index_t num_edges = end - start;
+
+    cuda_t *slots[NUM_STAGES];
+#pragma unroll
+    for (size_t s = 0; s < NUM_STAGES; ++s) {
+        slots[s] = dbuf + s * TW;
+    }
+    index_t src_buf[NUM_STAGES];
+
+    cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
+
+    auto prefetch = [&pipe, num_edges, start, edge_idx, &src_buf, X, d, base_f, &slots](index_t it) {
+        pipe.producer_acquire();
+        if (it < num_edges) {
+            const index_t eid                 = start + it;
+            const index_t src                 = edge_idx[eid];
+            src_buf[it % NUM_STAGES]          = src;
+            const cuda_t *src_ptr             = X + static_cast<size_t>(src) * d + base_f;
+            async_copy_slice_thread<TW, cuda_t>(slots[it % NUM_STAGES], src_ptr, pipe);
+        }
+        pipe.producer_commit();
+    };
+
+#pragma unroll
+    for (size_t s = 0; s < NUM_STAGES; ++s) {
+        prefetch(s);
+    }
+
+    for (index_t it = 0; it < num_edges; ++it) {
+        cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
+        visit(src_buf[it % NUM_STAGES], slots[it % NUM_STAGES]);
+        pipe.consumer_release();
+        prefetch(it + NUM_STAGES);
+    }
+}
+
+// PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
+template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
     index_t const *const __restrict__ light_nodes_indices,
     index_t const *const __restrict__ edge_ptr,
@@ -36,6 +91,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 
     const size_t d_vec = d / TW;
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES;
+
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
+    cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
+
     for (size_t fv = tid; fv < d_vec; fv += tile_dim) {
         const size_t base_f = fv * TW;
 
@@ -47,9 +110,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             best_srcs[e] = Sentinel::INVALID;
         }
 
-        for (index_t eid = row_start; eid < row_end; ++eid) {
-            const index_t src              = edge_idx[eid];
-            const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+        auto visit = [&best_vals, &best_srcs](index_t src, cuda_t const *val) {
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 const cuda_t v_e = val[e];
@@ -57,6 +118,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
                     best_vals[e] = v_e;
                     best_srcs[e] = src;
                 }
+            }
+        };
+
+        if constexpr (USE_PIPELINE) {
+            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(row_start, row_end, edge_idx, X, d, base_f, my_dbuf, visit);
+        } else {
+            for (index_t eid = row_start; eid < row_end; ++eid) {
+                const index_t src              = edge_idx[eid];
+                const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+                visit(src, val.data);
             }
         }
 
@@ -128,7 +199,10 @@ __device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int&
 
 // Packed heavy kernel: blockIdx.x = node, blockIdx.y = edge chunk
 // Only for 32-bit index types (packs float32 + int32 into uint64)
-template <size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
+// PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
+template <
+    size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float,
+    int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
     index_t const *const __restrict__ heavy_nodes_indices,
     index_t const *const __restrict__ edge_ptr,
@@ -166,6 +240,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 
     const size_t d_vec = d / TW;
 
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES;
+
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
+    cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
+
     for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
         const size_t base_f = fv * TW;
 
@@ -177,9 +259,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             best_srcs[e] = Sentinel::INVALID;
         }
 
-        for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
-            index_t src                    = edge_idx[eid];
-            const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+        auto visit = [&best_vals, &best_srcs](index_t src, cuda_t const *val) {
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 cuda_t v_e = val[e];
@@ -187,6 +267,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
                     best_vals[e] = v_e;
                     best_srcs[e] = src;
                 }
+            }
+        };
+
+        if constexpr (USE_PIPELINE) {
+            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(chunk_start, chunk_end, edge_idx, X, d, base_f, my_dbuf, visit);
+        } else {
+            for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
+                index_t src                    = edge_idx[eid];
+                const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+                visit(src, val.data);
             }
         }
 
@@ -459,7 +549,8 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     int edges_per_block_heavy_nodes,
     bool use_2d_kernel,
     int features_per_block,
-    int tiles_y
+    int tiles_y,
+    int pipeline_stages
 ) {
     using ROps = ReductionOps<Op>;
 
@@ -485,13 +576,15 @@ void reduction_aggr_forward_partitioned_cuda_impl(
     const int num_light = light_nodes.numel();
     if (num_light > 0) {
         std::visit(
-            [&](auto idxInfo, auto typeInfo, auto warps_const) {
+            [&](auto idxInfo, auto typeInfo, auto warps_const, auto stages_c) {
                 using index_t = typename decltype(idxInfo)::Type;
                 using torch_t = typename decltype(typeInfo)::TorchType;
                 using cuda_t  = typename decltype(typeInfo)::CudaType;
 
                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+                constexpr int STAGES            = decltype(stages_c)::value;
+                constexpr size_t TW             = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
                 cuda_t const *X_ptr   = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
                 cuda_t *out_ptr = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
@@ -502,8 +595,14 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 const size_t node_y   = std::max<size_t>(THREADS_PER_BLOCK / tile_x, 1);
                 const dim3 threads_l(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y));
                 const unsigned blocks_l = static_cast<unsigned>((num_light + node_y - 1) / node_y);
+                // val_dbuf (STAGES == 0 makes this term vanish)
+                size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
 
-                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t><<<blocks_l, threads_l>>>(
+                ensure_dynamic_shmem(
+                    reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>, shmem, "reduction_aggr light"
+                );
+
+                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES><<<blocks_l, threads_l, shmem>>>(
                     index_ptr<index_t>(light_nodes),
                     index_ptr<index_t>(edge_ptr),
                     index_ptr<index_t>(edge_idx),
@@ -516,7 +615,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
             MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
-            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block), MakeIntVariant<0, 1>(pipeline_stages)
         );
     }
 
@@ -560,15 +659,25 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         );
 
                         std::visit(
-                            [&](auto edges_const, auto warps_const) {
+                            [&](auto edges_const, auto warps_const, auto stages_c) {
                                 constexpr int EDGES_PER_BLOCK   = edges_const.value;
                                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
+                                constexpr int STAGES            = decltype(stages_c)::value;
+                                constexpr size_t TW             = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
                                 dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
 
-                                reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t>
-                                    <<<grid, THREADS_PER_BLOCK>>>(
+                                // val_dbuf (STAGES == 0 makes this term vanish)
+                                size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
+
+                                ensure_dynamic_shmem(
+                                    reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>,
+                                    shmem, "reduction_aggr heavy"
+                                );
+
+                                reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>
+                                    <<<grid, THREADS_PER_BLOCK, shmem>>>(
                                         index_ptr<index_t>(heavy_nodes),
                                         index_ptr<index_t>(edge_ptr),
                                         index_ptr<index_t>(edge_idx),
@@ -578,7 +687,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                     );
                             },
                             MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
-                            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block)
+                            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block), MakeIntVariant<0, 1>(pipeline_stages)
                         );
 
                         std::visit(
@@ -641,17 +750,18 @@ void reduction_aggr_forward_partitioned_cuda(
     bool use_2d_kernel,
     int features_per_block,
     int tiles_y,
-    const std::string& reduce
+    const std::string& reduce,
+    int pipeline_stages
 ) {
     if (reduce == "min") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MIN>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y
+            use_2d_kernel, features_per_block, tiles_y, pipeline_stages
         );
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
-            use_2d_kernel, features_per_block, tiles_y
+            use_2d_kernel, features_per_block, tiles_y, pipeline_stages
         );
     } else {
         TORCH_CHECK(false, "Unsupported reduce: " + reduce);

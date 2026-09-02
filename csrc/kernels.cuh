@@ -21,7 +21,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     bool use_2d_kernel              = false,
     int features_per_block          = 32,
     int tiles_y                     = 8,
-    std::string reduce              = "min"
+    std::string reduce              = "min",
+    int pipeline_stages              = 0
 );
 
 at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);
@@ -40,7 +41,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 1,
-    int heavy_warps_per_block = 8
+    int heavy_warps_per_block = 8,
+    int pipeline_stages = 0
 );
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
@@ -61,7 +63,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor bwd_heavy_nodes,
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
-    bool is_directed          = true
+    bool is_directed          = true,
+    int pipeline_stages       = 0
 );
 
 // ============================================================================
@@ -78,7 +81,8 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 4,
-    int heavy_warps_per_block = 8
+    int heavy_warps_per_block = 8,
+    int pipeline_stages       = 0
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward_csr_mh_cuda(
@@ -97,7 +101,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
-    bool is_directed          = true
+    bool is_directed          = true,
+    int pipeline_stages       = 0
 );
 
 // ============================================================================

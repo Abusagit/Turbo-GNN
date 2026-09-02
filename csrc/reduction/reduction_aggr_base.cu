@@ -16,7 +16,8 @@ void reduction_aggr_forward_partitioned_cuda(
     bool use_2d_kernel              = false,
     int features_per_block          = 32,
     int tiles_y                     = 8,
-    const std::string& reduce       = "min"
+    const std::string& reduce       = "min",
+    int pipeline_stages             = 0
 );
 
 at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8) {
@@ -51,7 +52,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     bool use_2d_kernel              = false,
     int features_per_block          = 32,
     int tiles_y                     = 8,
-    std::string reduce              = "min"
+    std::string reduce              = "min",
+    int pipeline_stages             = 0
 ) {
     TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
@@ -95,7 +97,8 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
         use_2d_kernel,
         features_per_block,
         tiles_y,
-        reduce
+        reduce,
+        pipeline_stages
     );
     return {out, arg_idx};
 }

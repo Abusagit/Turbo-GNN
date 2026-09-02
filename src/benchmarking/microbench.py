@@ -53,10 +53,8 @@ def measure_memory(func):
     return result, peak_memory, peak_memory
 
 
-def time_callable(
-    fn: Callable[[], Any], warmup: int = 10, iters: int = 50, do_memory_profile: bool = True
-) -> MicrobenchResult:
-    """Benchmark a zero-arg callable with warmup and averaged iterations.
+def _time_exact(fn: Callable[[], Any], warmup: int, iters: int) -> float:
+    """Run exactly ``warmup`` + ``iters`` calls, timing each iteration with CUDA events.
 
     Args:
         fn (Callable[[], Any]): Callable to benchmark.
@@ -64,12 +62,61 @@ def time_callable(
         iters (int): Timed iterations.
 
     Returns:
+        float: Mean time per timed iteration in ms (nan if ``iters`` <= 0).
+    """
+    for _ in range(max(0, warmup)):
+        fn()
+    torch.cuda.synchronize()
+
+    if iters <= 0:
+        return float("nan")
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        starts[i].record()
+        fn()
+        ends[i].record()
+    torch.cuda.synchronize()
+
+    times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    return sum(times) / len(times)  # type: ignore
+
+
+def time_callable(
+    fn: Callable[[], Any],
+    warmup: int = 10,
+    iters: int = 50,
+    do_memory_profile: bool = True,
+    exact_iters: bool = False,
+) -> MicrobenchResult:
+    """Benchmark a zero-arg callable with warmup and averaged iterations.
+
+    Args:
+        fn (Callable[[], Any]): Callable to benchmark.
+        warmup (int): Warmup iterations (discarded).
+        iters (int): Timed iterations.
+        do_memory_profile (bool): Also measure peak memory (costs an extra call).
+        exact_iters (bool): Issue exactly ``warmup`` + ``iters`` calls instead of
+            delegating to ``triton.testing.do_bench``. do_bench interprets its
+            ``warmup``/``rep`` arguments as *milliseconds*, not counts, and adds
+            6 calibration calls on top (1 initial + a 5-iteration estimate loop)
+            before deriving its own repeat counts from the measured runtime. It
+            therefore cannot produce a small fixed number of kernel launches,
+            which is what a profiler such as Nsight Compute needs. Leave this
+            False for normal benchmarking: do_bench also flushes the L2 cache
+            between reps, so its numbers are the more trustworthy ones.
+
+    Returns:
         MicrobenchResult: Average time per iteration in ms.
     """
     device = torch.get_default_device()
 
     if torch.cuda.is_available():
-        ms_per_iter = triton.testing.do_bench(fn, warmup=warmup, rep=iters)
+        if exact_iters:
+            ms_per_iter = _time_exact(fn, warmup, iters)
+        else:
+            ms_per_iter = triton.testing.do_bench(fn, warmup=warmup, rep=iters)
         if do_memory_profile:
             _, memory_allocated, peak_memory = measure_memory(func=fn)
             del _
