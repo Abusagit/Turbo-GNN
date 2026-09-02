@@ -18,12 +18,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
-
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
-    if (i >= num_light) {
+    if (static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y >= num_light) {
         return;
     }
-    index_t v = light_nodes_indices[i];
+    const index_t v = light_nodes_indices[i];
 
     const index_t row_start = edge_ptr[v];
     const index_t row_end   = edge_ptr[v + 1];
@@ -505,7 +503,8 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 const dim3 threads_l(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y));
                 const unsigned blocks_l = static_cast<unsigned>((num_light + node_y - 1) / node_y);
 
-                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t><<<blocks_l, threads_l>>>(                    index_ptr<index_t>(light_nodes),
+                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t><<<blocks_l, threads_l>>>(
+                    index_ptr<index_t>(light_nodes),
                     index_ptr<index_t>(edge_ptr),
                     index_ptr<index_t>(edge_idx),
                     X_ptr,
