@@ -65,22 +65,24 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     cuda_t const *const __restrict__ X,
     cuda_t *const __restrict__ out,
     index_t *const __restrict__ arg_idx,
-    size_t d
+    size_t d,
+    size_t num_light
 ) {
     using ROps     = ReductionOps<Op>;
     using Sentinel = IndexSentinel<index_t>;
     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
-
-    const size_t i = blockIdx.x;
-    index_t v      = light_nodes_indices[i];
+    if (static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y >= num_light) {
+        return;
+    }
+    const index_t v = light_nodes_indices[i];
 
     const index_t row_start = edge_ptr[v];
     const index_t row_end   = edge_ptr[v + 1];
 
-    const size_t tid           = threadIdx.x;
-    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
+    const size_t tid      = threadIdx.x;
+    const size_t tile_dim = blockDim.x;
 
     const size_t node_stride = static_cast<size_t>(v) * d;
 
@@ -97,7 +99,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
     cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
 
-    for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
+    for (size_t fv = tid; fv < d_vec; fv += tile_dim) {
         const size_t base_f = fv * TW;
 
         cuda_t best_vals[TW];
@@ -587,6 +589,12 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 cuda_t const *X_ptr   = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
                 cuda_t *out_ptr = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
 
+                constexpr size_t TW_L = Vec<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
+                const size_t d_vec_l  = static_cast<size_t>(d) / TW_L;
+                const size_t tile_x   = std::min<size_t>(std::max<size_t>(d_vec_l, 1), THREADS_PER_BLOCK);
+                const size_t node_y   = std::max<size_t>(THREADS_PER_BLOCK / tile_x, 1);
+                const dim3 threads_l(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y));
+                const unsigned blocks_l = static_cast<unsigned>((num_light + node_y - 1) / node_y);
                 // val_dbuf (STAGES == 0 makes this term vanish)
                 size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
 
@@ -594,14 +602,15 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>, shmem, "reduction_aggr light"
                 );
 
-                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES><<<num_light, THREADS_PER_BLOCK, shmem>>>(
+                reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES><<<blocks_l, threads_l, shmem>>>(
                     index_ptr<index_t>(light_nodes),
                     index_ptr<index_t>(edge_ptr),
                     index_ptr<index_t>(edge_idx),
                     X_ptr,
                     out_ptr,
                     index_ptr_mut<index_t>(arg_idx),
-                    d
+                    d,
+                    static_cast<size_t>(num_light)
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
