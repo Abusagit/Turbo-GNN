@@ -7,7 +7,6 @@
 #include <type_traits>
 #include <variant>
 
-
 template <typename T>
 struct TTypeTraits;
 

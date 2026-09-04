@@ -1,5 +1,6 @@
 .vscode
 CLAUDE.md
+.claude
 
 .venv
 .env
@@ -15,6 +16,9 @@ dataset
 dist
 runs
 
+.pytest_cache
+.ruff_cache
+~
 **/__pycache__
 *.egg-info
 /build
