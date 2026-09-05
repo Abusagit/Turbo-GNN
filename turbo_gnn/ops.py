@@ -12,6 +12,7 @@ import torch
 
 from turbo_gnn._autotune import with_autotune
 from turbo_gnn._functions import (
+    GSpMMFunction,
     ReductionAggrFunction,
     _CudaSpMMConvFn,
     _FusedGraphAttention,
@@ -20,6 +21,7 @@ from turbo_gnn._functions import (
 )
 from turbo_gnn._kernels import (
     GATv2AggrKernel,
+    GSpMMKernel,
     GraphTransformerAggrKernel,
     ReductionAggrKernel,
 )
@@ -38,11 +40,15 @@ def reduction_aggr(
     reduce: str = "min",
     pipeline_stages: int = 0,
 ) -> torch.Tensor:
-    """Element-wise min or max aggregation over incoming neighbors.
+    """Element-wise min, max or sum aggregation over incoming neighbors.
 
     For each destination node *v*, computes::
 
-        out[v] = reduce_{u in N(v)} X[u]   (reduce = "min" or "max")
+        out[v] = reduce_{u in N(v)} X[u]   (reduce = "min", "max" or "sum")
+
+    With ``reduce="sum"`` this is plain SpMM against the unweighted adjacency
+    (DGL's ``copy_u_sum``); the summation is accumulated in fp32 even for
+    fp16/bf16 inputs.
 
     Uses a partitioned kernel: "light" nodes (low degree) use an atomic-based
     kernel; "heavy" nodes (high degree) use a tiled reduction kernel for better
@@ -50,20 +56,25 @@ def reduction_aggr(
 
     Args:
         graph: CSR graph with forward adjacency and light/heavy node buckets.
+            ``reduce="sum"`` additionally uses the backward (transposed)
+            adjacency for its gradient.
         X: Node features, shape ``[N, F]``.
         warps_per_block: Warps per CUDA thread block (light-node kernel).
         edges_per_block_heavy_nodes: Edges processed per block (heavy-node kernel).
         use_2d_kernel: Use the 2-D tiled kernel variant for the heavy-node path.
+            Ignored for ``reduce="sum"``, which has no packed-atomics
+            alternative and always takes the 2-D path.
         features_per_block: Feature-dimension tile size (2-D kernel only).
         tiles_y: Number of row tiles (2-D kernel only).
-        reduce: ``"min"`` or ``"max"``.
+        reduce: ``"min"``, ``"max"`` or ``"sum"``.
         pipeline_stages: Number of async-copy pipeline stages for the light-node
             and packed-atomics heavy-node kernels' per-thread neighbor scan. 0
             disables the pipeline. Ignored when ``use_2d_kernel=True``.
 
     Returns:
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
-        receive zeros (infinities are clamped internally).
+        receive zeros -- for min/max the identity (+-inf) is clamped
+        internally, for sum it is already the empty-sum value.
     """
     return ReductionAggrFunction.apply(
         graph.forward_indptr,
@@ -79,6 +90,11 @@ def reduction_aggr(
         tiles_y,
         reduce,
         pipeline_stages,
+        graph.backward_indptr,
+        graph.backward_indices,
+        graph.backward_light_nodes,
+        graph.backward_heavy_nodes,
+        graph.backward_max_degree,
     )
 
 
@@ -240,3 +256,195 @@ def spmm_aggr(x, forward_indptr, forward_indices, norm_type, cu_sparse_algorithm
         Aggregated features, shape ``[N, F]``.
     """
     return _CudaSpMMConvFn.apply(x, forward_indptr, forward_indices, norm_type, cu_sparse_algorithm_id, block_dim)
+
+
+
+_GSPMM_OPS = ("copy_u", "copy_e", "add", "sub", "mul", "div")
+_GSPMM_REDUCERS = ("sum", "min", "max")
+
+
+def _gspmm_apply(
+    graph: AdjacencyForwardBackwardWithNodeBuckets,
+    lhs: torch.Tensor | None,
+    rhs: torch.Tensor | None,
+    op: str,
+    reduce: str,
+    warps_per_block: int,
+    features_per_block: int,
+    tiles_y: int,
+) -> torch.Tensor:
+    """Unpack the graph and hand off to :class:`GSpMMFunction`."""
+    edge_map = graph.backward_edge_map if (op in ("mul", "div") and reduce == "sum") else None
+
+    return GSpMMFunction.apply(
+        lhs,
+        rhs,
+        op,
+        reduce,
+        graph.forward_indptr,
+        graph.forward_indices,
+        graph.forward_light_nodes,
+        graph.forward_heavy_nodes,
+        graph.backward_indptr,
+        graph.backward_indices,
+        graph.backward_light_nodes,
+        graph.backward_heavy_nodes,
+        edge_map,
+        warps_per_block,
+        features_per_block,
+        tiles_y,
+    )
+
+
+@with_autotune(GSpMMKernel, init_params=("op", "reduce"))
+def gspmm(
+    graph: AdjacencyForwardBackwardWithNodeBuckets,
+    lhs: torch.Tensor | None,
+    rhs: torch.Tensor | None = None,
+    op: str = "copy_u",
+    reduce: str = "sum",
+    warps_per_block: int = 8,
+    features_per_block: int = 32,
+    tiles_y: int = 8,
+) -> torch.Tensor:
+    """Generalized SpMM -- one message operation composed with one reduction.
+
+    For every destination node *v*::
+
+        out[v] = reduce_{(u, e) in in_edges(v)}  op( lhs[u], rhs[e] )
+
+    This is the ``dgl.ops.gspmm`` contract: ``op`` selects how a source node's
+    features combine with the edge's own data, ``reduce`` how the resulting
+    messages collapse into the destination.
+
+    Args:
+        graph: CSR graph with forward and backward adjacency plus light/heavy
+            node buckets.
+        lhs: Node data, shape ``[N, d]``. Pass ``None`` for ``op="copy_e"``.
+        rhs: Edge data, shape ``[E, d]`` (element-wise) or ``[E]`` / ``[E, 1]``
+            (broadcast over the feature dimension). Pass ``None`` for
+            ``op="copy_u"``.
+        op: One of ``"copy_u"``, ``"copy_e"``, ``"add"``, ``"sub"``, ``"mul"``,
+            ``"div"``.
+        reduce: One of ``"sum"``, ``"min"``, ``"max"``.
+        warps_per_block: Block size (in warps) of the light-node kernel.
+        features_per_block: Feature tile width of the heavy-node kernel.
+        tiles_y: Edge tiles reduced in parallel by the heavy-node kernel; must
+            be a power of two.
+
+    Returns:
+        Aggregated features, shape ``[N, d]``. Nodes with no incoming edges get
+        zeros: for ``sum`` that is the empty sum, for ``min``/``max`` the
+        identity (+-inf) is clamped, which differs from DGL -- it returns the
+        raw infinity there.
+
+    Note:
+        **Edge data must be in CSR order.** ``rhs[i]`` is the data of the edge
+        at ``graph.forward_indices[i]``, not of ``edge_index[:, i]``.
+        :meth:`AdjacencyForwardBackwardWithNodeBuckets.from_edge_list` sorts
+        edges while building the CSR, so data aligned to the original
+        ``edge_index`` must be permuted first via ``graph.to_csr_edge_order``.
+        Getting this wrong is silent -- the shapes still match.
+    """
+    if op not in _GSPMM_OPS:
+        raise ValueError(f"Unknown gspmm op {op!r}, expected one of {_GSPMM_OPS}")
+    if reduce not in _GSPMM_REDUCERS:
+        raise ValueError(f"Unknown gspmm reduce {reduce!r}, expected one of {_GSPMM_REDUCERS}")
+    if op == "copy_u" and rhs is not None:
+        raise ValueError("gspmm(op='copy_u') ignores edge data; pass rhs=None")
+    if op == "copy_e" and lhs is not None:
+        raise ValueError("gspmm(op='copy_e') ignores node data; pass lhs=None")
+
+    return _gspmm_apply(graph, lhs, rhs, op, reduce, warps_per_block, features_per_block, tiles_y)
+
+
+
+
+def copy_u_sum(graph, x, **kwargs):
+    """``out[v] = sum_{u in N(v)} x[u]`` -- plain unweighted SpMM."""
+    return reduction_aggr(graph, x, reduce="sum", **kwargs)
+
+
+def copy_u_min(graph, x, **kwargs):
+    """``out[v] = min_{u in N(v)} x[u]``."""
+    return reduction_aggr(graph, x, reduce="min", **kwargs)
+
+
+def copy_u_max(graph, x, **kwargs):
+    """``out[v] = max_{u in N(v)} x[u]``."""
+    return reduction_aggr(graph, x, reduce="max", **kwargs)
+
+
+def copy_e_sum(graph, e, **kwargs):
+    """``out[v] = sum_{edges into v} e[edge]`` -- node data is not read."""
+    return gspmm(graph, None, e, op="copy_e", reduce="sum", **kwargs)
+
+
+def copy_e_min(graph, e, **kwargs):
+    """``out[v] = min_{edges into v} e[edge]``."""
+    return gspmm(graph, None, e, op="copy_e", reduce="min", **kwargs)
+
+
+def copy_e_max(graph, e, **kwargs):
+    """``out[v] = max_{edges into v} e[edge]``."""
+    return gspmm(graph, None, e, op="copy_e", reduce="max", **kwargs)
+
+
+def u_add_e_sum(graph, x, e, **kwargs):
+    """``out[v] = sum (x[u] + e[edge])``."""
+    return gspmm(graph, x, e, op="add", reduce="sum", **kwargs)
+
+
+def u_add_e_min(graph, x, e, **kwargs):
+    """``out[v] = min (x[u] + e[edge])``."""
+    return gspmm(graph, x, e, op="add", reduce="min", **kwargs)
+
+
+def u_add_e_max(graph, x, e, **kwargs):
+    """``out[v] = max (x[u] + e[edge])``."""
+    return gspmm(graph, x, e, op="add", reduce="max", **kwargs)
+
+
+def u_sub_e_sum(graph, x, e, **kwargs):
+    """``out[v] = sum (x[u] - e[edge])``."""
+    return gspmm(graph, x, e, op="sub", reduce="sum", **kwargs)
+
+
+def u_sub_e_min(graph, x, e, **kwargs):
+    """``out[v] = min (x[u] - e[edge])``."""
+    return gspmm(graph, x, e, op="sub", reduce="min", **kwargs)
+
+
+def u_sub_e_max(graph, x, e, **kwargs):
+    """``out[v] = max (x[u] - e[edge])``."""
+    return gspmm(graph, x, e, op="sub", reduce="max", **kwargs)
+
+
+def u_mul_e_sum(graph, x, e, **kwargs):
+    """``out[v] = sum (x[u] * e[edge])`` -- weighted SpMM."""
+    return gspmm(graph, x, e, op="mul", reduce="sum", **kwargs)
+
+
+def u_mul_e_min(graph, x, e, **kwargs):
+    """``out[v] = min (x[u] * e[edge])``."""
+    return gspmm(graph, x, e, op="mul", reduce="min", **kwargs)
+
+
+def u_mul_e_max(graph, x, e, **kwargs):
+    """``out[v] = max (x[u] * e[edge])``."""
+    return gspmm(graph, x, e, op="mul", reduce="max", **kwargs)
+
+
+def u_div_e_sum(graph, x, e, **kwargs):
+    """``out[v] = sum (x[u] / e[edge])``."""
+    return gspmm(graph, x, e, op="div", reduce="sum", **kwargs)
+
+
+def u_div_e_min(graph, x, e, **kwargs):
+    """``out[v] = min (x[u] / e[edge])``."""
+    return gspmm(graph, x, e, op="div", reduce="min", **kwargs)
+
+
+def u_div_e_max(graph, x, e, **kwargs):
+    """``out[v] = max (x[u] / e[edge])``."""
+    return gspmm(graph, x, e, op="div", reduce="max", **kwargs)

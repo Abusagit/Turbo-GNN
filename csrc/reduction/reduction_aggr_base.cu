@@ -68,8 +68,10 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
         X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16, "X must be float32/float16/bfloat16"
     );
     TORCH_CHECK(X.dim() == 2, "X must be 2D");
+    const bool tracks_arg      = (reduce != "sum");
+    const bool needs_2d_params = use_2d_kernel || !tracks_arg;
 
-    if (use_2d_kernel) {
+    if (needs_2d_params) {
         TORCH_CHECK(tiles_y > 0 && tiles_y <= 32, "tiles_y must be in range [1, 32]");
         TORCH_CHECK((tiles_y & (tiles_y - 1)) == 0, "tiles_y must be power of 2");
         TORCH_CHECK(features_per_block > 0 && features_per_block <= 1024, "features_per_block must be in range [1, 1024]");
@@ -80,8 +82,10 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     const auto d         = X.size(1);
 
     auto out = torch::empty({num_nodes, d}, X.options());
-    // arg_idx uses the same index dtype as edge_ptr
-    auto arg_idx = torch::empty({num_nodes, d}, edge_ptr.options());
+    // arg_idx uses the same index dtype as edge_ptr.  Accumulating reducers
+    // never write it and their backward does not read it, so skip the
+    // allocation entirely -- at [N, d] it costs as much as the output itself.
+    auto arg_idx = tracks_arg ? torch::empty({num_nodes, d}, edge_ptr.options()) : torch::empty({0}, edge_ptr.options());
 
     reduction_aggr_forward_partitioned_cuda(
         edge_ptr,

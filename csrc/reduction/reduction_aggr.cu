@@ -1,540 +1,14 @@
-#include <cstdint>
-
-#include "common.cuh"
-
-// Per-thread pipelined scan over edges [start, end): each edge contributes the
-// TW-wide slice X[edge_idx[eid]*d + base_f : +TW]. Per-thread (not per-warp)
-// parallelism, so each thread prefetches its own <=16B slice.
-//
-// NOTE: benchmarks show PIPELINE_STAGES>0 regresses min/max_aggr -- visit() is
-// a few compares, too little compute to hide the cp.async latency, while the
-// pipeline serializes edges the compiler could otherwise overlap. Keep at 0.
-//
-// visit(src, val): val is the prefetched slice, valid only inside the call.
-// dbuf: this thread's scratch, NUM_STAGES * TW elements.
-template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, typename index_t, typename VisitFn>
-__device__ __forceinline__ void pipelined_thread_edge_scan(
-    index_t start, index_t end, index_t const *__restrict__ edge_idx, cuda_t const *__restrict__ X, size_t d, size_t base_f, cuda_t *dbuf,
-    VisitFn&& visit
-) {
-    if (end <= start) {
-        return;
-    }
-    const index_t num_edges = end - start;
-
-    cuda_t *slots[NUM_STAGES];
-#pragma unroll
-    for (size_t s = 0; s < NUM_STAGES; ++s) {
-        slots[s] = dbuf + s * TW;
-    }
-    index_t src_buf[NUM_STAGES];
-
-    cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
-
-    auto prefetch = [&pipe, num_edges, start, edge_idx, &src_buf, X, d, base_f, &slots](index_t it) {
-        pipe.producer_acquire();
-        if (it < num_edges) {
-            const index_t eid        = start + it;
-            const index_t src        = edge_idx[eid];
-            src_buf[it % NUM_STAGES] = src;
-            const cuda_t *src_ptr    = X + static_cast<size_t>(src) * d + base_f;
-            async_copy_slice_thread<TW, cuda_t>(slots[it % NUM_STAGES], src_ptr, pipe);
-        }
-        pipe.producer_commit();
-    };
-
-#pragma unroll
-    for (size_t s = 0; s < NUM_STAGES; ++s) {
-        prefetch(s);
-    }
-
-    for (index_t it = 0; it < num_edges; ++it) {
-        cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
-        visit(src_buf[it % NUM_STAGES], slots[it % NUM_STAGES]);
-        pipe.consumer_release();
-        prefetch(it + NUM_STAGES);
-    }
-}
-
-// PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
-    index_t const *const __restrict__ light_nodes_indices,
-    index_t const *const __restrict__ edge_ptr,
-    index_t const *const __restrict__ edge_idx,
-    cuda_t const *const __restrict__ X,
-    cuda_t *const __restrict__ out,
-    index_t *const __restrict__ arg_idx,
-    size_t d,
-    size_t num_light
-) {
-    using ROps     = ReductionOps<Op>;
-    using Sentinel = IndexSentinel<index_t>;
-    // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
-    using Tile          = TileOps<TW, cuda_t>;
-    if (static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y >= num_light) {
-        return;
-    }
-    const index_t v = light_nodes_indices[i];
-
-    const index_t row_start = edge_ptr[v];
-    const index_t row_end   = edge_ptr[v + 1];
-
-    const size_t tid      = threadIdx.x;
-    const size_t tile_dim = blockDim.x;
-
-    const size_t node_stride = static_cast<size_t>(v) * d;
-
-    const cuda_t identity_val = static_cast<cuda_t>(ROps::IDENTITY);
-    constexpr cuda_t zero_val{};
-
-    const size_t d_vec = d / TW;
-
-    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
-    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
-    constexpr int NUM_STAGES    = PIPELINE_STAGES;
-
-    extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
-    cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
-
-    for (size_t fv = tid; fv < d_vec; fv += tile_dim) {
-        const size_t base_f = fv * TW;
-
-        cuda_t best_vals[TW];
-        index_t best_srcs[TW];
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            best_vals[e] = identity_val;
-            best_srcs[e] = Sentinel::INVALID;
-        }
-
-        auto visit = [&best_vals, &best_srcs](index_t src, cuda_t const *val) {
-#pragma unroll
-            for (size_t e = 0; e < TW; ++e) {
-                const cuda_t v_e = val[e];
-                if (ROps::is_better(v_e, best_vals[e])) {
-                    best_vals[e] = v_e;
-                    best_srcs[e] = src;
-                }
-            }
-        };
-
-        if constexpr (USE_PIPELINE) {
-            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(row_start, row_end, edge_idx, X, d, base_f, my_dbuf, visit);
-        } else {
-            for (index_t eid = row_start; eid < row_end; ++eid) {
-                const index_t src              = edge_idx[eid];
-                const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
-                visit(src, val.data);
-            }
-        }
-
-        cuda_t result[TW];
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            result[e]                         = Sentinel::is_valid(best_srcs[e]) ? best_vals[e] : zero_val;
-            arg_idx[node_stride + base_f + e] = best_srcs[e];
-        }
-        Tile::write(&out[node_stride], fv, *reinterpret_cast<Tile::vec_t const *>(&result));
-    }
-
-    // Scalar tail for d % TW != 0 (compiles away for TW=1)
-    if (d % TW != 0 && tid == 0) {
-        for (size_t f = d_vec * TW; f < d; ++f) {
-            cuda_t best_val  = identity_val;
-            index_t best_src = Sentinel::INVALID;
-            for (index_t eid = row_start; eid < row_end; ++eid) {
-                const index_t src = edge_idx[eid];
-                const cuda_t val  = X[static_cast<size_t>(src) * d + f];
-                if (ROps::is_better(val, best_val)) {
-                    best_val = val;
-                    best_src = src;
-                }
-            }
-            out[node_stride + f]     = Sentinel::is_valid(best_src) ? best_val : zero_val;
-            arg_idx[node_stride + f] = best_src;
-        }
-    }
-}
-
-__device__ __forceinline__ uint32_t float_to_ordered_uint(float x) {
-    uint32_t bits = __float_as_uint(x);
-    if (bits & 0x80000000u) {
-        // negative: invert bits so ordering is preserved
-        return ~bits;
-    } else {
-        // non-negative: set sign bit so they come after all negatives
-        return bits | 0x80000000u;
-    }
-}
-
-__device__ __forceinline__ float ordered_uint_to_float(uint32_t key) {
-    uint32_t bits;
-    if (key & 0x80000000u) {
-        // non-negative branch
-        bits = key & 0x7fffffffu;
-    } else {
-        // negative branch
-        bits = ~key;
-    }
-    return __uint_as_float(bits);
-}
-
-// pack float and int into uint64 for atomic updates (32-bit indices only)
-__device__ __forceinline__ uint64_t pack_val_idx(float val, int idx) {
-    uint32_t key = float_to_ordered_uint(val);
-    return (static_cast<uint64_t>(key) << 32) | static_cast<uint32_t>(idx);
-}
-
-// unpack float and int from uint64
-__device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int& idx) {
-    uint32_t key  = static_cast<uint32_t>(packed >> 32);
-    uint32_t idxu = static_cast<uint32_t>(packed & 0xFFFFFFFFu);
-
-    val = ordered_uint_to_float(key);
-    idx = static_cast<int>(idxu);
-}
-
-// Packed heavy kernel: blockIdx.x = node, blockIdx.y = edge chunk
-// Only for 32-bit index types (packs float32 + int32 into uint64)
-// PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
-template <
-    size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float,
-    int PIPELINE_STAGES = 0
->
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
-    index_t const *const __restrict__ heavy_nodes_indices,
-    index_t const *const __restrict__ edge_ptr,
-    index_t const *const __restrict__ edge_idx,
-    cuda_t const *const __restrict__ X,
-    uint64_t *const __restrict__ packed,
-    size_t d
-) {
-    static_assert(sizeof(index_t) <= 4, "Packed heavy kernel only supports 32-bit index types");
-    using ROps     = ReductionOps<Op>;
-    using Sentinel = IndexSentinel<index_t>;
-    // constexpr size_t TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
-    using Tile          = TileOps<TW, cuda_t>;
-
-    const size_t node_idx  = blockIdx.x;
-    const size_t chunk_idx = blockIdx.y;
-    const index_t v        = heavy_nodes_indices[node_idx];
-
-    const index_t row_start = edge_ptr[v];
-    const index_t row_end   = edge_ptr[v + 1];
-
-    const index_t chunk_start         = row_start + static_cast<index_t>(chunk_idx * EDGES_PER_BLOCK);
-    const index_t chunk_end_candidate = chunk_start + static_cast<index_t>(EDGES_PER_BLOCK);
-    const index_t chunk_end           = (chunk_end_candidate < row_end) ? chunk_end_candidate : row_end;
-
-    // exit for chunks beyond this node's edges
-    if (chunk_start >= row_end) [[unlikely]] {
-        return;
-    }
-
-    const size_t tid           = threadIdx.x;
-    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
-    const cuda_t identity_val  = static_cast<cuda_t>(ROps::IDENTITY);
-
-    const size_t d_vec = d / TW;
-
-    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
-    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
-    constexpr int NUM_STAGES    = PIPELINE_STAGES;
-
-    extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
-    cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
-
-    for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
-        const size_t base_f = fv * TW;
-
-        cuda_t best_vals[TW];
-        index_t best_srcs[TW];
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            best_vals[e] = identity_val;
-            best_srcs[e] = Sentinel::INVALID;
-        }
-
-        auto visit = [&best_vals, &best_srcs](index_t src, cuda_t const *val) {
-#pragma unroll
-            for (size_t e = 0; e < TW; ++e) {
-                cuda_t v_e = val[e];
-                if (ROps::is_better(v_e, best_vals[e])) {
-                    best_vals[e] = v_e;
-                    best_srcs[e] = src;
-                }
-            }
-        };
-
-        if constexpr (USE_PIPELINE) {
-            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(chunk_start, chunk_end, edge_idx, X, d, base_f, my_dbuf, visit);
-        } else {
-            for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
-                index_t src                    = edge_idx[eid];
-                const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
-                visit(src, val.data);
-            }
-        }
-
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            if (Sentinel::is_valid(best_srcs[e])) {
-                uint64_t new_val = pack_val_idx(static_cast<accum_t>(best_vals[e]), static_cast<size_t>(best_srcs[e]));
-                ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
-            }
-        }
-    }
-
-    // scalar tail for d % TW != 0
-    if (d % TW != 0 && tid == 0) {
-        for (size_t f = d_vec * TW; f < d; ++f) {
-            cuda_t local_best = identity_val;
-            index_t local_arg = Sentinel::INVALID;
-
-            for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
-                const index_t src = edge_idx[eid];
-                const cuda_t val  = X[static_cast<size_t>(src) * d + f];
-                if (ROps::is_better(val, local_best)) {
-                    local_best = val;
-                    local_arg  = src;
-                }
-            }
-
-            if (Sentinel::is_valid(local_arg)) {
-                const uint64_t new_val = pack_val_idx(static_cast<accum_t>(local_best), static_cast<size_t>(local_arg));
-                ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
-            }
-        }
-    }
-}
-
-// unpack results back to separate arrays (32-bit indices only, pairs with heavy kernel)
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_kernel(
-    uint64_t const *const __restrict__ packed,
-    index_t const *const __restrict__ nodes,
-    cuda_t *const __restrict__ out,
-    index_t *const __restrict__ arg_idx,
-    size_t num_nodes,
-    size_t d
-) {
-    static_assert(sizeof(index_t) <= 4, "Unpack kernel only supports 32-bit index types");
-    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
-    const size_t tid           = blockIdx.x * BLOCK_DIM + threadIdx.x;
-
-    for (size_t i = tid; i < num_nodes * d; i += gridDim.x * BLOCK_DIM) {
-        size_t node_idx = i / d;
-        size_t f        = i % d;
-        index_t v       = nodes[node_idx];
-
-        float val;
-        int idx;
-        unpack_val_idx(packed[node_idx * d + f], val, idx);
-
-        out[static_cast<size_t>(v) * d + f]     = (idx > -1) ? static_cast<cuda_t>(val) : cuda_t{};
-        arg_idx[static_cast<size_t>(v) * d + f] = static_cast<index_t>(idx);
-    }
-}
-
-// 2D kernel: blockIdx.x = node, threadIdx.x = feature, threadIdx.y = edge tile
-// uses shared memory tree reduction across tiles instead of packed atomicMin/Max
-// Works with all index sizes (no packing constraint)
-template <FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
-__global__ void reduction_aggr_forward_heavy_kernel_2d(
-    const index_t *__restrict__ nodes,
-    const index_t *__restrict__ edge_ptr,
-    const index_t *__restrict__ edge_idx,
-    const cuda_t *__restrict__ X,
-    cuda_t *__restrict__ out,
-    index_t *__restrict__ arg_idx,
-    size_t d
-) {
-    using ROps     = ReductionOps<Op>;
-    using Sentinel = IndexSentinel<index_t>;
-    // constexpr int TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
-    using Tile          = TileOps<TW, cuda_t>;
-
-    size_t i  = blockIdx.x;
-    index_t v = nodes[i];
-
-    index_t row_start   = edge_ptr[v];
-    index_t row_end     = edge_ptr[v + 1];
-    const size_t degree = static_cast<size_t>(row_end - row_start);
-
-    size_t fid = threadIdx.x;  // feature dimension
-    size_t tid = threadIdx.y;  // tile index
-
-    const size_t F_BLOCK      = blockDim.x;
-    const size_t TILES_Y      = blockDim.y;
-    const size_t SHMEM_STRIDE = F_BLOCK * TW;
-
-    extern __shared__ __align__(16) uint8_t shared_mem[];
-    float *shmem_val = reinterpret_cast<float *>(shared_mem);
-    // index_t shared memory for arg indices
-    index_t *shmem_idx = reinterpret_cast<index_t *>(shmem_val + (TILES_Y * SHMEM_STRIDE));
-
-    const cuda_t identity_val = static_cast<cuda_t>(ROps::IDENTITY);
-    constexpr cuda_t zero_val{};
-
-    size_t tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;
-    index_t start         = row_start + static_cast<index_t>(tid * tile_size_ceil);
-    index_t end_candidate = start + static_cast<index_t>(tile_size_ceil);
-    index_t end           = (end_candidate < row_end) ? end_candidate : row_end;
-
-    size_t node_stride = static_cast<size_t>(v) * d;
-    const size_t d_vec = d / TW;
-
-    for (size_t fv = fid; fv < d_vec; fv += F_BLOCK) {
-        const size_t base_f = fv * TW;
-
-        cuda_t best_vals[TW];
-        index_t best_srcs[TW];
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            best_vals[e] = identity_val;
-            best_srcs[e] = Sentinel::INVALID;
-        }
-
-        for (index_t eid = start; eid < end; ++eid) {
-            index_t src                    = edge_idx[eid];
-            const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
-#pragma unroll
-            for (size_t e = 0; e < TW; ++e) {
-                cuda_t v_e = val[e];
-                if (ROps::is_better(v_e, best_vals[e])) {
-                    best_vals[e] = v_e;
-                    best_srcs[e] = src;
-                }
-            }
-        }
-
-// Write to shmem (convert to float for cross-tile reduction)
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            shmem_val[tid * SHMEM_STRIDE + fid * TW + e] = static_cast<accum_t>(best_vals[e]);
-            shmem_idx[tid * SHMEM_STRIDE + fid * TW + e] = best_srcs[e];
-        }
-
-        __syncthreads();
-
-        // Tree reduction across tiles
-        for (size_t offset = TILES_Y / 2; offset > 0; offset /= 2) {
-            if (tid < offset) {
-#pragma unroll
-                for (size_t e = 0; e < TW; ++e) {
-                    const size_t a = tid * SHMEM_STRIDE + fid * TW + e;
-                    const size_t b = (tid + offset) * SHMEM_STRIDE + fid * TW + e;
-
-                    const float val_a   = shmem_val[a];
-                    const index_t idx_a = shmem_idx[a];
-                    const float val_b   = shmem_val[b];
-                    const index_t idx_b = shmem_idx[b];
-
-                    if (ROps::is_better_f(val_b, val_a) ||
-                        (val_b == val_a && Sentinel::is_valid(idx_b) && (!Sentinel::is_valid(idx_a) || idx_b < idx_a))) {
-                        shmem_val[a] = val_b;
-                        shmem_idx[a] = idx_b;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-
-        // Vectorized final write
-        if (tid == 0) {
-            cuda_t result[TW];
-#pragma unroll
-            for (size_t e = 0; e < TW; ++e) {
-                index_t best_idx                  = shmem_idx[fid * TW + e];
-                result[e]                         = Sentinel::is_valid(best_idx) ? static_cast<cuda_t>(shmem_val[fid * TW + e]) : zero_val;
-                arg_idx[node_stride + base_f + e] = best_idx;
-            }
-            Tile::write(&out[node_stride], fv, *reinterpret_cast<Tile::vec_t const *>(&result));
-        }
-
-        __syncthreads();
-    }
-
-    // scalar tail for d % TW != 0 (compiles away for TW=1)
-    if (d % TW != 0) {
-        const size_t tail_f = d_vec * TW;
-
-        // only fid==0 does actual edge scanning; others contribute identity/INVALID.
-        float local_best  = ROps::IDENTITY;
-        index_t local_arg = Sentinel::INVALID;
-
-        if (fid == 0) {
-            for (index_t eid = start; eid < end; ++eid) {
-                index_t src = edge_idx[eid];
-                float fval  = static_cast<accum_t>(X[static_cast<size_t>(src) * d + tail_f]);
-                if (ROps::is_better_f(fval, local_best)) {
-                    local_best = fval;
-                    local_arg  = src;
-                }
-            }
-        }
-
-        shmem_val[tid * SHMEM_STRIDE + fid] = local_best;
-        shmem_idx[tid * SHMEM_STRIDE + fid] = local_arg;
-
-        __syncthreads();
-
-        for (size_t offset = TILES_Y / 2; offset > 0; offset /= 2) {
-            if (tid < offset && fid == 0) {
-                const size_t a = tid * SHMEM_STRIDE;
-                const size_t b = (tid + offset) * SHMEM_STRIDE;
-
-                const float val_a   = shmem_val[a];
-                const index_t idx_a = shmem_idx[a];
-                const float val_b   = shmem_val[b];
-                const index_t idx_b = shmem_idx[b];
-
-                if (ROps::is_better_f(val_b, val_a) ||
-                    (val_b == val_a && Sentinel::is_valid(idx_b) && (!Sentinel::is_valid(idx_a) || idx_b < idx_a))) {
-                    shmem_val[a] = val_b;
-                    shmem_idx[a] = idx_b;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (tid == 0 && fid == 0) {
-            float best_val                = shmem_val[0];
-            index_t best_idx              = shmem_idx[0];
-            out[node_stride + tail_f]     = Sentinel::is_valid(best_idx) ? static_cast<cuda_t>(best_val) : zero_val;
-            arg_idx[node_stride + tail_f] = best_idx;
-        }
-    }
-}
-
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_backward_typed(
-    const cuda_t *__restrict__ grad_out, const index_t *__restrict__ arg_idx, cuda_t *__restrict__ grad_x, size_t num_nodes, size_t d
-) {
-    using Sentinel = IndexSentinel<index_t>;
-
-    size_t block_idx = blockIdx.x;
-    if (block_idx >= num_nodes) {
-        return;
-    }
-
-    size_t tid                 = threadIdx.x;
-    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
-    const size_t base_offset   = block_idx * d;
-
-    for (size_t f = tid; f < d; f += BLOCK_DIM) {
-        index_t src = arg_idx[base_offset + f];
-        if (Sentinel::is_valid(src)) {
-            atomicAdd(&grad_x[static_cast<size_t>(src) * d + f], grad_out[base_offset + f]);
-        }
-    }
-}
+#include "reduction/reduction_aggr_kernels.cuh"
+
+template <ReductionOp Op, typename = void>
+struct PackedIdentity {
+    static constexpr uint64_t value = 0;
+};
+
+template <ReductionOp Op>
+struct PackedIdentity<Op, std::void_t<decltype(ReductionOps<Op>::PACKED_IDENTITY)>> {
+    static constexpr uint64_t value = ReductionOps<Op>::PACKED_IDENTITY;
+};
 
 template <ReductionOp Op>
 void reduction_aggr_forward_partitioned_cuda_impl(
@@ -631,7 +105,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 cuda_t const *X_ptr = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
                 cuda_t *out_ptr     = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
 
-                if constexpr (sizeof(index_t) <= 4) {
+                if constexpr (sizeof(index_t) <= 4 && ROps::TRACKS_ARG) {
                     // 32-bit: user can choose packed atomics or 2D
                     if (use_2d_kernel) {
                         // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
@@ -640,8 +114,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         dim3 grid(num_heavy);
                         dim3 block(features_per_block, tiles_y);
 
-                        size_t shmem_size =
-                            (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                        size_t shmem_size = aggr_heavy_shmem_bytes<index_t>((size_t)tiles_y * (size_t)features_per_block * TW);
 
                         reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                             index_ptr<index_t>(heavy_nodes),
@@ -653,7 +126,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             d
                         );
                     } else {
-                        constexpr uint64_t PACKED_INIT = ROps::PACKED_IDENTITY;
+                        constexpr uint64_t PACKED_INIT = PackedIdentity<Op>::value;
 
                         auto packed = at::full(
                             {num_heavy, d}, static_cast<int64_t>(PACKED_INIT), at::TensorOptions().dtype(torch::kInt64).device(X.device())
@@ -710,15 +183,16 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         );
                     }
                 } else {
-                    // 64-bit: must use 2D (packing doesn't fit)
+                    // Must use 2D: either 64-bit indices (packing doesn't fit),
+                    // or an accumulating reducer, which has no order-preserving
+                    // (value, index) uint64 packing to atomically fold over.
                     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
                     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
                     dim3 grid(num_heavy);
                     dim3 block(features_per_block, tiles_y);
 
-                    size_t shmem_size =
-                        (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                    size_t shmem_size = aggr_heavy_shmem_bytes<index_t>((size_t)tiles_y * (size_t)features_per_block * TW);
 
                     reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                         index_ptr<index_t>(heavy_nodes),
@@ -762,6 +236,11 @@ void reduction_aggr_forward_partitioned_cuda(
         );
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
+            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
+            use_2d_kernel, features_per_block, tiles_y, pipeline_stages
+        );
+    } else if (reduce == "sum") {
+        reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::SUM>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
             use_2d_kernel, features_per_block, tiles_y, pipeline_stages
         );
