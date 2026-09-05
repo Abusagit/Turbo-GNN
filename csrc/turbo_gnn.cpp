@@ -1,5 +1,6 @@
 #include "kernels.cuh"
 #include "spmm/cusparse_spmm.h"
+#include "spmm/gspmm.h"
 
 namespace py = pybind11;
 
@@ -71,6 +72,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     m.def("clear_graph_cache", &clear_graph_cache, "Clear graph cache");
+
+    // Generalized SpMM (DGL dgl.ops.gspmm family)
+    m.def(
+        "gspmm_forward", &gspmm_forward, "Generalized SpMM forward: reduce_{(u,e) in in(v)} op(lhs[u], rhs[e])", py::arg("edge_ptr"),
+        py::arg("edge_idx"), py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"),
+        py::arg("reduce"), py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32, py::arg("tiles_y") = 8
+    );
+
+    m.def(
+        "gspmm_backward_arg", &gspmm_backward_arg, "Generalized SpMM backward for min/max (scatter over winning edges)",
+        py::arg("grad_out"), py::arg("arg_eid"), py::arg("edge_idx"), py::arg("lhs"), py::arg("rhs"), py::arg("op"),
+        py::arg("warps_per_block") = 8
+    );
+
+    m.def(
+        "gspmm_backward_edge", &gspmm_backward_edge, "Generalized SpMM backward for sum: gradient w.r.t. edge data",
+        py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("grad_out"), py::arg("lhs"), py::arg("rhs"), py::arg("op"),
+        py::arg("warps_per_block") = 8
+    );
 
     // Edge normalization
     m.def(
