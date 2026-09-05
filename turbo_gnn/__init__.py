@@ -6,6 +6,8 @@ Provides fused, autotunable CUDA kernels for common GNN operations:
 - **gatv2_aggr**: GATv2 attention-weighted aggregation (LeakyReLU + edge softmax).
 - **graph_transformer_aggr**: Fused multi-head graph attention (Q*K dot + edge softmax + V aggregation).
 - **spmm_aggr**: cuSPARSE-based SpMM with GCN/mean/sum normalization.
+- **gspmm**: generalized SpMM -- {copy_u, copy_e, add, sub, mul, div} x {sum, min, max},
+  the ``dgl.ops.gspmm`` operator family, also exposed under those 18 names.
 
 All kernels operate on CSR graphs wrapped in
 :class:`AdjacencyForwardBackwardWithNodeBuckets`, which stores forward and
@@ -25,14 +27,33 @@ Quick start::
 """
 
 from turbo_gnn._autotune import AutotuneConfig, TunableKernel, TunableParam, with_autotune
-from turbo_gnn._kernels import GATv2AggrKernel, GraphTransformerAggrKernel, ReductionAggrKernel
+from turbo_gnn._kernels import GATv2AggrKernel, GraphTransformerAggrKernel, GSpMMKernel, ReductionAggrKernel
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 from turbo_gnn.ops import (
+    copy_e_max,
+    copy_e_min,
+    copy_e_sum,
+    copy_u_max,
+    copy_u_min,
+    copy_u_sum,
     csr_SPMM_normalized,
     gatv2_aggr,
     graph_transformer_aggr,
+    gspmm,
     reduction_aggr,
     spmm_aggr,
+    u_add_e_max,
+    u_add_e_min,
+    u_add_e_sum,
+    u_div_e_max,
+    u_div_e_min,
+    u_div_e_sum,
+    u_mul_e_max,
+    u_mul_e_min,
+    u_mul_e_sum,
+    u_sub_e_max,
+    u_sub_e_min,
+    u_sub_e_sum,
 )
 
 __all__ = [
@@ -44,9 +65,30 @@ __all__ = [
     "ReductionAggrKernel",
     "GATv2AggrKernel",
     "GraphTransformerAggrKernel",
+    "GSpMMKernel",
     "reduction_aggr",
     "gatv2_aggr",
     "graph_transformer_aggr",
     "spmm_aggr",
     "csr_SPMM_normalized",
+    # generalized SpMM (dgl.ops.gspmm family)
+    "gspmm",
+    "copy_u_sum",
+    "copy_u_min",
+    "copy_u_max",
+    "copy_e_sum",
+    "copy_e_min",
+    "copy_e_max",
+    "u_add_e_sum",
+    "u_add_e_min",
+    "u_add_e_max",
+    "u_sub_e_sum",
+    "u_sub_e_min",
+    "u_sub_e_max",
+    "u_mul_e_sum",
+    "u_mul_e_min",
+    "u_mul_e_max",
+    "u_div_e_sum",
+    "u_div_e_min",
+    "u_div_e_max",
 ]

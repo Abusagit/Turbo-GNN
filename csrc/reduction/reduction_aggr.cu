@@ -1,5 +1,14 @@
 #include "reduction/reduction_aggr_kernels.cuh"
 
+template <ReductionOp Op, typename = void>
+struct PackedIdentity {
+    static constexpr uint64_t value = 0;
+};
+
+template <ReductionOp Op>
+struct PackedIdentity<Op, std::void_t<decltype(ReductionOps<Op>::PACKED_IDENTITY)>> {
+    static constexpr uint64_t value = ReductionOps<Op>::PACKED_IDENTITY;
+};
 
 template <ReductionOp Op>
 void reduction_aggr_forward_partitioned_cuda_impl(
@@ -117,7 +126,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             d
                         );
                     } else {
-                        constexpr uint64_t PACKED_INIT = ROps::PACKED_IDENTITY;
+                        constexpr uint64_t PACKED_INIT = PackedIdentity<Op>::value;
 
                         auto packed = at::full(
                             {num_heavy, d}, static_cast<int64_t>(PACKED_INIT), at::TensorOptions().dtype(torch::kInt64).device(X.device())

@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from turbo_gnn._autotune import TunableKernel, TunableParam
-from turbo_gnn._functions import ReductionAggrFunction, _FusedGraphAttention, gatv2_function
+from turbo_gnn._functions import GSpMMFunction, ReductionAggrFunction, _FusedGraphAttention, gatv2_function
 
 
 class ReductionAggrKernel(TunableKernel):
@@ -67,6 +67,11 @@ class ReductionAggrKernel(TunableKernel):
             self.forward_tiles_y,
             self.reduce,
             self.forward_pipeline_stages,
+            graph.backward_indptr,
+            graph.backward_indices,
+            graph.backward_light_nodes,
+            graph.backward_heavy_nodes,
+            graph.backward_max_degree,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -271,5 +276,74 @@ class GraphTransformerAggrKernel(TunableKernel):
                 V=V,
                 scale=scale,
             )
+
+        return _bench
+
+
+class GSpMMKernel(TunableKernel):
+    """Tunable kernel for generalized SpMM (the ``dgl.ops.gspmm`` family).
+
+    One singleton per ``(op, reduce)`` pair -- different operations have
+    different optimal launch shapes, and the autotune cache is keyed on the
+    kernel instance.
+
+    Tunable forward parameters:
+
+    - ``forward_warps_per_block``: block size for the light-node kernel, as
+      warps. Features are spread across threadIdx.x and nodes across
+      threadIdx.y, so this trades feature parallelism against node parallelism.
+    - ``forward_features_per_block``, ``forward_tiles_y``: tile shape of the
+      heavy-node kernel. ``tiles_y`` is how many edge chunks are reduced in
+      parallel through shared memory and must be a power of two.
+
+    Tunable graph parameter:
+
+    - ``forward_huge_degree_threshold_quantile``: degree quantile for the
+      light/heavy partition (-1 disables bucketing, all nodes go to light).
+
+    Unlike :class:`ReductionAggrKernel` there is no ``use_2d_kernel`` or
+    ``pipeline_stages`` knob: the packed-atomics heavy variant does not
+    generalize past min/max, so the tiled kernel is the only heavy path.
+    """
+
+    def __init__(self, op: str = "copy_u", reduce: str = "sum", **kwargs):
+        super().__init__()
+        self.op = op
+        self.reduce = reduce
+        self.forward_warps_per_block = kwargs.get("warps_per_block", 8)
+        self.forward_features_per_block = kwargs.get("features_per_block", 32)
+        self.forward_tiles_y = kwargs.get("tiles_y", 8)
+
+    def _execute(self, graph, x, *, rhs=None, **kwargs):
+        from turbo_gnn.ops import _gspmm_apply
+
+        return _gspmm_apply(
+            graph,
+            x,
+            rhs,
+            self.op,
+            self.reduce,
+            self.forward_warps_per_block,
+            self.forward_features_per_block,
+            self.forward_tiles_y,
+        )
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
+            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
+            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=8),
+        ]
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99, 0.999], default=-1),
+        ]
+
+    def make_forward_bench_fn(self, x, graph_repr, **kwargs):
+        rhs = kwargs.get("rhs")
+
+        def _bench():
+            return self._execute(graph_repr, x, rhs=rhs)
 
         return _bench

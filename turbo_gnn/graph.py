@@ -41,11 +41,16 @@ def build_csr_as_is(
     edge_weight: Optional[torch.Tensor],
     num_nodes: int,
     do_transpose: bool = False,
+    return_perm: bool = False,
 ):
     """Build CSR from COO edge_index.
 
+    Args:
+        return_perm: also return the COO->CSR edge permutation, so that edge
+            data aligned to ``edge_index`` can be reordered to match ``cols``.
+
     Returns:
-        row_ptr, cols, w, counts
+        row_ptr, cols, w, counts -- plus perm when ``return_perm`` is set.
     """
     if do_transpose:
         rows = edge_index[1]
@@ -64,6 +69,8 @@ def build_csr_as_is(
     row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
     row_ptr[1:] = counts.cumsum(0)
 
+    if return_perm:
+        return row_ptr, cols, w, counts, perm
     return row_ptr, cols, w, counts
 
 
@@ -106,6 +113,9 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     max_degree: int = -1
     _device: torch.device = torch.device("cpu")
     is_directed: bool | None = None  # None = auto-detect, True/False = explicit
+    # COO->CSR edge permutation, recorded only by from_edge_list; lets callers
+    # reorder edge data that is aligned to the original edge_index.
+    forward_edge_perm: torch.Tensor | None = None
 
     def __post_init__(self):
         self._device = self.forward_indptr.device
@@ -139,6 +149,15 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             self.backward_indptr = self.forward_indptr
             self.backward_indices = self.forward_indices
 
+        # Out-degree bound, needed to size the heavy-node grid when a kernel
+        # runs an aggregation over the transposed CSR (e.g. the sum backward).
+        if self.is_directed:
+            bwd_indptr = self._to_signed_view(self.backward_indptr)
+            bwd_degrees = bwd_indptr[1:] - bwd_indptr[:-1]
+            self.backward_max_degree = int(bwd_degrees.max().item())
+        else:
+            self.backward_max_degree = int(self.max_degree)
+
     @staticmethod
     def _to_signed_view(t: torch.Tensor) -> torch.Tensor:
         """View unsigned index tensor as its signed counterpart for arithmetic."""
@@ -147,6 +166,67 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         elif t.dtype == torch.uint64:
             return t.view(torch.int64)
         return t
+
+    @property
+    def backward_edge_map(self) -> torch.Tensor:
+        """Backward-CSR edge position -> forward-CSR edge position.
+
+        Edge data handed to :func:`turbo_gnn.ops.gspmm` is indexed by *forward*
+        CSR position.  A gradient that walks the transposed CSR visits the same
+        edges in a different order, so operations whose message depends on the
+        edge value (``mul``, ``div``) need this remapping to fetch it.
+
+        Both CSRs are sorted by (row, col): forward rows are destinations, so
+        forward is ordered by (dst, src), and backward rows are sources, so
+        backward is ordered by (src, dst) -- which is exactly the sort key
+        below.  Hence the t-th backward edge is the t-th forward edge in key
+        order, and a single argsort gives the whole map.
+
+        Computed on first use and cached; costs one int64 array of E elements.
+
+        Note:
+            Ambiguous for multigraphs -- with two parallel edges between the
+            same pair, which of them a backward position maps to is arbitrary
+            (though the multiset of values is still correct).
+        """
+        cached = getattr(self, "_backward_edge_map", None)
+        if cached is not None:
+            return cached
+
+        indptr = self._to_signed_view(self.forward_indptr)
+        num_nodes = indptr.numel() - 1
+        degrees = indptr[1:] - indptr[:-1]
+
+        # dst per forward CSR position, then the (src, dst) sort key
+        dst = torch.repeat_interleave(
+            torch.arange(num_nodes, device=indptr.device, dtype=torch.int64), degrees.to(torch.int64)
+        )
+        src = self._to_signed_view(self.forward_indices).to(torch.int64)
+        key = src * num_nodes + dst
+
+        edge_map = torch.argsort(key, stable=True).to(self.index_dtype)
+        self._backward_edge_map = edge_map
+        return edge_map
+
+    def to_csr_edge_order(self, edge_data: torch.Tensor) -> torch.Tensor:
+        """Permute edge data from the original ``edge_index`` order into CSR order.
+
+        Only meaningful for graphs built by :meth:`from_edge_list`, which is the
+        only constructor that knows the COO ordering it started from; other
+        constructors receive data already in CSR order and this raises.
+        """
+        perm = getattr(self, "forward_edge_perm", None)
+        if perm is None:
+            raise RuntimeError(
+                "This graph carries no COO->CSR edge permutation, so edge data cannot be "
+                "reordered automatically. Only from_edge_list() records one; graphs built "
+                "from CSR arrays already expect edge data in CSR order."
+            )
+        return edge_data[perm]
+
+    def to_backward_edge_order(self, edge_data: torch.Tensor) -> torch.Tensor:
+        """Permute edge data from forward-CSR order into backward-CSR order."""
+        return edge_data[self.backward_edge_map]
 
     @property
     def light_nodes(self) -> torch.Tensor:
@@ -203,6 +283,10 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         self.forward_heavy_nodes = self.forward_heavy_nodes.to(device)
         self.backward_light_nodes = self.backward_light_nodes.to(device)
         self.backward_heavy_nodes = self.backward_heavy_nodes.to(device)
+        if self.forward_edge_perm is not None:
+            self.forward_edge_perm = self.forward_edge_perm.to(device)
+        # Drop the lazily built edge map: it lives on the old device.
+        self._backward_edge_map = None
         torch.cuda.empty_cache()
         return self
 
@@ -221,7 +305,9 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             is_directed: None = auto-detect, True = always directed,
                          False = skip backward CSR (alias to forward).
         """
-        fwd_indptr, fwd_indices, _, fwd_counts = build_csr_as_is(edge_index, None, num_nodes, do_transpose=True)
+        fwd_indptr, fwd_indices, _, fwd_counts, fwd_perm = build_csr_as_is(
+            edge_index, None, num_nodes, do_transpose=True, return_perm=True
+        )
 
         if is_directed is not False:
             bwd_indptr, bwd_indices, _, bwd_counts = build_csr_as_is(edge_index, None, num_nodes, do_transpose=False)
@@ -257,6 +343,7 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             backward_light_nodes=bwd_light,
             backward_heavy_nodes=bwd_heavy,
             is_directed=is_directed,
+            forward_edge_perm=fwd_perm.to(idx_dt),
         )
 
     @classmethod
