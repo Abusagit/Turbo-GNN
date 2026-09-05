@@ -382,7 +382,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     const cuda_t identity_val = static_cast<cuda_t>(ROps::IDENTITY);
     constexpr cuda_t zero_val{};
 
-    size_t tile_size_ceil = (degree + TILES_Y - 1) / TILES_Y;
+    size_t tile_size_ceil = ceil_div(degree, TILES_Y);
     index_t start         = row_start + static_cast<index_t>(tid * tile_size_ceil);
     index_t end_candidate = start + static_cast<index_t>(tile_size_ceil);
     index_t end           = (end_candidate < row_end) ? end_candidate : row_end;
@@ -595,7 +595,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 const size_t tile_x   = std::min<size_t>(std::max<size_t>(d_vec_l, 1), THREADS_PER_BLOCK);
                 const size_t node_y   = std::max<size_t>(THREADS_PER_BLOCK / tile_x, 1);
                 const dim3 threads_l(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y));
-                const unsigned blocks_l = static_cast<unsigned>((num_light + node_y - 1) / node_y);
+                const unsigned blocks_l = static_cast<unsigned>(ceil_div<size_t>(num_light, node_y));
                 // val_dbuf (STAGES == 0 makes this term vanish)
                 size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
 
@@ -667,7 +667,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                 constexpr int STAGES            = decltype(stages_c)::value;
                                 constexpr size_t TW             = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
-                                dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                                dim3 grid(num_heavy, ceil_div(max_degree, EDGES_PER_BLOCK));
 
                                 // val_dbuf (STAGES == 0 makes this term vanish)
                                 size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
@@ -696,7 +696,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-                                int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+                                int unpack_blocks = ceil_div(num_heavy * d, THREADS_PER_BLOCK);
                                 unpack_results_kernel<WARPS_PER_BLOCK, cuda_t, index_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
                                     reinterpret_cast<uint64_t *>(packed.template data_ptr<int64_t>()),
                                     index_ptr<index_t>(heavy_nodes),

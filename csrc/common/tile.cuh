@@ -66,7 +66,7 @@ template <int D_CONST, typename cuda_t, int THREADS_PER_D = kWarpSize>
 struct SelectTW {
    private:
     static consteval int calculate_tile_width(size_t type_size, size_t d, size_t thread_count) {
-        size_t elems_per_thread = (d + thread_count - 1) / thread_count;
+        size_t elems_per_thread = ceil_div(d, thread_count);
 
         return std::min(elems_per_thread, Vec<1, float>::max_vec_size_bytes / type_size);  // 16 bytes is the most wide load/store
     }

@@ -77,7 +77,7 @@ void launch_compute_degrees(
     out_degrees.zero_();
 
     dim3 block(block_dim);
-    dim3 grid((num_nodes + block.x - 1) / block.x);
+    dim3 grid(ceil_div<uint32_t>(num_nodes, block.x));
 
     std::visit(
         [&](auto idxInfo) {
@@ -116,7 +116,7 @@ void launch_compute_normalized_weights(
     int32_t num_nodes = static_cast<int32_t>(indptr.size(0) - 1);
 
     dim3 block(block_dim);
-    dim3 grid((num_nodes + block.x - 1) / block.x);
+    dim3 grid(ceil_div<uint32_t>(num_nodes, block.x));
 
     const float *edge_weights_ptr = nullptr;
 

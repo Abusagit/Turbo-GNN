@@ -32,10 +32,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
 ) {
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
-    constexpr int ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                                                  // Accumulatores used by one thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
+    constexpr int ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                        // Accumulatores used by one thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
@@ -116,7 +116,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     OnlineSoftmaxState softmax_state;
 
     if constexpr (USE_PIPELINE) {
-        const int loop_iters = (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
+        const int loop_iters = (num_neighbors > warp_id) ? ceil_div(num_neighbors - warp_id, WARPS_PER_BLOCK) : 0;
 
         if (loop_iters > 0) {
             cuda_t *rows[NUM_STAGES];

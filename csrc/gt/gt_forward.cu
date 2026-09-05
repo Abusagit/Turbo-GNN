@@ -20,9 +20,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
 
     constexpr size_t TW = TW_SELECTOR::value;  // Tile width
     static_assert(D_CONST % TW == 0, "Per-head features dim should be divisible by Tile width");
-    constexpr size_t TILES            = D_CONST / TW;                                                             // Total tiles count
-    constexpr size_t TILES_PER_THREAD = (TILES + (TW_SELECTOR::threads_per_d)-1) / (TW_SELECTOR::threads_per_d);  // Tiles per thread
-    constexpr size_t ACCS_PER_THREAD  = TW * TILES_PER_THREAD;  // Accumulatores used by one thread
+    constexpr size_t TILES            = D_CONST / TW;                                 // Total tiles count
+    constexpr size_t TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
+    constexpr size_t ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                        // Accumulatores used by one thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
@@ -152,7 +152,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
             block_neighbor_id, lane_id, num_neighbors, edge_start, col_idx, row_bases, row_stride_n, row_stride_h, head_h, warp_dbuf, consume
         );
     } else {
-        const size_t rounds = (num_neighbors + neighbor_block_size - 1) / neighbor_block_size;
+        const size_t rounds = ceil_div(num_neighbors, neighbor_block_size);
         for (size_t r = 0; r < rounds; ++r) {
             const size_t neighbor_id = r * neighbor_block_size + block_neighbor_id;
             if (neighbor_id >= num_neighbors) [[unlikely]] {
@@ -218,7 +218,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
         // cross-neighbor output write (uses write_typed for vec2 stores)
         cuda_t *const out_base = O + node_i * stride_o_n + head_h * stride_o_h;
 #pragma unroll
-        for (size_t t = 0; t < (TILES + lane_cnt - 1) / lane_cnt; ++t) {
+        for (size_t t = 0; t < ceil_div(TILES, lane_cnt); ++t) {
             const size_t vi = lane_id + t * kWarpSize;
             if (vi < TILES) [[likely]] {
                 accum_t combined[TW] = {0};

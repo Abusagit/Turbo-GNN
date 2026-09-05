@@ -63,7 +63,7 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
     cuda_t const *__restrict__ const (&row_bases)[NUM_ROWS], int64_t const (&stride_n)[NUM_ROWS], int64_t const (&stride_h)[NUM_ROWS],
     size_t head_h, cuda_t *dbuf, ConsumeFn&& consume
 ) {
-    const size_t loop_iters = (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
+    const size_t loop_iters = (num_neighbors > warp_id) ? ceil_div(num_neighbors - warp_id, WARPS_PER_BLOCK) : 0;
     if (loop_iters == 0) {
         return;
     }

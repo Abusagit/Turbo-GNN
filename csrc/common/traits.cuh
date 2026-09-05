@@ -198,3 +198,30 @@ concept FloatingNum = is_floating_point_cuda_v<T>;
 
 template <typename T>
 inline constexpr bool is_half_fp_v = std::is_same_v<std::remove_cv_t<T>, half> || std::is_same_v<std::remove_cv_t<T>, nv_bfloat16>;
+
+// Is integer trait
+
+template <typename T>
+struct is_integral_cuda {
+   private:
+    // Strip const/volatile, but intentionally keep references/pointers
+    // so they correctly evaluate to false, matching std:: behavior.
+    using U = std::remove_cvref_t<T>;
+
+   public:
+    static constexpr bool value = std::is_integral_v<U> ||              // Standard: car, short, int, long long , e.t.c.
+                                  std::is_same_v<U, __int128> ||        // CUDA: i128
+                                  std::is_same_v<U, unsigned __int128>  // CUDA: ui128
+        ;
+};
+
+template <typename T>
+inline constexpr bool is_integral_cuda_v = is_integral_cuda<T>::value;
+
+template <typename T>
+concept IntegralNum = is_integral_cuda_v<T>;
+
+template <IntegralNum T>
+inline constexpr T ceil_div(T num, T den) {
+    return (num + den - 1) / den;
+}

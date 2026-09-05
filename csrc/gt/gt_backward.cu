@@ -23,9 +23,9 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using Tile = TileOps<TW, cuda_t, accum_t>;
 
@@ -81,9 +81,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
@@ -303,9 +303,8 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
     constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
-
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
 
