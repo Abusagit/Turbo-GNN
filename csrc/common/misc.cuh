@@ -143,25 +143,55 @@ struct OnlineSoftmaxState {
 };
 
 // =============================================================================
-// ReductionOps<Op> — compile-time traits for min/max reduction kernels
+// ReductionOps<Op> — compile-time traits for the neighbor-reduction kernels
+//
+// reduce(a, b, upgrade)
+//     Folds the incoming neighbor value `a` into the running accumulator `b`
+//     and returns the new accumulator.  `upgrade` is *set* to true (never
+//     reset) when `a` becomes the new representative of the accumulator, i.e.
+//     when the arg index must be updated alongside it; callers must therefore
+//     initialize it to false before every call.  Only meaningful when
+//     TRACKS_ARG is true -- accumulating reducers leave it untouched.
+//     Ties keep the incumbent (`upgrade` stays false), so the arg index is the
+//     *first* neighbor attaining the extremum in edge order.
+//
+// TRACKS_ARG
+//     Whether the reducer needs argmin/argmax bookkeeping.  Comparison
+//     reducers (MIN/MAX) do: the backward pass scatters the gradient to the
+//     single winning source, and the heavy-node path packs (value, index) into
+//     a uint64 for atomicMin/Max.  Accumulating reducers (SUM) do not -- the
+//     arg tensor stays empty, the packed path is never instantiated, and the
+//     backward is a reduction over the transposed CSR instead.
+//
+// AccumType<cuda_t, accum_t>
+//     Type of the running accumulator.  MIN/MAX stay in cuda_t (a comparison
+//     never loses precision).  SUM widens to accum_t (float) so that adding up
+//     thousands of fp16/bf16 neighbors does not drift -- a high-degree node in
+//     fp16 saturates the 11-bit mantissa long before the reduction ends.
 // =============================================================================
 
-enum class ReductionOp { MIN, MAX };
+enum class ReductionOp { MIN, MAX, SUM };
 
 template <ReductionOp Op>
 struct ReductionOps;
 
 template <>
 struct ReductionOps<ReductionOp::MIN> {
+    static constexpr bool TRACKS_ARG          = true;
     static constexpr float IDENTITY           = INFINITY;  // +inf
     static constexpr uint64_t PACKED_IDENTITY = 0xff800000ffffffffULL;
 
-    template <typename cuda_t>
-    static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) {
-        return a < b;
-    }
+    template <typename cuda_t, typename accum_t>
+    using AccumType = cuda_t;
 
-    static __device__ __forceinline__ bool is_better_f(float a, float b) { return a < b; }
+    template <typename val_t>
+    static __device__ __forceinline__ val_t reduce(val_t a, val_t b, bool& upgrade) {
+        if (a < b) {
+            upgrade = true;
+            return a;
+        }
+        return b;
+    }
 
     static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
         return atomicMin(reinterpret_cast<unsigned long long *>(addr), val);
@@ -170,19 +200,44 @@ struct ReductionOps<ReductionOp::MIN> {
 
 template <>
 struct ReductionOps<ReductionOp::MAX> {
+    static constexpr bool TRACKS_ARG          = true;
     static constexpr float IDENTITY           = -INFINITY;  // -inf
     static constexpr uint64_t PACKED_IDENTITY = 0x007fffffffffffffULL;
 
-    template <typename cuda_t>
-    static __device__ __forceinline__ bool is_better(cuda_t a, cuda_t b) {
-        return a > b;
-    }
+    template <typename cuda_t, typename accum_t>
+    using AccumType = cuda_t;
 
-    static __device__ __forceinline__ bool is_better_f(float a, float b) { return a > b; }
+    template <typename val_t>
+    static __device__ __forceinline__ val_t reduce(val_t a, val_t b, bool& upgrade) {
+        if (a > b) {
+            upgrade = true;
+            return a;
+        }
+        return b;
+    }
 
     static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
         return atomicMax(reinterpret_cast<unsigned long long *>(addr), val);
     }
+};
+
+template <>
+struct ReductionOps<ReductionOp::SUM> {
+    static constexpr bool TRACKS_ARG = false;
+    static constexpr float IDENTITY  = 0.0f;
+
+    template <typename cuda_t, typename accum_t>
+    using AccumType = accum_t;
+
+    template <typename val_t>
+    static __device__ __forceinline__ val_t reduce(val_t a, val_t b, bool& /*upgrade*/) {
+        return a + b;
+    }
+
+    // No atomic_reduce / PACKED_IDENTITY on purpose: there is no order-
+    // preserving (value, index) packing to atomically add over, so the packed
+    // heavy-node path is not instantiated for this reducer (see the
+    // TRACKS_ARG branch in reduction_aggr_forward_partitioned_cuda_impl).
 };
 
 template <size_t bytes>
