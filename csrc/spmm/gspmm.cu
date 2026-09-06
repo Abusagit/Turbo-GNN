@@ -117,7 +117,8 @@ std::vector<torch::Tensor> gspmm_forward(
     const std::string& reduce,
     int warps_per_block,
     int features_per_block,
-    int tiles_y
+    int tiles_y,
+    int pipeline_stages
 ) {
     const BinaryOp bop    = binary_op_from_string(op);
     const ReductionOp rop = reduce_op_from_string(reduce);
@@ -156,7 +157,7 @@ std::vector<torch::Tensor> gspmm_forward(
     auto arg_eid          = tracks_arg ? torch::empty({num_nodes, layout.d}, edge_ptr.options()) : torch::empty({0}, edge_ptr.options());
 
     std::visit(
-        [&](auto idxInfo, auto typeInfo, auto op_c, auto rop_c, auto bcast_c) {
+        [&](auto idxInfo, auto typeInfo, auto op_c, auto rop_c, auto bcast_c, auto stages_c) {
             using index_t = typename decltype(idxInfo)::Type;
             using torch_t = typename decltype(typeInfo)::TorchType;
             using cuda_t  = typename decltype(typeInfo)::CudaType;
@@ -164,6 +165,7 @@ std::vector<torch::Tensor> gspmm_forward(
             constexpr BinaryOp BOP    = static_cast<BinaryOp>(decltype(op_c)::value);
             constexpr ReductionOp ROP = static_cast<ReductionOp>(decltype(rop_c)::value);
             constexpr bool BCAST      = decltype(bcast_c)::value;
+            constexpr int STAGES      = decltype(stages_c)::value;
             using BOps                = BinaryOps<BOP>;
 
             // deduce_rhs_broadcast never raises the flag for an operation that
@@ -191,11 +193,20 @@ std::vector<torch::Tensor> gspmm_forward(
 
                     const dim3 block_l(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y));
                     const unsigned blocks_l = static_cast<unsigned>((static_cast<size_t>(num_light) + node_y - 1) / node_y);
+                    const size_t shmem_l = tile_x * node_y * STAGES * aggr_tile_width<kGSpMMVectorize, cuda_t> * sizeof(cuda_t);
+
+                    if constexpr (STAGES > 0) {
+                        ensure_dynamic_shmem(
+                            reduction_aggr_forward_light_kernel_1d<
+                                kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, true, kGSpMMVectorize>,
+                            shmem_l, "gspmm light"
+                        );
+                    }
 
                     reduction_aggr_forward_light_kernel_1d<
-                        kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, /*PIPELINE_STAGES=*/0, BOP, BCAST, /*ARG_IS_EDGE=*/true,
+                        kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, /*ARG_IS_EDGE=*/true,
                         kGSpMMVectorize
-                    ><<<blocks_l, block_l>>>(
+                    ><<<blocks_l, block_l, shmem_l>>>(
                         index_ptr<index_t>(light_nodes),
                         index_ptr<index_t>(edge_ptr),
                         index_ptr<index_t>(edge_idx),
@@ -238,7 +249,8 @@ std::vector<torch::Tensor> gspmm_forward(
         MakeTypeVariant<float, at::Half, at::BFloat16>(value_dtype(bop, lhs, rhs)),
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
         MakeIntVariant<0, 1, 2>(static_cast<int>(rop)),
-        MakeBoolVariant<false, true>(layout.rhs_broadcast)
+        MakeBoolVariant<false, true>(layout.rhs_broadcast),
+        MakeIntVariant<0, 1, 2, 4>(pipeline_stages)
     );
 
     CUDA_KERNEL_CHECK();

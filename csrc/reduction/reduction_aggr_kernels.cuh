@@ -41,7 +41,7 @@
 // a few compares, too little compute to hide the cp.async latency, while the
 // pipeline serializes edges the compiler could otherwise overlap. Keep at 0.
 //
-// visit(src, val): val is the prefetched slice, valid only inside the call.
+// visit(src, eid, val): val is the prefetched slice, valid only inside the call.
 // dbuf: this thread's scratch, NUM_STAGES * TW elements.
 template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, typename index_t, typename VisitFn>
 __device__ __forceinline__ void pipelined_thread_edge_scan(
@@ -81,7 +81,7 @@ __device__ __forceinline__ void pipelined_thread_edge_scan(
 
     for (index_t it = 0; it < num_edges; ++it) {
         cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
-        visit(src_buf[it % NUM_STAGES], slots[it % NUM_STAGES]);
+        visit(src_buf[it % NUM_STAGES], start + it, slots[it % NUM_STAGES]);
         pipe.consumer_release();
         prefetch(it + NUM_STAGES);
     }
@@ -202,11 +202,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             }
         };
 
-        // The pipeline prefetches X only, so it stays available exactly where
-        // reduction_aggr uses it: the node-only operation reporting node args.
-        if constexpr (USE_PIPELINE && !BOps::USE_RHS && !ARG_IS_EDGE) {
-            auto visit_node = [&visit](index_t src, cuda_t const *val) { visit(src, index_t{}, val); };
-            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(row_start, row_end, edge_idx, X, d, base_f, my_dbuf, visit_node);
+        if constexpr (USE_PIPELINE && BOps::USE_LHS) {
+            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(row_start, row_end, edge_idx, X, d, base_f, my_dbuf, visit);
         } else {
             for (index_t eid = row_start; eid < row_end; ++eid) {
                 if constexpr (BOps::USE_LHS) {
@@ -377,7 +374,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             best_srcs[e] = Sentinel::INVALID;
         }
 
-        auto visit = [&best_vals, &best_srcs](index_t src, cuda_t const *val) {
+        auto visit = [&best_vals, &best_srcs](index_t src, index_t, cuda_t const *val) {
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 cuda_t v_e = val[e];
@@ -395,7 +392,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
             for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
                 index_t src                    = edge_idx[eid];
                 const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
-                visit(src, val.data);
+                visit(src, eid, val.data);
             }
         }
 

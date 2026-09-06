@@ -77,7 +77,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gspmm_forward", &gspmm_forward, "Generalized SpMM forward: reduce_{(u,e) in in(v)} op(lhs[u], rhs[e])", py::arg("edge_ptr"),
         py::arg("edge_idx"), py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"),
-        py::arg("reduce"), py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32, py::arg("tiles_y") = 8
+        py::arg("reduce"), py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32, py::arg("tiles_y") = 8,
+        py::arg("pipeline_stages") = 0
     );
 
     m.def(

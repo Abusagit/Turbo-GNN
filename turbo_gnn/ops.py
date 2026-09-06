@@ -272,6 +272,7 @@ def _gspmm_apply(
     warps_per_block: int,
     features_per_block: int,
     tiles_y: int,
+    pipeline_stages: int,
 ) -> torch.Tensor:
     """Unpack the graph and hand off to :class:`GSpMMFunction`."""
     edge_map = graph.backward_edge_map if (op in ("mul", "div") and reduce == "sum") else None
@@ -293,6 +294,7 @@ def _gspmm_apply(
         warps_per_block,
         features_per_block,
         tiles_y,
+        pipeline_stages,
     )
 
 
@@ -306,6 +308,7 @@ def gspmm(
     warps_per_block: int = 8,
     features_per_block: int = 32,
     tiles_y: int = 8,
+    pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """Generalized SpMM -- one message operation composed with one reduction.
 
@@ -355,7 +358,7 @@ def gspmm(
     if op == "copy_e" and lhs is not None:
         raise ValueError("gspmm(op='copy_e') ignores node data; pass lhs=None")
 
-    return _gspmm_apply(graph, lhs, rhs, op, reduce, warps_per_block, features_per_block, tiles_y)
+    return _gspmm_apply(graph, lhs, rhs, op, reduce, warps_per_block, features_per_block, tiles_y, pipeline_stages)
 
 
 

@@ -15,7 +15,8 @@ std::vector<torch::Tensor> gspmm_forward(
     const std::string& reduce,
     int warps_per_block    = 8,
     int features_per_block = 32,
-    int tiles_y            = 8
+    int tiles_y            = 8,
+    int pipeline_stages    = 0
 );
 
 std::vector<torch::Tensor> gspmm_backward_arg(

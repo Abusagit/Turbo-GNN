@@ -17,7 +17,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dim", type=int, default=None, help="show only this feature width (default: all)")
     p.add_argument("--reducers", default="sum,min,max")
     p.add_argument("--ops", default=None, help="comma-separated subset of ops")
+    p.add_argument("--kind", default=None, choices=["fwd", "bwd", "fb"], help="forward, backward, or both")
     p.add_argument("--title", default=None)
+    p.add_argument("--xlabel", default=None)
     p.add_argument("--max-bars", type=int, default=64, help="keep the chart legible; drops the middle of the ranking")
     return p.parse_args()
 
@@ -33,7 +35,10 @@ def main() -> int:
         with open(path) as fh:
             blob = json.load(fh)
         meta = blob["meta"]
-        subtitle_bits.append(f"{meta['graph']} (N={meta['N']:,}, E={meta['E']:,})")
+        if meta.get("subtitle"):
+            subtitle_bits.append(meta["subtitle"])
+        else:
+            subtitle_bits.append(f"{meta['graph']} (N={meta['N']:,}, E={meta['E']:,})")
         for cell in blob["cells"]:
             if args.dim is not None and cell["d"] != args.dim:
                 continue
@@ -41,8 +46,10 @@ def main() -> int:
                 continue
             if keep_ops and cell["op"] not in keep_ops:
                 continue
+            if args.kind is not None and cell.get("kind", "fwd") != args.kind:
+                continue
             rows.append({
-                "label": f"{meta['graph']} | {cell['op']}/{cell['reduce']} | d={cell['d']}",
+                "label": f"{cell.get('graph', meta['graph'])} | {cell['op']}/{cell['reduce']} | d={cell['d']}",
                 "speedup": cell["dgl_ms"] / cell["turbo_ms"],
             })
 
@@ -68,7 +75,7 @@ def main() -> int:
     ax.set_yticklabels(labels, fontsize=9)
     ax.axvline(1.0, color="black", linestyle="--", linewidth=1)
     ax.set_xlim(0, max(vals) * 1.12)
-    ax.set_xlabel("Ускорение: dgl / turbo_gnn (forward, медиана из 7 прогонов по 30 запусков)")
+    ax.set_xlabel(args.xlabel or "Ускорение: dgl / turbo_gnn (forward, медиана из 7 прогонов по 30 запусков)")
     ax.set_title(args.title or "g-SpMM: turbo_gnn против DGL по конфигурациям"
                  + (f" (d={args.dim})" if args.dim else ""))
     for i, v in enumerate(vals):

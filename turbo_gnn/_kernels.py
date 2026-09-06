@@ -301,9 +301,9 @@ class GSpMMKernel(TunableKernel):
     - ``forward_huge_degree_threshold_quantile``: degree quantile for the
       light/heavy partition (-1 disables bucketing, all nodes go to light).
 
-    Unlike :class:`ReductionAggrKernel` there is no ``use_2d_kernel`` or
-    ``pipeline_stages`` knob: the packed-atomics heavy variant does not
-    generalize past min/max, so the tiled kernel is the only heavy path.
+    Unlike :class:`ReductionAggrKernel` there is no ``use_2d_kernel`` knob: the
+    packed-atomics heavy variant does not generalize past min/max, so the tiled
+    kernel is the only heavy path.
     """
 
     def __init__(self, op: str = "copy_u", reduce: str = "sum", **kwargs):
@@ -313,6 +313,7 @@ class GSpMMKernel(TunableKernel):
         self.forward_warps_per_block = kwargs.get("warps_per_block", 8)
         self.forward_features_per_block = kwargs.get("features_per_block", 32)
         self.forward_tiles_y = kwargs.get("tiles_y", 8)
+        self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
 
     def _execute(self, graph, x, *, rhs=None, **kwargs):
         from turbo_gnn.ops import _gspmm_apply
@@ -326,6 +327,7 @@ class GSpMMKernel(TunableKernel):
             self.forward_warps_per_block,
             self.forward_features_per_block,
             self.forward_tiles_y,
+            self.forward_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -333,6 +335,7 @@ class GSpMMKernel(TunableKernel):
             TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
             TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
             TunableParam("forward_tiles_y", [2, 4, 8, 16], default=8),
+            TunableParam("forward_pipeline_stages", [0, 1], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
