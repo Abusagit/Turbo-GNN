@@ -127,7 +127,7 @@ class TunableKernel(ABC):
             x = args[1]
             extra_args = args[2:]
 
-            feat_dim = x.shape[-1] if x.ndim > 1 else 1
+            feat_dim = _infer_feat_dim(x, *extra_args, *kwargs.values())
             cached = self._inline_cache.lookup(graph, feat_dim)
             if cached is not None:
                 if cached["kernel_config"]:
@@ -241,6 +241,22 @@ class TunableKernel(ABC):
         return type(self).__name__
 
 
+def _infer_feat_dim(*candidates) -> int:
+    """Feature width of the first tensor-like argument that is actually present.
+
+    The autotune cache is keyed on it, so it must not be taken from a fixed
+    argument position: `gspmm(graph, None, e, op="copy_e")` carries no node
+    tensor at all, and its width lives on the edge operand instead. A 1-D
+    operand (per-edge scalars) counts as width 1, matching how the kernels
+    derive `d`.
+    """
+    for t in candidates:
+        if t is None or not hasattr(t, "shape"):
+            continue
+        return t.shape[-1] if t.ndim > 1 else 1
+    return 1
+
+
 def with_autotune(kernel_class, *, init_params=()):
     """Decorator that adds autotune=True support to a kernel function.
 
@@ -273,7 +289,7 @@ def with_autotune(kernel_class, *, init_params=()):
 
             kernel = kernel_class._get_or_create(**init_kw)
 
-            feat_dim = x.shape[-1] if x.ndim > 1 else 1
+            feat_dim = _infer_feat_dim(x, *all_kw.values())
             cached = kernel._inline_cache.lookup(graph, feat_dim)
             if cached is not None:
                 if cached["kernel_config"]:

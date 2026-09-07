@@ -1,4 +1,7 @@
 .vscode
+.clangd
+compile_commands.json
+.cache/clangd
 CLAUDE.md
 .claude
 

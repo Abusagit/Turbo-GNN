@@ -21,8 +21,8 @@ from turbo_gnn._functions import (
 )
 from turbo_gnn._kernels import (
     GATv2AggrKernel,
-    GSpMMKernel,
     GraphTransformerAggrKernel,
+    GSpMMKernel,
     ReductionAggrKernel,
 )
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
@@ -258,7 +258,6 @@ def spmm_aggr(x, forward_indptr, forward_indices, norm_type, cu_sparse_algorithm
     return _CudaSpMMConvFn.apply(x, forward_indptr, forward_indices, norm_type, cu_sparse_algorithm_id, block_dim)
 
 
-
 _GSPMM_OPS = ("copy_u", "copy_e", "add", "sub", "mul", "div")
 _GSPMM_REDUCERS = ("sum", "min", "max")
 
@@ -359,8 +358,6 @@ def gspmm(
         raise ValueError("gspmm(op='copy_e') ignores node data; pass lhs=None")
 
     return _gspmm_apply(graph, lhs, rhs, op, reduce, warps_per_block, features_per_block, tiles_y, pipeline_stages)
-
-
 
 
 def copy_u_sum(graph, x, **kwargs):
