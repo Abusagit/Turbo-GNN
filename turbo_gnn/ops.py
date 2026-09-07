@@ -294,6 +294,8 @@ def _gspmm_apply(
         features_per_block,
         tiles_y,
         pipeline_stages,
+        graph.max_degree,
+        graph.backward_max_degree,
     )
 
 

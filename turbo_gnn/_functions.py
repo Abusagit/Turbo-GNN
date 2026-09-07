@@ -540,6 +540,8 @@ class GSpMMFunction(torch.autograd.Function):
         features_per_block=32,
         tiles_y=8,
         pipeline_stages=0,
+        max_degree=-1,
+        bwd_max_degree=-1,
     ):
         if torch.is_autocast_enabled():
             target = torch.get_autocast_gpu_dtype()
@@ -570,6 +572,8 @@ class GSpMMFunction(torch.autograd.Function):
             features_per_block,
             tiles_y,
             pipeline_stages,
+            edge_ptr[:0],  # no edge map on a forward pass
+            max_degree,
         )
 
         ctx.save_for_backward(
@@ -581,6 +585,7 @@ class GSpMMFunction(torch.autograd.Function):
         ctx.features_per_block = features_per_block
         ctx.tiles_y = tiles_y
         ctx.pipeline_stages = pipeline_stages
+        ctx.bwd_max_degree = bwd_max_degree
         return out
 
     @staticmethod
@@ -659,6 +664,7 @@ class GSpMMFunction(torch.autograd.Function):
                     ctx.tiles_y,
                     ctx.pipeline_stages,
                     edge_map,
+                    ctx.bwd_max_degree,
                 )
 
             if rhs_needs_grad:
@@ -684,4 +690,6 @@ class GSpMMFunction(torch.autograd.Function):
             None,  # features_per_block
             None,  # tiles_y
             None,  # pipeline_stages
+            None,  # max_degree
+            None,  # bwd_max_degree
         )

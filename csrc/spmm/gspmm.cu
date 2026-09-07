@@ -108,6 +108,12 @@ constexpr size_t kGSpMMWarpsPerBlock = 1024 / kWarpSize;
 // (d = 65 among them), so it always takes the scalar path.
 constexpr bool kGSpMMVectorize = false;
 
+// Neighbors one block of the sliced heavy-node kernel takes.  Only graphs
+// whose top degree exceeds this get sliced at all: below it every node would
+// come out as a single slice, and the partials buffer and its reduce pass
+// would be pure overhead.
+constexpr int64_t kGSpMMHeavySliceEdges = 1024;
+
 // Edges one warp of the edge-gradient kernel walks before the grid stride.
 // Long enough to amortize the binary search that locates the first edge's
 // destination, short enough to keep tens of thousands of warps in flight.
@@ -128,7 +134,8 @@ std::vector<torch::Tensor> gspmm_forward(
     int features_per_block,
     int tiles_y,
     int pipeline_stages,
-    const torch::Tensor& edge_map
+    const torch::Tensor& edge_map,
+    int max_degree
 ) {
     const BinaryOp bop    = binary_op_from_string(op);
     const ReductionOp rop = reduce_op_from_string(reduce);
@@ -178,6 +185,11 @@ std::vector<torch::Tensor> gspmm_forward(
         TORCH_CHECK(features_per_block * tiles_y <= 1024, "features_per_block * tiles_y must be <= 1024");
     }
 
+    // Slicing pays off only when some heavy node is far bigger than the rest;
+    // it also needs an accumulating reducer, since a partial value alone does
+    // not carry the winning edge index that min/max must report.
+    const bool slice_heavy = (num_heavy > 0 && rop == ReductionOp::SUM && max_degree > kGSpMMHeavySliceEdges);
+
     const torch::Tensor& val_ref = op_uses_lhs(bop) ? lhs : rhs;
 
     auto out = torch::empty({num_nodes, layout.d}, val_ref.options());
@@ -185,6 +197,27 @@ std::vector<torch::Tensor> gspmm_forward(
     // [N, d] of index dtype that allocation would cost as much as the output.
     const bool tracks_arg = (rop != ReductionOp::SUM);
     auto arg_eid          = tracks_arg ? torch::empty({num_nodes, layout.d}, edge_ptr.options()) : torch::empty({0}, edge_ptr.options());
+
+    torch::Tensor slice_offsets;
+    torch::Tensor slice_partials;
+    if (slice_heavy) {
+        // Exclusive prefix sum of each heavy node's slice count, shaped like a
+        // CSR row pointer so the kernel can binary-search it.  Its last entry
+        // is the total slice count, which the kernel reads on the device --
+        // fetching it here would mean a device-to-host sync per call.
+        const auto heavy_long = heavy_nodes.to(torch::kLong);
+        const auto degrees    = edge_ptr.index_select(0, heavy_long + 1) - edge_ptr.index_select(0, heavy_long);
+        const auto counts     = (degrees.to(torch::kLong) + (kGSpMMHeavySliceEdges - 1)).div(kGSpMMHeavySliceEdges, "trunc");
+
+        slice_offsets = torch::zeros({num_heavy + 1}, edge_ptr.options());
+        slice_offsets.slice(0, 1, num_heavy + 1).copy_(counts.cumsum(0));
+
+        // Σ ceil(deg / SLICE) <= num_heavy + E / SLICE, and that bound is
+        // known here, so the buffer can be sized without reading the real
+        // count back from the device.
+        const int64_t max_slices = num_heavy + (edge_idx.numel() + kGSpMMHeavySliceEdges - 1) / kGSpMMHeavySliceEdges;
+        slice_partials           = torch::empty({max_slices, layout.d}, out.options().dtype(torch::kFloat));
+    }
 
     // The two buckets own disjoint output rows, so their launches are
     // independent.  Given a stream each, the light kernel can occupy the SMs
@@ -204,8 +237,8 @@ std::vector<torch::Tensor> gspmm_forward(
         // These were allocated against the caller's stream but are touched on
         // another one, so the caching allocator has to be told before it can
         // consider recycling them.
-        const std::array<const torch::Tensor *, 7> touched_on_side = {
-            &out, &arg_eid, &lhs, &rhs, &edge_ptr, &edge_idx, &heavy_nodes
+        const std::array<const torch::Tensor *, 9> touched_on_side = {
+            &out, &arg_eid, &lhs, &rhs, &edge_ptr, &edge_idx, &heavy_nodes, &slice_offsets, &slice_partials
         };
         for (const torch::Tensor *t : touched_on_side) {
             if (t->defined() && t->numel() > 0) {
@@ -289,7 +322,57 @@ std::vector<torch::Tensor> gspmm_forward(
                     );
                 }
 
-                if (num_heavy > 0) {
+                if (num_heavy > 0 && slice_heavy) {
+                    // Comparison reducers never reach here (slice_heavy is
+                    // gated on SUM), so this half of the table is not built.
+                    if constexpr (ROP != ReductionOp::SUM) {
+                        return;
+                    } else {
+                        const dim3 block_h(static_cast<unsigned>(features_per_block), static_cast<unsigned>(tiles_y));
+                        const size_t shmem_s =
+                            static_cast<size_t>(features_per_block) * static_cast<size_t>(tiles_y) * sizeof(float);
+
+                        // Sized for occupancy: the kernel grid-strides over the
+                        // slice count, which only the device knows.
+                        const int sm_count      = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+                        const unsigned blocks_s = static_cast<unsigned>(std::max(sm_count * 16, 1));
+
+                        ensure_dynamic_shmem(
+                            gspmm_heavy_sum_sliced_kernel<
+                                cuda_t, index_t, BOP, BCAST, EMAP, static_cast<size_t>(kGSpMMHeavySliceEdges)>,
+                            shmem_s, "gspmm heavy sliced"
+                        );
+
+                        gspmm_heavy_sum_sliced_kernel<
+                            cuda_t, index_t, BOP, BCAST, EMAP, static_cast<size_t>(kGSpMMHeavySliceEdges)
+                        ><<<blocks_s, block_h, shmem_s, heavy_stream>>>(
+                            index_ptr<index_t>(heavy_nodes),
+                            index_ptr<index_t>(slice_offsets),
+                            index_ptr<index_t>(edge_ptr),
+                            index_ptr<index_t>(edge_idx),
+                            lhs_ptr,
+                            rhs_ptr,
+                            emap_ptr,
+                            slice_partials.data_ptr<float>(),
+                            static_cast<size_t>(num_heavy),
+                            d
+                        );
+
+                        const unsigned reduce_threads = 256;
+                        const unsigned reduce_blocks  = static_cast<unsigned>(
+                            std::min<int64_t>((num_heavy * layout.d + reduce_threads - 1) / reduce_threads, 65535)
+                        );
+                        gspmm_heavy_reduce_slices_kernel<cuda_t, index_t>
+                            <<<std::max(reduce_blocks, 1u), reduce_threads, 0, heavy_stream>>>(
+                                index_ptr<index_t>(heavy_nodes),
+                                index_ptr<index_t>(slice_offsets),
+                                slice_partials.data_ptr<float>(),
+                                out_ptr,
+                                static_cast<size_t>(num_heavy),
+                                d
+                            );
+                    }
+                } else if (num_heavy > 0) {
                     const dim3 grid_h(static_cast<unsigned>(num_heavy));
                     const dim3 block_h(static_cast<unsigned>(features_per_block), static_cast<unsigned>(tiles_y));
                     // Same expression the kernel places its index array with.

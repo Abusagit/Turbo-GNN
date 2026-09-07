@@ -26,7 +26,12 @@ std::vector<torch::Tensor> gspmm_forward(
     // The pybind binding hands over an *empty* tensor rather than relying on
     // this default: an undefined one renders as a Python None that pybind then
     // cannot cast back to a Tensor reference.
-    const torch::Tensor& edge_map  = {}
+    const torch::Tensor& edge_map  = {},
+    // Largest in-degree of the CSR being walked, which decides whether the
+    // heavy bucket is worth slicing across blocks.  -1 means "unknown", and
+    // slicing is then left off -- reading it off the device here would cost a
+    // sync on every call.
+    int max_degree                 = -1
 );
 
 std::vector<torch::Tensor> gspmm_backward_arg(
