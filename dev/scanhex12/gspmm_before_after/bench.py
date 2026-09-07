@@ -102,26 +102,24 @@ def time_ms(fn, iters=30, repeats=5, warmup=10) -> float:
     return statistics.median(samples)
 
 
-def run(args) -> dict:
-    dtype = getattr(torch, args.dtype)
-    graph = make_graph(args.nodes, args.degree, args.graph)
-    num_edges = graph.forward_indices.numel()
-    indptr = graph.forward_indptr.long()
-    degrees = indptr[1:] - indptr[:-1]
+def measure_cell(graph, num_nodes, num_edges, op, reduce, d, dtype, stages) -> dict:
+    """Time one (op, reduce, d) both ways, or record why it could not run.
 
-    warm_up_device(lambda: gspmm(graph, torch.randn(args.nodes, args.dim, device="cuda", dtype=dtype), None, op="copy_u", reduce="sum"))
-
-    cells = []
-    for op, reduce in CELLS:
-        x = None
+    An OOM is caught and reported rather than raised: this sweep is meant to be
+    started and left alone, and a wide operand at float32 running out of memory
+    should cost that one cell, not the night.
+    """
+    row = {"op": op, "reduce": reduce, "d": d}
+    x = e = y = grad_out = None
+    try:
         if op != "copy_e":
-            x = torch.randn(args.nodes, args.dim, device="cuda", dtype=dtype, requires_grad=True)
-        e = None
+            x = torch.randn(num_nodes, d, device="cuda", dtype=dtype, requires_grad=True)
         if op != "copy_u":
-            e = (torch.rand(num_edges, args.dim, device="cuda", dtype=dtype) + 0.5).requires_grad_(True)
+            # offset away from zero so that div stays well conditioned
+            e = (torch.rand(num_edges, d, device="cuda", dtype=dtype) + 0.5).requires_grad_(True)
 
-        kw = {"op": op, "reduce": reduce, "pipeline_stages": args.stages}
-        fwd = time_ms(lambda: gspmm(graph, x, e, **kw))
+        kw = {"op": op, "reduce": reduce, "pipeline_stages": stages}
+        row["fwd_ms"] = time_ms(lambda: gspmm(graph, x, e, **kw))
 
         y = gspmm(graph, x, e, **kw)
         grad_out = torch.randn_like(y)
@@ -132,14 +130,40 @@ def run(args) -> dict:
                     t.grad = None
             y.backward(grad_out, retain_graph=True)
 
-        cells.append({"op": op, "reduce": reduce, "fwd_ms": fwd, "bwd_ms": time_ms(backward)})
+        row["bwd_ms"] = time_ms(backward)
+    except torch.OutOfMemoryError as exc:
+        row["error"] = f"out of memory: {exc}".split("\n")[0]
+    except RuntimeError as exc:
+        row["error"] = str(exc).split("\n")[0]
+    finally:
+        del x, e, y, grad_out
+        torch.cuda.empty_cache()
+    return row
+
+
+def run(args) -> dict:
+    dtype = getattr(torch, args.dtype)
+    graph = make_graph(args.nodes, args.degree, args.graph)
+    num_edges = graph.forward_indices.numel()
+    indptr = graph.forward_indptr.long()
+    degrees = indptr[1:] - indptr[:-1]
+
+    warm = torch.randn(args.nodes, args.dims[0], device="cuda", dtype=dtype)
+    warm_up_device(lambda: gspmm(graph, warm, None, op="copy_u", reduce="sum"))
+    del warm
+    torch.cuda.empty_cache()
+
+    cells = []
+    for d in args.dims:
+        for op, reduce in CELLS:
+            cells.append(measure_cell(graph, args.nodes, num_edges, op, reduce, d, dtype, args.stages))
 
     return {
         "meta": {
             "graph": args.graph,
             "N": args.nodes,
             "E": num_edges,
-            "d": args.dim,
+            "dims": args.dims,
             "dtype": args.dtype,
             "stages": args.stages,
             "max_degree": int(degrees.max().item()),
@@ -157,11 +181,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--graph", default="random", choices=["random", "skewed"])
     p.add_argument("--nodes", type=int, default=169343)
     p.add_argument("--degree", type=int, default=8)
-    p.add_argument("--dim", type=int, default=64)
+    p.add_argument("--dims", default="64", help="comma-separated feature widths, e.g. 32,64,128")
     p.add_argument("--dtype", default="float16")
     p.add_argument("--stages", type=int, default=0)
     p.add_argument("--label", default=None, help="shown on the chart, e.g. a commit subject")
-    return p.parse_args()
+    args = p.parse_args()
+    args.dims = [int(v) for v in args.dims.split(",")]
+    return args
 
 
 def main() -> int:
@@ -169,11 +195,16 @@ def main() -> int:
     blob = run(args)
     meta = blob["meta"]
 
-    print(f"{meta['dtype']}, {meta['graph']}, N={meta['N']:,}, E={meta['E']:,}, d={meta['d']}, stages={meta['stages']}")
+    print(f"{meta['dtype']}, {meta['graph']}, N={meta['N']:,}, E={meta['E']:,}, "
+          f"d={','.join(map(str, meta['dims']))}, stages={meta['stages']}")
     print(f"max in-degree {meta['max_degree']:,}, heavy nodes {meta['heavy_nodes']:,}, {meta['gpu']}")
-    print(f"{'cell':14s} {'fwd':>8s} {'bwd':>8s}")
+    print(f"{'cell':14s} {'d':>4s} {'fwd':>8s} {'bwd':>8s}")
     for c in blob["cells"]:
-        print(f"{c['op'] + '/' + c['reduce']:14s} {c['fwd_ms']:8.3f} {c['bwd_ms']:8.3f}")
+        name = f"{c['op']}/{c['reduce']}"
+        if "error" in c:
+            print(f"{name:14s} {c['d']:4d}   SKIPPED  {c['error'][:60]}")
+        else:
+            print(f"{name:14s} {c['d']:4d} {c['fwd_ms']:8.3f} {c['bwd_ms']:8.3f}")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
