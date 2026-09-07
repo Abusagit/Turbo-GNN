@@ -146,6 +146,17 @@ for k in bwd fwd; do
 done
 ```
 
+Ниже — headline-конфигурация (fp16, stages=0, d=64). Полный набор по всем
+конфигурациям лежит в [gspmm_before_after/plots/](gspmm_before_after/plots/),
+его строит `run.sh` тем же прогоном:
+
+| имя | что показывает |
+|---|---|
+| `ba_{dtype}_st{N}_{fwd,bwd}_d64.png` | до/после для каждого dtype и каждого числа стадий |
+| `ba_float16_st0_{fwd,bwd}_d{32,128}.png` | то же на других ширинах признаков |
+| `stages_{dtype}_{graph}_{fwd,bwd}_d64.png` | каждое stages против stages=0 |
+| `dtype_{fwd,bwd}_d64.png` | float32 против float16 |
+
 ![backward](fp16_bwd_before_after.png)
 
 ![forward](fp16_fwd_before_after.png)
