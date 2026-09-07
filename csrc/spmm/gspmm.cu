@@ -105,6 +105,11 @@ constexpr size_t kGSpMMWarpsPerBlock = 1024 / kWarpSize;
 // (d = 65 among them), so it always takes the scalar path.
 constexpr bool kGSpMMVectorize = false;
 
+// Edges one warp of the edge-gradient kernel walks before the grid stride.
+// Long enough to amortize the binary search that locates the first edge's
+// destination, short enough to keep tens of thousands of warps in flight.
+constexpr int64_t kGSpMMEdgesPerWarp = 32;
+
 }  // namespace
 
 std::vector<torch::Tensor> gspmm_forward(
@@ -421,6 +426,7 @@ torch::Tensor gspmm_backward_edge(
     auto grad_rhs = torch::empty(rhs.sizes(), grad_opts);
 
     const int64_t num_nodes = grad_out.size(0);
+    const int64_t num_edges = edge_idx.numel();
     const int64_t d         = grad_out.size(1);
 
     std::visit(
@@ -446,9 +452,11 @@ torch::Tensor gspmm_backward_edge(
                 }
 
                 const unsigned threads = static_cast<unsigned>(static_cast<size_t>(warps_per_block) * kWarpSize);
-                // One block per destination node, capped: the kernel
-                // grid-strides over whatever does not fit.
-                const unsigned blocks = static_cast<unsigned>(std::min<int64_t>(num_nodes, 65535));
+                // One warp per run of kGSpMMEdgesPerWarp edges, capped: the
+                // kernel grid-strides over whatever does not fit.
+                const int64_t runs         = (num_edges + kGSpMMEdgesPerWarp - 1) / kGSpMMEdgesPerWarp;
+                const int64_t warps_needed = (runs + static_cast<int64_t>(warps_per_block) - 1) / warps_per_block;
+                const unsigned blocks      = static_cast<unsigned>(std::max<int64_t>(std::min<int64_t>(warps_needed, 65535), 1));
 
                 gspmm_backward_edge_kernel<BOP, BCAST, cuda_t, index_t, /*grad_t=*/cuda_t><<<blocks, threads>>>(
                     index_ptr<index_t>(edge_ptr),
@@ -458,6 +466,7 @@ torch::Tensor gspmm_backward_edge(
                     rhs_ptr,
                     reinterpret_cast<cuda_t *>(grad_rhs.data_ptr<torch_t>()),
                     static_cast<size_t>(num_nodes),
+                    static_cast<size_t>(num_edges),
                     static_cast<size_t>(d)
                 );
             }

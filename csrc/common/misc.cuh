@@ -116,38 +116,26 @@ __device__ __forceinline__ T warp_reduce_max(T x) {
     return x;
 }
 
-// Largest warp count a block can hold, and hence the size of the scratch a
-// block-wide reduction needs.
-inline constexpr size_t kMaxWarpsInBlock = kMaxThreadsInBlock / kWarpSize;
-
-// Block-wide sum over a 1-D block: every thread contributes one value and
-// thread 0 receives the total (other threads get an unspecified value).
+// Row that owns a given CSR position: the largest v with edge_ptr[v] <= pos.
 //
-// Every thread of the block must reach this call -- it synchronizes twice, and
-// the warp shuffles assume a full warp -- so a thread with nothing to add
-// passes the identity rather than skipping the call.  The second sync is what
-// makes the scratch reusable, so the same buffer can serve a reduction inside
-// a loop.
-template <typename T>
-__device__ __forceinline__ T block_reduce_sum(T x, T *const __restrict__ scratch) {
-    const size_t lane      = threadIdx.x % kWarpSize;
-    const size_t warp      = threadIdx.x / kWarpSize;
-    const size_t num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
-
-    x = warp_reduce_sum(x);
-    if (lane == 0) {
-        scratch[warp] = x;
-    }
-    __syncthreads();
-
-    T total{};
-    if (threadIdx.x == 0) {
-        for (size_t w = 0; w < num_warps; ++w) {
-            total += scratch[w];
+// Lets a kernel parallelize over edges without a precomputed row-per-edge
+// array -- a skewed graph makes one-block-per-row hopeless, since a single
+// block would then walk tens of thousands of edges while its neighbours idle.
+// Empty rows are handled by taking the *last* v of a run of equal offsets,
+// which is the row that actually owns the position.
+template <typename index_t>
+__device__ __forceinline__ size_t csr_row_of(index_t const *const __restrict__ edge_ptr, size_t num_rows, size_t pos) {
+    size_t lo = 0;
+    size_t hi = num_rows;  // invariant: the answer lives in [lo, hi)
+    while (hi - lo > 1) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (static_cast<size_t>(edge_ptr[mid]) <= pos) {
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
-    __syncthreads();
-    return total;
+    return lo;
 }
 
 struct OnlineSoftmaxState {
