@@ -4,13 +4,46 @@ import heapq
 from collections import deque
 from dataclasses import dataclass, field
 from math import ceil, floor
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 import numpy as np
 
-
 Assignment = Literal["contiguous", "grid_strided", "lpt"]
 LaunchMode = Literal["single", "sequential", "concurrent"]
+
+
+@dataclass(frozen=True)
+class CostModel:
+    """Thread-block lifetime as ``alpha + beta * degree`` ticks per node.
+
+    One tick is the time to process one neighbour, so ``beta`` is 1 by construction for a
+    calibrated model and ``alpha`` carries the prologue and epilogue: loading the node's own
+    feature row, and writing its output back to HBM.  ``alpha = 2, beta = 1`` reproduces the
+    original ``D + 2`` model exactly.
+
+    Real convolutions have a much heavier prologue than min-aggregation -- GT and GATv2 read
+    Q/K/V rows and attention parameters and write a logsumexp -- so ``alpha`` is fitted per
+    (conv, pass, head dim) by :mod:`turbo_gnn.calibration` rather than assumed.
+    """
+
+    alpha: float = 2.0
+    beta: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.alpha < 0:
+            raise ValueError("alpha must be non-negative")
+        if self.beta <= 0:
+            raise ValueError("beta must be positive")
+
+    def node_cost(self, degree: int) -> float:
+        return self.alpha + self.beta * degree
+
+    def block_cost(self, degrees: Sequence[int]) -> int:
+        """Ticks a block spends on ``degrees``, rounded to a whole tick and at least one."""
+        return max(1, round(sum(self.node_cost(int(degree)) for degree in degrees)))
+
+
+DEFAULT_COST_MODEL = CostModel()
 
 
 @dataclass(frozen=True)
@@ -34,10 +67,11 @@ class BlockSpec:
     kernel: str
     node_ids: tuple[int, ...]
     degrees: tuple[int, ...]
+    cost_model: CostModel = DEFAULT_COST_MODEL
 
     @property
     def cost(self) -> int:
-        return sum(d + 2 for d in self.degrees)
+        return self.cost_model.block_cost(self.degrees)
 
 
 @dataclass
@@ -47,6 +81,11 @@ class SimulationConfig:
     seed: int = 42
     launch_mode: LaunchMode = "single"
     light_launch_latency: int = 0
+    ns_per_tick: float | None = None
+    """Wall-clock duration of one tick, from :func:`turbo_gnn.calibration.fit_cost_model`.
+
+    Set it and the makespan becomes a predicted time in nanoseconds, directly comparable to a
+    measured kernel time.  Left unset, the simulation is only comparable to itself."""
 
 
 @dataclass
@@ -62,10 +101,18 @@ class SimulationResult:
     bandwidth_utilisation: np.ndarray
     retired_work: np.ndarray
     active_blocks: dict[str, np.ndarray]
+    ns_per_tick: float | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
+    @property
+    def predicted_ms(self) -> float | None:
+        """Makespan in milliseconds, or None when the timebase was never calibrated."""
+        if self.ns_per_tick is None:
+            return None
+        return self.makespan * self.ns_per_tick / 1e6
+
     def summary(self) -> dict[str, object]:
-        result = {
+        result: dict[str, object] = {
             "makespan": self.makespan,
             "perfect_packing_time": self.perfect_packing_time,
             "imbalance_ratio": self.imbalance_ratio,
@@ -73,11 +120,10 @@ class SimulationResult:
             "retired_95_time": self.retired_95_time,
             "total_work": self.total_work,
             "bandwidth_cap": self.bandwidth_cap,
+            "predicted_ms": self.predicted_ms,
             "mean_slot_utilisation": float(self.sm_utilisation.mean()) if self.sm_utilisation.size else 0.0,
             "mean_bandwidth_utilisation": (
-                float(self.bandwidth_utilisation.mean())
-                if self.bandwidth_utilisation.size
-                else 0.0
+                float(self.bandwidth_utilisation.mean()) if self.bandwidth_utilisation.size else 0.0
             ),
         }
         result.update(self.metadata)
@@ -105,14 +151,15 @@ def _validate_degrees(degrees: Sequence[int]) -> np.ndarray:
     return degree_array
 
 
-def _lpt_bins(degrees: np.ndarray, num_blocks: int) -> list[list[int]]:
+def _lpt_bins(degrees: np.ndarray, num_blocks: int, cost_model: CostModel) -> list[list[int]]:
+    costs = cost_model.alpha + cost_model.beta * degrees.astype(np.float64)
     bins: list[list[int]] = [[] for _ in range(num_blocks)]
-    loads = [(0, block_id) for block_id in range(num_blocks)]
+    loads = [(0.0, block_id) for block_id in range(num_blocks)]
     heapq.heapify(loads)
-    for node in np.argsort(-degrees, kind="stable"):
+    for node in np.argsort(-costs, kind="stable"):
         load, block_id = heapq.heappop(loads)
         bins[block_id].append(int(node))
-        heapq.heappush(loads, (load + int(degrees[node]), block_id))
+        heapq.heappush(loads, (load + float(costs[node]), block_id))
     return bins
 
 
@@ -123,6 +170,7 @@ def build_blocks(
     vertices_per_block: int = 1,
     num_blocks: int | None = None,
     num_heads: int = 1,
+    cost_model: CostModel = DEFAULT_COST_MODEL,
 ) -> list[BlockSpec]:
     degree_array = _validate_degrees(degrees)
     if num_heads <= 0:
@@ -145,7 +193,7 @@ def build_blocks(
     elif assignment == "grid_strided":
         groups = [list(range(block_id, num_nodes, num_blocks)) for block_id in range(num_blocks)]
     elif assignment == "lpt":
-        groups = _lpt_bins(degree_array, num_blocks)
+        groups = _lpt_bins(degree_array, num_blocks, cost_model)
     else:
         raise ValueError(f"unknown assignment: {assignment}")
 
@@ -156,6 +204,7 @@ def build_blocks(
             kernel,
             tuple(g),
             tuple(int(degree_array[node]) for node in g),
+            cost_model,
         )
         for head in range(num_heads)
         for block_id, g in enumerate(groups)
@@ -163,7 +212,11 @@ def build_blocks(
 
 
 def build_heavy_slices(
-    degrees: Sequence[int], slice_size: int, kernel: str = "heavy", num_heads: int = 1
+    degrees: Sequence[int],
+    slice_size: int,
+    kernel: str = "heavy",
+    num_heads: int = 1,
+    cost_model: CostModel = DEFAULT_COST_MODEL,
 ) -> list[BlockSpec]:
     degree_array = _validate_degrees(degrees)
     if slice_size <= 0:
@@ -176,12 +229,9 @@ def build_heavy_slices(
             if degree == 0:
                 sizes = [0]
             else:
-                sizes = [
-                    min(slice_size, int(degree) - start)
-                    for start in range(0, int(degree), slice_size)
-                ]
+                sizes = [min(slice_size, int(degree) - start) for start in range(0, int(degree), slice_size)]
             for size in sizes:
-                blocks.append(BlockSpec(len(blocks), kernel, (node,), (size,)))
+                blocks.append(BlockSpec(len(blocks), kernel, (node,), (size,), cost_model))
     return blocks
 
 
@@ -193,8 +243,8 @@ class _Running:
 
 
 def simulate(
-    workloads: dict[str, Sequence[BlockSpec]],
-    kernels: dict[str, KernelConfig],
+    workloads: Mapping[str, Sequence[BlockSpec]],
+    kernels: Mapping[str, KernelConfig],
     config: SimulationConfig,
 ) -> SimulationResult:
     if config.num_sms <= 0:
@@ -206,10 +256,7 @@ def simulate(
         raise ValueError(f"unknown launch_mode: {config.launch_mode}")
 
     rng = np.random.default_rng(config.seed)
-    queues = {
-        name: deque(sorted(blocks, key=lambda block: block.block_id))
-        for name, blocks in workloads.items()
-    }
+    queues = {name: deque(sorted(blocks, key=lambda block: block.block_id)) for name, blocks in workloads.items()}
 
     total_work = sum(block.cost for blocks in workloads.values() for block in blocks)
     bandwidth_cap = config.bandwidth_cap
@@ -227,7 +274,7 @@ def simulate(
     sm_history: list[np.ndarray] = []
     bw_history: list[float] = []
     retired_history: list[int] = []
-    active_history = {name: [] for name in kernel_names}
+    active_history: dict[str, list[int]] = {name: [] for name in kernel_names}
     processed_work = 0
     retired_work = 0
     time = 0
@@ -311,10 +358,10 @@ def simulate(
     retired = np.asarray(retired_history, dtype=np.int64)
     threshold = 0.95 * total_work
     retired_95 = int(np.searchsorted(retired, threshold, side="left") + 1) if total_work else 0
-    slot_lower_bound = sum(
-        block.cost / kernels[name].resident_blocks_per_sm
-        for name, blocks in workloads.items() for block in blocks
-    ) / config.num_sms
+    slot_lower_bound = (
+        sum(block.cost / kernels[name].resident_blocks_per_sm for name, blocks in workloads.items() for block in blocks)
+        / config.num_sms
+    )
     bandwidth_lower_bound = total_work / bandwidth_cap
     perfect_packing_time = max(slot_lower_bound, bandwidth_lower_bound)
     return SimulationResult(
@@ -328,15 +375,18 @@ def simulate(
         sm_utilisation=np.stack(sm_history) if sm_history else np.empty((0, config.num_sms)),
         bandwidth_utilisation=np.asarray(bw_history),
         retired_work=retired,
-        active_blocks={
-            name: np.asarray(values, dtype=np.int64)
-            for name, values in active_history.items()
-        },
+        active_blocks={name: np.asarray(values, dtype=np.int64) for name, values in active_history.items()},
+        ns_per_tick=config.ns_per_tick,
         metadata={
             "num_sms": config.num_sms,
             "seed": config.seed,
             "launch_mode": config.launch_mode,
             "light_launch_latency": config.light_launch_latency,
             "resident_blocks_per_sm": {name: kernel.resident_blocks_per_sm for name, kernel in kernels.items()},
+            "cost_model": {
+                name: {"alpha": block.cost_model.alpha, "beta": block.cost_model.beta}
+                for name, blocks in workloads.items()
+                for block in blocks[:1]
+            },
         },
     )

@@ -15,8 +15,10 @@ import torch
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
+from turbo_gnn.calibration import load_cost_models, lookup  # noqa: E402
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
 from turbo_gnn.simulation import (  # noqa: E402
+    CostModel,
     KernelConfig,
     SimulationConfig,
     bandwidth_cap_from_hardware,
@@ -24,7 +26,6 @@ from turbo_gnn.simulation import (  # noqa: E402
     build_heavy_slices,
     simulate,
 )
-
 
 REAL_SOURCE = {
     "ogbn-arxiv": "ogbn",
@@ -162,6 +163,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--launch-latency", type=int, default=5)
 
+    parser.add_argument(
+        "--cost-model",
+        type=Path,
+        help="cost_models.json from calibrate_cost_model.py; sets alpha, beta and the tick duration",
+    )
+    parser.add_argument("--conv", default="gt", help="Cost model cell to use from --cost-model")
+    parser.add_argument("--pass", dest="pass_name", default="forward", choices=["forward", "backward"])
+    parser.add_argument("--head-dim", type=int, default=128, help="Cost model cell to use from --cost-model")
+    parser.add_argument("--alpha", type=float, help="Override the fitted per-node cost, in ticks")
+    parser.add_argument("--beta", type=float, help="Override the fitted per-neighbour cost, in ticks")
+    parser.add_argument(
+        "--allow-untrustworthy-cost-model",
+        action="store_true",
+        help="Simulate a cell the calibration flagged as degenerate; expect a very slow, meaningless run",
+    )
+
     parser.add_argument("--sms", type=int, default=132)
     parser.add_argument("--max-blocks-light", type=int, default=8)
     parser.add_argument("--max-blocks-heavy", type=int, default=4)
@@ -173,16 +190,65 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timestep-duration-ns",
         type=float,
-        default=1.0,
-        help="Duration of one simulator iteration in nanoseconds",
+        help="Duration of one simulator iteration in nanoseconds; default is the calibrated tick, or 1.0",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=Path, default=Path("simulation_results"))
     return parser.parse_args()
 
 
+def resolve_cost_model(args: argparse.Namespace) -> tuple[CostModel, float, float | None, dict[str, object]]:
+    """Pick the cost model and the tick duration, and describe where they came from.
+
+    A calibrated cell supplies both: ``alpha`` from the regression, and the tick duration the
+    bandwidth cap needs.  Without one the simulator falls back to ``D + 2`` on a nominal 1 ns
+    tick -- self-consistent, but not a wall clock, so no predicted time is reported.
+
+    Returns:
+        tuple: The cost model, the tick duration to size the bandwidth cap with, the tick
+        duration to report predicted times with (None when uncalibrated), and provenance for
+        ``config.json``.
+    """
+    provenance: dict[str, object] = {"cost_model_source": "default D+2"}
+    calibrated = False
+    alpha, beta, tick = 2.0, 1.0, 1.0
+    if args.cost_model:
+        fit = lookup(load_cost_models(args.cost_model), args.conv, args.pass_name, args.head_dim)
+        alpha, beta, tick = fit.alpha, fit.beta, fit.ns_per_tick
+        calibrated = True
+        provenance = {
+            "cost_model_source": f"{args.cost_model}:{args.conv}/{args.pass_name}/{args.head_dim}",
+            "cost_model_r2": fit.r2,
+            "cost_model_median_rel_error": fit.median_rel_error,
+            "cost_model_note": fit.note,
+        }
+        if fit.note and not args.allow_untrustworthy_cost_model:
+            # Refuse rather than warn: a degenerate fit is not merely inaccurate. A cell whose
+            # time does not scale with degree fits an enormous alpha, and every node then costs
+            # thousands of ticks, so the sweep runs for hours to produce a meaningless number.
+            raise SystemExit(
+                f"{args.conv}/{args.pass_name}/{args.head_dim}: {fit.note}.\n"
+                "Pass --allow-untrustworthy-cost-model to simulate it anyway."
+            )
+    if args.alpha is not None:
+        alpha, provenance["cost_model_source"] = args.alpha, "command line"
+    if args.beta is not None:
+        beta, provenance["cost_model_source"] = args.beta, "command line"
+    if args.timestep_duration_ns is not None:
+        tick, calibrated = args.timestep_duration_ns, True
+    if not calibrated:
+        print(
+            "warning: no --cost-model and no --timestep-duration-ns, so the tick has no duration; "
+            "reporting ticks only. Run scripts/ablation/calibrate_cost_model.py to fix this.",
+            file=sys.stderr,
+        )
+    provenance |= {"alpha": alpha, "beta": beta, "timestep_duration_ns": tick, "calibrated": calibrated}
+    return CostModel(alpha=alpha, beta=beta), tick, tick if calibrated else None, provenance
+
+
 def main() -> int:
     args = parse_args()
+    cost_model, timestep_duration_ns, ns_per_tick, provenance = resolve_cost_model(args)
     all_degrees, light_degrees, heavy_degrees = load_degrees(args)
     args.out.mkdir(parents=True, exist_ok=True)
     trace_dir = args.out / "traces"
@@ -190,16 +256,15 @@ def main() -> int:
     trace_dir.mkdir(exist_ok=True)
     plot_dir.mkdir(exist_ok=True)
 
-    # TODO: Calibrate timestep_duration_ns from measured per-neighbour kernel time.
     bandwidth_cap = bandwidth_cap_from_hardware(
         args.memory_bandwidth_gbps,
         args.feature_dim,
         args.dtype_bytes,
-        args.timestep_duration_ns,
+        timestep_duration_ns,
     )
     rows: list[dict[str, object]] = []
     experiment = 0
-    block_layouts = []
+    block_layouts: list[tuple[str, int | None, int | None]] = []
     for assignment in args.assignments:
         if assignment == "contiguous":
             block_layouts.extend((assignment, value, None) for value in args.vertices_per_block)
@@ -226,13 +291,16 @@ def main() -> int:
             1 if vertices_per_block is None else vertices_per_block,
             block_count,
             args.num_heads,
+            cost_model,
         )
         workloads = {"light": blocks}
         if len(heavy_for_run):
             workloads["heavy"] = (
-                build_heavy_slices(heavy_for_run, heavy_slice, num_heads=args.num_heads)
+                build_heavy_slices(heavy_for_run, heavy_slice, num_heads=args.num_heads, cost_model=cost_model)
                 if heavy_slice > 0
-                else build_blocks(heavy_for_run, "heavy", "contiguous", 1, num_heads=args.num_heads)
+                else build_blocks(
+                    heavy_for_run, "heavy", "contiguous", 1, num_heads=args.num_heads, cost_model=cost_model
+                )
             )
         kernels = {
             "light": KernelConfig("light", args.max_blocks_light, occupancy),
@@ -248,12 +316,11 @@ def main() -> int:
                 seed=args.seed,
                 launch_mode=launch_mode,
                 light_launch_latency=args.launch_latency,
+                ns_per_tick=ns_per_tick,
             ),
         )
         layout_tag = f"v{vertices_per_block}" if assignment == "contiguous" else f"k{block_count}"
-        tag = safe_name(
-            f"{experiment:04d}_{assignment}_{layout_tag}_slice{heavy_slice}_{launch_mode}_occ{occupancy:g}"
-        )
+        tag = safe_name(f"{experiment:04d}_{assignment}_{layout_tag}_slice{heavy_slice}_{launch_mode}_occ{occupancy:g}")
         row = result.summary()
         row.update(
             experiment=experiment,
@@ -271,9 +338,10 @@ def main() -> int:
         rows.append(row)
         save_trace(trace_dir / f"{tag}.npz", result)
         plot_result(plot_dir / f"{tag}.png", tag, result)
+        predicted = "" if result.predicted_ms is None else f" predicted={result.predicted_ms:.3f}ms"
         print(
             f"{tag}: T={result.makespan} T*={result.perfect_packing_time:.2f} "
-            f"imbalance={result.imbalance_ratio:.3f} tail={result.drain_tail}"
+            f"imbalance={result.imbalance_ratio:.3f} tail={result.drain_tail}{predicted}"
         )
         experiment += 1
 
@@ -283,16 +351,16 @@ def main() -> int:
         writer.writeheader()
         for row in rows:
             writer.writerow(
-                {
-                    key: json.dumps(value) if isinstance(value, dict) else value
-                    for key, value in row.items()
-                }
+                {key: json.dumps(value) if isinstance(value, dict) else value for key, value in row.items()}
             )
     plot_comparison(args.out / "comparison.png", rows)
     metadata = vars(args).copy()
     metadata.update(
-        dataset=str(args.dataset), light_nodes=len(light_degrees),
-        heavy_nodes=len(heavy_degrees), bandwidth_cap=bandwidth_cap,
+        dataset=str(args.dataset),
+        light_nodes=len(light_degrees),
+        heavy_nodes=len(heavy_degrees),
+        bandwidth_cap=bandwidth_cap,
+        **provenance,
     )
     metadata = {key: str(value) if isinstance(value, Path) else value for key, value in metadata.items()}
     (args.out / "config.json").write_text(json.dumps(metadata, indent=2) + "\n")
