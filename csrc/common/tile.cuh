@@ -949,7 +949,6 @@ struct TileOps {
         AllCache,
         L2Only,
         Streaming,
-        LastUse, // Only for reads
         NoCache,
         ReadOnly, // Only for reads
     };
@@ -958,17 +957,15 @@ struct TileOps {
     template<MemoryHint hint = MemoryHint::NoHint>
     static __device__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
         if constexpr(hint == MemoryHint::AllCache) {
-            return *reinterpret_cast<vec_t const *>(__ldca(&src_arr[vec_idx * TW]));
+            return __ldca(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
         } else if constexpr(hint == MemoryHint::L2Only) {
-            return *reinterpret_cast<vec_t const *>(__ldcg(&src_arr[vec_idx * TW]));
+            return __ldcg(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
         } else if constexpr(hint == MemoryHint::Streaming) {
-            return *reinterpret_cast<vec_t const *>(__ldcs(&src_arr[vec_idx * TW]));
-        } else if constexpr(hint == MemoryHint::LastUse) {
-            return *reinterpret_cast<vec_t const *>(__ldlu(&src_arr[vec_idx * TW]));
+            return __ldcs(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
         } else if constexpr(hint == MemoryHint::NoCache) {
-            return *reinterpret_cast<vec_t const *>(__ldcv(&src_arr[vec_idx * TW]));
+            return __ldcv(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
         } else if constexpr(hint == MemoryHint::ReadOnly) {
-            return *reinterpret_cast<vec_t const *>(__ldg(&src_arr[vec_idx * TW]));
+            return __ldg(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
         } else {
             return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
         }

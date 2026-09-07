@@ -78,6 +78,8 @@ struct GsddmmPlan {
     static constexpr bool L_EDGE_INDEXED = (ll == GSDDMM_MEMBER::Edge);
     static constexpr bool R_EDGE_INDEXED = USE_R && (rr == GSDDMM_MEMBER::Edge);
 
+    static constexpr bool R_FIRST = R_DST || (rr == GSDDMM_MEMBER::Src_V && ll == GSDDMM_MEMBER::Edge);
+
     static constexpr bool IS_DOT = (op == GSDDMM_OP::Dot);
 };
 
