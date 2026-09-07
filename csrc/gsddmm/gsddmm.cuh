@@ -5,7 +5,7 @@
 namespace gsddmm {
 
 // Operation to do over
-enum class GSDDMM_OP {
+enum class GSDDMM_OP: uint8_t {
     Add,   // Add the right operand to the left(elementwise)
     Sub,   // Subtract the right operand from the left(elementwise)
     Mul,   // Multiply the right operand by the left(elementwise)
@@ -15,7 +15,7 @@ enum class GSDDMM_OP {
 };
 
 // Member to take feature values from. Maybe Source vertex, destination vertex or edge
-enum class GSDDMM_MEMBER {
+enum class GSDDMM_MEMBER: uint8_t {
     Src_V,  // Source vertex
     Dst_V,  // Destination vertex
     Edge,   // Edge
@@ -59,6 +59,8 @@ template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr>
 struct GsddmmPlan {
     // The right operand is read for every op except Copy (Copy propagates lhs only).
     static constexpr bool USE_R = (op != GSDDMM_OP::Copy);
+    static_assert((ll != rr) || !USE_R, "You should use more efficient methods to do ops between the same dense data.");
+    static_assert(op != GSDDMM_OP::Copy || ll != GSDDMM_MEMBER::Edge, "We can not copy edge features to the edge.");
 
     static constexpr bool L_DST = (ll == GSDDMM_MEMBER::Dst_V);
     static constexpr bool R_DST = USE_R && (rr == GSDDMM_MEMBER::Dst_V);
@@ -79,16 +81,24 @@ struct GsddmmPlan {
     static constexpr bool IS_DOT = (op == GSDDMM_OP::Dot);
 };
 
-// Dynamic shared memory requirement of GSDDMM_forward_edge_block for one instantiation.
+// Dynamic shared memory requirement of GSDDMM_forward_normal for one instantiation.
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, int PIPELINE_STAGES>
 inline consteval size_t gsddmm_forward_shmem_bytes() {
     using Plan = GsddmmPlan<op, ll, rr>;
     return Plan::NUM_DST_ROWS * D_CONST * sizeof(cuda_t) +
-           (PIPELINE_STAGES > 0 ? N_PER_BLOCK * Plan::NUM_EDGE_ROWS * PIPELINE_STAGES * D_CONST * sizeof(cuda_t) : 0);
+           (PIPELINE_STAGES > 0 ? N_PER_BLOCK * Plan::NUM_EDGE_ROWS * (PIPELINE_STAGES + 1) * D_CONST * sizeof(cuda_t) : 0);
 }
 
 // forward kernel: one thread block per (bucketed) CSR row node; each warp of the
 // block owns one edge at a time, lanes split the D_CONST features into vector tiles
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal ( // no-format
+    size_t N,
+    cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
+    index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
+    index_t const *__restrict__ node_indices  // node indirection: node_i = node_indices[blockIdx.x]
+);
+
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_edge_block ( // no-format
     size_t N,

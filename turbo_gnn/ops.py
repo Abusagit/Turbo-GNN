@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 
+import turbo_gnn._C as _C
 from turbo_gnn._autotune import with_autotune
 from turbo_gnn._functions import (
     ReductionAggrFunction,
@@ -21,6 +22,7 @@ from turbo_gnn._functions import (
 from turbo_gnn._kernels import (
     GATv2AggrKernel,
     GraphTransformerAggrKernel,
+    GSDDMMKernel,
     ReductionAggrKernel,
 )
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
@@ -240,3 +242,155 @@ def spmm_aggr(x, forward_indptr, forward_indices, norm_type, cu_sparse_algorithm
         Aggregated features, shape ``[N, F]``.
     """
     return _CudaSpMMConvFn.apply(x, forward_indptr, forward_indices, norm_type, cu_sparse_algorithm_id, block_dim)
+
+
+# =============================================================================
+# GSDDMM: per-edge binary ops over node/edge features
+# =============================================================================
+
+# Member name mapping for DGL-style op names: u = source, v = destination, e = edge.
+_GSDDMM_MEMBER_TO_NAME = {"src": "u", "dst": "v", "edge": "e"}
+_GSDDMM_NAME_TO_MEMBER = {v: k for k, v in _GSDDMM_MEMBER_TO_NAME.items()}
+_GSDDMM_OPS = ("add", "sub", "mul", "div", "dot")
+# Ordered member pairs with lhs != rhs (same-member ops are dense-data ops and
+# are rejected by the kernel's static_assert).
+_GSDDMM_MEMBER_PAIRS = (
+    ("src", "dst"),
+    ("dst", "src"),
+    ("src", "edge"),
+    ("edge", "src"),
+    ("dst", "edge"),
+    ("edge", "dst"),
+)
+
+
+@with_autotune(GSDDMMKernel, init_params=("op", "lhs_target", "rhs_target"))
+def gsddmm(
+    graph: AdjacencyForwardBackwardWithNodeBuckets,
+    lhs: torch.Tensor,
+    rhs: torch.Tensor | None = None,
+    op: str = "mul",
+    lhs_target: str = "src",
+    rhs_target: str = "dst",
+    light_warps_per_block: int = 4,
+    heavy_warps_per_block: int = 32,
+    pipeline_stages: int = 0,
+) -> torch.Tensor:
+    """Generalized SDDMM: per-edge binary op over node/edge feature rows.
+
+    For every edge ``e = (u -> v)`` of the graph (CSR order), computes::
+
+        out[e] = op(lhs[sel_l], rhs[sel_r])
+
+    where ``sel_*`` picks a row by source node ``u`` (``"src"``), destination
+    node ``v`` (``"dst"``), or edge position ``e`` (``"edge"``). ``"dot"``
+    reduces the feature axis (output ``[E]``); all other ops are elementwise
+    (output ``[E, D]``). ``"copy"`` propagates ``lhs`` to the edges and never
+    reads ``rhs``.
+
+    Forward-only (no autograd): the CUDA kernel has no backward pass yet, so
+    the output is detached from the autograd graph.
+
+    Args:
+        graph: CSR graph with forward adjacency and light/heavy node buckets.
+        lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
+            ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
+        rhs: Right operand, same layout rules as ``lhs``. May be omitted for
+            ``op="copy"`` (it is never read by the kernel).
+        op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
+        lhs_target: ``"src"``, ``"dst"``, or ``"edge"``.
+        rhs_target: ``"src"``, ``"dst"``, or ``"edge"``. Forced to ``"edge"``
+            for ``op="copy"`` (the value is irrelevant since rhs is unread).
+        light_warps_per_block: Warps per block for the light-node bucket. Only
+            the counts instantiated by the binding are accepted (currently 4).
+        heavy_warps_per_block: Warps per block for the heavy-node bucket. Only
+            the counts instantiated by the binding are accepted (currently 32).
+        pipeline_stages: Async-copy pipeline stages for the per-edge Src/Edge
+            row prefetch, one of 0, 1, 2, 3. 0 disables the pipeline; stage
+            ``i + stages`` is prefetched while stage ``i`` is consumed, which
+            costs ``stages + 1`` shared-memory row slots per warp. A deep
+            pipeline on a wide D with two per-edge operands can exceed the
+            GPU's opt-in shared memory per block (e.g. D=256, 32 heavy warps
+            and both operands gathered per edge needs 192 KiB at stages=2);
+            the kernel raises with the exact figures when it does.
+
+    Returns:
+        ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"``, in CSR edge order.
+    """
+    if op == "copy":
+        rhs_target = "edge"
+    if rhs is None:
+        if op != "copy":
+            raise ValueError(f"gsddmm: rhs is required for op={op!r}")
+        # Copy never reads R, but the binding validates its shape: [E, D].
+        rhs = lhs.new_empty((graph.forward_indices.numel(), lhs.shape[-1]))
+    return _C.gsddmm_forward(
+        lhs,
+        rhs,
+        graph.forward_indptr,
+        graph.forward_indices,
+        op,
+        lhs_target,
+        rhs_target,
+        graph.light_nodes,
+        graph.heavy_nodes,
+        light_warps_per_block,
+        heavy_warps_per_block,
+        pipeline_stages,
+    )
+
+
+def _make_gsddmm_op(op: str, lhs_target: str, rhs_target: str):
+    """Build a DGL-style gsddmm op with pre-filled op/targets (e.g. u_sub_v)."""
+    name = f"{_GSDDMM_MEMBER_TO_NAME[lhs_target]}_{op}_{_GSDDMM_MEMBER_TO_NAME[rhs_target]}"
+
+    def _gsddmm_op(
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return gsddmm(graph, lhs, rhs, op=op, lhs_target=lhs_target, rhs_target=rhs_target, **kwargs)
+
+    _gsddmm_op.__name__ = name
+    _gsddmm_op.__qualname__ = name
+    _gsddmm_op.__doc__ = f"""{name}(graph, lhs, rhs): per-edge ``{op}`` of {lhs_target!r} and {rhs_target!r} rows.
+
+    Alias for :func:`gsddmm` with ``op={op!r}, lhs_target={lhs_target!r}, rhs_target={rhs_target!r}``.
+    Returns ``[E]`` if op is "dot" else ``[E, D]``, in CSR edge order. Forward-only (no autograd).
+    """
+    return _gsddmm_op
+
+
+def _make_gsddmm_copy(lhs_target: str):
+    """Build a DGL-style copy op (copy_u / copy_v): broadcast node rows to edges."""
+    name = f"copy_{_GSDDMM_MEMBER_TO_NAME[lhs_target]}"
+
+    def _gsddmm_copy(
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
+        x: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return gsddmm(graph, x, None, op="copy", lhs_target=lhs_target, rhs_target="edge", **kwargs)
+
+    _gsddmm_copy.__name__ = name
+    _gsddmm_copy.__qualname__ = name
+    _gsddmm_copy.__doc__ = f"""{name}(graph, x): copy {lhs_target!r}-node feature rows onto incident edges.
+
+    Alias for :func:`gsddmm` with ``op="copy", lhs_target={lhs_target!r}``. ``x`` is ``[N, D]``;
+    returns ``[E, D]`` in CSR edge order. Forward-only (no autograd).
+    """
+    return _gsddmm_copy
+
+
+# DGL-style prefilled ops: u_sub_v(graph, x, y) == gsddmm(..., op="sub", lhs="src", rhs="dst").
+_GSDDMM_PREFILLED_OPS: dict[str, callable] = {}
+for _ll, _rr in _GSDDMM_MEMBER_PAIRS:
+    for _op in _GSDDMM_OPS:
+        _fn = _make_gsddmm_op(_op, _ll, _rr)
+        _GSDDMM_PREFILLED_OPS[_fn.__name__] = _fn
+for _target in ("src", "dst"):
+    _fn = _make_gsddmm_copy(_target)
+    _GSDDMM_PREFILLED_OPS[_fn.__name__] = _fn
+
+globals().update(_GSDDMM_PREFILLED_OPS)

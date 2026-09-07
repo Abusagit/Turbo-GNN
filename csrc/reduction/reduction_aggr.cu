@@ -73,7 +73,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
-    if (static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y >= num_light) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    if (i >= num_light) [[unlikely]] {
         return;
     }
     const index_t v = light_nodes_indices[i];

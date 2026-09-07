@@ -146,7 +146,7 @@ struct OnlineSoftmaxState {
 // ReductionOps<Op> — compile-time traits for min/max reduction kernels
 // =============================================================================
 
-enum class ReductionOp { MIN, MAX };
+enum class ReductionOp: uint8_t { MIN, MAX };
 
 template <ReductionOp Op>
 struct ReductionOps;

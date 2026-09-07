@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+import turbo_gnn._C as _C
 from turbo_gnn._autotune import TunableKernel, TunableParam
 from turbo_gnn._functions import ReductionAggrFunction, _FusedGraphAttention, gatv2_function
 
@@ -177,6 +178,86 @@ class GATv2AggrKernel(TunableKernel):
                 attention_weights=attention_weights,
                 negative_slope=negative_slope,
             )
+
+        return _bench
+
+
+class GSDDMMKernel(TunableKernel):
+    """Tunable kernel for GSDDMM (generalized sampled dense-dense matmul).
+
+    Computes a per-edge binary op over feature rows selected from source
+    nodes, destination nodes, or edges::
+
+        out[e] = op(lhs[sel_l], rhs[sel_r])   (elementwise; dot reduces the feature axis)
+
+    The (op, lhs_target, rhs_target) triple is fixed at construction (one
+    kernel instance per DGL-style op, e.g. ``u_sub_v`` == sub(src, dst)).
+
+    Tunable forward parameters:
+
+    - ``forward_light_warps`` / ``forward_heavy_warps``: warps per block for
+      the light/heavy node buckets. Only the counts the binding instantiates
+      are searchable (see ``csrc/gsddmm/gsddmm_dispatch.cuh``); any other value
+      raises from the dispatch.
+    - ``forward_pipeline_stages``: async-copy pipeline depth for the per-edge
+      Src/Edge row prefetch, in {0, 1, 2, 3} (0 disables the pipeline). Deeper
+      pipelines buy more overlap but cost ``stages + 1`` shared-memory row
+      slots per warp, so the whole range is searched.
+
+    Tunable graph parameter:
+
+    - ``forward_huge_degree_threshold_quantile``: light/heavy partition.
+    """
+
+    def __init__(self, op: str, lhs_target: str, rhs_target: str, **kwargs):
+        super().__init__()
+        self.op = op
+        self.lhs_target = lhs_target
+        # The binding instantiates Copy only with an edge-indexed (ignored) rhs;
+        # normalize here so any user-supplied rhs_target works for copy.
+        self.rhs_target = "edge" if op == "copy" else rhs_target
+        self.forward_light_warps = kwargs.get("light_warps_per_block", 4)
+        self.forward_heavy_warps = kwargs.get("heavy_warps_per_block", 32)
+        self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
+
+    def _execute(self, graph, x, *, rhs=None, **kwargs):
+        if rhs is None:
+            if self.op != "copy":
+                raise ValueError(f"gsddmm: rhs is required for op={self.op!r}")
+            # Copy never reads R, but the binding validates its shape: [E, D].
+            rhs = x.new_empty((graph.forward_indices.numel(), x.shape[-1]))
+        return _C.gsddmm_forward(
+            x,
+            rhs,
+            graph.forward_indptr,
+            graph.forward_indices,
+            self.op,
+            self.lhs_target,
+            self.rhs_target,
+            graph.light_nodes,
+            graph.heavy_nodes,
+            self.forward_light_warps,
+            self.forward_heavy_warps,
+            self.forward_pipeline_stages,
+        )
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_light_warps", [4], default=4),
+            TunableParam("forward_heavy_warps", [32], default=32),
+            TunableParam("forward_pipeline_stages", [0, 1, 2, 3], default=0),
+        ]
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return [
+            TunableParam("forward_huge_degree_threshold_quantile", [-1, 0.9, 0.95, 0.99], default=-1),
+        ]
+
+    def make_forward_bench_fn(self, x, graph_repr, **kwargs):
+        rhs = kwargs.get("rhs")
+
+        def _bench():
+            return self._execute(graph_repr, x, rhs=rhs)
 
         return _bench
 

@@ -944,15 +944,52 @@ struct TileOps {
 
     static constexpr int TW = N;
 
+    enum class MemoryHint: uint8_t {
+        NoHint, 
+        AllCache,
+        L2Only,
+        Streaming,
+        LastUse, // Only for reads
+        NoCache,
+        ReadOnly, // Only for reads
+    };
+
     // Common
+    template<MemoryHint hint = MemoryHint::NoHint>
     static __device__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
-        return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
+        if constexpr(hint == MemoryHint::AllCache) {
+            return *reinterpret_cast<vec_t const *>(__ldca(&src_arr[vec_idx * TW]));
+        } else if constexpr(hint == MemoryHint::L2Only) {
+            return *reinterpret_cast<vec_t const *>(__ldcg(&src_arr[vec_idx * TW]));
+        } else if constexpr(hint == MemoryHint::Streaming) {
+            return *reinterpret_cast<vec_t const *>(__ldcs(&src_arr[vec_idx * TW]));
+        } else if constexpr(hint == MemoryHint::LastUse) {
+            return *reinterpret_cast<vec_t const *>(__ldlu(&src_arr[vec_idx * TW]));
+        } else if constexpr(hint == MemoryHint::NoCache) {
+            return *reinterpret_cast<vec_t const *>(__ldcv(&src_arr[vec_idx * TW]));
+        } else if constexpr(hint == MemoryHint::ReadOnly) {
+            return *reinterpret_cast<vec_t const *>(__ldg(&src_arr[vec_idx * TW]));
+        } else {
+            return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
+        }
     }
     static __device__ void write_zero(num_type *const __restrict__ dst_arr, size_t vec_idx) {
         reinterpret_cast<vec_t *>(&dst_arr[vec_idx * TW])->store_zero_();
     }
+    template<MemoryHint hint = MemoryHint::NoHint>
     static __device__ void write(num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t src_val) {
-        *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(&src_val);
+        static_assert(hint == MemoryHint::NoHint || hint == MemoryHint::AllCache || hint == MemoryHint::L2Only || hint == MemoryHint::Streaming || hint == MemoryHint::NoCache, "Only AllCache, L2Only, Streaming, NoCache and NoHint options are available for stores.");
+        if constexpr(hint == MemoryHint::AllCache) {
+            __stwb(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+        } else if constexpr(hint == MemoryHint::L2Only) {
+            __stcg(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+        } else if constexpr(hint == MemoryHint::Streaming) {
+            __stcs(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+        } else if constexpr(hint == MemoryHint::NoCache) {
+            __stwt(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+        } else {
+            *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(&src_val);
+        }
     }
     static __device__ void write_convert_to_accum(accum_t *const __restrict__ dst, num_type const *const __restrict__ src) {
         constexpr size_t compact_N  = std::min(N, VecFloat<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));

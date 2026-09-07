@@ -21,7 +21,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     constexpr size_t TW = TW_SELECTOR::value;  // Tile width
     static_assert(D_CONST % TW == 0, "Per-head features dim should be divisible by Tile width");
     constexpr size_t TILES            = D_CONST / TW;                                 // Total tiles count
-    constexpr size_t TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
+    constexpr size_t TILES_PER_THREAD = ceil_div(TILES, static_cast<size_t>(TW_SELECTOR::threads_per_d));  // Tiles per thread
     constexpr size_t ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                        // Accumulatores used by one thread
 
     using AccumOps = AdOps<accum_t>;
@@ -109,7 +109,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
     accum_t o_acc[ACCS_PER_THREAD] = {0};
 
     // neighbor loop
-    auto consume = [lane_id, k_shared, scale, &softmax_state, &o_acc](index_t /*j*/, cuda_t const *const(&rows)[NUM_PREFETCH_ROWS]) {
+    auto consume = [lane_id, lane_cnt, k_shared, scale, &softmax_state, &o_acc](index_t /*j*/, cuda_t const *const(&rows)[NUM_PREFETCH_ROWS]) {
         const cuda_t *q_base = rows[0];
         const cuda_t *v_base = rows[1];
 

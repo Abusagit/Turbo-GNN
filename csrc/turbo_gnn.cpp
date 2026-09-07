@@ -17,6 +17,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("num_src_nodes"), py::arg("warps_per_block") = 8
     );
 
+    m.def(
+        "gsddmm_forward", &gsddmm_forward_cuda, "Generalized Sparse Dense-Dense matrpix multiplication", py::arg("l"), py::arg("r"),
+        py::arg("row_ptr"), py::arg("col_idx"), py::arg("op"), py::arg("lhs_target"), py::arg("rhs_target"), py::arg("light_nodes"),
+        py::arg("heavy_nodes"), py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 32, py::arg("pipeline_stages") = 0
+    );
+
     // GATv2 aggregation
     m.def(
         "gatv2_forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)", py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),
