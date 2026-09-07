@@ -1,4 +1,7 @@
+#include <ATen/cuda/CUDAEvent.h>
+
 #include <algorithm>
+#include <array>
 #include <type_traits>
 
 #include "spmm/gspmm.h"
@@ -183,6 +186,34 @@ std::vector<torch::Tensor> gspmm_forward(
     const bool tracks_arg = (rop != ReductionOp::SUM);
     auto arg_eid          = tracks_arg ? torch::empty({num_nodes, layout.d}, edge_ptr.options()) : torch::empty({0}, edge_ptr.options());
 
+    // The two buckets own disjoint output rows, so their launches are
+    // independent.  Given a stream each, the light kernel can occupy the SMs
+    // that the heavy kernel leaves idle: a heavy launch degenerates into a few
+    // long-running blocks on a skewed graph, and back-to-back on one stream
+    // that tail is dead time.
+    const bool overlap_buckets        = (num_light > 0 && num_heavy > 0);
+    const auto main_stream            = at::cuda::getCurrentCUDAStream();
+    at::cuda::CUDAStream heavy_stream = main_stream;
+    if (overlap_buckets) {
+        heavy_stream = at::cuda::getStreamFromPool(main_stream.device_index());
+        // The heavy launch must not overtake whatever produced the inputs on
+        // the caller's stream.
+        at::cuda::CUDAEvent inputs_ready;
+        inputs_ready.record(main_stream);
+        inputs_ready.block(heavy_stream);
+        // These were allocated against the caller's stream but are touched on
+        // another one, so the caching allocator has to be told before it can
+        // consider recycling them.
+        const std::array<const torch::Tensor *, 7> touched_on_side = {
+            &out, &arg_eid, &lhs, &rhs, &edge_ptr, &edge_idx, &heavy_nodes
+        };
+        for (const torch::Tensor *t : touched_on_side) {
+            if (t->defined() && t->numel() > 0) {
+                t->record_stream(heavy_stream);
+            }
+        }
+    }
+
     std::visit(
         [&](auto idxInfo, auto typeInfo, auto op_c, auto rop_c, auto bcast_c, auto stages_c, auto emap_c) {
             using index_t = typename decltype(idxInfo)::Type;
@@ -244,7 +275,7 @@ std::vector<torch::Tensor> gspmm_forward(
                     reduction_aggr_forward_light_kernel_1d<
                         kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, /*ARG_IS_EDGE=*/true,
                         kGSpMMVectorize, EMAP
-                    ><<<blocks_l, block_l, shmem_l>>>(
+                    ><<<blocks_l, block_l, shmem_l, main_stream>>>(
                         index_ptr<index_t>(light_nodes),
                         index_ptr<index_t>(edge_ptr),
                         index_ptr<index_t>(edge_idx),
@@ -273,7 +304,7 @@ std::vector<torch::Tensor> gspmm_forward(
 
                     reduction_aggr_forward_heavy_kernel_2d<
                         cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize, EMAP>
-                        <<<grid_h, block_h, shmem>>>(
+                        <<<grid_h, block_h, shmem, heavy_stream>>>(
                             index_ptr<index_t>(heavy_nodes),
                             index_ptr<index_t>(edge_ptr),
                             index_ptr<index_t>(edge_idx),
@@ -295,6 +326,12 @@ std::vector<torch::Tensor> gspmm_forward(
         MakeIntVariant<0, 1, 2, 4>(pipeline_stages),
         MakeBoolVariant<false, true>(use_edge_map)
     );
+
+    if (overlap_buckets) {
+        at::cuda::CUDAEvent heavy_done;
+        heavy_done.record(heavy_stream);
+        heavy_done.block(main_stream);
+    }
 
     CUDA_KERNEL_CHECK();
 
