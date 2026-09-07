@@ -90,6 +90,22 @@ __device__ __forceinline__ void pipelined_thread_edge_scan(
 template <bool VECTORIZE, FloatingNum cuda_t>
 inline constexpr size_t aggr_tile_width = VECTORIZE ? VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t) : 1;
 
+// Position of an edge's data given its position in the CSR being walked.
+//
+// The two coincide for a forward pass, but a gradient that walks the
+// transposed CSR meets the same edges in a different order while the edge
+// operand stays indexed by *forward* position.  Mapping here lets that pass
+// read the operand in place, instead of materializing a permuted [E, d] copy
+// of it before every backward.
+template <bool EDGE_MAP, typename index_t>
+__device__ __forceinline__ index_t aggr_edge_data_pos(index_t eid, index_t const *const __restrict__ edge_map) {
+    if constexpr (EDGE_MAP) {
+        return edge_map[static_cast<size_t>(eid)];
+    } else {
+        return eid;
+    }
+}
+
 template <BinaryOp BOp, bool RHS_BROADCAST, size_t TW, FloatingNum cuda_t, typename index_t, FloatingNum accum_t>
 __device__ __forceinline__ void aggr_edge_message(
     cuda_t const *const __restrict__ uslice, cuda_t const *const __restrict__ rhs, index_t eid, size_t fv, size_t d, accum_t (&msg)[TW]
@@ -123,7 +139,7 @@ __device__ __forceinline__ void aggr_edge_message(
 // PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
 template <
     size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0,
-    BinaryOp BOp = BinaryOp::COPY_U, bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true
+    BinaryOp BOp = BinaryOp::COPY_U, bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false
 >
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
     index_t const *const __restrict__ light_nodes_indices,
@@ -134,7 +150,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     index_t *const __restrict__ arg_idx,
     size_t d,
     size_t num_light,
-    cuda_t const *const __restrict__ rhs = nullptr
+    cuda_t const *const __restrict__ rhs      = nullptr,
+    index_t const *const __restrict__ edge_map = nullptr
 ) {
     using ROps     = ReductionOps<Op>;
     using BOps     = BinaryOps<BOp>;
@@ -188,7 +205,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 
         auto visit = [&](index_t src, index_t eid, cuda_t const *uslice) {
             accum_t msg[TW];
-            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t>(uslice, rhs, eid, fv, d, msg);
+            const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
+            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t>(uslice, rhs, e_pos, fv, d, msg);
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 const acc_t v_e    = static_cast<acc_t>(msg[e]);
@@ -253,7 +271,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
                         src = edge_idx[eid];
                     }
                     accum_t msg[1];
-                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(&u_val, rhs, eid, f, d, msg);
+                    const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
+                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(&u_val, rhs, e_pos, f, d, msg);
                     bool upgrade_index = false;
                     best_val           = ROps::reduce(static_cast<acc_t>(msg[0]), best_val, upgrade_index);
                     if constexpr (ROps::TRACKS_ARG) {
@@ -477,7 +496,7 @@ __host__ __device__ inline size_t aggr_heavy_shmem_bytes(size_t slots) {
 // Works with all index sizes (no packing constraint)
 template <
     FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, BinaryOp BOp = BinaryOp::COPY_U,
-    bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true
+    bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false
 >
 __global__ void reduction_aggr_forward_heavy_kernel_2d(
     const index_t *__restrict__ nodes,
@@ -487,7 +506,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     cuda_t *__restrict__ out,
     index_t *__restrict__ arg_idx,
     size_t d,
-    const cuda_t *__restrict__ rhs = nullptr
+    const cuda_t *__restrict__ rhs      = nullptr,
+    const index_t *__restrict__ edge_map = nullptr
 ) {
     using ROps     = ReductionOps<Op>;
     using BOps     = BinaryOps<BOp>;
@@ -540,7 +560,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 
         auto visit = [&](index_t src, index_t eid, cuda_t const *uslice) {
             accum_t msg[TW];
-            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t>(uslice, rhs, eid, fv, d, msg);
+            const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
+            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t>(uslice, rhs, e_pos, fv, d, msg);
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 const acc_t v_e    = static_cast<acc_t>(msg[e]);
@@ -647,7 +668,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
                         src = edge_idx[eid];
                     }
                     accum_t msg[1];
-                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(&u_val, rhs, eid, tail_f, d, msg);
+                    const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
+                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(&u_val, rhs, e_pos, tail_f, d, msg);
                     bool upgrade_index = false;
                     local_best         = ROps::reduce(static_cast<float>(msg[0]), local_best, upgrade_index);
                     if constexpr (ROps::TRACKS_ARG) {
@@ -711,11 +733,20 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
 // source node from it, and the edge half of the gradient lands in grad_rhs
 // (shaped [E, d], or [E] when the edge operand broadcast over the features).
 //
-// grad_t is the accumulate dtype: cuda_t for reduction_aggr, float for g-SpMM,
-// whose Python layer casts back -- fp16 atomicAdd is arch-gated and lossy.
+// grad_t is the accumulate dtype of the *node* gradient: cuda_t for
+// reduction_aggr, float for g-SpMM, whose Python layer casts back -- several
+// destinations can pick the same source, so that write accumulates, and fp16
+// atomicAdd is arch-gated and lossy.
+//
+// grad_rhs_t is separate because the edge gradient usually does not accumulate
+// at all: a full-width edge operand gives every (arg, f) pair a slot of its
+// own -- distinct destinations own disjoint edge ranges, and distinct features
+// land at distinct offsets -- so the write is exactly-once and can go straight
+// out in the operand dtype.  Only a broadcast operand, which folds all d
+// features of an edge into one slot, still needs an atomic (and hence float).
 template <
     size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t, BinaryOp BOp = BinaryOp::COPY_U, bool RHS_BROADCAST = false,
-    bool ARG_IS_EDGE = false, FloatingNum grad_t = cuda_t, FloatingNum accum_t = float
+    bool ARG_IS_EDGE = false, FloatingNum grad_t = cuda_t, FloatingNum accum_t = float, FloatingNum grad_rhs_t = grad_t
 >
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_backward_typed(
     const cuda_t *__restrict__ grad_out,
@@ -726,7 +757,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_bac
     const index_t *__restrict__ edge_idx = nullptr,
     const cuda_t *__restrict__ lhs       = nullptr,
     const cuda_t *__restrict__ rhs       = nullptr,
-    grad_t *__restrict__ grad_rhs        = nullptr
+    grad_rhs_t *__restrict__ grad_rhs    = nullptr
 ) {
     using Sentinel = IndexSentinel<index_t>;
     using BOps     = BinaryOps<BOp>;
@@ -768,10 +799,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_bac
             atomicAdd(&grad_x[static_cast<size_t>(u) * d + f], static_cast<grad_t>(BOps::grad_lhs(u_val, e_val, g)));
         }
         if constexpr (BOps::USE_RHS) {
-            // Both writes need atomics: several destinations can pick the same
-            // source node, and a broadcast edge operand collapses all d
-            // features of one edge into a single slot.
-            atomicAdd(&grad_rhs[e_off], static_cast<grad_t>(BOps::grad_rhs(u_val, e_val, g)));
+            const grad_rhs_t contribution = static_cast<grad_rhs_t>(BOps::grad_rhs(u_val, e_val, g));
+            if constexpr (RHS_BROADCAST) {
+                // One slot per edge, shared by all d features of it.
+                atomicAdd(&grad_rhs[e_off], contribution);
+            } else {
+                // (arg, f) is unique across the whole output, so nothing else
+                // ever touches this slot.  Slots of edges that won nothing keep
+                // the zero the allocation gave them.
+                grad_rhs[e_off] = contribution;
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <type_traits>
 
 #include "spmm/gspmm.h"
 #include "spmm/gspmm_kernels.cuh"
@@ -118,7 +119,8 @@ std::vector<torch::Tensor> gspmm_forward(
     int warps_per_block,
     int features_per_block,
     int tiles_y,
-    int pipeline_stages
+    int pipeline_stages,
+    const torch::Tensor& edge_map
 ) {
     const BinaryOp bop    = binary_op_from_string(op);
     const ReductionOp rop = reduce_op_from_string(reduce);
@@ -140,6 +142,26 @@ std::vector<torch::Tensor> gspmm_forward(
         " nodes -- output rows outside both buckets would be left uninitialized"
     );
 
+    // An edge map re-indexes the edge operand, which only matters for the ops
+    // whose message actually reads it and whose gradient needs its value; the
+    // rest degenerate to copy_u on the transposed pass and never ask for one.
+    const bool use_edge_map = edge_map.defined() && edge_map.numel() > 0;
+    if (use_edge_map) {
+        TORCH_CHECK(
+            bop == BinaryOp::MUL || bop == BinaryOp::DIV, "an edge map is only supported for op 'mul' or 'div' (got '", op,
+            "'); the other ops do not read the edge operand on a transposed pass"
+        );
+        TORCH_CHECK(rop == ReductionOp::SUM, "an edge map is only supported for reduce='sum' (got '", reduce, "')");
+        TORCH_CHECK(edge_map.is_cuda() && edge_map.is_contiguous(), "edge_map must be a contiguous CUDA tensor");
+        TORCH_CHECK(
+            edge_map.scalar_type() == edge_ptr.scalar_type(), "edge_map dtype (", edge_map.scalar_type(),
+            ") must match edge_ptr dtype (", edge_ptr.scalar_type(), ")"
+        );
+        TORCH_CHECK(
+            edge_map.numel() == edge_idx.numel(), "edge_map must have one entry per edge (", edge_map.numel(), " vs ", edge_idx.numel(), ")"
+        );
+    }
+
     TORCH_CHECK(warps_per_block > 0 && warps_per_block <= 32, "warps_per_block must be in [1, 32]");
     if (num_heavy > 0) {
         TORCH_CHECK(tiles_y > 0 && tiles_y <= 32, "tiles_y must be in [1, 32]");
@@ -157,7 +179,7 @@ std::vector<torch::Tensor> gspmm_forward(
     auto arg_eid          = tracks_arg ? torch::empty({num_nodes, layout.d}, edge_ptr.options()) : torch::empty({0}, edge_ptr.options());
 
     std::visit(
-        [&](auto idxInfo, auto typeInfo, auto op_c, auto rop_c, auto bcast_c, auto stages_c) {
+        [&](auto idxInfo, auto typeInfo, auto op_c, auto rop_c, auto bcast_c, auto stages_c, auto emap_c) {
             using index_t = typename decltype(idxInfo)::Type;
             using torch_t = typename decltype(typeInfo)::TorchType;
             using cuda_t  = typename decltype(typeInfo)::CudaType;
@@ -166,12 +188,18 @@ std::vector<torch::Tensor> gspmm_forward(
             constexpr ReductionOp ROP = static_cast<ReductionOp>(decltype(rop_c)::value);
             constexpr bool BCAST      = decltype(bcast_c)::value;
             constexpr int STAGES      = decltype(stages_c)::value;
+            constexpr bool EMAP       = decltype(emap_c)::value;
             using BOps                = BinaryOps<BOP>;
 
             // deduce_rhs_broadcast never raises the flag for an operation that
             // ignores edge data, so this half of the cross product is
             // unreachable -- pruned here rather than instantiated and skipped.
+            // The edge-map half is pruned to the combination the checks above
+            // admit, which keeps it from doubling the whole instantiation
+            // table for a path only mul/div sum backward takes.
             if constexpr (BCAST && !BOps::USE_RHS) {
+                return;
+            } else if constexpr (EMAP && !(BOps::GRAD_USES_OPERANDS && ROP == ReductionOp::SUM)) {
                 return;
             } else {
                 cuda_t const *lhs_ptr = nullptr;
@@ -184,6 +212,11 @@ std::vector<torch::Tensor> gspmm_forward(
                 }
                 cuda_t *out_ptr = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
                 const size_t d  = static_cast<size_t>(layout.d);
+
+                index_t const *emap_ptr = nullptr;
+                if constexpr (EMAP) {
+                    emap_ptr = index_ptr<index_t>(edge_map);
+                }
 
                 if (num_light > 0) {
                     // Features along x, capped at the block; nodes fill y.
@@ -198,14 +231,14 @@ std::vector<torch::Tensor> gspmm_forward(
                     if constexpr (STAGES > 0) {
                         ensure_dynamic_shmem(
                             reduction_aggr_forward_light_kernel_1d<
-                                kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, true, kGSpMMVectorize>,
+                                kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, true, kGSpMMVectorize, EMAP>,
                             shmem_l, "gspmm light"
                         );
                     }
 
                     reduction_aggr_forward_light_kernel_1d<
                         kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, /*ARG_IS_EDGE=*/true,
-                        kGSpMMVectorize
+                        kGSpMMVectorize, EMAP
                     ><<<blocks_l, block_l, shmem_l>>>(
                         index_ptr<index_t>(light_nodes),
                         index_ptr<index_t>(edge_ptr),
@@ -215,7 +248,8 @@ std::vector<torch::Tensor> gspmm_forward(
                         index_ptr_mut<index_t>(arg_eid),
                         d,
                         static_cast<size_t>(num_light),
-                        rhs_ptr
+                        rhs_ptr,
+                        emap_ptr
                     );
                 }
 
@@ -227,11 +261,13 @@ std::vector<torch::Tensor> gspmm_forward(
                         aggr_heavy_shmem_bytes<index_t>(static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block));
 
                     ensure_dynamic_shmem(
-                        reduction_aggr_forward_heavy_kernel_2d<cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize>,
+                        reduction_aggr_forward_heavy_kernel_2d<
+                            cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize, EMAP>,
                         shmem, "gspmm heavy"
                     );
 
-                    reduction_aggr_forward_heavy_kernel_2d<cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize>
+                    reduction_aggr_forward_heavy_kernel_2d<
+                        cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize, EMAP>
                         <<<grid_h, block_h, shmem>>>(
                             index_ptr<index_t>(heavy_nodes),
                             index_ptr<index_t>(edge_ptr),
@@ -240,7 +276,8 @@ std::vector<torch::Tensor> gspmm_forward(
                             out_ptr,
                             index_ptr_mut<index_t>(arg_eid),
                             d,
-                            rhs_ptr
+                            rhs_ptr,
+                            emap_ptr
                         );
                 }
             }
@@ -250,7 +287,8 @@ std::vector<torch::Tensor> gspmm_forward(
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
         MakeIntVariant<0, 1, 2>(static_cast<int>(rop)),
         MakeBoolVariant<false, true>(layout.rhs_broadcast),
-        MakeIntVariant<0, 1, 2, 4>(pipeline_stages)
+        MakeIntVariant<0, 1, 2, 4>(pipeline_stages),
+        MakeBoolVariant<false, true>(use_edge_map)
     );
 
     CUDA_KERNEL_CHECK();
@@ -274,10 +312,20 @@ std::vector<torch::Tensor> gspmm_backward_arg(
 
     const bool uses_lhs = op_uses_lhs(bop);
     const bool uses_rhs = op_uses_rhs(bop);
+    const bool bcast    = deduce_rhs_broadcast(bop, rhs, d);
 
-    const auto grad_opts = grad_out.options().dtype(torch::kFloat);
-    auto grad_lhs        = uses_lhs ? torch::zeros({num_nodes, d}, grad_opts) : torch::empty({0}, grad_opts);
-    auto grad_rhs        = uses_rhs ? torch::zeros(rhs.sizes(), grad_opts) : torch::empty({0}, grad_opts);
+    // The node gradient accumulates (many destinations can share a winning
+    // source), so it is staged in float and cast by the caller.  The edge
+    // gradient only accumulates for a broadcast operand; at full width it is
+    // written once per slot and goes out directly in the operand dtype, which
+    // for an [E, d] operand is the difference between touching 6 bytes per
+    // element and 12.
+    const auto accum_opts = grad_out.options().dtype(torch::kFloat);
+    const auto value_opts = grad_out.options();
+
+    auto grad_lhs = uses_lhs ? torch::zeros({num_nodes, d}, accum_opts) : torch::empty({0}, accum_opts);
+    auto grad_rhs = !uses_rhs ? torch::empty({0}, value_opts)
+                              : torch::zeros(rhs.sizes(), bcast ? accum_opts : value_opts);
 
     // No reducer axis here: min and max share one scatter.
     std::visit(
@@ -304,27 +352,41 @@ std::vector<torch::Tensor> gspmm_backward_arg(
 
                 const unsigned threads = static_cast<unsigned>(static_cast<size_t>(warps_per_block) * kWarpSize);
 
-                reduction_aggr_backward_typed<kGSpMMWarpsPerBlock, cuda_t, index_t, BOP, BCAST, /*ARG_IS_EDGE=*/true, /*grad_t=*/float>
-                    <<<static_cast<unsigned>(num_nodes), threads>>>(
-                        reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
-                        index_ptr<index_t>(arg_eid),
-                        grad_lhs.data_ptr<float>(),
-                        static_cast<size_t>(num_nodes),
-                        static_cast<size_t>(d),
-                        index_ptr<index_t>(edge_idx),
-                        lhs_ptr,
-                        rhs_ptr,
-                        grad_rhs.data_ptr<float>()
-                    );
+                // A broadcast edge gradient stays in the float staging buffer
+                // because its slots are shared; a full-width one is written in
+                // the operand dtype.
+                using grad_rhs_t = std::conditional_t<BCAST, float, cuda_t>;
+                auto *grad_rhs_ptr =
+                    uses_rhs ? reinterpret_cast<grad_rhs_t *>(grad_rhs.data_ptr()) : static_cast<grad_rhs_t *>(nullptr);
+
+                reduction_aggr_backward_typed<
+                    kGSpMMWarpsPerBlock, cuda_t, index_t, BOP, BCAST, /*ARG_IS_EDGE=*/true, /*grad_t=*/float, /*accum_t=*/float, grad_rhs_t
+                ><<<static_cast<unsigned>(num_nodes), threads>>>(
+                    reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
+                    index_ptr<index_t>(arg_eid),
+                    grad_lhs.data_ptr<float>(),
+                    static_cast<size_t>(num_nodes),
+                    static_cast<size_t>(d),
+                    index_ptr<index_t>(edge_idx),
+                    lhs_ptr,
+                    rhs_ptr,
+                    grad_rhs_ptr
+                );
             }
         },
         MakeIndexVariant<int32_t, int64_t>(edge_idx.scalar_type()),
         MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
-        MakeBoolVariant<false, true>(deduce_rhs_broadcast(bop, rhs, d))
+        MakeBoolVariant<false, true>(bcast)
     );
 
     CUDA_KERNEL_CHECK();
+
+    // Uniform contract: the edge gradient always comes back in the operand
+    // dtype, so only the broadcast path pays for a cast, and it is [E] wide.
+    if (uses_rhs && bcast) {
+        grad_rhs = grad_rhs.to(value_opts.dtype());
+    }
 
     return {grad_lhs, grad_rhs};
 }
@@ -340,7 +402,10 @@ torch::Tensor gspmm_backward_edge(
 ) {
     const BinaryOp bop = binary_op_from_string(op);
 
-    const auto grad_opts = grad_out.options().dtype(torch::kFloat);
+    // The operand dtype, not float: every slot of this gradient is written
+    // exactly once, so there is no atomic accumulation to protect and no
+    // reason to stage it through a float buffer the caller then has to cast.
+    const auto grad_opts = grad_out.options();
     if (!op_uses_rhs(bop)) {
         return torch::empty({0}, grad_opts);  // copy_u has no edge operand
     }
@@ -350,10 +415,10 @@ torch::Tensor gspmm_backward_edge(
     TORCH_CHECK(grad_out.size(0) == edge_ptr.numel() - 1, "grad_out.size(0) must equal N = edge_ptr.numel() - 1");
     TORCH_CHECK(warps_per_block > 0 && warps_per_block <= 32, "warps_per_block must be in [1, 32]");
 
-    // Zeroed because the broadcast path accumulates with atomicAdd.  The
-    // non-broadcast path writes every (eid, f) slot exactly once, so the memset
-    // is redundant there but too cheap to branch on.
-    auto grad_rhs = torch::zeros(rhs.sizes(), grad_opts);
+    // Not zeroed: the non-broadcast path writes every (eid, f) slot once, and
+    // the broadcast path reduces each edge across the whole block down to a
+    // single store, so no slot is left untouched.
+    auto grad_rhs = torch::empty(rhs.sizes(), grad_opts);
 
     const int64_t num_nodes = grad_out.size(0);
     const int64_t d         = grad_out.size(1);
@@ -385,13 +450,13 @@ torch::Tensor gspmm_backward_edge(
                 // grid-strides over whatever does not fit.
                 const unsigned blocks = static_cast<unsigned>(std::min<int64_t>(num_nodes, 65535));
 
-                gspmm_backward_edge_kernel<BOP, BCAST, cuda_t, index_t><<<blocks, threads>>>(
+                gspmm_backward_edge_kernel<BOP, BCAST, cuda_t, index_t, /*grad_t=*/cuda_t><<<blocks, threads>>>(
                     index_ptr<index_t>(edge_ptr),
                     index_ptr<index_t>(edge_idx),
                     reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
                     lhs_ptr,
                     rhs_ptr,
-                    grad_rhs.data_ptr<float>(),
+                    reinterpret_cast<cuda_t *>(grad_rhs.data_ptr<torch_t>()),
                     static_cast<size_t>(num_nodes),
                     static_cast<size_t>(d)
                 );

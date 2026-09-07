@@ -511,8 +511,8 @@ class GSpMMFunction(torch.autograd.Function):
       gradient is this same g-SpMM re-run on the *transposed* CSR; the edge
       gradient is ``_C.gspmm_backward_edge`` over the forward CSR. For ``mul``
       and ``div`` the transposed run still needs the edge values, which live in
-      forward-CSR order, so they are permuted through
-      ``graph.backward_edge_map`` first.
+      forward-CSR order, so ``graph.backward_edge_map`` goes to the kernel and
+      the read is redirected there.
     """
 
     # Operations whose node gradient depends on the edge value; their sum
@@ -607,12 +607,14 @@ class GSpMMFunction(torch.autograd.Function):
 
         if ctx.reduce in ("min", "max"):
             g_lhs, g_rhs = _C.gspmm_backward_arg(grad_out, arg_eid, edge_idx, lhs_t, rhs_t, op, ctx.warps_per_block)
-            # The kernels accumulate in fp32 because their scatter is
-            # atomicAdd-based; cast back to the operand dtypes here.
+            # Only the node gradient is staged in fp32 -- its scatter is
+            # atomicAdd-based, since several destinations can share a winning
+            # source.  The edge gradient already comes back in the operand
+            # dtype (see gspmm_backward_arg).
             if lhs_needs_grad:
                 grad_lhs = g_lhs.to(lhs_t.dtype)
             if rhs_needs_grad:
-                grad_rhs = g_rhs.to(rhs_t.dtype)
+                grad_rhs = g_rhs
         else:
             if lhs_needs_grad:
                 if bwd_edge_ptr is None:
@@ -628,12 +630,19 @@ class GSpMMFunction(torch.autograd.Function):
                             f"gspmm(op='{op}', reduce='sum') backward needs graph.backward_edge_map "
                             "to read edge data while walking the transposed CSR."
                         )
-                    rhs_bwd = rhs_t[bwd_edge_map.long()].contiguous()
+                    # Handed to the kernel rather than used to permute rhs
+                    # here: materializing rhs[bwd_edge_map] cost a full [E, d]
+                    # gather and a second [E, d] allocation on every backward.
+                    rhs_bwd = rhs_t
+                    edge_map = bwd_edge_map
                     bwd_op = op
                 else:
                     # add/sub/copy_u contribute a factor of 1 per edge, so the
                     # edge operand drops out of the node gradient entirely.
                     rhs_bwd = torch.empty(0, device=grad_out.device, dtype=grad_out.dtype)
+                    # Absent, spelled as an empty tensor of the index dtype:
+                    # the pybind signature takes a Tensor, not an optional.
+                    edge_map = bwd_edge_ptr[:0]
                     bwd_op = "copy_u"
 
                 grad_lhs, _ = _C.gspmm_forward(
@@ -649,11 +658,13 @@ class GSpMMFunction(torch.autograd.Function):
                     ctx.features_per_block,
                     ctx.tiles_y,
                     ctx.pipeline_stages,
+                    edge_map,
                 )
 
             if rhs_needs_grad:
-                g_rhs = _C.gspmm_backward_edge(edge_ptr, edge_idx, grad_out, lhs_t, rhs_t, op, ctx.warps_per_block)
-                grad_rhs = g_rhs.to(rhs_t.dtype)
+                # Already in the operand dtype: this kernel writes every slot
+                # exactly once, so it has no float staging buffer to cast back.
+                grad_rhs = _C.gspmm_backward_edge(edge_ptr, edge_idx, grad_out, lhs_t, rhs_t, op, ctx.warps_per_block)
 
         return (
             grad_lhs,
