@@ -101,8 +101,21 @@ class SimulationResult:
     bandwidth_utilisation: np.ndarray
     retired_work: np.ndarray
     active_blocks: dict[str, np.ndarray]
+    slot_bound: float = 0.0
+    bandwidth_bound: float = 0.0
+    critical_path: int = 0
     ns_per_tick: float | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def binding_bound(self) -> str:
+        """Which of the three lower bounds decides ``perfect_packing_time``.
+
+        Reading ``imbalance_ratio`` without this is a trap.  When the critical path binds, the
+        ratio is measuring one enormous node that no scheduling policy can split, not packing.
+        """
+        bounds = {"slot": self.slot_bound, "bandwidth": self.bandwidth_bound, "critical_path": self.critical_path}
+        return max(bounds, key=lambda name: bounds[name])
 
     @property
     def predicted_ms(self) -> float | None:
@@ -120,6 +133,10 @@ class SimulationResult:
             "retired_95_time": self.retired_95_time,
             "total_work": self.total_work,
             "bandwidth_cap": self.bandwidth_cap,
+            "slot_bound": self.slot_bound,
+            "bandwidth_bound": self.bandwidth_bound,
+            "critical_path": self.critical_path,
+            "binding_bound": self.binding_bound,
             "predicted_ms": self.predicted_ms,
             "mean_slot_utilisation": float(self.sm_utilisation.mean()) if self.sm_utilisation.size else 0.0,
             "mean_bandwidth_utilisation": (
@@ -134,14 +151,25 @@ def bandwidth_cap_from_hardware(
     bandwidth_gbps: float,
     feature_dim: int,
     dtype_bytes: int,
-    timestep_duration_ns: float,
+    memory_latency_ns: float,
 ) -> int:
-    """Calculate how many feature rows HBM can transfer in one timestep."""
-    if min(bandwidth_gbps, feature_dim, dtype_bytes, timestep_duration_ns) <= 0:
+    """How many feature-row fetches the memory system keeps in flight at once.
+
+    By Little's law, a system delivering ``bandwidth`` at ``latency`` has
+    ``bandwidth * latency`` bytes outstanding at any moment; divided by the row size, that is
+    the number of blocks that can be making progress simultaneously -- which is exactly what
+    the simulator's per-tick cap means.
+
+    This deliberately does not involve the tick duration.  Sizing the cap as "rows per tick"
+    and then deriving the tick from a measured per-edge time counts the machine's parallelism
+    twice: the measurement is an aggregate rate over thousands of concurrent blocks, so the
+    concurrency is already inside it.
+    """
+    if min(bandwidth_gbps, feature_dim, dtype_bytes, memory_latency_ns) <= 0:
         raise ValueError("bandwidth inputs must be positive")
-    bytes_per_timestep = bandwidth_gbps * timestep_duration_ns  # GB/s == bytes/ns
+    bytes_in_flight = bandwidth_gbps * memory_latency_ns  # GB/s == bytes/ns
     bytes_per_row = feature_dim * dtype_bytes
-    return max(1, floor(bytes_per_timestep / bytes_per_row))
+    return max(1, floor(bytes_in_flight / bytes_per_row))
 
 
 def _validate_degrees(degrees: Sequence[int]) -> np.ndarray:
@@ -363,10 +391,14 @@ def simulate(
         / config.num_sms
     )
     bandwidth_lower_bound = total_work / bandwidth_cap
-    perfect_packing_time = max(slot_lower_bound, bandwidth_lower_bound)
+    critical_path = max((block.cost for blocks in workloads.values() for block in blocks), default=0)
+    perfect_packing_time = max(slot_lower_bound, bandwidth_lower_bound, critical_path)
     return SimulationResult(
         makespan=makespan,
         perfect_packing_time=perfect_packing_time,
+        slot_bound=slot_lower_bound,
+        bandwidth_bound=bandwidth_lower_bound,
+        critical_path=critical_path,
         imbalance_ratio=makespan / perfect_packing_time if perfect_packing_time else 1.0,
         drain_tail=makespan - retired_95,
         retired_95_time=retired_95,

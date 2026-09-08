@@ -231,6 +231,42 @@ def fit_cost_model(
     )
 
 
+def anchor_tick_ns(fit: FitResult, num_nodes: int, num_edges: int, baseline_ticks: int) -> float:
+    """Tick duration that makes the simulator reproduce the measurement it was calibrated on.
+
+    ``ns_per_edge`` is an *aggregate* rate: the whole device retires one edge every ``b``
+    nanoseconds while thousands of blocks run at once.  The simulator's tick is a *per-block*
+    quantity -- one block advancing one neighbour -- and it then lets up to ``bandwidth_cap``
+    blocks advance per tick.  Using ``b`` directly as the tick therefore counts the machine's
+    parallelism twice and predicts a wall clock several times too short.
+
+    Rather than model that parallelism from first principles (it is intra-block warps, memory
+    level parallelism and latency hiding all at once), anchor the tick empirically: simulate the
+    configuration that was actually measured, and scale the tick so that run reproduces the
+    measured time.  Every other configuration is then expressed in the same units, so the
+    simulator predicts *changes* from a measured baseline rather than absolute time from
+    nothing -- which is the only claim it can honestly support.
+
+    Launch overhead is excluded: the simulator does not model it, and it does not move with the
+    scheduling policy, so it belongs added back as a constant rather than smeared across ticks.
+
+    Args:
+        fit: Calibration for the (conv, pass, head dim) being simulated.
+        num_nodes: Nodes in the simulated graph.
+        num_edges: Edges in the simulated graph.
+        baseline_ticks: Makespan of the simulated baseline, in ticks.
+
+    Returns:
+        float: Nanoseconds per tick.
+    """
+    if baseline_ticks <= 0:
+        raise ValueError("baseline_ticks must be positive")
+    work_ns = fit.ns_per_node * num_nodes + fit.ns_per_edge * num_edges
+    if work_ns <= 0:
+        raise ValueError("the fit attributes no time to this graph's nodes and edges")
+    return work_ns / baseline_ticks
+
+
 def fit_all(
     measurements: Iterable[Measurement],
     weighting: Weighting = "relative",

@@ -13,9 +13,7 @@ from turbo_gnn.simulation import (
 
 def test_single_block_cost_is_degree_plus_two():
     blocks = build_blocks([3], "light")
-    result = simulate(
-        {"light": blocks}, {"light": KernelConfig("light", 1)}, SimulationConfig(num_sms=1)
-    )
+    result = simulate({"light": blocks}, {"light": KernelConfig("light", 1)}, SimulationConfig(num_sms=1))
     assert blocks[0].cost == 5
     assert result.makespan == 5
     assert result.imbalance_ratio == pytest.approx(1.0)
@@ -23,12 +21,8 @@ def test_single_block_cost_is_degree_plus_two():
 
 def test_occupancy_allows_multiple_resident_blocks():
     blocks = build_blocks([2, 2], "light")
-    full = simulate(
-        {"light": blocks}, {"light": KernelConfig("light", 2, 1.0)}, SimulationConfig(num_sms=1)
-    )
-    half = simulate(
-        {"light": blocks}, {"light": KernelConfig("light", 2, 0.5)}, SimulationConfig(num_sms=1)
-    )
+    full = simulate({"light": blocks}, {"light": KernelConfig("light", 2, 1.0)}, SimulationConfig(num_sms=1))
+    half = simulate({"light": blocks}, {"light": KernelConfig("light", 2, 0.5)}, SimulationConfig(num_sms=1))
     assert full.makespan == 4
     assert half.makespan == 8
 
@@ -116,5 +110,6 @@ def test_concurrent_streams_start_light_after_latency():
 
 
 def test_hardware_bandwidth_conversion():
-    # 100 bytes/ns for 1 ns, 4-byte x 10-element row => two full rows.
+    # Little's law: 100 bytes/ns held for 1 ns is 100 bytes outstanding, and a 4-byte
+    # x 10-element row means two fetches in flight.
     assert bandwidth_cap_from_hardware(100, 10, 4, 1) == 2

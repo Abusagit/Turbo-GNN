@@ -7,6 +7,7 @@ import torch
 
 from turbo_gnn.calibration import (
     Measurement,
+    anchor_tick_ns,
     fit_all,
     fit_cost_model,
     load_cost_models,
@@ -15,7 +16,15 @@ from turbo_gnn.calibration import (
     measurements_from_kernel_benchmark_summary,
     save_cost_models,
 )
-from turbo_gnn.simulation import CostModel, KernelConfig, SimulationConfig, build_blocks, simulate
+from turbo_gnn.simulation import (
+    CostModel,
+    KernelConfig,
+    SimulationConfig,
+    bandwidth_cap_from_hardware,
+    build_blocks,
+    build_heavy_slices,
+    simulate,
+)
 
 
 def synthesise(launch_ns: float, ns_per_node: float, ns_per_edge: float, shapes) -> list[Measurement]:
@@ -287,3 +296,80 @@ def test_backward_pass_simulates_the_transposed_graph():
 
     with pytest.raises(ValueError, match="unknown direction"):
         bucket_degrees(FakeGraph(), "sideways")
+
+
+# --------------------------------------------------------------------------------------------
+# Lower bounds and the anchored tick
+# --------------------------------------------------------------------------------------------
+
+
+def test_critical_path_bounds_the_ideal():
+    # One node of degree 40 among 132 SMs with unlimited bandwidth: its block cannot be split,
+    # so no packing finishes sooner than that one block does.
+    blocks = build_blocks([40, 1, 1, 1], "light", cost_model=CostModel(alpha=0.0))
+    result = simulate(
+        {"light": blocks},
+        {"light": KernelConfig("light", 8)},
+        SimulationConfig(num_sms=132, bandwidth_cap=10_000),
+    )
+    assert result.critical_path == 40
+    assert result.slot_bound < 1
+    assert result.bandwidth_bound < 1
+    assert result.perfect_packing_time == 40
+    assert result.binding_bound == "critical_path"
+
+
+def test_binding_bound_names_the_active_constraint():
+    blocks = build_blocks([2] * 64, "light")
+    starved = simulate(
+        {"light": blocks}, {"light": KernelConfig("light", 8)}, SimulationConfig(num_sms=132, bandwidth_cap=1)
+    )
+    roomy = simulate(
+        {"light": blocks}, {"light": KernelConfig("light", 1)}, SimulationConfig(num_sms=1, bandwidth_cap=10_000)
+    )
+    assert starved.binding_bound == "bandwidth"
+    assert roomy.binding_bound == "slot"
+
+
+def test_slicing_a_hub_moves_the_binding_bound_off_the_critical_path():
+    hub = build_blocks([4_000], "heavy", cost_model=CostModel(alpha=0.0))
+    sliced = build_heavy_slices([4_000], slice_size=100, cost_model=CostModel(alpha=0.0))
+    config = SimulationConfig(num_sms=132, bandwidth_cap=10_000)
+    whole = simulate({"heavy": hub}, {"heavy": KernelConfig("heavy", 4)}, config)
+    split = simulate({"heavy": sliced}, {"heavy": KernelConfig("heavy", 4)}, config)
+    assert whole.binding_bound == "critical_path"
+    assert split.critical_path == 100
+    assert split.makespan < whole.makespan
+
+
+def test_anchored_tick_makes_the_baseline_reproduce_the_measurement():
+    fit = fit_cost_model(synthesise(30_000.0, 2.4, 0.4, SHAPES))
+    num_nodes, num_edges = SHAPES[2]
+    baseline_ticks = 5_000
+    tick = anchor_tick_ns(fit, num_nodes, num_edges, baseline_ticks)
+
+    kernel_ms = baseline_ticks * tick / 1e6
+    assert kernel_ms + fit.launch_overhead_ns / 1e6 == pytest.approx(fit.predict_ms(num_nodes, num_edges))
+
+
+def test_anchored_tick_excludes_launch_overhead():
+    # Overhead does not move with the scheduling policy, so smearing it across ticks would make
+    # every configuration inherit a share of it.
+    shapes = [SHAPES[2]]
+    with_overhead = fit_cost_model(synthesise(500_000.0, 2.4, 0.4, SHAPES))
+    without = fit_cost_model(synthesise(0.0, 2.4, 0.4, SHAPES))
+    assert anchor_tick_ns(with_overhead, *shapes[0], 5_000) == pytest.approx(
+        anchor_tick_ns(without, *shapes[0], 5_000), rel=1e-6
+    )
+
+
+def test_anchoring_needs_a_baseline_that_ran():
+    fit = fit_cost_model(synthesise(0.0, 2.4, 0.4, SHAPES))
+    with pytest.raises(ValueError, match="baseline_ticks"):
+        anchor_tick_ns(fit, 100, 1_000, 0)
+
+
+def test_bandwidth_cap_is_rows_in_flight_not_rows_per_tick():
+    # Little's law: 100 bytes/ns held for 400 ns is 40,000 bytes outstanding, and a 40-byte row
+    # means 1000 fetches in flight. It must not depend on the tick.
+    assert bandwidth_cap_from_hardware(100, 10, 4, 400) == 1_000

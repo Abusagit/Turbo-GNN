@@ -15,11 +15,14 @@ import torch
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-from turbo_gnn.calibration import load_cost_models, lookup  # noqa: E402
+from turbo_gnn.calibration import FitResult, anchor_tick_ns, load_cost_models, lookup  # noqa: E402
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
 from turbo_gnn.simulation import (  # noqa: E402
+    Assignment,
+    BlockSpec,
     CostModel,
     KernelConfig,
+    LaunchMode,
     SimulationConfig,
     bandwidth_cap_from_hardware,
     build_blocks,
@@ -210,34 +213,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=1)
     parser.add_argument("--dtype-bytes", type=int, default=4)
     parser.add_argument(
+        "--memory-latency-ns",
+        type=float,
+        default=400.0,
+        help="HBM latency; with bandwidth this sets how many row fetches stay in flight at once",
+    )
+    parser.add_argument(
         "--timestep-duration-ns",
         type=float,
-        help="Duration of one simulator iteration in nanoseconds; default is the calibrated tick, or 1.0",
+        help="Override the tick duration; by default it is anchored on the measured baseline run",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=Path, default=Path("simulation_results"))
     return parser.parse_args()
 
 
-def resolve_cost_model(args: argparse.Namespace) -> tuple[CostModel, float, float | None, dict[str, object]]:
-    """Pick the cost model and the tick duration, and describe where they came from.
+# The configuration the benchmark measured: one block per node, natural order, one stream. The
+# tick is anchored on this run, so it has to match what benchmark_kernels.py timed as its
+# baseline -- `one_per_block` in natural node order.
+BASELINE_ASSIGNMENT: Assignment = "contiguous"
+BASELINE_LAUNCH_MODE: LaunchMode = "sequential"
+BASELINE_VERTICES_PER_BLOCK = 1
+BASELINE_HEAVY_SLICE = 0
 
-    A calibrated cell supplies both: ``alpha`` from the regression, and the tick duration the
-    bandwidth cap needs.  Without one the simulator falls back to ``D + 2`` on a nominal 1 ns
-    tick -- self-consistent, but not a wall clock, so no predicted time is reported.
 
-    Returns:
-        tuple: The cost model, the tick duration to size the bandwidth cap with, the tick
-        duration to report predicted times with (None when uncalibrated), and provenance for
-        ``config.json``.
+def resolve_cost_model(args: argparse.Namespace) -> tuple[CostModel, FitResult | None, dict[str, object]]:
+    """Pick the cost model and say where it came from.
+
+    The tick duration is *not* decided here: it is anchored later, once the measured baseline
+    configuration has been simulated.  See :func:`turbo_gnn.calibration.anchor_tick_ns`.
     """
     provenance: dict[str, object] = {"cost_model_source": "default D+2"}
-    calibrated = False
-    alpha, beta, tick = 2.0, 1.0, 1.0
+    fit: FitResult | None = None
+    alpha, beta = 2.0, 1.0
     if args.cost_model:
         fit = lookup(load_cost_models(args.cost_model), args.conv, args.pass_name, args.head_dim)
-        alpha, beta, tick = fit.alpha, fit.beta, fit.ns_per_tick
-        calibrated = True
+        alpha, beta = fit.alpha, fit.beta
         provenance = {
             "cost_model_source": f"{args.cost_model}:{args.conv}/{args.pass_name}/{args.head_dim}",
             "cost_model_r2": fit.r2,
@@ -256,22 +267,106 @@ def resolve_cost_model(args: argparse.Namespace) -> tuple[CostModel, float, floa
         alpha, provenance["cost_model_source"] = args.alpha, "command line"
     if args.beta is not None:
         beta, provenance["cost_model_source"] = args.beta, "command line"
+    provenance |= {"alpha": alpha, "beta": beta}
+    return CostModel(alpha=alpha, beta=beta), fit, provenance
+
+
+def build_workloads(
+    args: argparse.Namespace,
+    cost_model: CostModel,
+    degrees: tuple[np.ndarray, np.ndarray, np.ndarray],
+    assignment: Assignment,
+    vertices_per_block: int | None,
+    block_count: int | None,
+    heavy_slice: int,
+    launch_mode: LaunchMode,
+    occupancy: float,
+) -> tuple[dict[str, list[BlockSpec]], dict[str, KernelConfig], np.ndarray, np.ndarray]:
+    """Blocks and kernel configs for one point of the sweep."""
+    all_degrees, light_degrees, heavy_degrees = degrees
+    if launch_mode == "single" and len(heavy_degrees):
+        light_for_run, heavy_for_run = all_degrees, np.empty(0, dtype=np.int64)
+    else:
+        light_for_run, heavy_for_run = light_degrees, heavy_degrees
+
+    workloads = {
+        "light": build_blocks(
+            light_for_run,
+            "light",
+            assignment,
+            1 if vertices_per_block is None else vertices_per_block,
+            block_count,
+            args.num_heads,
+            cost_model,
+        )
+    }
+    if len(heavy_for_run):
+        workloads["heavy"] = (
+            build_heavy_slices(heavy_for_run, heavy_slice, num_heads=args.num_heads, cost_model=cost_model)
+            if heavy_slice > 0
+            else build_blocks(heavy_for_run, "heavy", "contiguous", 1, num_heads=args.num_heads, cost_model=cost_model)
+        )
+    kernels = {"light": KernelConfig("light", args.max_blocks_light, occupancy)}
+    if "heavy" in workloads:
+        kernels["heavy"] = KernelConfig("heavy", args.max_blocks_heavy, occupancy)
+    return workloads, kernels, light_for_run, heavy_for_run
+
+
+def anchor_tick(
+    args: argparse.Namespace,
+    cost_model: CostModel,
+    fit: FitResult | None,
+    degrees: tuple[np.ndarray, np.ndarray, np.ndarray],
+    bandwidth_cap: int,
+) -> tuple[float | None, dict[str, object]]:
+    """Simulate the measured baseline once and scale the tick so it reproduces the measurement."""
     if args.timestep_duration_ns is not None:
-        tick, calibrated = args.timestep_duration_ns, True
-    if not calibrated:
+        return args.timestep_duration_ns, {"tick_source": "command line"}
+    if fit is None:
         print(
             "warning: no --cost-model and no --timestep-duration-ns, so the tick has no duration; "
             "reporting ticks only. Run scripts/ablation/calibrate_cost_model.py to fix this.",
             file=sys.stderr,
         )
-    provenance |= {"alpha": alpha, "beta": beta, "timestep_duration_ns": tick, "calibrated": calibrated}
-    return CostModel(alpha=alpha, beta=beta), tick, tick if calibrated else None, provenance
+        return None, {"tick_source": "uncalibrated"}
+
+    occupancy = max(args.occupancies)
+    workloads, kernels, _, _ = build_workloads(
+        args,
+        cost_model,
+        degrees,
+        BASELINE_ASSIGNMENT,
+        BASELINE_VERTICES_PER_BLOCK,
+        None,
+        BASELINE_HEAVY_SLICE,
+        BASELINE_LAUNCH_MODE,
+        occupancy,
+    )
+    baseline = simulate(
+        workloads,
+        kernels,
+        SimulationConfig(
+            num_sms=args.sms,
+            bandwidth_cap=bandwidth_cap,
+            seed=args.seed,
+            launch_mode=BASELINE_LAUNCH_MODE,
+            light_launch_latency=args.launch_latency,
+        ),
+    )
+    all_degrees = degrees[0]
+    tick = anchor_tick_ns(fit, len(all_degrees), int(all_degrees.sum()), baseline.makespan)
+    return tick, {
+        "tick_source": f"anchored on {BASELINE_ASSIGNMENT} v1 {BASELINE_LAUNCH_MODE} occ{occupancy:g}",
+        "baseline_makespan": baseline.makespan,
+        "baseline_binding_bound": baseline.binding_bound,
+    }
 
 
 def main() -> int:
     args = parse_args()
-    cost_model, timestep_duration_ns, ns_per_tick, provenance = resolve_cost_model(args)
+    cost_model, fit, provenance = resolve_cost_model(args)
     all_degrees, light_degrees, heavy_degrees = load_degrees(args)
+    degrees = (all_degrees, light_degrees, heavy_degrees)
     args.out.mkdir(parents=True, exist_ok=True)
     trace_dir = args.out / "traces"
     plot_dir = args.out / "plots"
@@ -282,11 +377,24 @@ def main() -> int:
         args.memory_bandwidth_gbps,
         args.feature_dim,
         args.dtype_bytes,
-        timestep_duration_ns,
+        args.memory_latency_ns,
     )
+    resident_slots = args.sms * args.max_blocks_light
+    if bandwidth_cap >= resident_slots:
+        print(
+            f"note: bandwidth cap {bandwidth_cap} exceeds the {resident_slots} resident block slots, so HBM "
+            "never stalls a block and the bandwidth model is inert in this configuration.",
+            file=sys.stderr,
+        )
+    if fit is not None:
+        # What the measurement says the kernel actually achieves, against the peak passed in.
+        provenance["achieved_bandwidth_gbps"] = args.feature_dim * args.dtype_bytes / fit.ns_per_edge
+    ns_per_tick, tick_provenance = anchor_tick(args, cost_model, fit, degrees, bandwidth_cap)
+    provenance |= tick_provenance | {"ns_per_tick": ns_per_tick}
+    launch_overhead_ms = fit.launch_overhead_ns / 1e6 if fit else 0.0
     rows: list[dict[str, object]] = []
     experiment = 0
-    block_layouts: list[tuple[str, int | None, int | None]] = []
+    block_layouts: list[tuple[Assignment, int | None, int | None]] = []
     for assignment in args.assignments:
         if assignment == "contiguous":
             block_layouts.extend((assignment, value, None) for value in args.vertices_per_block)
@@ -300,35 +408,9 @@ def main() -> int:
         args.occupancies,
     ):
         assignment, vertices_per_block, block_count = block_layout
-        if launch_mode == "single" and len(heavy_degrees):
-            light_for_run = all_degrees
-            heavy_for_run = np.empty(0, dtype=np.int64)
-        else:
-            light_for_run, heavy_for_run = light_degrees, heavy_degrees
-
-        blocks = build_blocks(
-            light_for_run,
-            "light",
-            assignment,
-            1 if vertices_per_block is None else vertices_per_block,
-            block_count,
-            args.num_heads,
-            cost_model,
+        workloads, kernels, light_for_run, heavy_for_run = build_workloads(
+            args, cost_model, degrees, assignment, vertices_per_block, block_count, heavy_slice, launch_mode, occupancy
         )
-        workloads = {"light": blocks}
-        if len(heavy_for_run):
-            workloads["heavy"] = (
-                build_heavy_slices(heavy_for_run, heavy_slice, num_heads=args.num_heads, cost_model=cost_model)
-                if heavy_slice > 0
-                else build_blocks(
-                    heavy_for_run, "heavy", "contiguous", 1, num_heads=args.num_heads, cost_model=cost_model
-                )
-            )
-        kernels = {
-            "light": KernelConfig("light", args.max_blocks_light, occupancy),
-        }
-        if "heavy" in workloads:
-            kernels["heavy"] = KernelConfig("heavy", args.max_blocks_heavy, occupancy)
         result = simulate(
             workloads,
             kernels,
@@ -352,6 +434,8 @@ def main() -> int:
             occupancy=occupancy,
             light_nodes=len(light_for_run),
             heavy_nodes=len(heavy_for_run),
+            launch_overhead_ms=launch_overhead_ms,
+            predicted_total_ms=None if result.predicted_ms is None else result.predicted_ms + launch_overhead_ms,
         )
         if assignment == "contiguous":
             row["vertices_per_block"] = vertices_per_block
@@ -360,9 +444,11 @@ def main() -> int:
         rows.append(row)
         save_trace(trace_dir / f"{tag}.npz", result)
         plot_result(plot_dir / f"{tag}.png", tag, result)
-        predicted = "" if result.predicted_ms is None else f" predicted={result.predicted_ms:.3f}ms"
+        predicted = (
+            "" if result.predicted_ms is None else f" predicted={result.predicted_ms + launch_overhead_ms:.4f}ms"
+        )
         print(
-            f"{tag}: T={result.makespan} T*={result.perfect_packing_time:.2f} "
+            f"{tag}: T={result.makespan} T*={result.perfect_packing_time:.2f} ({result.binding_bound}) "
             f"imbalance={result.imbalance_ratio:.3f} tail={result.drain_tail}{predicted}"
         )
         experiment += 1
