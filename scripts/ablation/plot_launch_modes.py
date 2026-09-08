@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -31,13 +32,14 @@ sys.path.append(str(Path(__file__).resolve().parent))
 
 from simulate_load_imbalance import (  # noqa: E402
     BASELINE_ASSIGNMENT,
-    BASELINE_HEAVY_SLICE,
     BASELINE_VERTICES_PER_BLOCK,
     add_common_arguments,
     anchor_tick,
     build_workloads,
+    dependencies,
     load_degrees,
     resolve_cost_model,
+    resolve_heavy_slice,
 )
 
 from turbo_gnn.simulation import (  # noqa: E402
@@ -67,10 +69,10 @@ def bin_columns(utilisation: np.ndarray, max_columns: int) -> np.ndarray:
     return np.stack([utilisation[start:stop].mean(axis=0) for start, stop in zip(edges[:-1], edges[1:])])
 
 
-def panel_title(mode: str, result: SimulationResult, launch_overhead_ms: float) -> str:
+def panel_title(label: str, blurb: str, result: SimulationResult, launch_overhead_ms: float) -> str:
     predicted = "" if result.predicted_ms is None else f"   {(result.predicted_ms + launch_overhead_ms) * 1e3:.1f} us"
     return (
-        f"{mode} -- {MODE_BLURB[mode]}   |   T/T* = {result.imbalance_ratio:.3f} "
+        f"{label} -- {blurb}   |   T/T* = {result.imbalance_ratio:.3f} "
         f"({result.binding_bound})   drain tail {result.drain_tail / result.makespan:.0%}{predicted}"
     )
 
@@ -78,6 +80,7 @@ def panel_title(mode: str, result: SimulationResult, launch_overhead_ms: float) 
 def plot(
     path: Path,
     results: dict[str, SimulationResult],
+    blurbs: dict[str, str],
     num_sms: int,
     tick_ns: float | None,
     overhead_ms: float,
@@ -112,7 +115,7 @@ def plot(
             vmax=1,
             extent=(0.0, width, 0.0, num_sms),
         )
-        axis.set(ylabel="SM", title=panel_title(mode, result, overhead_ms))
+        axis.set(ylabel="SM", title=panel_title(mode, blurbs[mode], result, overhead_ms))
         axis.set_xlim(0.0, span)
     axes[-1].set_xlabel(f"time, {unit}")
     fig.colorbar(image, ax=axes.tolist(), label="occupied slot fraction", fraction=0.02)
@@ -129,6 +132,13 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=["single", "sequential", "concurrent"],
         default=["single", "sequential", "concurrent"],
+    )
+    parser.add_argument(
+        "--slice-blocks-per-sm",
+        type=float,
+        nargs="+",
+        default=[0, 8],
+        help="Split-K: target blocks per SM the heavy slice size is chosen for; 0 means do not split",
     )
     parser.add_argument("--max-columns", type=int, default=1600, help="Time steps are averaged down to this width")
     parser.add_argument("--out", type=Path, default=Path("launch_modes.png"))
@@ -148,7 +158,12 @@ def main() -> int:
     occupancy = args.occupancies[0]
 
     results: dict[str, SimulationResult] = {}
-    for mode in args.launch_modes:
+    blurbs: dict[str, str] = {}
+    for mode, blocks_per_sm in product(args.launch_modes, args.slice_blocks_per_sm):
+        # "single" has no heavy bucket to split, so slicing it would repeat the same run.
+        if mode == "single" and blocks_per_sm > 0:
+            continue
+        slice_size = resolve_heavy_slice(0, blocks_per_sm, degrees[2], args.sms)
         workloads, kernels, light, heavy = build_workloads(
             args,
             cost_model,
@@ -156,11 +171,17 @@ def main() -> int:
             BASELINE_ASSIGNMENT,
             BASELINE_VERTICES_PER_BLOCK,
             None,
-            BASELINE_HEAVY_SLICE,
+            slice_size,
             mode,
             occupancy,
         )
-        results[mode] = simulate(
+        label = mode if slice_size <= 0 else f"{mode} + split-K"
+        blurbs[label] = (
+            MODE_BLURB[mode]
+            if slice_size <= 0
+            else f"{MODE_BLURB[mode]}; heavy edges cut into {slice_size:,}-edge slices, then merged"
+        )
+        result = simulate(
             workloads,
             kernels,
             SimulationConfig(
@@ -169,14 +190,16 @@ def main() -> int:
                 seed=args.seed,
                 launch_mode=mode,
                 light_launch_latency=args.launch_latency,
+                depends_on=dependencies(workloads, mode),
                 ns_per_tick=tick_ns,
             ),
         )
-        result = results[mode]
+        results[label] = result
+        blocks = "".join(f" {name}={len(spec):,}" for name, spec in sorted(workloads.items()))
         print(
-            f"{mode:<11} T={result.makespan:>7} T*={result.perfect_packing_time:>10.1f} ({result.binding_bound}) "
-            f"imbalance={result.imbalance_ratio:.3f} tail={result.drain_tail:>6} "
-            f"light={len(light)} heavy={len(heavy)}"
+            f"{label:<22} T={result.makespan:>7} T*={result.perfect_packing_time:>10.1f} "
+            f"({result.binding_bound}) imbalance={result.imbalance_ratio:.3f} "
+            f"tail={result.drain_tail:>6} slice={slice_size:>7,} blocks:{blocks}"
         )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -191,7 +214,7 @@ def main() -> int:
         f"alpha={provenance['alpha']:.2f} beta={provenance['beta']:.2f}  "
         f"{args.sms} SMs x {args.max_blocks_light} slots  occ={occupancy:g}"
     )
-    plot(args.out, results, args.sms, tick_ns, overhead_ms, args.max_columns, title)
+    plot(args.out, results, blurbs, args.sms, tick_ns, overhead_ms, args.max_columns, title)
     print(f"\nwrote {args.out}")
     return 0
 

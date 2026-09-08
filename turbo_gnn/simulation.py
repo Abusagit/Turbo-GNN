@@ -81,6 +81,13 @@ class SimulationConfig:
     seed: int = 42
     launch_mode: LaunchMode = "single"
     light_launch_latency: int = 0
+    depends_on: dict[str, str] = field(default_factory=dict)
+    """Kernels that cannot start until another kernel has fully drained.
+
+    A separate launch is a global barrier, so split-K's merge pass cannot begin before the last
+    slice retires however much of the device is idle.  That wait is the price the split pays for
+    the balance it buys, and leaving it out would make slicing look free."""
+
     ns_per_tick: float | None = None
     """Wall-clock duration of one tick, from :func:`turbo_gnn.calibration.fit_cost_model`.
 
@@ -263,6 +270,57 @@ def build_heavy_slices(
     return blocks
 
 
+def slices_per_node(degree: int, slice_size: int) -> int:
+    """Blocks :func:`build_heavy_slices` makes for one node.  An isolated node still gets one."""
+    if slice_size <= 0:
+        raise ValueError("slice_size must be positive")
+    return max(1, ceil(int(degree) / slice_size))
+
+
+def slice_size_for_blocks_per_sm(degrees: Sequence[int], blocks_per_sm: float, num_sms: int) -> int:
+    """Slice size that fills the device with ``blocks_per_sm`` blocks per SM.
+
+    Ported from the measured result in the split-K work: sizing a slice from a degree statistic
+    does not transfer between graphs, because graphs wanting similar slices have similar heavy
+    *edge counts* rather than similar degrees.  Targeting a block count does transfer, and is
+    device-relative rather than tied to one card's SM count.
+
+    Returns 0, meaning "do not slice", for a non-positive target or an empty bucket.
+    """
+    edges = int(np.asarray(degrees, dtype=np.int64).sum()) if len(degrees) else 0
+    if blocks_per_sm <= 0 or edges <= 0 or num_sms <= 0:
+        return 0
+    return max(1, round(edges / (blocks_per_sm * num_sms)))
+
+
+def build_slice_merge(
+    degrees: Sequence[int],
+    slice_size: int,
+    kernel: str = "merge",
+    num_heads: int = 1,
+    cost_model: CostModel = DEFAULT_COST_MODEL,
+) -> list[BlockSpec]:
+    """The second launch that combines a sliced node's partial results.
+
+    Split-K's slice kernel stops before normalising and writes per-slice partial state; a merge
+    kernel then runs the same n-way reduction across a node's slices.  Its grid is one block per
+    heavy node, and each block reads one partial per slice, so a partial costs what a neighbour
+    costs and the node's merge is ``alpha + beta * slice_count``.
+
+    This is a separate launch, which is why :attr:`SimulationConfig.depends_on` exists: no merge
+    block may start until the last slice has retired.
+    """
+    degree_array = _validate_degrees(degrees)
+    if num_heads <= 0:
+        raise ValueError("num_heads must be positive")
+    counts = [slices_per_node(int(degree), slice_size) for degree in degree_array]
+    return [
+        BlockSpec(head * len(counts) + node, kernel, (node,), (count,), cost_model)
+        for head in range(num_heads)
+        for node, count in enumerate(counts)
+    ]
+
+
 @dataclass
 class _Running:
     spec: BlockSpec
@@ -293,10 +351,15 @@ def simulate(
     if bandwidth_cap <= 0:
         raise ValueError("bandwidth_cap must be positive")
 
+    unknown_dependency = {k: v for k, v in config.depends_on.items() if k not in workloads or v not in workloads}
+    if unknown_dependency:
+        raise ValueError(f"depends_on names a kernel that has no workload: {unknown_dependency}")
+
     kernel_names = list(workloads)
-    if "heavy" in kernel_names:
-        kernel_names.remove("heavy")
-        kernel_names.insert(0, "heavy")
+    for preferred in ("merge", "heavy"):
+        if preferred in kernel_names:
+            kernel_names.remove(preferred)
+            kernel_names.insert(0, preferred)
     running: list[_Running] = []
     sm_load = np.zeros(config.num_sms, dtype=np.float64)
     sm_history: list[np.ndarray] = []
@@ -312,9 +375,12 @@ def simulate(
         return bool(queues[name] or any(block.spec.kernel == name for block in running))
 
     def released(name: str) -> bool:
-        if config.launch_mode == "concurrent" and name != "heavy":
+        blocker = config.depends_on.get(name)
+        if blocker is not None and blocker in queues and has_pending(blocker):
+            return False
+        if config.launch_mode == "concurrent" and name not in ("heavy", "merge"):
             return time >= config.light_launch_latency
-        if config.launch_mode == "sequential" and name != "heavy" and "heavy" in workloads:
+        if config.launch_mode == "sequential" and name not in ("heavy", "merge") and "heavy" in workloads:
             return not has_pending("heavy")
         return True
 
@@ -344,7 +410,7 @@ def simulate(
 
         if not running:
             future = []
-            light_is_queued = any(queues[name] for name in kernel_names if name != "heavy")
+            light_is_queued = any(queues[name] for name in kernel_names if name not in ("heavy", "merge"))
             if config.launch_mode == "concurrent" and light_is_queued:
                 future.append(config.light_launch_latency)
             if not future:

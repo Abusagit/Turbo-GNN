@@ -2,6 +2,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,7 +24,9 @@ from turbo_gnn.simulation import (
     bandwidth_cap_from_hardware,
     build_blocks,
     build_heavy_slices,
+    build_slice_merge,
     simulate,
+    slice_size_for_blocks_per_sm,
 )
 
 
@@ -373,3 +376,91 @@ def test_bandwidth_cap_is_rows_in_flight_not_rows_per_tick():
     # Little's law: 100 bytes/ns held for 400 ns is 40,000 bytes outstanding, and a 40-byte row
     # means 1000 fetches in flight. It must not depend on the tick.
     assert bandwidth_cap_from_hardware(100, 10, 4, 400) == 1_000
+
+
+# --------------------------------------------------------------------------------------------
+# Split-K: slices, their merge pass, and the launch boundary between them
+# --------------------------------------------------------------------------------------------
+
+
+def test_merge_block_costs_one_partial_per_slice():
+    # 300 edges at 100 per slice is three slices, so three partials to combine.
+    (merge,) = build_slice_merge([300], slice_size=100, cost_model=CostModel(alpha=0.0, beta=1.0))
+    assert merge.degrees == (3,)
+    assert merge.cost == 3
+    assert len(build_heavy_slices([300], slice_size=100)) == 3
+
+
+def test_every_node_gets_a_merge_block_including_isolated_ones():
+    # An isolated node keeps one empty slice so the merge still writes its identity result.
+    merges = build_slice_merge([0, 5, 300], slice_size=100)
+    assert [m.node_ids for m in merges] == [(0,), (1,), (2,)]
+    assert [m.degrees[0] for m in merges] == [1, 1, 3]
+    assert [len(build_heavy_slices([d], 100)) for d in (0, 5, 300)] == [1, 1, 3]
+
+
+def test_merge_waits_for_the_last_slice():
+    # A separate launch is a global barrier: no merge block may start while a slice is running.
+    cost_model = CostModel(alpha=0.0)
+    workloads = {
+        "heavy": build_heavy_slices([4_000], slice_size=1_000, cost_model=cost_model),
+        "merge": build_slice_merge([4_000], slice_size=1_000, cost_model=cost_model),
+    }
+    kernels = {"heavy": KernelConfig("heavy", 4), "merge": KernelConfig("merge", 16)}
+    gated = simulate(
+        workloads, kernels, SimulationConfig(num_sms=132, bandwidth_cap=10_000, depends_on={"merge": "heavy"})
+    )
+    ungated = simulate(workloads, kernels, SimulationConfig(num_sms=132, bandwidth_cap=10_000))
+
+    slices_done = int(np.flatnonzero(gated.active_blocks["heavy"] == 0)[0])
+    assert gated.active_blocks["merge"][:slices_done].sum() == 0
+    # Ungated, the merge runs alongside the slices and costs nothing; gated it is pure tail.
+    assert ungated.makespan == 1_000
+    assert gated.makespan == 1_004
+
+
+def test_dependency_must_name_a_real_workload():
+    workloads = {"light": build_blocks([2], "light")}
+    with pytest.raises(ValueError, match="depends_on"):
+        simulate(workloads, {"light": KernelConfig("light", 8)}, SimulationConfig(depends_on={"light": "heavy"}))
+
+
+def test_splitting_a_hub_trades_the_critical_path_for_a_merge():
+    degrees = [4_000, *([10] * 200)]
+    cost_model = CostModel(alpha=0.0)
+    config = SimulationConfig(num_sms=132, bandwidth_cap=100_000)
+    whole = simulate(
+        {"heavy": build_blocks(degrees, "heavy", cost_model=cost_model)},
+        {"heavy": KernelConfig("heavy", 4)},
+        config,
+    )
+    split_workloads = {
+        "heavy": build_heavy_slices(degrees, 100, cost_model=cost_model),
+        "merge": build_slice_merge(degrees, 100, cost_model=cost_model),
+    }
+    split = simulate(
+        split_workloads,
+        {"heavy": KernelConfig("heavy", 4), "merge": KernelConfig("merge", 16)},
+        SimulationConfig(num_sms=132, bandwidth_cap=100_000, depends_on={"merge": "heavy"}),
+    )
+    assert whole.binding_bound == "critical_path"
+    assert whole.critical_path == 4_000
+    assert split.critical_path == 100
+    assert split.makespan < whole.makespan / 5
+
+
+def test_slice_size_targets_a_block_count_not_a_degree():
+    # 1,056,000 heavy edges over 132 SMs at 8 blocks each is 1,056 blocks of 1,000 edges.
+    assert slice_size_for_blocks_per_sm([1_056_000], blocks_per_sm=8, num_sms=132) == 1_000
+    assert slice_size_for_blocks_per_sm([1_000], blocks_per_sm=0, num_sms=132) == 0
+    assert slice_size_for_blocks_per_sm([], blocks_per_sm=8, num_sms=132) == 0
+
+
+def test_sequential_light_waits_for_the_merge_too():
+    sys.path.append(str(Path(__file__).resolve().parents[2] / "scripts" / "ablation"))
+    from simulate_load_imbalance import dependencies
+
+    sliced = {"heavy": [], "merge": [], "light": []}
+    assert dependencies(sliced, "sequential") == {"merge": "heavy", "light": "merge"}
+    assert dependencies(sliced, "concurrent") == {"merge": "heavy"}
+    assert dependencies({"heavy": [], "light": []}, "sequential") == {}

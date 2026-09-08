@@ -27,7 +27,9 @@ from turbo_gnn.simulation import (  # noqa: E402
     bandwidth_cap_from_hardware,
     build_blocks,
     build_heavy_slices,
+    build_slice_merge,
     simulate,
+    slice_size_for_blocks_per_sm,
 )
 
 # Anything src.data.datasets can resolve. "auto" sends ogbn-* to OGB and everything else to
@@ -176,6 +178,12 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sms", type=int, default=132)
     parser.add_argument("--max-blocks-light", type=int, default=8)
     parser.add_argument("--max-blocks-heavy", type=int, default=4)
+    parser.add_argument(
+        "--max-blocks-merge",
+        type=int,
+        default=16,
+        help="Merge blocks are one warp, so many more fit per SM than a heavy block",
+    )
     parser.add_argument("--occupancies", type=float, nargs="+", default=[0.5, 0.75, 1.0])
     parser.add_argument("--memory-bandwidth-gbps", type=float, default=3350.0)
     parser.add_argument("--feature-dim", type=int, default=64)
@@ -297,15 +305,47 @@ def build_workloads(
         )
     }
     if len(heavy_for_run):
-        workloads["heavy"] = (
-            build_heavy_slices(heavy_for_run, heavy_slice, num_heads=args.num_heads, cost_model=cost_model)
-            if heavy_slice > 0
-            else build_blocks(heavy_for_run, "heavy", "contiguous", 1, num_heads=args.num_heads, cost_model=cost_model)
-        )
+        if heavy_slice > 0:
+            # Split-K: one block per fixed-size slice, then a second launch merging each node's
+            # partials. The merge is not free and cannot overlap the slices, so both go in.
+            workloads["heavy"] = build_heavy_slices(
+                heavy_for_run, heavy_slice, num_heads=args.num_heads, cost_model=cost_model
+            )
+            workloads["merge"] = build_slice_merge(
+                heavy_for_run, heavy_slice, num_heads=args.num_heads, cost_model=cost_model
+            )
+        else:
+            workloads["heavy"] = build_blocks(
+                heavy_for_run, "heavy", "contiguous", 1, num_heads=args.num_heads, cost_model=cost_model
+            )
     kernels = {"light": KernelConfig("light", args.max_blocks_light, occupancy)}
     if "heavy" in workloads:
         kernels["heavy"] = KernelConfig("heavy", args.max_blocks_heavy, occupancy)
+    if "merge" in workloads:
+        kernels["merge"] = KernelConfig("merge", args.max_blocks_merge, occupancy)
     return workloads, kernels, light_for_run, heavy_for_run
+
+
+def dependencies(workloads: dict[str, list[BlockSpec]], launch_mode: LaunchMode) -> dict[str, str]:
+    """Which kernels have to wait for which.
+
+    The merge is a separate launch, so it waits for every slice. On one stream the light bucket
+    then waits for the merge as well -- otherwise slicing would appear to shorten the wait that
+    sequential imposes, when a launch boundary has merely moved.
+    """
+    if "merge" not in workloads:
+        return {}
+    chain = {"merge": "heavy"}
+    if launch_mode == "sequential" and "light" in workloads:
+        chain["light"] = "merge"
+    return chain
+
+
+def resolve_heavy_slice(size: int, blocks_per_sm: float, heavy_degrees: np.ndarray, num_sms: int) -> int:
+    """An explicit slice size wins; otherwise size it to a target block count, or 0 for no split."""
+    if size > 0:
+        return size
+    return slice_size_for_blocks_per_sm(heavy_degrees, blocks_per_sm, num_sms)
 
 
 def anchor_tick(
@@ -347,6 +387,7 @@ def anchor_tick(
             seed=args.seed,
             launch_mode=BASELINE_LAUNCH_MODE,
             light_launch_latency=args.launch_latency,
+            depends_on=dependencies(workloads, BASELINE_LAUNCH_MODE),
         ),
     )
     all_degrees = degrees[0]
@@ -416,6 +457,7 @@ def main() -> int:
                 seed=args.seed,
                 launch_mode=launch_mode,
                 light_launch_latency=args.launch_latency,
+                depends_on=dependencies(workloads, launch_mode),
                 ns_per_tick=ns_per_tick,
             ),
         )
