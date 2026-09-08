@@ -100,7 +100,7 @@ def plot(
     span = max(r.makespan * (tick_ns * scale if tick_ns else 1.0) for r in results.values())
 
     fig, axes = plt.subplots(
-        len(results), 1, figsize=(13, 1.1 + 2.4 * len(results)), sharex=True, constrained_layout=True
+        len(results), 1, figsize=(14, 1.3 + 2.1 * len(results)), sharex=True, constrained_layout=True
     )
     axes = np.atleast_1d(axes)
     image = None
@@ -115,11 +115,12 @@ def plot(
             vmax=1,
             extent=(0.0, width, 0.0, num_sms),
         )
-        axis.set(ylabel="SM", title=panel_title(mode, blurbs[mode], result, overhead_ms))
+        axis.set(ylabel="SM")
+        axis.set_title(panel_title(mode, blurbs[mode], result, overhead_ms), fontsize=10)
         axis.set_xlim(0.0, span)
     axes[-1].set_xlabel(f"time, {unit}")
     fig.colorbar(image, ax=axes.tolist(), label="occupied slot fraction", fraction=0.02)
-    fig.suptitle(title)
+    fig.suptitle(title, fontsize=11)
     fig.savefig(path, dpi=160)
     plt.close(fig)
 
@@ -177,9 +178,7 @@ def main() -> int:
         )
         label = mode if slice_size <= 0 else f"{mode} + split-K"
         blurbs[label] = (
-            MODE_BLURB[mode]
-            if slice_size <= 0
-            else f"{MODE_BLURB[mode]}; heavy edges cut into {slice_size:,}-edge slices, then merged"
+            MODE_BLURB[mode] if slice_size <= 0 else f"heavy cut into {slice_size:,}-edge slices, then merged"
         )
         result = simulate(
             workloads,
