@@ -19,10 +19,13 @@ these numbers repeat to under 1%, but a cool card and a hot one differ by up to
 from __future__ import annotations
 
 import argparse
+import gzip
+import os
 import json
 import statistics
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
@@ -44,28 +47,64 @@ CELLS = [
 ]
 
 
-def make_graph(num_nodes: int, avg_degree: int, kind: str, device="cuda", seed=0):
-    """`skewed` is dst ~ U^4, matching ../gspmm_vs_dgl/dgl_side.py.
+def load_ogb(name: str, ogb_root: str) -> tuple[torch.Tensor, int]:
+    """(edge_index, N) for an OGB node-property dataset, read from its raw CSVs.
 
-    In-degree then concentrates on a handful of nodes, which is the only shape
-    where the heavy-node path, its slicing and the backward's load balance are
-    visible at all -- at a uniform degree of 8 none of them matter.
+    Deliberately not through the `ogb` package: it pulls in pandas and
+    scikit-learn, and all that is needed here is the edge list, which the
+    download already carries as a two-column csv.gz.  The parse is cached as
+    .npy next to it -- the sweep loads each graph a dozen times over.
     """
-    g = torch.Generator(device=device).manual_seed(seed)
-    num_edges = num_nodes * avg_degree
-    src = torch.randint(0, num_nodes, (num_edges,), device=device, generator=g)
-    if kind == "skewed":
-        dst = (torch.rand(num_edges, device=device, generator=g) ** 4 * num_nodes).long().clamp_(0, num_nodes - 1)
+    root = Path(ogb_root) / name.replace("-", "_")
+    raw = root / "raw"
+    if not raw.is_dir():
+        raise SystemExit(
+            f"{name} is not in {ogb_root}: expected {raw}. Download it (the OGB "
+            f"archive from snap.stanford.edu unpacks straight into this layout)."
+        )
+
+    cache = root / "edge_index.npy"
+    if cache.exists():
+        edges = np.load(cache)
     else:
-        dst = torch.randint(0, num_nodes, (num_edges,), device=device, generator=g)
+        with gzip.open(raw / "edge.csv.gz", "rt") as fh:
+            edges = np.loadtxt(fh, delimiter=",", dtype=np.int64)
+        np.save(cache, edges)
+
+    with gzip.open(raw / "num-node-list.csv.gz", "rt") as fh:
+        num_nodes = int(fh.readline().strip())
+
+    return torch.from_numpy(edges.T.copy()), num_nodes
+
+
+def make_graph(kind: str, num_nodes: int, avg_degree: int, ogb_root: str, device="cuda", seed=0):
+    """`random`, `skewed`, or any OGB name -- the same set the DGL charts used.
+
+    `skewed` is dst ~ U^4, matching ../gspmm_vs_dgl/dgl_side.py: in-degree then
+    concentrates on a handful of nodes, which is the only synthetic shape where
+    the heavy-node path, its slicing and the backward's load balance are visible
+    at all -- at a uniform degree of 8 none of them matter.
+    """
+    if kind in ("random", "skewed"):
+        g = torch.Generator(device=device).manual_seed(seed)
+        num_edges = num_nodes * avg_degree
+        src = torch.randint(0, num_nodes, (num_edges,), device=device, generator=g)
+        if kind == "skewed":
+            dst = (torch.rand(num_edges, device=device, generator=g) ** 4 * num_nodes).long().clamp_(0, num_nodes - 1)
+        else:
+            dst = torch.randint(0, num_nodes, (num_edges,), device=device, generator=g)
+    else:
+        edge_index, num_nodes = load_ogb(kind, ogb_root)
+        src, dst = edge_index[0].to(device), edge_index[1].to(device)
 
     # Self-loops keep every in-degree non-zero, so no cell is measuring the
-    # isolated-node path.
+    # isolated-node path -- the same thing dgl_side.py does, and what kept the
+    # DGL reference check clean.
     loops = torch.arange(num_nodes, device=device)
     edge_index = torch.stack([torch.cat([src, loops]), torch.cat([dst, loops])])
     return AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
         edge_index, num_nodes=num_nodes, quantile=0.95, index_dtype=torch.int32
-    ).to(device)
+    ).to(device), num_nodes
 
 
 def warm_up_device(fn, seconds=1.5) -> None:
@@ -143,12 +182,12 @@ def measure_cell(graph, num_nodes, num_edges, op, reduce, d, dtype, stages) -> d
 
 def run(args) -> dict:
     dtype = getattr(torch, args.dtype)
-    graph = make_graph(args.nodes, args.degree, args.graph)
+    graph, num_nodes = make_graph(args.graph, args.nodes, args.degree, args.ogb_root)
     num_edges = graph.forward_indices.numel()
     indptr = graph.forward_indptr.long()
     degrees = indptr[1:] - indptr[:-1]
 
-    warm = torch.randn(args.nodes, args.dims[0], device="cuda", dtype=dtype)
+    warm = torch.randn(num_nodes, args.dims[0], device="cuda", dtype=dtype)
     warm_up_device(lambda: gspmm(graph, warm, None, op="copy_u", reduce="sum"))
     del warm
     torch.cuda.empty_cache()
@@ -156,12 +195,12 @@ def run(args) -> dict:
     cells = []
     for d in args.dims:
         for op, reduce in CELLS:
-            cells.append(measure_cell(graph, args.nodes, num_edges, op, reduce, d, dtype, args.stages))
+            cells.append(measure_cell(graph, num_nodes, num_edges, op, reduce, d, dtype, args.stages))
 
     return {
         "meta": {
             "graph": args.graph,
-            "N": args.nodes,
+            "N": num_nodes,
             "E": num_edges,
             "dims": args.dims,
             "dtype": args.dtype,
@@ -178,9 +217,10 @@ def run(args) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("out", help="where to write the results JSON")
-    p.add_argument("--graph", default="random", choices=["random", "skewed"])
-    p.add_argument("--nodes", type=int, default=169343)
-    p.add_argument("--degree", type=int, default=8)
+    p.add_argument("--graph", default="random", help="random | skewed | an OGB name (ogbn-arxiv, ogbn-products)")
+    p.add_argument("--nodes", type=int, default=169343, help="synthetic graphs only; OGB brings its own")
+    p.add_argument("--degree", type=int, default=8, help="synthetic graphs only")
+    p.add_argument("--ogb-root", default=os.environ.get("OGB_ROOT", "data/ogb"))
     p.add_argument("--dims", default="64", help="comma-separated feature widths, e.g. 32,64,128")
     p.add_argument("--dtype", default="float16")
     p.add_argument("--stages", type=int, default=0)

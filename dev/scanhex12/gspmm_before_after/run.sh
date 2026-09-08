@@ -4,9 +4,16 @@
 #   cd dev/scanhex12/gspmm_before_after
 #   nohup ./run.sh > run.log 2>&1 &
 #
-# Measures two commits over {random, skewed} x {float16, float32} x
+# Measures two commits over the same four graphs the DGL charts used --
+# random, skewed, ogbn-arxiv, ogbn-products -- times {float16, float32} x
 # {stages 0,1,2,4} x {d 32,64,128}, forward and backward, then draws every
-# chart from the results.  Roughly an hour on a T4; safe to leave.
+# chart from the results.  Several hours on a T4; safe to leave.
+#
+# ogbn-products is 126M edges: an [E, d] edge operand does not fit in 15 GB, so
+# on that graph only the copy_u cells measure and the rest are recorded as
+# skipped -- which is also why the original four-graph chart showed copy_u
+# alone.  Its raw csv.gz has to be under OGB_ROOT; bench.py reads that directly
+# rather than depending on the ogb package.
 #
 # Resumable: a results file that already exists and is non-empty is skipped, so
 # an interrupted run continues where it stopped.  Delete the file (or the whole
@@ -15,6 +22,7 @@
 # Knobs, all optional:
 #   BEFORE_REF / AFTER_REF   commits to compare      (default: the PR base, HEAD)
 #   GRAPHS / DTYPES / STAGES / DIMS   what to sweep
+#   OGB_ROOT                 where the OGB downloads live (default: data/ogb)
 #   PYTHON                   interpreter             (default: python)
 #   WORKDIR                  where the worktrees go  (default: /tmp/turbo-bench)
 #   SKIP_BUILD=1             do not build the extension in each worktree
@@ -38,7 +46,7 @@ REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
 
 BEFORE_REF="${BEFORE_REF:-603239d}"
 AFTER_REF="${AFTER_REF:-HEAD}"
-GRAPHS="${GRAPHS:-random skewed}"
+GRAPHS="${GRAPHS:-random skewed ogbn-arxiv ogbn-products}"
 DTYPES="${DTYPES:-float16 float32}"
 STAGES="${STAGES:-0 1 2 4}"
 DIMS="${DIMS:-32,64,128}"
@@ -46,6 +54,7 @@ PLOT_DIM="${PLOT_DIM:-64}"
 PYTHON="${PYTHON:-python}"
 WORKDIR="${WORKDIR:-/tmp/turbo-bench}"
 BENCH_CMD="${BENCH_CMD:-}"
+OGB_ROOT="${OGB_ROOT:-data/ogb}"
 
 RESULTS="$HERE/results"
 PLOTS="$HERE/plots"
@@ -115,7 +124,7 @@ bench_one() {
 
     if TURBO_REPO="$dir" PYTHONPATH="$dir:${PYTHONPATH:-}" \
         "${cmd[@]}" "$out" --graph "$graph" --dtype "$dtype" --stages "$stages" \
-        --dims "$DIMS" --label "$label"
+        --dims "$DIMS" --label "$label" --ogb-root "$OGB_ROOT"
     then
         measured=$((measured + 1))
     else
@@ -202,7 +211,7 @@ for dtype in $DTYPES; do
             plot "${args[@]}" --kind "$kind" --dim "$PLOT_DIM" --compare stages \
                 -o "$PLOTS/stages_${dtype}_${graph}_${kind}_d${PLOT_DIM}.png" \
                 --title "Пайплайнинг, $graph, $dtype, $kind, d=$PLOT_DIM: stages=0 против остальных" \
-                --xlabel "Ускорение: stages=0 / stages=N ($kind). Больше 1 — с пайплайном медленнее"
+                --xlabel "Отношение времени stages=0 / stages=N ($kind). Меньше 1 — с пайплайном медленнее"
         done
     done
 done
