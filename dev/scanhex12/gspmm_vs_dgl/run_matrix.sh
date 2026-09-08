@@ -23,13 +23,20 @@ STAGES_LIST="${STAGES_LIST:-0 1 2 4}"
 GRAPHS="${GRAPHS:-random skewed ogbn-arxiv ogbn-products}"
 DIMS="${DIMS:-32,64,128}"
 WORK="${WORK:-/home/ubuntu/work/gspmm_scratch}"
+ITERS="${ITERS:-30}"
+# Two, not run.sh's default of seven: inside one process these timings repeat
+# to under 0.5%, so the extra samples buy almost nothing and cost 3.5x the wall
+# clock over a matrix this size.  Two still leaves a consistency check; one
+# would leave none.
+REPEATS="${REPEATS:-2}"
 RESULTS="$HERE/results"
 
-export GRAPHS DIMS WORK
+export GRAPHS DIMS WORK ITERS REPEATS
 
 started=$(date +%s)
 echo "matrix started $(date -Is)"
 echo "  dtypes=[$DTYPES] stages=[$STAGES_LIST] graphs=[$GRAPHS] dims=$DIMS"
+echo "  $ITERS iters x $REPEATS repeats"
 echo
 
 done_count=0
