@@ -306,6 +306,14 @@ def save_cost_models(path: Path, fits: dict[str, FitResult], source: str, weight
 
 
 def load_cost_models(path: Path) -> dict[str, FitResult]:
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"{path}: no calibration file. It is not checked in -- it is derived from measurements, so it "
+            "goes stale. Build one with scripts/ablation/calibrate_cost_model.py, e.g. from the kernel "
+            "benchmark report:\n"
+            "  git show pr/55:reports/kernel-benchmarks/summary.txt > /tmp/kernel-benchmarks.txt\n"
+            f"  python scripts/ablation/calibrate_cost_model.py --from-summary /tmp/kernel-benchmarks.txt --out {path}"
+        )
     payload = json.loads(Path(path).read_text())
     if payload.get("schema") != SCHEMA:
         raise ValueError(f"{path}: expected schema {SCHEMA!r}, got {payload.get('schema')!r}")
