@@ -103,7 +103,80 @@ __global__ void gspmm_backward_edge_kernel(
     }
 }
 
-// Heavy-node forward for an accumulating reducer, sliced by edges.
+// Backward of a comparison reducer: only the winning edge of each output
+// element contributed anything, so both gradients are one scatter over the
+// saved arg indices.
+//
+// reduction_aggr_backward_typed gives one block to a node, which leaves that
+// block d elements of work whatever the node's degree is: at d = 32 with a
+// 256-thread block seven eighths of the threads exit immediately, and the grid
+// is as long as the node count.  Degree does not enter into it -- the work is
+// uniform per output *element*, so bucketing by degree has nothing to balance
+// here.  What does help is dropping the node-to-block mapping: this kernel
+// grid-strides over the flat [N, d] output, so every block is full and the grid
+// is sized for the device rather than for the graph.
+template <
+    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t = float,
+    FloatingNum grad_rhs_t = cuda_t, FloatingNum accum_t = float
+>
+__global__ void gspmm_backward_arg_kernel(
+    cuda_t const *const __restrict__ grad_out,
+    index_t const *const __restrict__ arg_idx,
+    index_t const *const __restrict__ edge_idx,
+    cuda_t const *const __restrict__ lhs,
+    cuda_t const *const __restrict__ rhs,
+    grad_t *const __restrict__ grad_lhs,
+    grad_rhs_t *const __restrict__ grad_rhs,
+    size_t num_nodes,
+    size_t d
+) {
+    using BOps     = BinaryOps<BOp>;
+    using Sentinel = IndexSentinel<index_t>;
+
+    const size_t total  = num_nodes * d;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+
+    for (size_t k = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; k < total; k += stride) {
+        const index_t arg = arg_idx[k];
+        if (!Sentinel::is_valid(arg)) {
+            continue;  // node with no in-edges: nothing reached it, nothing flows back
+        }
+
+        const size_t f     = k - (k / d) * d;
+        const accum_t g    = static_cast<accum_t>(grad_out[k]);
+        const size_t e_off = RHS_BROADCAST ? static_cast<size_t>(arg) : static_cast<size_t>(arg) * d + f;
+
+        // copy_e never reads the source node, and only mul and div
+        // differentiate to something that reads the operands at all.
+        size_t u_off = 0;
+        if constexpr (BOps::USE_LHS) {
+            u_off = static_cast<size_t>(edge_idx[static_cast<size_t>(arg)]) * d + f;
+        }
+        accum_t u_val{};
+        accum_t e_val{};
+        if constexpr (BOps::GRAD_USES_OPERANDS) {
+            u_val = static_cast<accum_t>(lhs[u_off]);
+            e_val = static_cast<accum_t>(rhs[e_off]);
+        }
+
+        if constexpr (BOps::USE_LHS) {
+            atomicAdd(&grad_lhs[u_off], static_cast<grad_t>(BOps::grad_lhs(u_val, e_val, g)));
+        }
+        if constexpr (BOps::USE_RHS) {
+            const grad_rhs_t contribution = static_cast<grad_rhs_t>(BOps::grad_rhs(u_val, e_val, g));
+            if constexpr (RHS_BROADCAST) {
+                // One slot per edge, shared by all d features of it.
+                atomicAdd(&grad_rhs[e_off], contribution);
+            } else {
+                // (arg, f) is unique across the whole output, so nothing else
+                // ever touches this slot.
+                grad_rhs[e_off] = contribution;
+            }
+        }
+    }
+}
+
+// Heavy-node forward, sliced by edges.
 //
 // The unsliced heavy kernel gives one block to a node and splits its neighbors
 // across blockDim.y.  That is fine until one node holds tens of thousands of
@@ -115,9 +188,9 @@ __global__ void gspmm_backward_edge_kernel(
 // Each block writes its own slot in `partials` rather than folding into a
 // shared accumulator, so no atomics appear and the result does not depend on
 // the order the slices happen to finish -- gspmm_heavy_reduce_slices_kernel
-// then sums each node's slices in index order.  A comparison reducer cannot
-// use this: it would have to carry the winning edge index alongside each
-// partial value, which is what the packed uint64 path does for min/max.
+// then folds each node's slices in index order.  A comparison reducer carries
+// the winning edge position alongside every partial value, in `partial_args`,
+// which is what lets min/max take this path too.
 //
 // The slice a block owns comes from a binary search over `slice_offsets` (an
 // exclusive prefix sum of each heavy node's slice count, shaped exactly like a
@@ -127,11 +200,30 @@ __global__ void gspmm_backward_edge_kernel(
 //
 // TW is 1: g-SpMM accepts any feature width, so it never takes the vectorized
 // TileOps path (see kGSpMMVectorize).
+
+// Dynamic shared-memory layout: `slots` accumulator floats, then -- only for a
+// reducer that reports an argument -- `slots` index_t, then -- only with the
+// pipeline on -- STAGES prefetch slots per thread.  Each region is padded to 16
+// bytes so the next one stays aligned for any (tiles_y, features_per_block).
+// The launcher sizes its allocation with this same function, so the two cannot
+// disagree.
+template <FloatingNum cuda_t, typename index_t, bool TRACKS_ARG, int STAGES>
+__host__ __device__ inline size_t gspmm_sliced_shmem_bytes(size_t slots) {
+    size_t bytes = ((slots * sizeof(float) + 15) / 16) * 16;
+    if constexpr (TRACKS_ARG) {
+        bytes += ((slots * sizeof(index_t) + 15) / 16) * 16;
+    }
+    if constexpr (STAGES > 0) {
+        bytes += ((slots * static_cast<size_t>(STAGES) * sizeof(cuda_t) + 15) / 16) * 16;
+    }
+    return bytes;
+}
+
 template <
-    FloatingNum cuda_t, typename index_t, BinaryOp BOp, bool RHS_BROADCAST, bool EDGE_MAP, size_t SLICE_EDGES,
-    FloatingNum accum_t = float
+    FloatingNum cuda_t, typename index_t, ReductionOp ROp, BinaryOp BOp, bool RHS_BROADCAST, bool EDGE_MAP, size_t SLICE_EDGES,
+    int PIPELINE_STAGES = 0, FloatingNum accum_t = float
 >
-__global__ void gspmm_heavy_sum_sliced_kernel(
+__global__ void gspmm_heavy_sliced_kernel(
     index_t const *const __restrict__ heavy_nodes,
     index_t const *const __restrict__ slice_offsets,
     index_t const *const __restrict__ edge_ptr,
@@ -140,19 +232,41 @@ __global__ void gspmm_heavy_sum_sliced_kernel(
     cuda_t const *const __restrict__ rhs,
     index_t const *const __restrict__ edge_map,
     accum_t *const __restrict__ partials,
+    index_t *const __restrict__ partial_args,
     size_t num_heavy,
     size_t d
 ) {
-    using BOps = BinaryOps<BOp>;
+    using BOps     = BinaryOps<BOp>;
+    using ROps     = ReductionOps<ROp>;
+    using Sentinel = IndexSentinel<index_t>;
+    // The reducer's own accumulate type, not accum_t: a comparison reducer
+    // compares operand-dtype values, and comparing the unrounded float message
+    // instead would pick a different winner among fp16 ties than the light and
+    // unsliced heavy kernels do.  The partial that leaves the block is float
+    // either way, which is order-preserving for both.
+    using acc_t = typename ROps::template AccumType<cuda_t, accum_t>;
+
+    constexpr bool TRACKS_ARG   = ROps::TRACKS_ARG;
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0 && BOps::USE_LHS;
+    constexpr int NUM_STAGES    = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
 
     extern __shared__ __align__(16) uint8_t shared_raw[];
-    accum_t *const shmem = reinterpret_cast<accum_t *>(shared_raw);
 
     const size_t fid          = threadIdx.x;  // feature
     const size_t tid          = threadIdx.y;  // edge tile within the slice
     const size_t f_block      = blockDim.x;
     const size_t tiles        = blockDim.y;
+    const size_t slots        = f_block * tiles;
+    const size_t slot         = tid * f_block + fid;
     const size_t total_slices = static_cast<size_t>(slice_offsets[num_heavy]);
+
+    accum_t *const shmem_val = reinterpret_cast<accum_t *>(shared_raw);
+    index_t *const shmem_arg =
+        reinterpret_cast<index_t *>(shared_raw + gspmm_sliced_shmem_bytes<cuda_t, index_t, false, 0>(slots));
+    cuda_t *const my_pipe =
+        reinterpret_cast<cuda_t *>(shared_raw + gspmm_sliced_shmem_bytes<cuda_t, index_t, TRACKS_ARG, 0>(slots)) + slot * NUM_STAGES;
+
+    const acc_t identity_val = static_cast<acc_t>(ROps::IDENTITY);
 
     for (size_t slice = blockIdx.x; slice < total_slices; slice += gridDim.x) {
         const size_t i       = csr_row_of<index_t>(slice_offsets, num_heavy, slice);
@@ -178,52 +292,102 @@ __global__ void gspmm_heavy_sum_sliced_kernel(
         const size_t f_iters = (d + f_block - 1) / f_block;
 
         for (size_t it = 0; it < f_iters; ++it) {
-            const size_t f     = it * f_block + fid;
+            const size_t f      = it * f_block + fid;
             const bool in_range = f < d;
 
-            accum_t acc{};
-            if (in_range) {
-                for (index_t eid = begin; eid < end; ++eid) {
-                    cuda_t u_val{};
-                    if constexpr (BOps::USE_LHS) {
-                        u_val = lhs[static_cast<size_t>(edge_idx[eid]) * d + f];
+            acc_t acc        = identity_val;
+            index_t best_arg = Sentinel::INVALID;
+
+            auto visit = [&](index_t /*src*/, index_t eid, cuda_t const *uslice) {
+                accum_t msg[1];
+                const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
+                aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(uslice, rhs, e_pos, f, d, msg);
+                bool upgrade_index = false;
+                acc                = ROps::reduce(static_cast<acc_t>(msg[0]), acc, upgrade_index);
+                if constexpr (TRACKS_ARG) {
+                    if (upgrade_index) {
+                        best_arg = eid;
                     }
-                    accum_t msg[1];
-                    const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
-                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(&u_val, rhs, e_pos, f, d, msg);
-                    acc += msg[0];
+                }
+            };
+
+            if (in_range) {
+                if constexpr (USE_PIPELINE) {
+                    pipelined_thread_edge_scan<1, static_cast<size_t>(NUM_STAGES), cuda_t, index_t>(
+                        begin, end, edge_idx, lhs, d, f, my_pipe, visit
+                    );
+                } else {
+                    for (index_t eid = begin; eid < end; ++eid) {
+                        cuda_t u_val{};
+                        cuda_t const *uslice = nullptr;
+                        if constexpr (BOps::USE_LHS) {
+                            u_val  = lhs[static_cast<size_t>(edge_idx[eid]) * d + f];
+                            uslice = &u_val;
+                        }
+                        visit(index_t{}, eid, uslice);
+                    }
                 }
             }
 
-            shmem[tid * f_block + fid] = acc;
+            shmem_val[slot] = static_cast<accum_t>(acc);
+            if constexpr (TRACKS_ARG) {
+                shmem_arg[slot] = best_arg;
+            }
             __syncthreads();
 
             for (size_t offset = tiles / 2; offset > 0; offset /= 2) {
                 if (tid < offset) {
-                    shmem[tid * f_block + fid] += shmem[(tid + offset) * f_block + fid];
+                    const size_t a = slot;
+                    const size_t b = slot + offset * f_block;
+                    if constexpr (TRACKS_ARG) {
+                        // Tie-break on the smaller edge position, so the arg a
+                        // slice reports does not depend on how its edges split
+                        // across tiles.
+                        const accum_t val_b = shmem_val[b];
+                        const index_t arg_b = shmem_arg[b];
+                        bool take_b         = false;
+                        ROps::reduce(val_b, shmem_val[a], take_b);
+                        if (take_b ||
+                            (val_b == shmem_val[a] && Sentinel::is_valid(arg_b) &&
+                             (!Sentinel::is_valid(shmem_arg[a]) || arg_b < shmem_arg[a]))) {
+                            shmem_val[a] = val_b;
+                            shmem_arg[a] = arg_b;
+                        }
+                    } else {
+                        shmem_val[a] += shmem_val[b];
+                    }
                 }
                 __syncthreads();
             }
 
             if (tid == 0 && in_range) {
-                partials[slice * d + f] = shmem[fid];
+                partials[slice * d + f] = shmem_val[fid];
+                if constexpr (TRACKS_ARG) {
+                    partial_args[slice * d + f] = shmem_arg[fid];
+                }
             }
             __syncthreads();
         }
     }
 }
 
-// Sums each heavy node's slices in index order and writes the node's output
-// row.  Deterministic by construction, which an atomic fold would not be.
-template <FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
+// Folds each heavy node's slices in index order and writes the node's output
+// row (and, for a comparison reducer, the winning edge position).
+// Deterministic by construction, which an atomic fold would not be.
+template <FloatingNum cuda_t, typename index_t, ReductionOp ROp, FloatingNum accum_t = float>
 __global__ void gspmm_heavy_reduce_slices_kernel(
     index_t const *const __restrict__ heavy_nodes,
     index_t const *const __restrict__ slice_offsets,
     accum_t const *const __restrict__ partials,
+    index_t const *const __restrict__ partial_args,
     cuda_t *const __restrict__ out,
+    index_t *const __restrict__ arg_idx,
     size_t num_heavy,
     size_t d
 ) {
+    using ROps     = ReductionOps<ROp>;
+    using Sentinel = IndexSentinel<index_t>;
+
     const size_t total  = num_heavy * d;
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
 
@@ -234,10 +398,37 @@ __global__ void gspmm_heavy_reduce_slices_kernel(
         const size_t from = static_cast<size_t>(slice_offsets[i]);
         const size_t to   = static_cast<size_t>(slice_offsets[i + 1]);
 
-        accum_t acc{};
+        accum_t acc = static_cast<accum_t>(ROps::IDENTITY);
+        index_t arg = Sentinel::INVALID;
         for (size_t slice = from; slice < to; ++slice) {
-            acc += partials[slice * d + f];
+            const accum_t val = partials[slice * d + f];
+            if constexpr (ROps::TRACKS_ARG) {
+                const index_t cand  = partial_args[slice * d + f];
+                bool upgrade_index  = false;
+                const accum_t taken = ROps::reduce(val, acc, upgrade_index);
+                // Slices are visited in ascending edge order, so a tie keeps
+                // the arg already held -- the smaller edge position.
+                if (upgrade_index && Sentinel::is_valid(cand)) {
+                    arg = cand;
+                } else if (!Sentinel::is_valid(arg) && Sentinel::is_valid(cand) && val == taken) {
+                    arg = cand;
+                }
+                acc = taken;
+            } else {
+                bool upgrade_index = false;
+                acc                = ROps::reduce(val, acc, upgrade_index);
+            }
         }
-        out[static_cast<size_t>(heavy_nodes[i]) * d + f] = static_cast<cuda_t>(acc);
+
+        const size_t at = static_cast<size_t>(heavy_nodes[i]) * d + f;
+        if constexpr (ROps::TRACKS_ARG) {
+            // A node with no in-edges keeps the identity, which is not a
+            // meaningful feature value -- report zero and let the invalid arg
+            // suppress its gradient, exactly as the unsliced kernels do.
+            out[at]     = Sentinel::is_valid(arg) ? static_cast<cuda_t>(acc) : cuda_t{};
+            arg_idx[at] = arg;
+        } else {
+            out[at] = static_cast<cuda_t>(acc);
+        }
     }
 }

@@ -491,12 +491,21 @@ __host__ __device__ inline size_t aggr_heavy_shmem_bytes(size_t slots) {
     return aggr_heavy_shmem_val_bytes<index_t>(slots) + ((slots * sizeof(index_t) + 15) / 16) * 16;
 }
 
+// Prefetch region appended after those two when the tiled heavy kernel runs
+// with the pipeline on: STAGES * TW elements per thread, and slots is already
+// threads * TW.  Zero bytes with the pipeline off, which is what keeps the
+// reduction_aggr launcher's allocation unchanged.
+template <FloatingNum cuda_t>
+__host__ __device__ inline size_t aggr_pipeline_bytes(size_t slots, int stages) {
+    return (stages > 0) ? ((slots * static_cast<size_t>(stages) * sizeof(cuda_t) + 15) / 16) * 16 : 0;
+}
+
 // 2D kernel: blockIdx.x = node, threadIdx.x = feature, threadIdx.y = edge tile
 // uses shared memory tree reduction across tiles instead of packed atomicMin/Max
 // Works with all index sizes (no packing constraint)
 template <
     FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, BinaryOp BOp = BinaryOp::COPY_U,
-    bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false
+    bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false, int PIPELINE_STAGES = 0
 >
 __global__ void reduction_aggr_forward_heavy_kernel_2d(
     const index_t *__restrict__ nodes,
@@ -535,6 +544,12 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     float *shmem_val = reinterpret_cast<float *>(shared_mem);
     // index_t shared memory for arg indices
     index_t *shmem_idx = reinterpret_cast<index_t *>(shared_mem + aggr_heavy_shmem_val_bytes<index_t>(TILES_Y * SHMEM_STRIDE));
+
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0 && BOps::USE_LHS;
+    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
+    cuda_t *my_dbuf = reinterpret_cast<cuda_t *>(shared_mem + aggr_heavy_shmem_bytes<index_t>(TILES_Y * SHMEM_STRIDE)) +
+                      (tid * F_BLOCK + fid) * NUM_STAGES * TW;
 
     const acc_t identity_val = static_cast<acc_t>(ROps::IDENTITY);
     constexpr cuda_t zero_val{};
@@ -575,16 +590,20 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
             }
         };
 
-        for (index_t eid = start; eid < end; ++eid) {
-            if constexpr (BOps::USE_LHS) {
-                const index_t src              = edge_idx[eid];
-                const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
-                visit(src, eid, val.data);
-            } else if constexpr (ARG_IS_EDGE) {
-                // copy_e reporting edge args touches neither X nor edge_idx
-                visit(index_t{}, eid, nullptr);
-            } else {
-                visit(edge_idx[eid], eid, nullptr);
+        if constexpr (USE_PIPELINE) {
+            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(start, end, edge_idx, X, d, base_f, my_dbuf, visit);
+        } else {
+            for (index_t eid = start; eid < end; ++eid) {
+                if constexpr (BOps::USE_LHS) {
+                    const index_t src              = edge_idx[eid];
+                    const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
+                    visit(src, eid, val.data);
+                } else if constexpr (ARG_IS_EDGE) {
+                    // copy_e reporting edge args touches neither X nor edge_idx
+                    visit(index_t{}, eid, nullptr);
+                } else {
+                    visit(edge_idx[eid], eid, nullptr);
+                }
             }
         }
 
