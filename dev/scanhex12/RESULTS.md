@@ -1,73 +1,94 @@
 # g-SpMM: turbo_gnn против DGL
 
-Tesla T4, d=64, медиана из 7 прогонов по 30 запусков, CUDA events на обеих сторонах.
-`ogbn-arxiv` (N=169 343, E=1 335 586) и `random` (N=200 000, E=3 400 000).
-turbo — через `turbo_gnn.gspmm`, DGL — через `dgl.ops.*`, обе стороны на побитово
-одинаковых данных. Прогон и методика: [gspmm_vs_dgl/](gspmm_vs_dgl/).
+Tesla T4, d=64, медиана из 2 прогонов по 30 запусков, CUDA events на обеих
+сторонах, побитово одинаковые данные. Четыре графа в каждой картинке, 57 клеток:
 
-В скобках — сколько клеток из 18×графов оказались быстрее у DGL.
-
-## fp32, без пайплайнинга
-
-| kind | geomean | медиана | мин | проигр. | картинка | данные |
-|---|---|---|---|---|---|---|
-| forward | **1.89x** | 1.92x | 1.10x | 0/36 | [fp32_forward.png](fp32_forward.png) | [arxiv](gspmm_vs_dgl/results/results_ogbn-arxiv_float32_bwd.json) · [random](gspmm_vs_dgl/results/results_random_float32_bwd.json) |
-| **backward** | **1.31x** | 1.18x | 0.44x | 5/36 | [fp32_backward.png](fp32_backward.png) | те же |
-| fwd+bwd | 1.52x | 1.48x | 0.64x | 2/36 | [fp32_fwd_bwd.png](fp32_fwd_bwd.png) | те же |
-
-## fp16, без пайплайнинга
-
-| kind | geomean | медиана | мин | проигр. | картинка | данные |
-|---|---|---|---|---|---|---|
-| forward | **2.00x** | 2.07x | 1.12x | 0/36 | [fp16_forward.png](fp16_forward.png) | [arxiv](gspmm_vs_dgl/results/results_ogbn-arxiv_float16_bwd.json) · [random](gspmm_vs_dgl/results/results_random_float16_bwd.json) |
-| **backward** | **0.68x** | 0.68x | 0.32x | 30/36 | [fp16_backward.png](fp16_backward.png) | те же |
-| fwd+bwd | 0.99x | 0.98x | 0.48x | 21/36 | [fp16_fwd_bwd.png](fp16_fwd_bwd.png) | те же |
-
-## fp32, pipeline_stages=2
-
-Три графа вместо двух — `skewed` попал бонусом от прогона, который ушёл не на те
-графы. Со stages=0 напрямую не сравнивается.
-
-| kind | geomean | медиана | мин | проигр. | картинка | данные |
-|---|---|---|---|---|---|---|
-| forward | 1.97x | 2.09x | 0.71x | 5/54 | [fp32_stages2_forward.png](fp32_stages2_forward.png) | [arxiv](gspmm_vs_dgl/results/results_ogbn-arxiv_float32_bwd_st2.json) · [random](gspmm_vs_dgl/results/results_random_float32_bwd_st2.json) · [skewed](gspmm_vs_dgl/results/results_skewed_float32_bwd_st2.json) |
-| backward | 1.18x | 1.14x | 0.24x | 14/54 | [fp32_stages2_backward.png](fp32_stages2_backward.png) | те же |
-| fwd+bwd | 1.53x | 1.55x | 0.54x | 8/54 | [fp32_stages2_fwd_bwd.png](fp32_stages2_fwd_bwd.png) | те же |
-
-## fp16, pipeline_stages=2
-
-| kind | geomean | медиана | мин | проигр. | картинка | данные |
-|---|---|---|---|---|---|---|
-| forward | **1.57x** | 1.72x | 0.67x | 5/36 | [fp16_stages2_forward.png](fp16_stages2_forward.png) | [arxiv](gspmm_vs_dgl/results/results_ogbn-arxiv_float16_bwd_st2.json) · [random](gspmm_vs_dgl/results/results_random_float16_bwd_st2.json) |
-| backward | 0.65x | 0.67x | 0.31x | 32/36 | [fp16_stages2_backward.png](fp16_stages2_backward.png) | те же |
-| fwd+bwd | 0.91x | 0.93x | 0.45x | 24/36 | [fp16_stages2_fwd_bwd.png](fp16_stages2_fwd_bwd.png) | те же |
-
-## Отдельный свип по пайплайнингу
-
-fp32 forward, три графа, только turbo меняется. Данные:
-[stages{0,1,2,4}.json](gspmm_vs_dgl/results/stages/) ·
-[pipeline_stages.json](gspmm_vs_dgl/results/pipeline_stages.json).
-
-| stages | geomean | проигр. | картинка |
+| граф | N | E | макс. входная степень |
 |---|---|---|---|
-| 0 | **2.15x** | 1/54 | [fp32_forward_stages0.png](fp32_forward_stages0.png) |
-| 1 | 2.06x | 1/54 | [fp32_forward_stages1.png](fp32_forward_stages1.png) |
-| 2 | 1.96x | 5/54 | [fp32_forward_stages2.png](fp32_forward_stages2.png) |
-| 4 | 1.96x | 4/54 | [fp32_forward_stages4.png](fp32_forward_stages4.png) |
+| `random` | 200 000 | 3 400 000 | 40 |
+| `skewed` | 200 000 | 3 400 000 | 66 865 |
+| `ogbn-arxiv` | 169 343 | 1 335 586 | 13 156 |
+| `ogbn-products` | 2 449 029 | 126 167 309 | — |
 
-По 162 клеткам (три ширины) **ни одна** не стала быстрее с пайплайном:
-stages=1 → 0.958x, stages=2 → 0.913x, stages=4 → 0.907x относительно stages=0,
-худшая 0.669x. То же записано в докстринге `ReductionAggrKernel` по H100.
+`ogbn-products` идёт только с `copy_u` и только при d=64: операнд `[E, d]` при
+126M рёбер не влезает в 15 GB. Прогон и методика: [gspmm_vs_dgl/](gspmm_vs_dgl/),
+всё считает `run_matrix.sh` одним проходом по матрице конфигураций.
 
-## fp32 forward на четырёх графах
+В колонке «проигр.» — сколько клеток из 57 оказались быстрее у DGL.
 
-[fp32_forward_4graphs.png](fp32_forward_4graphs.png) — самый первый прогон,
-добавляет `skewed` и `ogbn-products` (126M рёбер, только `copy_u`): geomean 2.15x,
-проигрывает только `copy_u/sum`. По 171 клетке всех ширин — geomean 2.14x.
+## fp32
+
+| stages | kind | geomean | медиана | мин | макс | проигр. | картинка |
+|---|---|---|---|---|---|---|---|
+| 0 | forward | **2.24x** | 2.31x | 0.96x | 6.48x | 1/57 | [fp32_forward.png](fp32_forward.png) |
+| 0 | **backward** | **1.47x** | 1.25x | 0.95x | 3.56x | 2/57 | [fp32_backward.png](fp32_backward.png) |
+| 0 | fwd+bwd | 1.82x | 1.75x | 0.93x | 3.67x | 3/57 | [fp32_fwd_bwd.png](fp32_fwd_bwd.png) |
+| 1 | forward | 2.14x | 2.17x | 0.85x | 6.47x | 5/57 | [fp32_stages1_forward.png](fp32_stages1_forward.png) |
+| 1 | backward | 1.43x | 1.23x | 0.85x | 3.56x | 4/57 | [fp32_stages1_backward.png](fp32_stages1_backward.png) |
+| 1 | fwd+bwd | 1.76x | 1.72x | 0.83x | 3.67x | 5/57 | [fp32_stages1_fwd_bwd.png](fp32_stages1_fwd_bwd.png) |
+| 2 | forward | 2.02x | 1.94x | 0.75x | 6.47x | 8/57 | [fp32_stages2_forward.png](fp32_stages2_forward.png) |
+| 2 | backward | 1.40x | 1.22x | 0.75x | 3.57x | 5/57 | [fp32_stages2_backward.png](fp32_stages2_backward.png) |
+| 2 | fwd+bwd | 1.70x | 1.66x | 0.73x | 3.67x | 7/57 | [fp32_stages2_fwd_bwd.png](fp32_stages2_fwd_bwd.png) |
+| 4 | forward | 2.02x | 1.92x | 0.83x | 6.48x | 8/57 | [fp32_stages4_forward.png](fp32_stages4_forward.png) |
+| 4 | backward | 1.41x | 1.22x | 0.83x | 3.57x | 5/57 | [fp32_stages4_backward.png](fp32_stages4_backward.png) |
+| 4 | fwd+bwd | 1.71x | 1.64x | 0.81x | 3.67x | 7/57 | [fp32_stages4_fwd_bwd.png](fp32_stages4_fwd_bwd.png) |
+
+## fp16
+
+| stages | kind | geomean | медиана | мин | макс | проигр. | картинка |
+|---|---|---|---|---|---|---|---|
+| 0 | forward | **2.52x** | 2.48x | 0.96x | 9.68x | 2/57 | [fp16_forward.png](fp16_forward.png) |
+| 0 | **backward** | **1.30x** | 1.31x | 0.67x | 2.64x | 15/57 | [fp16_backward.png](fp16_backward.png) |
+| 0 | fwd+bwd | 1.87x | 1.97x | 0.88x | 5.55x | 4/57 | [fp16_fwd_bwd.png](fp16_fwd_bwd.png) |
+| 1 | forward | 2.42x | 2.34x | 0.91x | 9.73x | 4/57 | [fp16_stages1_forward.png](fp16_stages1_forward.png) |
+| 1 | backward | 1.27x | 1.31x | 0.67x | 2.64x | 19/57 | [fp16_stages1_backward.png](fp16_stages1_backward.png) |
+| 1 | fwd+bwd | 1.82x | 1.92x | 0.87x | 5.53x | 6/57 | [fp16_stages1_fwd_bwd.png](fp16_stages1_fwd_bwd.png) |
+| 2 | forward | 2.06x | 2.01x | 0.66x | 9.67x | 8/57 | [fp16_stages2_forward.png](fp16_stages2_forward.png) |
+| 2 | backward | 1.20x | 1.21x | 0.63x | 2.64x | 21/57 | [fp16_stages2_backward.png](fp16_stages2_backward.png) |
+| 2 | fwd+bwd | 1.66x | 1.72x | 0.64x | 5.54x | 8/57 | [fp16_stages2_fwd_bwd.png](fp16_stages2_fwd_bwd.png) |
+| 4 | forward | 2.24x | 2.18x | 0.81x | 9.66x | 6/57 | [fp16_stages4_forward.png](fp16_stages4_forward.png) |
+| 4 | backward | 1.24x | 1.28x | 0.67x | 2.64x | 20/57 | [fp16_stages4_backward.png](fp16_stages4_backward.png) |
+| 4 | fwd+bwd | 1.74x | 1.85x | 0.79x | 5.52x | 7/57 | [fp16_stages4_fwd_bwd.png](fp16_stages4_fwd_bwd.png) |
+
+## Что из этого следует
+
+**fp16 backward больше не проигрывает.** Было 0.68x при 30 проигранных клетках
+из 36, стало 1.30x при 15 из 57. Это то, что чинилось; чем именно — ниже, в
+разделе про сделанное. Прежние числа считались на двух графах, семи прогонах и
+без прогрева устройства, так что сравнивать их с этими напрямую нельзя: чистое
+сравнение кода с кодом — в разделе «Держится ли выигрыш по всем конфигурациям».
+
+**Пайплайнинг проигрывает во всех восьми конфигурациях.** По geomean stages=0
+лучше любого другого значения и в fp32, и в fp16, и в обе стороны; число
+проигранных DGL клеток растёт со стадиями монотонно (fp16 backward: 15 → 19 →
+21 → 20 из 57). Отдельный свип turbo-против-turbo в разделе про сделанное
+доводит это до 192 сравнений с тем же выводом.
+
+**Где мы всё ещё проигрываем.** Минимум по fp16 backward — 0.67x, и это
+`copy_u/min` и `copy_u/max` на всех графах сразу. Причина не в балансировке: у
+min/max градиент по вершинам оставлен в fp32 с кастом на выходе, потому что его
+скаттер накапливает, а у `copy_u` нет рёберного градиента, на котором это можно
+отыграть. Рядом `add/min` и `add/max` на 0.94–0.98x — тот же механизм.
+
+**На `ogbn-products` — паритет, 0.93–1.03x.** При 126M рёбер операция чисто
+bandwidth-bound: обе реализации упираются в пропускную способность памяти, и
+выигрывать там нечем.
+
+**Расхождения с DGL в градиентах min/max — не ошибка.** В fp16 их 15–19 на
+конфигурацию, в fp32 одно-два. Все до единого — только `grad_lhs`/`grad_rhs` у
+min/max, ни одного в forward и ни одного у sum. Субградиент min/max при равных
+сообщениях не единственный: DGL и turbo выбирают разное побеждающее ребро. В
+fp32 ничьих почти нет, в fp16 значения квантованы и ничьи повсюду. Проверено на
+`603239d`, то есть до всех оптимизаций: там ровно те же 19 расхождений в тех же
+клетках с теми же величинами.
 
 ---
 
 # Выводы
+
+Это диагностика состояния **до** правок, с числами того прогона (два графа, семь
+прогонов, без прогрева) — она и определила, что чинить. Текущие числа в таблицах
+выше, что из них сделано — в разделе «Что сделано по этому списку».
 
 **1. Forward стабильно 1.9–2.0x в обоих dtype, ни одного проигрыша.**
 
