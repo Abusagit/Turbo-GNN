@@ -30,13 +30,9 @@ from turbo_gnn.simulation import (  # noqa: E402
     simulate,
 )
 
-REAL_SOURCE = {
-    "ogbn-arxiv": "ogbn",
-    "ogbn-products": "ogbn",
-    "web-traffic": "pyg",
-    "hm-categories": "pyg",
-    "city-roads-L": "pyg",
-}
+# Anything src.data.datasets can resolve. "auto" sends ogbn-* to OGB and everything else to
+# PyG, so a hand-maintained name -> source table would only go out of date.
+SYNTHETIC_PREFIX = "synth-N"
 
 
 def make_powerlaw_degrees(n: int, avg_degree: int, exponent: float, seed: int) -> np.ndarray:
@@ -50,9 +46,7 @@ def make_powerlaw_degrees(n: int, avg_degree: int, exponent: float, seed: int) -
     return degrees
 
 
-def load_real_degrees(
-    name: str, root: str, quantile: float, direction: str
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_real_degrees(name: str, root: str, quantile: float, direction: str) -> tuple[np.ndarray, ...]:
     """Degrees and light/heavy buckets for one pass.
 
     The backward pass walks the transposed CSR -- rows are source nodes -- so its degrees and
@@ -62,7 +56,7 @@ def load_real_degrees(
     """
     from src.data.datasets import DatasetConfig, load_single_graph
 
-    cfg = DatasetConfig(source=REAL_SOURCE[name], name=name, root=root, conv_backend="cuda")
+    cfg = DatasetConfig(source="auto", name=name, root=root, conv_backend="cuda")
     graph_data = load_single_graph(cfg)
     edge_index = graph_data.edge_index
     if not isinstance(edge_index, torch.Tensor):
@@ -85,14 +79,12 @@ def bucket_degrees(graph, direction: str) -> tuple[np.ndarray, np.ndarray, np.nd
 
 
 def load_degrees(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if args.dataset.startswith("synth-N"):
-        n = int(args.dataset.removeprefix("synth-N"))
+    if args.dataset.startswith(SYNTHETIC_PREFIX):
+        n = int(args.dataset.removeprefix(SYNTHETIC_PREFIX))
         all_degrees = make_powerlaw_degrees(n, args.avg_degree, args.exponent, args.seed)
         threshold = np.quantile(all_degrees, args.quantile) if args.quantile != -1 else np.inf
         return all_degrees, all_degrees[all_degrees < threshold], all_degrees[all_degrees >= threshold]
-    if args.dataset in REAL_SOURCE:
-        return load_real_degrees(args.dataset, args.data_root, args.quantile, args.pass_name)
-    raise ValueError(f"unknown dataset {args.dataset!r}; use synth-N<size> or a known real graph")
+    return load_real_degrees(args.dataset, args.data_root, args.quantile, args.pass_name)
 
 
 def safe_name(value: str) -> str:

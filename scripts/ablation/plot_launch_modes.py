@@ -180,8 +180,14 @@ def main() -> int:
         )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    all_degrees = degrees[0]
+    # Skew is the reason any of this matters, so it belongs on the figure: max/avg degree says
+    # at a glance whether a long drain tail was ever avoidable.
     title = (
-        f"{args.dataset}  {args.conv}/{args.pass_name}/d{args.head_dim}  "
+        f"{args.dataset}  N={len(all_degrees):,} E={int(all_degrees.sum()):,} "
+        f"avg deg {all_degrees.mean():.1f}  max deg {all_degrees.max():,} "
+        f"(skew {all_degrees.max() / all_degrees.mean():.0f}x)  heavy {len(degrees[2]):,}\n"
+        f"{args.conv}/{args.pass_name}/d{args.head_dim}  "
         f"alpha={provenance['alpha']:.2f} beta={provenance['beta']:.2f}  "
         f"{args.sms} SMs x {args.max_blocks_light} slots  occ={occupancy:g}"
     )
