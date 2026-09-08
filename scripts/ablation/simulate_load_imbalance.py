@@ -151,36 +151,13 @@ def plot_comparison(path: Path, rows: list[dict[str, object]]) -> None:
     plt.close(fig)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """Graph, cost model and hardware flags, shared with the launch-mode figure."""
     parser.add_argument("--dataset", default="synth-N65536")
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--quantile", type=float, default=0.99)
     parser.add_argument("--avg-degree", type=int, default=8)
     parser.add_argument("--exponent", type=float, default=2.3)
-
-    parser.add_argument(
-        "--assignments",
-        nargs="+",
-        choices=["contiguous", "grid_strided", "lpt"],
-        default=["contiguous", "grid_strided", "lpt"],
-    )
-    parser.add_argument("--vertices-per-block", type=int, nargs="+", default=[1, 4])
-    parser.add_argument("--num-blocks", type=int, default=1056, help="Number of grid-strided or LPT blocks")
-    parser.add_argument(
-        "--heavy-slice-sizes",
-        type=int,
-        nargs="+",
-        default=[0, 256],
-        help="0 means one block per heavy node",
-    )
-    parser.add_argument(
-        "--launch-modes",
-        nargs="+",
-        choices=["single", "sequential", "concurrent"],
-        default=["sequential", "concurrent"],
-    )
-    parser.add_argument("--launch-latency", type=int, default=5)
 
     parser.add_argument(
         "--cost-model",
@@ -223,7 +200,34 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Override the tick duration; by default it is anchored on the measured baseline run",
     )
+    parser.add_argument("--launch-latency", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    add_common_arguments(parser)
+    parser.add_argument(
+        "--assignments",
+        nargs="+",
+        choices=["contiguous", "grid_strided", "lpt"],
+        default=["contiguous", "grid_strided", "lpt"],
+    )
+    parser.add_argument("--vertices-per-block", type=int, nargs="+", default=[1, 4])
+    parser.add_argument("--num-blocks", type=int, default=1056, help="Number of grid-strided or LPT blocks")
+    parser.add_argument(
+        "--heavy-slice-sizes",
+        type=int,
+        nargs="+",
+        default=[0, 256],
+        help="0 means one block per heavy node",
+    )
+    parser.add_argument(
+        "--launch-modes",
+        nargs="+",
+        choices=["single", "sequential", "concurrent"],
+        default=["sequential", "concurrent"],
+    )
     parser.add_argument("--out", type=Path, default=Path("simulation_results"))
     return parser.parse_args()
 
