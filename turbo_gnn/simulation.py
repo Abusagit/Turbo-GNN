@@ -81,6 +81,13 @@ class SimulationConfig:
     seed: int = 42
     launch_mode: LaunchMode = "single"
     light_launch_latency: int = 0
+    record_history: bool = True
+    """Keep the per-SM occupancy matrix.
+
+    It is what the heatmap draws, and it is [makespan x num_sms] -- 242 MB on a run of a quarter
+    million ticks. A sweep that only wants the scalars should turn it off; everything else in
+    the result is one-dimensional and stays."""
+
     depends_on: dict[str, str] = field(default_factory=dict)
     """Kernels that cannot start until another kernel has fully drained.
 
@@ -108,6 +115,7 @@ class SimulationResult:
     bandwidth_utilisation: np.ndarray
     retired_work: np.ndarray
     active_blocks: dict[str, np.ndarray]
+    mean_slot_occupancy: float = 0.0
     slot_bound: float = 0.0
     bandwidth_bound: float = 0.0
     critical_path: int = 0
@@ -145,7 +153,7 @@ class SimulationResult:
             "critical_path": self.critical_path,
             "binding_bound": self.binding_bound,
             "predicted_ms": self.predicted_ms,
-            "mean_slot_utilisation": float(self.sm_utilisation.mean()) if self.sm_utilisation.size else 0.0,
+            "mean_slot_utilisation": self.mean_slot_occupancy,
             "mean_bandwidth_utilisation": (
                 float(self.bandwidth_utilisation.mean()) if self.bandwidth_utilisation.size else 0.0
             ),
@@ -363,11 +371,13 @@ def simulate(
     running: list[_Running] = []
     sm_load = np.zeros(config.num_sms, dtype=np.float64)
     sm_history: list[np.ndarray] = []
+    occupancy_total = 0.0
     bw_history: list[float] = []
     retired_history: list[int] = []
     active_history: dict[str, list[int]] = {name: [] for name in kernel_names}
     processed_work = 0
     retired_work = 0
+    steps = 0
     time = 0
     next_kernel_index = 0
 
@@ -417,7 +427,9 @@ def simulate(
                 raise RuntimeError("simulation deadlocked")
             target = max(time + 1, min(future))
             while time < target:
-                sm_history.append(np.zeros(config.num_sms, dtype=np.float64))
+                if config.record_history:
+                    sm_history.append(np.zeros(config.num_sms, dtype=np.float64))
+                steps += 1
                 bw_history.append(0.0)
                 retired_history.append(retired_work)
                 for name in kernel_names:
@@ -436,7 +448,10 @@ def simulate(
                 finished_indices.append(int(running_index))
 
         retired_work += sum(running[index].spec.cost for index in finished_indices)
-        sm_history.append(sm_load.copy())
+        if config.record_history:
+            sm_history.append(sm_load.copy())
+        occupancy_total += float(sm_load.sum())
+        steps += 1
         bw_history.append(len(granted) / bandwidth_cap)
         retired_history.append(retired_work)
         for name in kernel_names:
@@ -448,7 +463,7 @@ def simulate(
             sm_load[item.sm] -= 1.0 / kernels[name].resident_blocks_per_sm
         time += 1
 
-    makespan = len(sm_history)
+    makespan = steps
     retired = np.asarray(retired_history, dtype=np.int64)
     threshold = 0.95 * total_work
     retired_95 = int(np.searchsorted(retired, threshold, side="left") + 1) if total_work else 0
@@ -471,6 +486,7 @@ def simulate(
         total_work=total_work,
         bandwidth_cap=bandwidth_cap,
         sm_utilisation=np.stack(sm_history) if sm_history else np.empty((0, config.num_sms)),
+        mean_slot_occupancy=occupancy_total / (steps * config.num_sms) if steps else 0.0,
         bandwidth_utilisation=np.asarray(bw_history),
         retired_work=retired,
         active_blocks={name: np.asarray(values, dtype=np.int64) for name, values in active_history.items()},
