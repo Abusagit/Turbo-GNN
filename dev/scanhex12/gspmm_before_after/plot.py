@@ -119,10 +119,12 @@ def main() -> int:
     # +-3% is the measured spread between two builds of the same sources, so
     # anything inside it is grey and only a genuine loss goes red.
     colors = ["#c44e52" if v < 0.97 else "#999999" if v < 1.03 else "#1f77b4" for v in vals]
-    ax.barh(range(len(rows)), vals, color=colors)
+    ax.barh(range(len(rows)), vals, color=colors, zorder=2)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels(labels, fontsize=9)
-    ax.axvline(1.0, color="black", linestyle="--", linewidth=1)
+    # Behind everything: at the default z-order it was drawn over the value
+    # labels, and a dashed line through "0.98x" is easy to misread.
+    ax.axvline(1.0, color="black", linestyle="--", linewidth=1, zorder=0.5)
     ax.set_xlim(0, max(vals) * 1.12)
     ax.set_xlabel(
         args.xlabel
@@ -131,7 +133,7 @@ def main() -> int:
     )
     ax.set_title(args.title or f"g-SpMM {KIND_LABEL[args.kind]}, d={args.dim}: до и после")
     for i, v in enumerate(vals):
-        ax.text(v + max(vals) * 0.008, i, f"{v:.2f}x", va="center", fontsize=8)
+        ax.text(v + max(vals) * 0.012, i, f"{v:.2f}x", va="center", fontsize=8, zorder=3)
     ax.margins(y=0.005)
 
     footer = " · ".join(sorted(set(subtitle_bits)))

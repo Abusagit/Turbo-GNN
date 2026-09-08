@@ -30,6 +30,28 @@ def dgl_op_name(op: str, reduce: str) -> str:
     return f"{op}_{reduce}" if op.startswith("copy") else f"u_{op}_e_{reduce}"
 
 
+def warm_up_device(seconds: float = 1.5) -> None:
+    """Burn the GPU clock ramp before anything is timed.
+
+    Measured on a T4: the *first* timed cell of a process came out 11-18%
+    slower than the next one and varied from run to run, while the second and
+    third repeated to 0.5% -- the 10 warmup iterations time_ms does per
+    measurement are not enough to cover the ramp.  Whichever cell happens to
+    sit first in the loop would otherwise carry that penalty, and since both
+    sides of the comparison measure in separate processes it does not cancel.
+    """
+    from time import perf_counter
+
+    scratch = torch.randn(4096, 4096, device="cuda")
+    deadline = perf_counter() + seconds
+    while perf_counter() < deadline:
+        for _ in range(5):
+            scratch = scratch * 1.0001 + 0.0001
+        torch.cuda.synchronize()
+    del scratch
+    torch.cuda.empty_cache()
+
+
 def time_ms(fn, iters: int, repeats: int, warmup: int = 10) -> float:
     for _ in range(warmup):
         fn()
@@ -194,6 +216,8 @@ def main() -> int:
             # dim-independent name makes a later run read out-of-range indices
             dump(f"samp_node_{d}.i64", si_node)
             dump(f"samp_edge_{d}.i64", si_edge)
+
+        warm_up_device()
 
         for op in ops:
             for reduce in REDUCERS:
