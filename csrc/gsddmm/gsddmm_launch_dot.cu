@@ -4,8 +4,6 @@
 
 namespace gsddmm {
 
-void gsddmm_forward_launch_dot(const GsddmmLaunchArgs& args) {
-    gsddmm_dispatch<GSDDMM_BINARY_LROS(Dot)>(args);
-}
+void gsddmm_forward_launch_dot(const GsddmmLaunchArgs& args) { gsddmm_dispatch<GSDDMM_BINARY_LROS(Dot)>(args); }
 
 };  // namespace gsddmm

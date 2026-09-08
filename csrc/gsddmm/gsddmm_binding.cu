@@ -136,13 +136,26 @@ torch::Tensor gsddmm_forward_cuda(
 
     // One call per op, each resolved in its own translation unit.
     switch (op_enum) {
-        case GSDDMM_OP::Add: gsddmm_forward_launch_add(args); break;
-        case GSDDMM_OP::Sub: gsddmm_forward_launch_sub(args); break;
-        case GSDDMM_OP::Mul: gsddmm_forward_launch_mul(args); break;
-        case GSDDMM_OP::Div: gsddmm_forward_launch_div(args); break;
-        case GSDDMM_OP::Dot: gsddmm_forward_launch_dot(args); break;
-        case GSDDMM_OP::Copy: gsddmm_forward_launch_copy(args); break;
-        default: TORCH_CHECK(false, "GSDDMM forward: op '", op, "' has no launcher");
+        case GSDDMM_OP::Add:
+            gsddmm_forward_launch_add(args);
+            break;
+        case GSDDMM_OP::Sub:
+            gsddmm_forward_launch_sub(args);
+            break;
+        case GSDDMM_OP::Mul:
+            gsddmm_forward_launch_mul(args);
+            break;
+        case GSDDMM_OP::Div:
+            gsddmm_forward_launch_div(args);
+            break;
+        case GSDDMM_OP::Dot:
+            gsddmm_forward_launch_dot(args);
+            break;
+        case GSDDMM_OP::Copy:
+            gsddmm_forward_launch_copy(args);
+            break;
+        default:
+            TORCH_CHECK(false, "GSDDMM forward: op '", op, "' has no launcher");
     }
 
     CUDA_KERNEL_CHECK();
@@ -167,11 +180,10 @@ torch::Tensor gsddmm_forward_cuda(
     torch::Tensor heavy_nodes,
     uint32_t light_warps_per_block = 4,
     uint32_t heavy_warps_per_block = 32,
-    uint32_t pipeline_stages = 0
+    uint32_t pipeline_stages       = 0
 ) {
     return gsddmm::gsddmm_forward_cuda(
-        std::move(L), std::move(R), std::move(row_ptr), std::move(col_idx), std::move(op), std::move(lhs_target),
-        std::move(rhs_target), std::move(light_nodes), std::move(heavy_nodes), light_warps_per_block, heavy_warps_per_block,
-        pipeline_stages
+        std::move(L), std::move(R), std::move(row_ptr), std::move(col_idx), std::move(op), std::move(lhs_target), std::move(rhs_target),
+        std::move(light_nodes), std::move(heavy_nodes), light_warps_per_block, heavy_warps_per_block, pipeline_stages
     );
 }

@@ -12,7 +12,7 @@
 //
 // visit(src, val): val is the prefetched slice, valid only inside the call.
 // dbuf: this thread's scratch, NUM_STAGES * TW elements.
-template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, typename index_t, typename VisitFn>
+template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, IntegralNum index_t, typename VisitFn>
 __device__ __forceinline__ void pipelined_thread_edge_scan(
     index_t start, index_t end, index_t const *__restrict__ edge_idx, cuda_t const *__restrict__ X, size_t d, size_t base_f, cuda_t *dbuf,
     VisitFn&& visit
@@ -57,7 +57,7 @@ __device__ __forceinline__ void pipelined_thread_edge_scan(
 }
 
 // PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
     index_t const *const __restrict__ light_nodes_indices,
     index_t const *const __restrict__ edge_ptr,
@@ -202,7 +202,7 @@ __device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int&
 // Only for 32-bit index types (packs float32 + int32 into uint64)
 // PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
 template <
-    size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float,
+    size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, IntegralNum index_t, FloatingNum accum_t = float,
     int PIPELINE_STAGES = 0
 >
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
@@ -315,7 +315,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 }
 
 // unpack results back to separate arrays (32-bit indices only, pairs with heavy kernel)
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
+template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, IntegralNum index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_kernel(
     uint64_t const *const __restrict__ packed,
     index_t const *const __restrict__ nodes,
@@ -345,7 +345,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_ker
 // 2D kernel: blockIdx.x = node, threadIdx.x = feature, threadIdx.y = edge tile
 // uses shared memory tree reduction across tiles instead of packed atomicMin/Max
 // Works with all index sizes (no packing constraint)
-template <FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float>
+template <FloatingNum cuda_t, ReductionOp Op, IntegralNum index_t, FloatingNum accum_t = float>
 __global__ void reduction_aggr_forward_heavy_kernel_2d(
     const index_t *__restrict__ nodes,
     const index_t *__restrict__ edge_ptr,
@@ -514,7 +514,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     }
 }
 
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
+template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, IntegralNum index_t>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_backward_typed(
     const cuda_t *__restrict__ grad_out, const index_t *__restrict__ arg_idx, cuda_t *__restrict__ grad_x, size_t num_nodes, size_t d
 ) {

@@ -30,9 +30,7 @@ struct LRO {
     GSDDMM_MEMBER l, r;
     GSDDMM_OP op;
 
-    bool operator==(LRO other) const {
-        return (l == other.l) && (r == other.r) && (op == other.op);
-    }
+    bool operator==(LRO other) const { return (l == other.l) && (r == other.r) && (op == other.op); }
 };
 
 // Everything a per-op launcher needs, assembled once by gsddmm_binding.cu after

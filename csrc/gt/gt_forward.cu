@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward_CSR_MH_v2_D( // no-format
     size_t N, size_t H,
     const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,

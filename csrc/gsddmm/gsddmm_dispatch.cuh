@@ -71,14 +71,13 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
                 dim3 threads(kWarpSize, W);
 
                 kernel<<<blocks, threads, shmem, args.stream>>>(
-                    static_cast<size_t>(args.N), L_ptr, R_ptr, O_ptr, index_ptr<index_t>(args.row_ptr),
-                    index_ptr<index_t>(args.col_idx), index_ptr<index_t>(node_indices)
+                    static_cast<size_t>(args.N), L_ptr, R_ptr, O_ptr, index_ptr<index_t>(args.row_ptr), index_ptr<index_t>(args.col_idx),
+                    index_ptr<index_t>(node_indices)
                 );
             },
             lro_variant, MakeIndexVariant<int32_t, int64_t>(args.row_ptr.scalar_type()),
-            MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)), warp_variant,
-            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
+            MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+            warp_variant, MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
         );
     };
 

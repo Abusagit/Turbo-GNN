@@ -6,7 +6,7 @@
 // =============================================================================
 // Undirected GATv2 backward impl: G kernel + fused ALR kernel + ReduceGradA
 // =============================================================================
-template <int D_CONST, typename cuda_t, typename index_t>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t>
 void GATv2Backward_CSR_Undirected_Impl(
     size_t N, size_t H, size_t D, const cuda_t *grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *d_l, int64_t stride_l_n,
     int64_t stride_l_h, const cuda_t *d_r, int64_t stride_r_n, int64_t stride_r_h, const index_t *d_row_ptr, const index_t *d_col_idx,
@@ -68,7 +68,7 @@ void GATv2Backward_CSR_Undirected_Impl(
 // =============================================================================
 
 // Legacy impl kept for reference; actual dispatch is in gatv2_backward_cuda below.
-template <int D_CONST, typename cuda_t, typename index_t>
+template <size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t>
 void GATv2Backward_CSR_Impl_UNUSED(
     // inputs
     size_t N, size_t H, size_t D,

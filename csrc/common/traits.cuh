@@ -143,34 +143,6 @@ struct IndexTypeInfo<uint64_t> {
     static constexpr c10::ScalarType ScalarType = c10::ScalarType::UInt64;
 };
 
-// Sentinel traits: universal "invalid index" for all types
-// For signed: -1. For unsigned: max value (all-ones bit pattern).
-// cast(-1) gives all-ones for both signed and unsigned.
-template <typename index_t>
-struct IndexSentinel {
-    static constexpr index_t INVALID = static_cast<index_t>(-1);
-    static __device__ __forceinline__ bool is_valid(index_t idx) { return idx != INVALID; }
-};
-
-// Runtime dispatch to compile-time index type
-template <typename... IndexTypes>
-std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {
-    std::variant<IndexTypeInfo<IndexTypes>...> result;
-    bool found = false;
-    (
-        [&] {
-            if (IndexTypeInfo<IndexTypes>::ScalarType == type) {
-                result.template emplace<IndexTypeInfo<IndexTypes>>();
-                found = true;
-            }
-        }(),
-        ...);
-    if (!found) {
-        throw std::runtime_error("Unsupported index scalar type");
-    }
-    return result;
-}
-
 // Is floating point trait
 
 template <typename T>
@@ -224,4 +196,32 @@ concept IntegralNum = is_integral_cuda_v<T>;
 template <IntegralNum T>
 inline constexpr T ceil_div(T num, T den) {
     return (num + den - 1) / den;
+}
+
+// Sentinel traits: universal "invalid index" for all types
+// For signed: -1. For unsigned: max value (all-ones bit pattern).
+// cast(-1) gives all-ones for both signed and unsigned.
+template <IntegralNum index_t>
+struct IndexSentinel {
+    static constexpr index_t INVALID = static_cast<index_t>(-1);
+    static __device__ __forceinline__ bool is_valid(index_t idx) { return idx != INVALID; }
+};
+
+// Runtime dispatch to compile-time index type
+template <typename... IndexTypes>
+std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {
+    std::variant<IndexTypeInfo<IndexTypes>...> result;
+    bool found = false;
+    (
+        [&] {
+            if (IndexTypeInfo<IndexTypes>::ScalarType == type) {
+                result.template emplace<IndexTypeInfo<IndexTypes>>();
+                found = true;
+            }
+        }(),
+        ...);
+    if (!found) {
+        throw std::runtime_error("Unsupported index scalar type");
+    }
+    return result;
 }

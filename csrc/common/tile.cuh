@@ -62,7 +62,7 @@ static_assert(std::is_trivially_destructible_v<Vec<8, nv_bfloat16>>);
 // SelectTW: pick widest TW where all threads are working but not wider than 128 bits
 // ==================================================================================
 
-template <int D_CONST, typename cuda_t, int THREADS_PER_D = kWarpSize>
+template <int D_CONST, FloatingNum cuda_t, int THREADS_PER_D = kWarpSize>
 struct SelectTW {
    private:
     static consteval int calculate_tile_width(size_t type_size, size_t d, size_t thread_count) {

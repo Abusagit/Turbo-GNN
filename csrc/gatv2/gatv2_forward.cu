@@ -11,7 +11,7 @@
 
 // PIPELINE_STAGES == 0 disables the async-copy pipeline (plain warp-strided loop);
 // PIPELINE_STAGES >= 1 enables it with that many ping-pong stages for r[j].
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
     size_t N,
     size_t H,

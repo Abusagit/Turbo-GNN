@@ -4,8 +4,6 @@
 
 namespace gsddmm {
 
-void gsddmm_forward_launch_copy(const GsddmmLaunchArgs& args) {
-    gsddmm_dispatch<GSDDMM_COPY_LROS>(args);
-}
+void gsddmm_forward_launch_copy(const GsddmmLaunchArgs& args) { gsddmm_dispatch<GSDDMM_COPY_LROS>(args); }
 
 };  // namespace gsddmm

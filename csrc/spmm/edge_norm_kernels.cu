@@ -2,7 +2,7 @@
 
 enum class NormType: uint8_t { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
 
-template <typename index_t>
+template <IntegralNum index_t>
 __global__ void compute_degrees_kernel(
     const index_t *indptr, const index_t *indices, float *in_degrees, float *out_degrees, int32_t num_nodes
 ) {
@@ -23,7 +23,7 @@ __global__ void compute_degrees_kernel(
     }
 }
 
-template <typename index_t>
+template <IntegralNum index_t>
 __global__ void compute_edge_weights_kernel(
     const index_t *indptr, const index_t *indices, const float *edge_weights, float *normalized_weights, const float *in_degrees,
     const float *out_degrees, int32_t num_nodes, NormType norm
