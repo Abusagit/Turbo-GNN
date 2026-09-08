@@ -240,6 +240,50 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     def device(self) -> torch.device:
         return self._device
 
+    def sorted_by_degree(self, descending: bool = True) -> "AdjacencyForwardBackwardWithNodeBuckets":
+        """New instance whose light/heavy buckets are ordered by degree.
+
+        Longest-processing-time-first scheduling: a node's cost is proportional
+        to its degree, so handing the expensive ones out first and letting the
+        cheap ones fill the tail is the standard makespan-minimising order.
+        The kernels walk these bucket arrays in order, so reordering them here
+        is all it takes.
+
+        Only *which* node a block visits changes, never where its result is
+        written, so the forward is bit-exact; a gradient that accumulates
+        through atomicAdd sees a different summation order, as it does for any
+        other launch geometry.
+
+        It trades locality for balance -- ascending node order streams indptr
+        and indices sequentially, degree order scatters those reads -- and which
+        wins depends on the graph, so it is opt-in.  The CSR tensors are shared
+        with the original; only the four index arrays are new, which makes the
+        result worth caching on the graph.
+        """
+        fwd_indptr = self._to_signed_view(self.forward_indptr)
+        fwd_deg = fwd_indptr[1:] - fwd_indptr[:-1]
+        bwd_indptr = self._to_signed_view(self.backward_indptr)
+        bwd_deg = bwd_indptr[1:] - bwd_indptr[:-1]
+
+        def _sort(bucket: torch.Tensor, degrees: torch.Tensor) -> torch.Tensor:
+            if bucket.numel() == 0:
+                return bucket
+            order = torch.argsort(degrees[bucket.long()], descending=descending)
+            return bucket[order].contiguous()
+
+        return AdjacencyForwardBackwardWithNodeBuckets(
+            forward_indptr=self.forward_indptr,
+            forward_indices=self.forward_indices,
+            backward_indptr=self.backward_indptr,
+            backward_indices=self.backward_indices,
+            forward_light_nodes=_sort(self.forward_light_nodes, fwd_deg),
+            forward_heavy_nodes=_sort(self.forward_heavy_nodes, fwd_deg),
+            backward_light_nodes=_sort(self.backward_light_nodes, bwd_deg),
+            backward_heavy_nodes=_sort(self.backward_heavy_nodes, bwd_deg),
+            is_directed=self.is_directed,
+            forward_edge_perm=self.forward_edge_perm,
+        )
+
     def repartition(self, **kwargs) -> AdjacencyForwardBackwardWithNodeBuckets:
         """New instance with same CSR but re-bucketed nodes. CSR tensors are shared."""
         fwd_q = kwargs.get("forward_huge_degree_threshold_quantile")
