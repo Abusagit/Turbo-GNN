@@ -85,11 +85,17 @@ def build_edge_index(args, device: str) -> tuple[torch.Tensor, int]:
         else:
             dst = torch.randint(0, n, (m,), device=device, generator=g)
     else:
-        from ogb.nodeproppred import NodePropPredDataset
+        # Any named graph comes from the cache prepare_graph.py writes, so both
+        # sides of the comparison walk the same edge list and neither needs
+        # torch_geometric or ogb at measurement time.
+        import numpy as np
 
-        graph, _ = NodePropPredDataset(name=args.graph, root=args.ogb_root)[0]
-        n = int(graph["num_nodes"])
-        ei = torch.from_numpy(graph["edge_index"]).long().to(device)
+        cache = os.path.join(args.graph_cache, f"{args.graph}.npz")
+        if not os.path.exists(cache):
+            sys.exit(f"{args.graph}: no {cache}. Run prepare_graph.py {args.graph} first.")
+        blob = np.load(cache)
+        n = int(blob["num_nodes"])
+        ei = torch.from_numpy(blob["edge_index"]).long().to(device)
         src, dst = ei[0], ei[1]
 
     loops = torch.arange(n, device=device)
@@ -112,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--repeats", type=int, default=7)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ogb-root", default=os.environ.get("OGB_ROOT", "data/ogb"))
+    p.add_argument("--graph-cache", default=os.environ.get("GRAPH_CACHE", "data/graph_cache"))
     return p.parse_args()
 
 

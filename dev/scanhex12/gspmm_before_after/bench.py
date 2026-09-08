@@ -19,7 +19,6 @@ these numbers repeat to under 1%, but a cool card and a hot one differ by up to
 from __future__ import annotations
 
 import argparse
-import gzip
 import os
 import json
 import statistics
@@ -47,38 +46,24 @@ CELLS = [
 ]
 
 
-def load_ogb(name: str, ogb_root: str) -> tuple[torch.Tensor, int]:
-    """(edge_index, N) for an OGB node-property dataset, read from its raw CSVs.
+def load_cached(name: str, cache_dir: str) -> tuple[torch.Tensor, int]:
+    """(edge_index, N) from the cache ../gspmm_vs_dgl/prepare_graph.py writes.
 
-    Deliberately not through the `ogb` package: it pulls in pandas and
-    scikit-learn, and all that is needed here is the edge list, which the
-    download already carries as a two-column csv.gz.  The parse is cached as
-    .npy next to it -- the sweep loads each graph a dozen times over.
+    One loader for every named graph -- GraphLand, OGB, Planetoid -- so this
+    sweep and the DGL comparison cannot end up on subtly different edge lists,
+    and neither depends on torch_geometric or ogb at measurement time.
     """
-    root = Path(ogb_root) / name.replace("-", "_")
-    raw = root / "raw"
-    if not raw.is_dir():
+    path = Path(cache_dir) / f"{name}.npz"
+    if not path.exists():
         raise SystemExit(
-            f"{name} is not in {ogb_root}: expected {raw}. Download it (the OGB "
-            f"archive from snap.stanford.edu unpacks straight into this layout)."
+            f"{name}: no {path}. Run ../gspmm_vs_dgl/prepare_graph.py {name} first."
         )
-
-    cache = root / "edge_index.npy"
-    if cache.exists():
-        edges = np.load(cache)
-    else:
-        with gzip.open(raw / "edge.csv.gz", "rt") as fh:
-            edges = np.loadtxt(fh, delimiter=",", dtype=np.int64)
-        np.save(cache, edges)
-
-    with gzip.open(raw / "num-node-list.csv.gz", "rt") as fh:
-        num_nodes = int(fh.readline().strip())
-
-    return torch.from_numpy(edges.T.copy()), num_nodes
+    blob = np.load(path)
+    return torch.from_numpy(blob["edge_index"]), int(blob["num_nodes"])
 
 
-def make_graph(kind: str, num_nodes: int, avg_degree: int, ogb_root: str, device="cuda", seed=0):
-    """`random`, `skewed`, or any OGB name -- the same set the DGL charts used.
+def make_graph(kind: str, num_nodes: int, avg_degree: int, cache_dir: str, device="cuda", seed=0):
+    """`random`, `skewed`, or any name in the prepared graph cache.
 
     `skewed` is dst ~ U^4, matching ../gspmm_vs_dgl/dgl_side.py: in-degree then
     concentrates on a handful of nodes, which is the only synthetic shape where
@@ -94,7 +79,7 @@ def make_graph(kind: str, num_nodes: int, avg_degree: int, ogb_root: str, device
         else:
             dst = torch.randint(0, num_nodes, (num_edges,), device=device, generator=g)
     else:
-        edge_index, num_nodes = load_ogb(kind, ogb_root)
+        edge_index, num_nodes = load_cached(kind, cache_dir)
         src, dst = edge_index[0].to(device), edge_index[1].to(device)
 
     # Self-loops keep every in-degree non-zero, so no cell is measuring the
@@ -182,7 +167,7 @@ def measure_cell(graph, num_nodes, num_edges, op, reduce, d, dtype, stages) -> d
 
 def run(args) -> dict:
     dtype = getattr(torch, args.dtype)
-    graph, num_nodes = make_graph(args.graph, args.nodes, args.degree, args.ogb_root)
+    graph, num_nodes = make_graph(args.graph, args.nodes, args.degree, args.graph_cache)
     num_edges = graph.forward_indices.numel()
     indptr = graph.forward_indptr.long()
     degrees = indptr[1:] - indptr[:-1]
@@ -217,10 +202,10 @@ def run(args) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("out", help="where to write the results JSON")
-    p.add_argument("--graph", default="random", help="random | skewed | an OGB name (ogbn-arxiv, ogbn-products)")
+    p.add_argument("--graph", default="random", help="random | skewed | any name in the prepared graph cache")
     p.add_argument("--nodes", type=int, default=169343, help="synthetic graphs only; OGB brings its own")
     p.add_argument("--degree", type=int, default=8, help="synthetic graphs only")
-    p.add_argument("--ogb-root", default=os.environ.get("OGB_ROOT", "data/ogb"))
+    p.add_argument("--graph-cache", default=os.environ.get("GRAPH_CACHE", "data/graph_cache"))
     p.add_argument("--dims", default="64", help="comma-separated feature widths, e.g. 32,64,128")
     p.add_argument("--dtype", default="float16")
     p.add_argument("--stages", type=int, default=0)

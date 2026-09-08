@@ -20,6 +20,7 @@ STAGES="${STAGES:-0}"
 ITERS="${ITERS:-30}"
 REPEATS="${REPEATS:-7}"
 GRAPHS="${GRAPHS:-random skewed ogbn-arxiv ogbn-products}"
+GRAPH_CACHE="${GRAPH_CACHE:-data/graph_cache}"
 RESULTS="$HERE/results"
 
 bwd_flag=""
@@ -40,8 +41,17 @@ mkdir -p "$WORK" "$RESULTS"
 
 for graph in $GRAPHS; do
     dir="$WORK/xchg_${graph}_${DIRTAG}"
+
+    # An [E, d] edge operand and its gradient come to 2*E*d*sizeof(dtype); past
+    # roughly ten million edges that alone outgrows 15 GB at d=64, so those
+    # graphs measure only the ops that read no edge data.  ogbn-products used to
+    # be special-cased here; this is the same rule, stated by size.
     ops="copy_u,copy_e,add,sub,mul,div"
-    case "$graph" in ogbn-products) ops="copy_u";; esac
+    edges=$("$PYTHON_DGL" "$HERE/edge_count.py" "$GRAPH_CACHE" "$graph")
+    if [ "${edges:-0}" -gt "${EDGE_LIMIT:-10000000}" ]; then
+        ops="copy_u"
+        echo "note: $graph has $edges edges -> copy_u only (an [E, d] operand does not fit)"
+    fi
 
     echo
     echo "=================== $graph  ($TAG) ==================="
@@ -58,7 +68,8 @@ for graph in $GRAPHS; do
             cp "$dir/meta_$d.json" "$dir/meta.json"
         else
             "$PYTHON_DGL" "$HERE/dgl_side.py" "$dir" --graph "$graph" --feat-dims "$d" \
-                --ops "$ops" --dtype "$DTYPE" --iters "$ITERS" --repeats "$REPEATS" $bwd_flag
+                --ops "$ops" --dtype "$DTYPE" --iters "$ITERS" --repeats "$REPEATS" $bwd_flag \
+                --graph-cache "$GRAPH_CACHE"
             cp "$dir/meta.json" "$dir/meta_$d.json"
         fi
 

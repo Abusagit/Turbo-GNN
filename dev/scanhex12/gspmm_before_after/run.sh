@@ -12,8 +12,8 @@
 # ogbn-products is 126M edges: an [E, d] edge operand does not fit in 15 GB, so
 # on that graph only the copy_u cells measure and the rest are recorded as
 # skipped -- which is also why the original four-graph chart showed copy_u
-# alone.  Its raw csv.gz has to be under OGB_ROOT; bench.py reads that directly
-# rather than depending on the ogb package.
+# alone.  Named graphs come from the cache ../gspmm_vs_dgl/prepare_graph.py
+# writes, which is also what the DGL comparison reads.
 #
 # Resumable: a results file that already exists and is non-empty is skipped, so
 # an interrupted run continues where it stopped.  Delete the file (or the whole
@@ -22,7 +22,7 @@
 # Knobs, all optional:
 #   BEFORE_REF / AFTER_REF   commits to compare      (default: the PR base, HEAD)
 #   GRAPHS / DTYPES / STAGES / DIMS   what to sweep
-#   OGB_ROOT                 where the OGB downloads live (default: data/ogb)
+#   GRAPH_CACHE              prepare_graph.py output (default: data/graph_cache)
 #   PYTHON                   interpreter             (default: python)
 #   WORKDIR                  where the worktrees go  (default: /tmp/turbo-bench)
 #   SKIP_BUILD=1             do not build the extension in each worktree
@@ -54,7 +54,7 @@ PLOT_DIM="${PLOT_DIM:-64}"
 PYTHON="${PYTHON:-python}"
 WORKDIR="${WORKDIR:-/tmp/turbo-bench}"
 BENCH_CMD="${BENCH_CMD:-}"
-OGB_ROOT="${OGB_ROOT:-data/ogb}"
+GRAPH_CACHE="${GRAPH_CACHE:-data/graph_cache}"
 
 RESULTS="$HERE/results"
 PLOTS="$HERE/plots"
@@ -124,7 +124,7 @@ bench_one() {
 
     if TURBO_REPO="$dir" PYTHONPATH="$dir:${PYTHONPATH:-}" \
         "${cmd[@]}" "$out" --graph "$graph" --dtype "$dtype" --stages "$stages" \
-        --dims "$DIMS" --label "$label" --ogb-root "$OGB_ROOT"
+        --dims "$DIMS" --label "$label" --graph-cache "$GRAPH_CACHE"
     then
         measured=$((measured + 1))
     else
