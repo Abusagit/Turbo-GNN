@@ -1,6 +1,9 @@
 import json
+import sys
+from pathlib import Path
 
 import pytest
+import torch
 
 from turbo_gnn.calibration import (
     Measurement,
@@ -253,3 +256,34 @@ def test_lookup_names_the_cells_it_does_have():
     fits, _ = fit_all(synthesise(5_000.0, 30.0, 0.5, SHAPES))
     with pytest.raises(KeyError, match="gt/forward/128"):
         lookup(fits, "gt", "backward", 128)
+
+
+# --------------------------------------------------------------------------------------------
+# Pass selection in the sweep script
+# --------------------------------------------------------------------------------------------
+
+
+def test_backward_pass_simulates_the_transposed_graph():
+    # --pass picks the cost model cell *and* the CSR. On a directed graph the two directions are
+    # different workloads, so taking backward constants over forward degrees would be wrong.
+    sys.path.append(str(Path(__file__).resolve().parents[2] / "scripts" / "ablation"))
+    from simulate_load_imbalance import bucket_degrees
+
+    class FakeGraph:
+        # A path 0 -> 1 -> 2: in-degrees (0, 1, 1), out-degrees (1, 1, 0).
+        forward_indptr = torch.tensor([0, 0, 1, 2])
+        forward_light_nodes = torch.tensor([0, 1])
+        forward_heavy_nodes = torch.tensor([2])
+        backward_indptr = torch.tensor([0, 1, 2, 2])
+        backward_light_nodes = torch.tensor([1, 2])
+        backward_heavy_nodes = torch.tensor([0])
+
+    forward_all, forward_light, forward_heavy = bucket_degrees(FakeGraph(), "forward")
+    backward_all, backward_light, backward_heavy = bucket_degrees(FakeGraph(), "backward")
+    assert forward_all.tolist() == [0, 1, 1]
+    assert backward_all.tolist() == [1, 1, 0]
+    assert (forward_light.tolist(), forward_heavy.tolist()) == ([0, 1], [1])
+    assert (backward_light.tolist(), backward_heavy.tolist()) == ([1, 0], [1])
+
+    with pytest.raises(ValueError, match="unknown direction"):
+        bucket_degrees(FakeGraph(), "sideways")

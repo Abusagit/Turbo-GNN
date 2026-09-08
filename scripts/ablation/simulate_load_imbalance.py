@@ -47,7 +47,16 @@ def make_powerlaw_degrees(n: int, avg_degree: int, exponent: float, seed: int) -
     return degrees
 
 
-def load_real_degrees(name: str, root: str, quantile: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_real_degrees(
+    name: str, root: str, quantile: float, direction: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Degrees and light/heavy buckets for one pass.
+
+    The backward pass walks the transposed CSR -- rows are source nodes -- so its degrees and
+    its bucketing are a different partition of the same graph, and only coincide when the graph
+    is undirected. Simulating a backward launch on forward degrees would silently model the
+    wrong workload.
+    """
     from src.data.datasets import DatasetConfig, load_single_graph
 
     cfg = DatasetConfig(source=REAL_SOURCE[name], name=name, root=root, conv_backend="cuda")
@@ -58,10 +67,17 @@ def load_real_degrees(name: str, root: str, quantile: float) -> tuple[np.ndarray
     graph = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
         edge_index, int(graph_data.num_nodes), quantile=quantile, index_dtype=torch.int64
     )
-    indptr = graph.forward_indptr
+    return bucket_degrees(graph, direction)
+
+
+def bucket_degrees(graph, direction: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split one direction's CSR into all / light / heavy degrees."""
+    if direction not in ("forward", "backward"):
+        raise ValueError(f"unknown direction: {direction!r}")
+    indptr = getattr(graph, f"{direction}_indptr")
     degrees = (indptr[1:] - indptr[:-1]).cpu().numpy()
-    light = graph.forward_light_nodes.long().cpu().numpy()
-    heavy = graph.forward_heavy_nodes.long().cpu().numpy()
+    light = getattr(graph, f"{direction}_light_nodes").long().cpu().numpy()
+    heavy = getattr(graph, f"{direction}_heavy_nodes").long().cpu().numpy()
     return degrees, degrees[light], degrees[heavy]
 
 
@@ -72,7 +88,7 @@ def load_degrees(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.n
         threshold = np.quantile(all_degrees, args.quantile) if args.quantile != -1 else np.inf
         return all_degrees, all_degrees[all_degrees < threshold], all_degrees[all_degrees >= threshold]
     if args.dataset in REAL_SOURCE:
-        return load_real_degrees(args.dataset, args.data_root, args.quantile)
+        return load_real_degrees(args.dataset, args.data_root, args.quantile, args.pass_name)
     raise ValueError(f"unknown dataset {args.dataset!r}; use synth-N<size> or a known real graph")
 
 
@@ -169,7 +185,13 @@ def parse_args() -> argparse.Namespace:
         help="cost_models.json from calibrate_cost_model.py; sets alpha, beta and the tick duration",
     )
     parser.add_argument("--conv", default="gt", help="Cost model cell to use from --cost-model")
-    parser.add_argument("--pass", dest="pass_name", default="forward", choices=["forward", "backward"])
+    parser.add_argument(
+        "--pass",
+        dest="pass_name",
+        default="forward",
+        choices=["forward", "backward"],
+        help="Selects both the cost model cell and which CSR the degrees come from",
+    )
     parser.add_argument("--head-dim", type=int, default=128, help="Cost model cell to use from --cost-model")
     parser.add_argument("--alpha", type=float, help="Override the fitted per-node cost, in ticks")
     parser.add_argument("--beta", type=float, help="Override the fitted per-neighbour cost, in ticks")
