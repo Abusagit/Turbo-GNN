@@ -178,10 +178,25 @@ def main() -> int:
     print(f"measuring on {gpu}\n")
 
     records = []
+    unavailable: list[str] = []
     for graph_name in [*args.graphs, *args.synthetic]:
-        graph, num_nodes, num_edges = build_graph(
-            graph_name, args.data_root, args.quantile, device, args.exponent, args.seed, args.locality_window
-        )
+        try:
+            graph, num_nodes, num_edges = build_graph(
+                graph_name, args.data_root, args.quantile, device, args.exponent, args.seed, args.locality_window
+            )
+        except Exception as error:  # noqa: BLE001 - a graph that will not load must not end the run
+            # One unreachable download should not cost the whole sweep. The loader's "auto"
+            # source falls back to DGL when PyG fails, so the exception that surfaces is often
+            # a missing dgl module rather than the download error underneath it; report the
+            # chain so the real cause is visible.
+            causes: list[str] = []
+            current: BaseException | None = error
+            while current is not None and len(causes) < 3:
+                causes.append(f"{type(current).__name__}: {str(current)[:110]}")
+                current = current.__context__ if current.__cause__ is None else current.__cause__
+            print(f"{graph_name}: unavailable -- {' <- '.join(causes)}\n", file=sys.stderr)
+            unavailable.append(graph_name)
+            continue
         print(f"{graph_name}: N={num_nodes:,} E={num_edges:,} heavy={graph.forward_heavy_nodes.numel():,}")
         for conv, head_dim, pass_name in product(args.convs, args.head_dims, args.passes):
             backward = pass_name == "backward"
@@ -212,7 +227,9 @@ def main() -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("".join(json.dumps(record) + "\n" for record in records))
     print(f"\nwrote {len(records)} measurements to {args.out}")
-    return 0
+    if unavailable:
+        print(f"could not load: {', '.join(unavailable)}", file=sys.stderr)
+    return 0 if records else 1
 
 
 if __name__ == "__main__":
