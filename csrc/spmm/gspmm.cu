@@ -1,7 +1,7 @@
 #include <ATen/cuda/CUDAEvent.h>
 
 #include <algorithm>
-#include <array>
+#include <initializer_list>
 #include <type_traits>
 
 #include "spmm/gspmm.h"
@@ -123,10 +123,99 @@ constexpr int64_t kGSpMMHeavySliceEdges = 1024;
 // min/max alike -- so the launcher slices only above it.
 constexpr int64_t kGSpMMHeavySliceShare = 16;
 
-// Edges one warp of the edge-gradient kernel walks before the grid stride.
-// Long enough to amortize the binary search that locates the first edge's
-// destination, short enough to keep tens of thousands of warps in flight.
-constexpr int64_t kGSpMMEdgesPerWarp = 32;
+// The light and heavy buckets own disjoint output rows, so their launches are
+// independent.  Given a stream each, the light kernel can occupy the SMs that
+// the heavy kernel leaves idle: a heavy launch degenerates into a few
+// long-running blocks on a skewed graph, and back-to-back on one stream that
+// tail is dead time.  Construct before the launches, join() after them; with
+// one bucket empty both members are the caller's stream and join() is a no-op.
+struct BucketStreams {
+    at::cuda::CUDAStream main;
+    at::cuda::CUDAStream heavy;
+    bool overlap;
+
+    BucketStreams(bool overlap_buckets, std::initializer_list<const torch::Tensor *> touched_on_side)
+        : main(at::cuda::getCurrentCUDAStream()), heavy(main), overlap(overlap_buckets) {
+        if (!overlap) {
+            return;
+        }
+        heavy = at::cuda::getStreamFromPool(main.device_index());
+        // The heavy launch must not overtake whatever produced the inputs on
+        // the caller's stream.
+        at::cuda::CUDAEvent inputs_ready;
+        inputs_ready.record(main);
+        inputs_ready.block(heavy);
+        // These were allocated against the caller's stream but are touched on
+        // another one, so the caching allocator has to be told before it can
+        // consider recycling them.
+        for (const torch::Tensor *t : touched_on_side) {
+            if (t->defined() && t->numel() > 0) {
+                t->record_stream(heavy);
+            }
+        }
+    }
+
+    void join() const {
+        if (!overlap) {
+            return;
+        }
+        at::cuda::CUDAEvent heavy_done;
+        heavy_done.record(heavy);
+        heavy_done.block(main);
+    }
+};
+
+// Block shape of a light-bucket launch: features along x, capped at the block;
+// nodes fill y.  A broadcast edge operand pins x to one warp, which the
+// backward kernels' shuffle fold relies on.
+struct LightShape {
+    dim3 block;
+    unsigned blocks;
+};
+
+LightShape light_launch_shape(int warps_per_block, int64_t d, bool rhs_broadcast, int64_t num_light) {
+    const size_t threads = static_cast<size_t>(warps_per_block) * kWarpSize;
+    const size_t tile_x  = rhs_broadcast ? kWarpSize : std::min<size_t>(std::max<size_t>(static_cast<size_t>(d), 1), threads);
+    const size_t node_y  = std::max<size_t>(threads / tile_x, 1);
+    return {
+        dim3(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y)),
+        static_cast<unsigned>((static_cast<size_t>(num_light) + node_y - 1) / node_y)
+    };
+}
+
+// Shared checks of the two backward launchers: the buckets must be CUDA index
+// tensors of the CSR's dtype that together cover every node, and the heavy
+// block shape must fit.
+void check_backward_buckets(
+    const torch::Tensor& edge_ptr,
+    const torch::Tensor& light_nodes,
+    const torch::Tensor& heavy_nodes,
+    int64_t num_nodes,
+    int warps_per_block,
+    int features_per_block,
+    int tiles_y,
+    bool tiles_pow2
+) {
+    TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node buckets must be CUDA");
+    TORCH_CHECK(
+        light_nodes.scalar_type() == edge_ptr.scalar_type() && heavy_nodes.scalar_type() == edge_ptr.scalar_type(),
+        "node buckets must have the same dtype as edge_ptr"
+    );
+    TORCH_CHECK(
+        light_nodes.numel() + heavy_nodes.numel() == num_nodes, "light_nodes (", light_nodes.numel(), ") + heavy_nodes (",
+        heavy_nodes.numel(), ") must cover all ", num_nodes, " nodes -- gradient rows outside both buckets would be left unwritten"
+    );
+    TORCH_CHECK(warps_per_block > 0 && warps_per_block <= 32, "warps_per_block must be in [1, 32]");
+    if (heavy_nodes.numel() > 0) {
+        TORCH_CHECK(tiles_y > 0 && tiles_y <= 32, "tiles_y must be in [1, 32]");
+        TORCH_CHECK(!tiles_pow2 || (tiles_y & (tiles_y - 1)) == 0, "tiles_y must be a power of 2 (shared-memory tree reduction)");
+        TORCH_CHECK(features_per_block > 0 && features_per_block <= 1024, "features_per_block must be in [1, 1024]");
+        TORCH_CHECK(
+            static_cast<size_t>(features_per_block) * static_cast<size_t>(tiles_y) <= kGSpMMArgHeavyMaxThreads,
+            "features_per_block * tiles_y must be <= ", kGSpMMArgHeavyMaxThreads
+        );
+    }
+}
 
 }  // namespace
 
@@ -235,33 +324,12 @@ std::vector<torch::Tensor> gspmm_forward(
         }
     }
 
-    // The two buckets own disjoint output rows, so their launches are
-    // independent.  Given a stream each, the light kernel can occupy the SMs
-    // that the heavy kernel leaves idle: a heavy launch degenerates into a few
-    // long-running blocks on a skewed graph, and back-to-back on one stream
-    // that tail is dead time.
-    const bool overlap_buckets        = (num_light > 0 && num_heavy > 0);
-    const auto main_stream            = at::cuda::getCurrentCUDAStream();
-    at::cuda::CUDAStream heavy_stream = main_stream;
-    if (overlap_buckets) {
-        heavy_stream = at::cuda::getStreamFromPool(main_stream.device_index());
-        // The heavy launch must not overtake whatever produced the inputs on
-        // the caller's stream.
-        at::cuda::CUDAEvent inputs_ready;
-        inputs_ready.record(main_stream);
-        inputs_ready.block(heavy_stream);
-        // These were allocated against the caller's stream but are touched on
-        // another one, so the caching allocator has to be told before it can
-        // consider recycling them.
-        const std::array<const torch::Tensor *, 10> touched_on_side = {
-            &out, &arg_eid, &lhs, &rhs, &edge_ptr, &edge_idx, &heavy_nodes, &slice_offsets, &slice_partials, &slice_args
-        };
-        for (const torch::Tensor *t : touched_on_side) {
-            if (t->defined() && t->numel() > 0) {
-                t->record_stream(heavy_stream);
-            }
-        }
-    }
+    BucketStreams streams(
+        num_light > 0 && num_heavy > 0,
+        {&out, &arg_eid, &lhs, &rhs, &edge_ptr, &edge_idx, &heavy_nodes, &slice_offsets, &slice_partials, &slice_args}
+    );
+    const at::cuda::CUDAStream main_stream  = streams.main;
+    const at::cuda::CUDAStream heavy_stream = streams.heavy;
 
     std::visit(
         [&](auto idxInfo, auto typeInfo, auto op_c, auto rop_c, auto bcast_c, auto stages_c, auto emap_c) {
@@ -426,11 +494,7 @@ std::vector<torch::Tensor> gspmm_forward(
         MakeBoolVariant<false, true>(use_edge_map)
     );
 
-    if (overlap_buckets) {
-        at::cuda::CUDAEvent heavy_done;
-        heavy_done.record(heavy_stream);
-        heavy_done.block(main_stream);
-    }
+    streams.join();
 
     CUDA_KERNEL_CHECK();
 
@@ -440,35 +504,70 @@ std::vector<torch::Tensor> gspmm_forward(
 std::vector<torch::Tensor> gspmm_backward_arg(
     const torch::Tensor& grad_out,
     const torch::Tensor& arg_eid,
-    const torch::Tensor& edge_idx,
+    const torch::Tensor& bwd_edge_ptr,
+    const torch::Tensor& bwd_edge_idx,
+    const torch::Tensor& bwd_edge_map,
     const torch::Tensor& lhs,
     const torch::Tensor& rhs,
+    const torch::Tensor& light_nodes,
+    const torch::Tensor& heavy_nodes,
     const std::string& op,
-    int warps_per_block
+    int warps_per_block,
+    int features_per_block,
+    int tiles_y
 ) {
     const BinaryOp bop = binary_op_from_string(op);
 
+    TORCH_CHECK(grad_out.is_cuda() && arg_eid.is_cuda() && bwd_edge_ptr.is_cuda() && bwd_edge_idx.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(grad_out.dim() == 2 && grad_out.is_contiguous(), "grad_out must be a contiguous 2-D [N, d]");
+    TORCH_CHECK(arg_eid.sizes() == grad_out.sizes(), "arg_eid must be shaped like grad_out");
+    TORCH_CHECK(is_supported_index_type(bwd_edge_ptr.scalar_type()), "bwd_edge_ptr must be int32/int64");
+    TORCH_CHECK(
+        arg_eid.scalar_type() == bwd_edge_ptr.scalar_type() && bwd_edge_idx.scalar_type() == bwd_edge_ptr.scalar_type() &&
+            bwd_edge_map.scalar_type() == bwd_edge_ptr.scalar_type(),
+        "arg_eid, bwd_edge_idx and bwd_edge_map must have the dtype of bwd_edge_ptr"
+    );
+
     const int64_t num_nodes = grad_out.size(0);
     const int64_t d         = grad_out.size(1);
+    const int64_t num_edges = bwd_edge_idx.numel();
+    TORCH_CHECK(bwd_edge_ptr.numel() == num_nodes + 1, "bwd_edge_ptr must have N + 1 = ", num_nodes + 1, " entries");
+    TORCH_CHECK(
+        bwd_edge_map.numel() == num_edges, "bwd_edge_map must have one entry per edge (", bwd_edge_map.numel(), " vs ", num_edges, ")"
+    );
 
     const bool uses_lhs = op_uses_lhs(bop);
     const bool uses_rhs = op_uses_rhs(bop);
     const bool bcast    = deduce_rhs_broadcast(bop, rhs, d);
+    if (uses_rhs) {
+        TORCH_CHECK(rhs.size(0) == num_edges, "rhs must have one row per edge (", rhs.size(0), " vs ", num_edges, ")");
+    }
 
-    // The node gradient accumulates (many destinations can share a winning
-    // source), so it is staged in float and cast by the caller.  The edge
-    // gradient only accumulates for a broadcast operand; at full width it is
-    // written once per slot and goes out directly in the operand dtype, which
-    // for an [E, d] operand is the difference between touching 6 bytes per
-    // element and 12.
-    const auto accum_opts = grad_out.options().dtype(torch::kFloat);
+    const int64_t num_light = light_nodes.numel();
+    const int64_t num_heavy = heavy_nodes.numel();
+    check_backward_buckets(bwd_edge_ptr, light_nodes, heavy_nodes, num_nodes, warps_per_block, features_per_block, tiles_y, /*tiles_pow2=*/true);
+
+    // Walking the transpose hands every (u, f) to exactly one thread, so the
+    // node gradient is written once and goes out in the operand dtype -- no
+    // float staging, no atomics, no zero fill.  So does a full-width edge
+    // gradient: every forward edge sits at exactly one backward position.  A
+    // broadcast edge operand folds d features into one slot, which the kernel
+    // accumulates across feature chunks in float; that one is zeroed here and
+    // cast below.
     const auto value_opts = grad_out.options();
+    const auto accum_opts = value_opts.dtype(torch::kFloat);
 
-    auto grad_lhs = uses_lhs ? torch::zeros({num_nodes, d}, accum_opts) : torch::empty({0}, accum_opts);
+    auto grad_lhs = uses_lhs ? torch::empty({num_nodes, d}, value_opts) : torch::empty({0}, value_opts);
     auto grad_rhs = !uses_rhs ? torch::empty({0}, value_opts)
-                              : torch::zeros(rhs.sizes(), bcast ? accum_opts : value_opts);
+                  : bcast     ? torch::zeros(rhs.sizes(), accum_opts)
+                              : torch::empty(rhs.sizes(), value_opts);
 
-    // No reducer axis here: min and max share one scatter.
+    BucketStreams streams(
+        num_light > 0 && num_heavy > 0,
+        {&grad_out, &arg_eid, &bwd_edge_ptr, &bwd_edge_idx, &bwd_edge_map, &lhs, &rhs, &heavy_nodes, &grad_lhs, &grad_rhs}
+    );
+
+    // No reducer axis here: min and max share one gather.
     std::visit(
         [&](auto idxInfo, auto typeInfo, auto op_c, auto bcast_c) {
             using index_t = typename decltype(idxInfo)::Type;
@@ -490,48 +589,59 @@ std::vector<torch::Tensor> gspmm_backward_arg(
                     lhs_ptr = reinterpret_cast<cuda_t const *>(lhs.data_ptr<torch_t>());
                     rhs_ptr = reinterpret_cast<cuda_t const *>(rhs.data_ptr<torch_t>());
                 }
+                cuda_t *grad_lhs_ptr = uses_lhs ? reinterpret_cast<cuda_t *>(grad_lhs.data_ptr<torch_t>()) : nullptr;
 
-                const unsigned threads = static_cast<unsigned>(static_cast<size_t>(warps_per_block) * kWarpSize);
-
-                // A broadcast edge gradient stays in the float staging buffer
-                // because its slots are shared; a full-width one is written in
-                // the operand dtype.
                 using grad_rhs_t = std::conditional_t<BCAST, float, cuda_t>;
                 auto *grad_rhs_ptr =
                     uses_rhs ? reinterpret_cast<grad_rhs_t *>(grad_rhs.data_ptr()) : static_cast<grad_rhs_t *>(nullptr);
 
-                // One block per node, and no wider than the row it walks: this
-                // scatter's work is d elements per node whatever the degree is,
-                // so a 256-thread block at d=64 would leave three quarters of
-                // itself idle.  Reshaping it further does not pay -- a grid
-                // strided over [N, d] measured 5-7% slower on every real graph
-                // (city-reviews 2.73 -> 2.91 ms), and so did the same kernel
-                // with rows along y.
-                const unsigned row_threads = static_cast<unsigned>(
-                    std::min<size_t>(threads, ((static_cast<size_t>(d) + kWarpSize - 1) / kWarpSize) * kWarpSize)
-                );
+                auto const *grad_out_ptr = reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>());
 
-                reduction_aggr_backward_typed<
-                    kGSpMMWarpsPerBlock, cuda_t, index_t, BOP, BCAST, /*ARG_IS_EDGE=*/true, /*grad_t=*/float, /*accum_t=*/float, grad_rhs_t
-                ><<<static_cast<unsigned>(num_nodes), row_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                    reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
-                    index_ptr<index_t>(arg_eid),
-                    grad_lhs.data_ptr<float>(),
-                    static_cast<size_t>(num_nodes),
-                    static_cast<size_t>(d),
-                    index_ptr<index_t>(edge_idx),
-                    lhs_ptr,
-                    rhs_ptr,
-                    grad_rhs_ptr
-                );
+                if (num_light > 0) {
+                    const LightShape shape = light_launch_shape(warps_per_block, d, BCAST, num_light);
+                    gspmm_backward_arg_light_kernel<BOP, BCAST, cuda_t, index_t, grad_rhs_t>
+                        <<<shape.blocks, shape.block, 0, streams.main>>>(
+                            index_ptr<index_t>(light_nodes),
+                            index_ptr<index_t>(bwd_edge_ptr),
+                            index_ptr<index_t>(bwd_edge_idx),
+                            index_ptr<index_t>(bwd_edge_map),
+                            index_ptr<index_t>(arg_eid),
+                            grad_out_ptr,
+                            lhs_ptr,
+                            rhs_ptr,
+                            grad_lhs_ptr,
+                            grad_rhs_ptr,
+                            static_cast<size_t>(num_light),
+                            static_cast<size_t>(d)
+                        );
+                }
+
+                if (num_heavy > 0) {
+                    const dim3 block_h(BCAST ? static_cast<unsigned>(kWarpSize) : static_cast<unsigned>(features_per_block), static_cast<unsigned>(tiles_y));
+                    gspmm_backward_arg_heavy_kernel<BOP, BCAST, cuda_t, index_t, grad_rhs_t>
+                        <<<static_cast<unsigned>(num_heavy), block_h, 0, streams.heavy>>>(
+                            index_ptr<index_t>(heavy_nodes),
+                            index_ptr<index_t>(bwd_edge_ptr),
+                            index_ptr<index_t>(bwd_edge_idx),
+                            index_ptr<index_t>(bwd_edge_map),
+                            index_ptr<index_t>(arg_eid),
+                            grad_out_ptr,
+                            lhs_ptr,
+                            rhs_ptr,
+                            grad_lhs_ptr,
+                            grad_rhs_ptr,
+                            static_cast<size_t>(d)
+                        );
+                }
             }
         },
-        MakeIndexVariant<int32_t, int64_t>(edge_idx.scalar_type()),
+        MakeIndexVariant<int32_t, int64_t>(bwd_edge_ptr.scalar_type()),
         MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
         MakeBoolVariant<false, true>(bcast)
     );
 
+    streams.join();
     CUDA_KERNEL_CHECK();
 
     // Uniform contract: the edge gradient always comes back in the operand
@@ -549,8 +659,13 @@ torch::Tensor gspmm_backward_edge(
     const torch::Tensor& grad_out,
     const torch::Tensor& lhs,
     const torch::Tensor& rhs,
+    const torch::Tensor& light_nodes,
+    const torch::Tensor& heavy_nodes,
     const std::string& op,
-    int warps_per_block
+    int warps_per_block,
+    int features_per_block,
+    int tiles_y,
+    int max_degree
 ) {
     const BinaryOp bop = binary_op_from_string(op);
 
@@ -563,18 +678,26 @@ torch::Tensor gspmm_backward_edge(
     }
 
     TORCH_CHECK(grad_out.is_cuda() && edge_ptr.is_cuda() && edge_idx.is_cuda(), "inputs must be CUDA");
-    TORCH_CHECK(grad_out.dim() == 2, "grad_out must be 2-D [N, d]");
+    TORCH_CHECK(grad_out.dim() == 2 && grad_out.is_contiguous(), "grad_out must be a contiguous 2-D [N, d]");
     TORCH_CHECK(grad_out.size(0) == edge_ptr.numel() - 1, "grad_out.size(0) must equal N = edge_ptr.numel() - 1");
-    TORCH_CHECK(warps_per_block > 0 && warps_per_block <= 32, "warps_per_block must be in [1, 32]");
-
-    // Not zeroed: the non-broadcast path writes every (eid, f) slot once, and
-    // the broadcast path reduces each edge across the whole block down to a
-    // single store, so no slot is left untouched.
-    auto grad_rhs = torch::empty(rhs.sizes(), grad_opts);
+    TORCH_CHECK(is_supported_index_type(edge_ptr.scalar_type()), "edge_ptr must be int32/int64");
+    TORCH_CHECK(edge_idx.scalar_type() == edge_ptr.scalar_type(), "edge_idx must have the dtype of edge_ptr");
 
     const int64_t num_nodes = grad_out.size(0);
     const int64_t num_edges = edge_idx.numel();
     const int64_t d         = grad_out.size(1);
+    TORCH_CHECK(rhs.size(0) == num_edges, "rhs must have one row per edge (", rhs.size(0), " vs ", num_edges, ")");
+
+    const int64_t num_light = light_nodes.numel();
+    const int64_t num_heavy = heavy_nodes.numel();
+    check_backward_buckets(edge_ptr, light_nodes, heavy_nodes, num_nodes, warps_per_block, features_per_block, tiles_y, /*tiles_pow2=*/false);
+
+    // Not zeroed: the non-broadcast path writes every (eid, f) slot once, and
+    // the broadcast path reduces each edge across its warp down to a single
+    // store, so no slot is left untouched.
+    auto grad_rhs = torch::empty(rhs.sizes(), grad_opts);
+
+    BucketStreams streams(num_light > 0 && num_heavy > 0, {&edge_ptr, &edge_idx, &grad_out, &lhs, &rhs, &heavy_nodes, &grad_rhs});
 
     std::visit(
         [&](auto idxInfo, auto typeInfo, auto op_c, auto bcast_c) {
@@ -586,9 +709,8 @@ torch::Tensor gspmm_backward_edge(
             constexpr bool BCAST   = decltype(bcast_c)::value;
             using BOps             = BinaryOps<BOP>;
 
-            // copy_u returned above, so it never reaches a launch; the
-            // broadcast flag is likewise impossible without an edge operand.
-            if constexpr (!BOps::USE_RHS || (BCAST && !BOps::USE_RHS)) {
+            // copy_u returned above, so it never reaches a launch.
+            if constexpr (!BOps::USE_RHS) {
                 return;
             } else {
                 cuda_t const *lhs_ptr = nullptr;
@@ -597,26 +719,46 @@ torch::Tensor gspmm_backward_edge(
                     lhs_ptr = reinterpret_cast<cuda_t const *>(lhs.data_ptr<torch_t>());
                     rhs_ptr = reinterpret_cast<cuda_t const *>(rhs.data_ptr<torch_t>());
                 }
+                auto const *grad_out_ptr = reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>());
+                auto *grad_rhs_ptr       = reinterpret_cast<cuda_t *>(grad_rhs.data_ptr<torch_t>());
 
-                const unsigned threads = static_cast<unsigned>(static_cast<size_t>(warps_per_block) * kWarpSize);
-                // One warp per run of kGSpMMEdgesPerWarp edges, capped: the
-                // kernel grid-strides over whatever does not fit.
-                const int64_t runs         = (num_edges + kGSpMMEdgesPerWarp - 1) / kGSpMMEdgesPerWarp;
-                const int64_t warps_needed = (runs + static_cast<int64_t>(warps_per_block) - 1) / warps_per_block;
-                const unsigned blocks      = static_cast<unsigned>(std::max<int64_t>(std::min<int64_t>(warps_needed, 65535), 1));
+                if (num_light > 0) {
+                    const LightShape shape = light_launch_shape(warps_per_block, d, BCAST, num_light);
+                    gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t>
+                        <<<shape.blocks, shape.block, 0, streams.main>>>(
+                            index_ptr<index_t>(light_nodes),
+                            index_ptr<index_t>(edge_ptr),
+                            index_ptr<index_t>(edge_idx),
+                            grad_out_ptr,
+                            lhs_ptr,
+                            rhs_ptr,
+                            grad_rhs_ptr,
+                            static_cast<size_t>(num_light),
+                            static_cast<size_t>(d)
+                        );
+                }
 
-                gspmm_backward_edge_kernel<BOP, BCAST, cuda_t, index_t, /*grad_t=*/cuda_t>
-                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                    index_ptr<index_t>(edge_ptr),
-                    index_ptr<index_t>(edge_idx),
-                    reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
-                    lhs_ptr,
-                    rhs_ptr,
-                    reinterpret_cast<cuda_t *>(grad_rhs.data_ptr<torch_t>()),
-                    static_cast<size_t>(num_nodes),
-                    static_cast<size_t>(num_edges),
-                    static_cast<size_t>(d)
-                );
+                if (num_heavy > 0) {
+                    // One block per (node, chunk of kGSpMMHeavySliceEdges);
+                    // with the top degree unknown the blocks stride over the
+                    // chunks instead.
+                    const int64_t chunks = max_degree > 0
+                        ? std::min<int64_t>((max_degree + kGSpMMHeavySliceEdges - 1) / kGSpMMHeavySliceEdges, 65535)
+                        : 1;
+                    const dim3 grid_h(static_cast<unsigned>(num_heavy), static_cast<unsigned>(chunks));
+                    const dim3 block_h(BCAST ? static_cast<unsigned>(kWarpSize) : static_cast<unsigned>(features_per_block), static_cast<unsigned>(tiles_y));
+                    gspmm_backward_edge_heavy_kernel<BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges)>
+                        <<<grid_h, block_h, 0, streams.heavy>>>(
+                            index_ptr<index_t>(heavy_nodes),
+                            index_ptr<index_t>(edge_ptr),
+                            index_ptr<index_t>(edge_idx),
+                            grad_out_ptr,
+                            lhs_ptr,
+                            rhs_ptr,
+                            grad_rhs_ptr,
+                            static_cast<size_t>(d)
+                        );
+                }
             }
         },
         MakeIndexVariant<int32_t, int64_t>(edge_ptr.scalar_type()),
@@ -625,6 +767,7 @@ torch::Tensor gspmm_backward_edge(
         MakeBoolVariant<false, true>(deduce_rhs_broadcast(bop, rhs, d))
     );
 
+    streams.join();
     CUDA_KERNEL_CHECK();
 
     return grad_rhs;

@@ -34,22 +34,41 @@ std::vector<torch::Tensor> gspmm_forward(
     int max_degree                 = -1
 );
 
+// Backward of a min/max reduction: both gradients from one walk of the
+// *transposed* CSR (rows are sources), whose light/heavy buckets are passed in.
+// bwd_edge_map takes a backward-CSR position to the forward-CSR position that
+// arg_eid records and the edge operand is indexed by.  grad_lhs comes back in
+// the operand dtype; so does grad_rhs, cast from float when it broadcast.
 std::vector<torch::Tensor> gspmm_backward_arg(
     const torch::Tensor& grad_out,
     const torch::Tensor& arg_eid,
-    const torch::Tensor& edge_idx,
+    const torch::Tensor& bwd_edge_ptr,
+    const torch::Tensor& bwd_edge_idx,
+    const torch::Tensor& bwd_edge_map,
     const torch::Tensor& lhs,
     const torch::Tensor& rhs,
+    const torch::Tensor& light_nodes,
+    const torch::Tensor& heavy_nodes,
     const std::string& op,
-    int warps_per_block = 8
+    int warps_per_block    = 8,
+    int features_per_block = 32,
+    int tiles_y            = 8
 );
 
+// Gradient w.r.t. the edge operand of a sum reduction, walking the forward CSR
+// with its light/heavy buckets.  max_degree sizes the heavy grid's chunk axis;
+// -1 means "unknown" and the blocks stride over the chunks instead.
 torch::Tensor gspmm_backward_edge(
     const torch::Tensor& edge_ptr,
     const torch::Tensor& edge_idx,
     const torch::Tensor& grad_out,
     const torch::Tensor& lhs,
     const torch::Tensor& rhs,
+    const torch::Tensor& light_nodes,
+    const torch::Tensor& heavy_nodes,
     const std::string& op,
-    int warps_per_block = 8
+    int warps_per_block    = 8,
+    int features_per_block = 32,
+    int tiles_y            = 8,
+    int max_degree         = -1
 );

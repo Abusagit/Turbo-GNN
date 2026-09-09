@@ -82,15 +82,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     m.def(
-        "gspmm_backward_arg", &gspmm_backward_arg, "Generalized SpMM backward for min/max (scatter over winning edges)",
-        py::arg("grad_out"), py::arg("arg_eid"), py::arg("edge_idx"), py::arg("lhs"), py::arg("rhs"), py::arg("op"),
-        py::arg("warps_per_block") = 8
+        "gspmm_backward_arg", &gspmm_backward_arg, "Generalized SpMM backward for min/max (gather over the transposed CSR)",
+        py::arg("grad_out"), py::arg("arg_eid"), py::arg("bwd_edge_ptr"), py::arg("bwd_edge_idx"), py::arg("bwd_edge_map"),
+        py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"),
+        py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32, py::arg("tiles_y") = 8
     );
 
     m.def(
         "gspmm_backward_edge", &gspmm_backward_edge, "Generalized SpMM backward for sum: gradient w.r.t. edge data",
-        py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("grad_out"), py::arg("lhs"), py::arg("rhs"), py::arg("op"),
-        py::arg("warps_per_block") = 8
+        py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("grad_out"), py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"),
+        py::arg("heavy_nodes"), py::arg("op"), py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32,
+        py::arg("tiles_y") = 8, py::arg("max_degree") = -1
     );
 
     // Edge normalization
