@@ -47,14 +47,42 @@ from turbo_gnn.simulation import (  # noqa: E402
     simulate,
 )
 
-# Categorical slots 1-5 of the reference palette, assigned in fixed order and never cycled.
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
-INK, MUTED, GRID = "#0b0b0b", "#52514e", "#d8d7d2"
+# Colour carries the launch mode and dash carries split-K, so the two factors read
+# independently instead of competing for five arbitrary hues. Slots 1-3 of the reference
+# palette, in fixed order.
+MODE_COLOUR = {"single": "#2a78d6", "sequential": "#eb6834", "concurrent": "#1baf7a"}
+INK, MUTED, GRID, RULE = "#0b0b0b", "#52514e", "#d8d7d2", "#8a8983"
 
 
-def resident(result: SimulationResult) -> np.ndarray:
-    """Blocks resident at each tick, summed over the kernels."""
-    return sum(result.active_blocks.values())
+def occupancy(result: SimulationResult, kernels: dict, num_sms: int) -> np.ndarray:
+    """Fraction of the machine's block slots occupied at each tick.
+
+    A block of kernel k takes ``1 / resident_blocks_per_sm[k]`` of one SM, so this is the same
+    quantity the per-SM heatmap coloured -- reconstructed from the per-kernel counts, which are
+    one-dimensional, rather than from the [ticks x SMs] matrix.
+
+    Plotting this instead of a raw block count matters for reading the figure: a merge block is
+    one warp and 2,112 of them fit, so on a block count the merge phase spikes above the light
+    kernel's ceiling and looks like a glitch. As a fraction, full is full.
+    """
+    total = np.zeros(result.makespan, dtype=np.float64)
+    for name, counts in result.active_blocks.items():
+        total += counts / (kernels[name].resident_blocks_per_sm * num_sms)
+    return total
+
+
+def utilisation(series: np.ndarray) -> float:
+    """Normalised area under the occupancy curve: what fraction of the machine was used.
+
+    A perfect run is a rectangle -- every slot busy for the whole makespan -- and scores 1. The
+    area itself is fixed, being the total work, so this equals ``slot_bound / makespan``: the
+    reciprocal of the imbalance ratio whenever the slot bound is what binds.
+
+    It is the better of the two to quote. The imbalance ratio measures distance to a floor that
+    may itself be one undividable node, and then reports 1.000 for a run that left the machine
+    88% idle; this number says 0.12 and means it.
+    """
+    return float(series.mean()) if len(series) else 0.0
 
 
 def thin(values: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
@@ -96,7 +124,7 @@ def main() -> int:
     tick_ns, _ = anchor_tick(args, cost_model, fit, degrees, bandwidth_cap)
     scale = (tick_ns or 1.0) / 1e3  # ticks -> microseconds
 
-    runs: list[tuple[str, SimulationResult]] = []
+    runs: list[tuple[str, str, bool, SimulationResult, dict]] = []
     for mode, blocks_per_sm in product(args.launch_modes, args.slice_blocks_per_sm):
         if mode == "single" and blocks_per_sm > 0:
             continue
@@ -127,7 +155,7 @@ def main() -> int:
             ),
         )
         label = mode if slice_size <= 0 else f"{mode} + split-K"
-        runs.append((label, result))
+        runs.append((label, mode, slice_size > 0, result, kernels))
         print(f"  {label:<22} T={result.makespan:>8,} ({result.binding_bound}) ratio={result.imbalance_ratio:.3f}")
 
     os.environ.setdefault("MPLCONFIGDIR", str(args.out.parent / ".matplotlib"))
@@ -136,30 +164,37 @@ def main() -> int:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    figure, axis = plt.subplots(figsize=(13, 6), constrained_layout=True)
-    # A full machine is not one number: a block's footprint depends on its kernel, so the light
-    # kernel fills at 132x8 while merge, one warp per block, fits four times as many.
-    capacities = {"light": args.max_blocks_light, "heavy": args.max_blocks_heavy, "merge": args.max_blocks_merge}
+    figure, axis = plt.subplots(figsize=(13, 6.4), constrained_layout=True)
     overhead_us = fit.launch_overhead_ns / 1e3 if fit else 0.0
-    span = max(r.makespan for _, r in runs) * scale
-    for name, per_sm in capacities.items():
-        full = args.sms * per_sm
-        axis.axhline(full, color=GRID, lw=1.2, zorder=1)
-        # Right-aligned: the left of the plot is where every curve is steepest.
-        axis.text(span * 1.16, full, f"{full:,} = full of {name}", color=MUTED, fontsize=8, va="center", ha="right")
-    ends = sorted((r.makespan * scale, label, c) for (label, r), c in zip(runs, SERIES))
-    for (label, result), colour in zip(runs, SERIES):
-        steps, values = thin(resident(result), args.max_points)
-        axis.plot(steps * scale, np.maximum(values, 0.5), lw=2, color=colour, label=label, zorder=3)
-        # Direct-label each line where it ends. Runs that finish together get stacked offsets so
-        # the makespans -- the numbers being compared -- do not overprint each other.
+    span = max(r.makespan for *_, r, _ in runs) * scale
+    floor = 0.5 / (args.sms * max(args.max_blocks_light, args.max_blocks_heavy, args.max_blocks_merge))
+
+    axis.axhline(1.0, color=RULE, lw=1.4, zorder=1)
+    axis.text(span * 1.15, 1.0, "machine full", color=MUTED, fontsize=9, va="bottom", ha="right")
+
+    ends = sorted(r.makespan for *_, r, _ in runs)
+    for label, mode, split, result, kernels in runs:
+        series = occupancy(result, kernels, args.sms)
+        steps, values = thin(series, args.max_points)
+        colour, style = MODE_COLOUR[mode], ((2, 2) if split else ())
         end = result.makespan * scale
-        rank = [e[1] for e in ends].index(label)
+        # Carry the line down to the floor at the end. Left to stop mid-air it is ambiguous
+        # whether the run finished there or the series simply ran out of data.
+        axis.plot(
+            np.append(steps * scale, [end, end]),
+            np.append(np.maximum(values, floor), [values[-1] if len(values) else floor, floor]),
+            lw=2,
+            color=colour,
+            label=label,
+            zorder=3,
+            dashes=style,
+        )
+        rank = ends.index(result.makespan)
         axis.annotate(
-            f"{end + overhead_us:.0f} us  {label}",
-            (end, 0.5),
+            f"{end + overhead_us:.0f} us   util {utilisation(series):.0%}",
+            (end, floor),
             textcoords="offset points",
-            xytext=(6, 4 + 13 * (rank % 3)),
+            xytext=(6, 3 + 14 * (rank % 3)),
             color=colour,
             fontsize=9,
             fontweight="bold",
@@ -168,9 +203,9 @@ def main() -> int:
         )
 
     axis.set_yscale("log")
-    axis.set_ylim(0.4, args.sms * max(capacities.values()) * 2.4)
-    axis.set_xlim(0, span * 1.17)
-    axis.set_ylabel("resident thread blocks", color=INK)
+    axis.set_ylim(floor * 0.75, 1.6)
+    axis.set_xlim(0, span * 1.16)
+    axis.set_ylabel("fraction of the machine's block slots occupied", color=INK)
     axis.set_xlabel(f"time, {'us' if tick_ns else 'ticks'}", color=INK)
     axis.grid(True, which="major", color=GRID, lw=0.6, zorder=0)
     axis.set_axisbelow(True)
@@ -182,7 +217,8 @@ def main() -> int:
     axis.set_title(
         f"{args.dataset}  N={len(all_degrees):,} E={int(all_degrees.sum()):,} "
         f"max deg {all_degrees.max():,} (skew {all_degrees.max() / all_degrees.mean():.0f}x)   "
-        f"{args.conv}/{args.pass_name}/d{args.head_dim}  q{args.quantile}  alpha={provenance['alpha']:.2f}",
+        f"{args.conv}/{args.pass_name}/d{args.head_dim}  q{args.quantile}  alpha={provenance['alpha']:.2f}\n"
+        "util = area under the curve / a full rectangle = the fraction of the machine actually used",
         color=INK,
         fontsize=11,
     )
