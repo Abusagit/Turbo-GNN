@@ -146,20 +146,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def render(args: argparse.Namespace, degrees: tuple[np.ndarray, ...] | None = None) -> None:
+    """Simulate every panel and write the figure.
+
+    Takes ``degrees`` so a caller rendering many figures for one graph loads it once; the big
+    graphs take longer to read than to simulate.
+    """
     args.occupancies = [max(args.occupancies)]
     cost_model, fit, provenance = resolve_cost_model(args)
-    degrees = load_degrees(args)
+    if degrees is None:
+        degrees = load_degrees(args)
     bandwidth_cap = bandwidth_cap_from_hardware(
         args.memory_bandwidth_gbps, args.feature_dim, args.dtype_bytes, args.memory_latency_ns
     )
-    tick_ns, _ = anchor_tick(args, cost_model, fit, degrees, bandwidth_cap)
     overhead_ms = fit.launch_overhead_ns / 1e6 if fit else 0.0
     occupancy = args.occupancies[0]
 
     results: dict[str, SimulationResult] = {}
     blurbs: dict[str, str] = {}
+    # The tick is anchored on the baseline -- contiguous, one vertex per block, one stream, no
+    # split -- which is also one of the panels, so run it once and keep it rather than paying
+    # for the same simulation twice.
+    tick_ns, _ = anchor_tick(args, cost_model, fit, degrees, bandwidth_cap)
     for mode, blocks_per_sm in product(args.launch_modes, args.slice_blocks_per_sm):
         # "single" has no heavy bucket to split, so slicing it would repeat the same run.
         if mode == "single" and blocks_per_sm > 0:
@@ -214,7 +222,11 @@ def main() -> int:
         f"{args.sms} SMs x {args.max_blocks_light} slots  occ={occupancy:g}"
     )
     plot(args.out, results, blurbs, args.sms, tick_ns, overhead_ms, args.max_columns, title)
-    print(f"\nwrote {args.out}")
+    print(f"wrote {args.out}")
+
+
+def main() -> int:
+    render(parse_args())
     return 0
 
 
