@@ -34,6 +34,9 @@ Creates a random graph and features, instantiates a backend convolution, and
 times forward/backward kernel using CUDA events (or wall-clock on CPU).
 """
 
+#: --dtype choices: the precision the input features/operands are materialized in.
+_OPERAND_DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+
 
 def _make_random_graph(
     num_nodes: int, avg_degree: int, *, device: torch.device
@@ -85,7 +88,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="Layer/op name; may be a comma-separated list to benchmark several ops in one process "
-        "(e.g. 'u_add_v,e_dot_v,copy_v' with --aggr --backend dgl).",
+        "(e.g. 'u_add_v,e_dot_v,copy_v' with --aggr --backend dgl, or "
+        "'u_add_v,u_add_v_edge,copy_u' with --aggr --backend cuda).",
     )
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--backend", type=str, required=True, help="Backend name (pyg|dgl|...).")
@@ -94,7 +98,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use backend.create_aggr (aggregation-only, no projections) instead of create_conv. "
         "For the dgl backend any raw dgl.ops gspmm/gsddmm op name (u_add_v, e_dot_v, copy_v, "
-        "u_mul_e_sum, ...) is launched directly; node/edge operands are generated automatically.",
+        "u_mul_e_sum, ...) is launched directly; for the cuda backend any turbo_gnn gsddmm op name "
+        "(u_add_v, e_dot_v, copy_u, plus the '_edge' edge-parallel variants) is launched directly. "
+        "Node/edge operands are generated automatically.",
     )
     p.add_argument(
         "--dataset",
@@ -110,6 +116,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--amp", type=str, default="none", choices=["none", "bf16", "fp16"])
+    p.add_argument(
+        "--dtype",
+        type=str,
+        default="fp32",
+        choices=list(_OPERAND_DTYPES),
+        help="Precision to materialize the input features/operands in. Unlike --amp (which only "
+        "wraps the call in torch.autocast, and so leaves custom C++/CUDA ops such as the turbo_gnn "
+        "gsddmm kernels running in fp32), this creates the inputs in the requested precision so the "
+        "kernel itself dispatches on it.",
+    )
     p.add_argument(
         "--exact-iters",
         action="store_true",
@@ -156,6 +172,7 @@ def _build_aggr_operands(
     num_edges: int,
     feature_dim: int,
     device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> list[torch.Tensor]:
     """Create input operands for an aggregation based on its ``operand_kinds``.
 
@@ -170,6 +187,9 @@ def _build_aggr_operands(
         num_edges (int): Number of graph edges (of the actual graph object).
         feature_dim (int): Feature width.
         device (torch.device): Torch device.
+        dtype (torch.dtype): Precision to materialize the operands in. Kernels
+            that dispatch on the input dtype (e.g. turbo_gnn's gsddmm) need the
+            operands themselves in the target precision.
 
     Returns:
         list[torch.Tensor]: Operand tensors in the order the aggr expects them.
@@ -177,7 +197,7 @@ def _build_aggr_operands(
     operands = []
     for kind in getattr(aggr, "operand_kinds", ("u",)):
         n = num_edges if kind == "e" else num_nodes
-        operands.append(torch.randn(n, feature_dim, device=device, requires_grad=True))
+        operands.append(torch.randn(n, feature_dim, device=device, dtype=dtype, requires_grad=True))
     return operands
 
 
@@ -217,6 +237,7 @@ def main() -> int:
     args = parse_args()
     device = torch.device("cuda", args.device) if torch.cuda.is_available() else torch.device("cpu")
     torch.set_default_device(device)
+    operand_dtype = _OPERAND_DTYPES[args.dtype]
 
     # graph + features
     if args.dataset is None:
@@ -230,6 +251,7 @@ def main() -> int:
             args.num_nodes,
             args.feature_dim,
             device=device,
+            dtype=operand_dtype,
             requires_grad=True,
         )
 
@@ -267,6 +289,7 @@ def main() -> int:
             sample.num_nodes,
             args.feature_dim,
             device=device,
+            dtype=operand_dtype,
             requires_grad=True,
         )
 
@@ -275,8 +298,15 @@ def main() -> int:
     graph = sample.graph_repr
     num_nodes = sample.num_nodes
     # Edge operands must match the edge count of the actual graph object:
-    # e.g. DGL graphs get self-loops added on top of the raw edge_index.
-    num_edges = int(graph.num_edges()) if hasattr(graph, "num_edges") else sample.num_edges
+    # e.g. DGL graphs and the CSR conversions get self-loops added on top of
+    # the raw edge_index, and the kernels reject a mismatched operand.
+    if hasattr(graph, "num_edges"):
+        num_edges = int(graph.num_edges())
+    elif hasattr(graph, "forward_indices"):
+        # CSR graph (cuda backend): its own nnz is what the kernels index by.
+        num_edges = int(graph.forward_indices.numel())
+    else:
+        num_edges = sample.num_edges
     head_dim = args.feature_dim
 
     layers = [s.strip() for s in args.layer.split(",") if s.strip()]
@@ -319,7 +349,11 @@ def main() -> int:
                     backward_pipeline_stages=args.backward_pipeline_stages,
                 )
 
-        operands = _build_aggr_operands(conv, num_nodes, num_edges, args.feature_dim, device) if args.aggr else None
+        operands = (
+            _build_aggr_operands(conv, num_nodes, num_edges, args.feature_dim, device, dtype=operand_dtype)
+            if args.aggr
+            else None
+        )
 
         def _fn_forward() -> torch.Tensor:
             if amp_dtype is not None and device.type == "cuda":
@@ -361,6 +395,7 @@ def main() -> int:
             "heads": args.heads,
             "head_dim": head_dim,
             "amp": args.amp,
+            "dtype": args.dtype,
             "aggr": args.aggr,
             "mode": args.mode,
             "autotuned": args.autotune,
