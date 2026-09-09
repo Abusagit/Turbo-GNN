@@ -21,7 +21,43 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--title", default=None)
     p.add_argument("--xlabel", default=None)
     p.add_argument("--max-bars", type=int, default=64, help="keep the chart legible; drops the middle of the ranking")
+    p.add_argument("--per-graph", action="store_true",
+                   help="one bar per graph (geomean over its cells) instead of one per cell")
     return p.parse_args()
+
+
+def aggregate_per_graph(rows: list[dict], shapes: dict[str, dict]) -> list[dict]:
+    """Collapse the cells of each graph into one geomean bar.
+
+    At sixteen graphs the per-cell chart is 183 bars and unreadable, and the
+    question "which graphs does this help" is really per graph anyway.
+
+    The label carries the shape, because a bar is only comparable to another
+    bar of the same kind: a graph past the edge limit measured `copy_u` alone
+    (three cells), the rest measured the whole 6x3 table (eighteen), so their
+    geomeans average different work.  Skew is max in-degree over mean, which is
+    what decides whether the heavy-node path matters at all.
+    """
+    by_graph: dict[str, list[float]] = {}
+    for r in rows:
+        by_graph.setdefault(r["graph"], []).append(r["speedup"])
+
+    out = []
+    for graph, vals in by_graph.items():
+        meta = shapes.get(graph, {})
+        e = meta.get("E")
+        n = meta.get("N")
+        skew = (meta["max_degree"] / (e / n)) if (e and n and meta.get("max_degree")) else None
+        label = graph
+        if e:
+            label += f"  E={e / 1e6:.1f}M"
+        if skew is not None:
+            label += f", перекос {skew:.0f}×"
+        if len(meta.get("ops", [])) == 1:
+            label += f", только {meta['ops'][0]}"
+        label += f"  [{len(vals)} кл.]"
+        out.append({"label": label, "speedup": st.geometric_mean(vals)})
+    return out
 
 
 def main() -> int:
@@ -30,6 +66,7 @@ def main() -> int:
     keep_ops = args.ops.split(",") if args.ops else None
 
     rows = []
+    shapes: dict[str, dict] = {}
     subtitle_bits = []
     for path in args.results:
         with open(path) as fh:
@@ -39,6 +76,7 @@ def main() -> int:
             subtitle_bits.append(meta["subtitle"])
         else:
             subtitle_bits.append(f"{meta['graph']} (N={meta['N']:,}, E={meta['E']:,})")
+        shapes[meta["graph"]] = meta
         for cell in blob["cells"]:
             if args.dim is not None and cell["d"] != args.dim:
                 continue
@@ -49,12 +87,16 @@ def main() -> int:
             if args.kind is not None and cell.get("kind", "fwd") != args.kind:
                 continue
             rows.append({
+                "graph": cell.get("graph", meta["graph"]),
                 "label": f"{cell.get('graph', meta['graph'])} | {cell['op']}/{cell['reduce']} | d={cell['d']}",
                 "speedup": cell["dgl_ms"] / cell["turbo_ms"],
             })
 
     if not rows:
         raise SystemExit("no cells matched the filters")
+
+    if args.per_graph:
+        rows = aggregate_per_graph(rows, shapes)
 
     rows.sort(key=lambda r: r["speedup"])
     all_vals = [r["speedup"] for r in rows]
