@@ -1,9 +1,9 @@
 #include <bit>
-#include <cmath>
 #include <cstdint>
 
 #include "common/misc.cuh"
 #include "common/tile.cuh"
+#include "common/traits.cuh"
 #include "gsddmm/gsddmm.cuh"
 
 namespace gsddmm {
@@ -57,7 +57,7 @@ struct GsddmmVecOp {
 //
 // dbuf: this warp's private shared scratch, NUM_ROWS * (NUM_STAGES + 1) * D_CONST elements.
 // =============================================================================
-template <size_t N_PER_BLOCK, size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, typename index_t, typename ConsumeFn>
+template <size_t N_PER_BLOCK, size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, IntegralNum index_t, typename ConsumeFn>
 __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
     size_t warp_id,
     size_t lane,
@@ -144,7 +144,7 @@ __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
 // =============================================================================
 // GSDDMM forward kernel. See gsddmm.cuh for semantics and conventions.
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t, int PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, int PIPELINE_STAGES>
 __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
@@ -308,9 +308,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
 }
 
 // Kernel variant, where each thread block processes only a single edge.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t>
 __global__ void __launch_bounds__(kWarpSize) GSDDMM_forward_edge_block( // no-format
-    size_t E, // total edge count
+    uint64_t E, // total edge count
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     ulonglong2 const * __restrict__ edge_nodes_idx
 ) {
@@ -334,30 +334,52 @@ __global__ void __launch_bounds__(kWarpSize) GSDDMM_forward_edge_block( // no-fo
     const size_t lane_id = threadIdx.x % kWarpSize;
 
     const uint64_t edge_index = (blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
-    if (edge_index > E) [[unlikely]] {
+    if (edge_index >= E) [[unlikely]] {
         return;
     }
-    const ulonglong2 edge_sides = __ldcs(&edge_nodes_idx[edge_index]); // Read without caching, because it's ThreadBlock-unique
+    const ulonglong2 edge_sides = __ldcs(&edge_nodes_idx[edge_index]);  // Read without caching, because it's ThreadBlock-unique
+    cuda_t const *L_row, *R_row;
+    if constexpr (ll == GSDDMM_MEMBER::Src_V) {
+        L_row = L + D_CONST * edge_sides.x;
+    } else if constexpr (ll == GSDDMM_MEMBER::Dst_V) {
+        L_row = L + D_CONST * edge_sides.y;
+    } else if constexpr (ll == GSDDMM_MEMBER::Edge) {
+        L_row = L + D_CONST * edge_index;
+    } else {
+        static_assert(!sizeof(cuda_t), "Unreachable branch");
+        __builtin_unreachable();
+    }
+    if constexpr (rr == GSDDMM_MEMBER::Src_V) {
+        R_row = R + D_CONST * edge_sides.x;
+    } else if constexpr (rr == GSDDMM_MEMBER::Dst_V) {
+        R_row = R + D_CONST * edge_sides.y;
+    } else if constexpr (rr == GSDDMM_MEMBER::Edge) {
+        R_row = R + D_CONST * edge_index;
+    } else {
+        static_assert(!sizeof(cuda_t), "Unreachable branch");
+        __builtin_unreachable();
+    }
 
     // Variant 1. Calculations on the go
+    cuda_t *const O_row = O + edge_index * D_CONST;  // elementwise ops write the edge's own row
     accum_t partial{};
     for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
         const size_t tile_idx = i * kWarpSize + lane_id;
         if constexpr (Plan::IS_DOT) {
             if (tile_idx < TILES) {
-                vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L, tile_idx);
-                vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R, tile_idx);
+                vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L_row, tile_idx);
+                vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R_row, tile_idx);
                 L_feats.dot_product_(&partial, R_feats);
             }
         } else {
             if (tile_idx < TILES) {
-                vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L, tile_idx);
+                vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L_row, tile_idx);
 
                 if constexpr (op == GSDDMM_OP::Copy) {
-                    Tile::write<Tile::MemoryHint::NoCache>(O, tile_idx, L_feats);
+                    Tile::write<Tile::MemoryHint::NoCache>(O_row, tile_idx, L_feats);
                 } else {
-                    vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R, tile_idx);
-                    Tile::write<Tile::MemoryHint::NoCache>(O, tile_idx, VecOp::apply(L_feats, R_feats));
+                    vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R_row, tile_idx);
+                    Tile::write<Tile::MemoryHint::NoCache>(O_row, tile_idx, VecOp::apply(L_feats, R_feats));
                 }
             }
         }
@@ -366,65 +388,9 @@ __global__ void __launch_bounds__(kWarpSize) GSDDMM_forward_edge_block( // no-fo
     if constexpr (Plan::IS_DOT) {
         partial = warp_reduce_sum(partial);
         if (lane_id == 0) {
-            O[0] = static_cast<cuda_t>(partial);
-        }
-    }
-
-    // Variant 2. Calculations separately
-    // Coalesced reads of features
-    vec_t L_feats[TILES_PER_THREAD];
-    vec_t R_feats[TILES_PER_THREAD];
-
-    if constexpr (Plan::R_FIRST) {
-        if constexpr (Plan::USE_R) {
-            for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-                const size_t tile_idx = i * kWarpSize + lane_id;
-                R_feats[i] = Tile::read<Tile::MemoryHint::AllCache>(R, tile_idx);
-            }
-        }
-        for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-            const size_t tile_idx = i * kWarpSize + lane_id;
-            L_feats[i] = Tile::read<Tile::MemoryHint::AllCache>(L, tile_idx);
-        }
-    } else {
-        for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-            const size_t tile_idx = i * kWarpSize + lane_id;
-            L_feats[i] = Tile::read<Tile::MemoryHint::AllCache>(L, tile_idx);
-        }
-        if constexpr (Plan::USE_R) {
-            for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-                const size_t tile_idx = i * kWarpSize + lane_id;
-                R_feats[i] = Tile::read<Tile::MemoryHint::AllCache>(R, tile_idx);
-            }
-        }
-    }
-
-    // Processing
-    vec_t O_feats[TILES_PER_THREAD];
-    if constexpr (Plan::IS_DOT) {
-        for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-            const size_t tile_idx = i * kWarpSize + lane_id;
-            L_feats[i].dot_product_(reinterpret_cast<cuda_t *>(O_feats), R_feats[i]);
-        }
-        reinterpret_cast<cuda_t *>(O_feats)[0] = warp_reduce_sum(reinterpret_cast<cuda_t *>(O_feats)[0]);
-    } else if constexpr (op != GSDDMM_OP::Copy) {
-        for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-            O_feats[i] = VecOp::apply(L_feats[i], R_feats[i]);
-        }
-    }
-    
-    // Uploading
-    if constexpr (op == GSDDMM_OP::Copy) {
-        for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-            const size_t tile_idx = i * kWarpSize + lane_id;
-            Tile::write<Tile::MemoryHint::NoCache>(O, tile_idx, L_feats[i]);
-        }
-    } else if constexpr (Plan::IS_DOT) {
-        O[0] = reinterpret_cast<cuda_t *>(O_feats)[0];
-    } else {
-        for (size_t i = 0; i < TILES_PER_THREAD; ++i) {
-            const size_t tile_idx = i * kWarpSize + lane_id;
-            Tile::write<Tile::MemoryHint::NoCache>(O, tile_idx, O_feats[i]);
+            // Dot output is [E] (one scalar per edge) -- O_row's edge_index *
+            // D_CONST offset only applies to the elementwise [E, D] output.
+            O[edge_index] = static_cast<cuda_t>(partial);
         }
     }
 }

@@ -44,13 +44,14 @@ struct GsddmmLaunchArgs {
     const torch::Tensor& col_idx;
     const torch::Tensor& light_nodes;
     const torch::Tensor& heavy_nodes;
-    at::cuda::CUDAStream stream;
-    int64_t N;
-    int64_t D;
+    const at::cuda::CUDAStream& stream;
+    uint64_t N;
+    uint64_t D;
     LRO key;
-    uint32_t light_warps_per_block;
-    uint32_t heavy_warps_per_block;
-    uint32_t pipeline_stages;
+    uint16_t light_warps_per_block;
+    uint16_t heavy_warps_per_block;
+    uint8_t pipeline_stages;
+    
 };
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
@@ -62,5 +63,26 @@ void gsddmm_forward_launch_mul(const GsddmmLaunchArgs& args);
 void gsddmm_forward_launch_div(const GsddmmLaunchArgs& args);
 void gsddmm_forward_launch_dot(const GsddmmLaunchArgs& args);
 void gsddmm_forward_launch_copy(const GsddmmLaunchArgs& args);
+
+struct GsddmmLaunchArgsEdge {
+    const torch::Tensor& L;
+    const torch::Tensor& R;
+    torch::Tensor& O;
+    ulonglong2 const * __restrict__ edge_nodes_idx;
+    const at::cuda::CUDAStream& stream;
+    uint64_t E;
+    uint64_t D;
+    LRO key;
+};
+
+// Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
+// covers the member pairs that op is instantiated for and raises from
+// MakeEnumVariant on any other pair.
+void gsddmm_forward_edge_launch_add(const GsddmmLaunchArgsEdge& args);
+void gsddmm_forward_edge_launch_sub(const GsddmmLaunchArgsEdge& args);
+void gsddmm_forward_edge_launch_mul(const GsddmmLaunchArgsEdge& args);
+void gsddmm_forward_edge_launch_div(const GsddmmLaunchArgsEdge& args);
+void gsddmm_forward_edge_launch_dot(const GsddmmLaunchArgsEdge& args);
+void gsddmm_forward_edge_launch_copy(const GsddmmLaunchArgsEdge& args);
 
 };  // namespace gsddmm

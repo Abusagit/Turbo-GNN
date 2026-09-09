@@ -5,7 +5,7 @@
 namespace gsddmm {
 
 // Operation to do over
-enum class GSDDMM_OP: uint8_t {
+enum class GSDDMM_OP : uint8_t {
     Add,   // Add the right operand to the left(elementwise)
     Sub,   // Subtract the right operand from the left(elementwise)
     Mul,   // Multiply the right operand by the left(elementwise)
@@ -15,7 +15,7 @@ enum class GSDDMM_OP: uint8_t {
 };
 
 // Member to take feature values from. Maybe Source vertex, destination vertex or edge
-enum class GSDDMM_MEMBER: uint8_t {
+enum class GSDDMM_MEMBER : uint8_t {
     Src_V,  // Source vertex
     Dst_V,  // Destination vertex
     Edge,   // Edge
@@ -84,16 +84,22 @@ struct GsddmmPlan {
 };
 
 // Dynamic shared memory requirement of GSDDMM_forward_normal for one instantiation.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, int PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, uint8_t PIPELINE_STAGES>
 inline consteval size_t gsddmm_forward_shmem_bytes() {
     using Plan = GsddmmPlan<op, ll, rr>;
     return Plan::NUM_DST_ROWS * D_CONST * sizeof(cuda_t) +
            (PIPELINE_STAGES > 0 ? N_PER_BLOCK * Plan::NUM_EDGE_ROWS * (PIPELINE_STAGES + 1) * D_CONST * sizeof(cuda_t) : 0);
 }
 
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, uint8_t PIPELINE_STAGES>
+inline consteval size_t gsddmm_forward_edge_shmem_bytes() {
+    // TODO: When transition to pipelines and asynchronous loads, change this code.
+    return 0;
+}
+
 // forward kernel: one thread block per (bucketed) CSR row node; each warp of the
 // block owns one edge at a time, lanes split the D_CONST features into vector tiles
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal ( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
@@ -101,12 +107,13 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
     index_t const *__restrict__ node_indices  // node indirection: node_i = node_indices[blockIdx.x]
 );
 
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
-__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_edge_block ( // no-format
-    size_t N,
+// Edge-block variant: one warp per edge, reading an explicit [E, 2] edge list
+// of (src, dst) node-id pairs (reinterpreted as ulonglong2) instead of the CSR.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(kWarpSize) GSDDMM_forward_edge_block ( // no-format
+    uint64_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
-    index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
-    index_t const *__restrict__ node_indices  // node indirection: node_i = node_indices[blockIdx.x]
+    ulonglong2 const *__restrict__ edge_nodes_idx
 );
 
 };  // namespace gsddmm

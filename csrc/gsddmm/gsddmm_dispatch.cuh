@@ -1,8 +1,8 @@
 #pragma once
 
-#include <string>
 #include <variant>
 
+#include "common/traits.cuh"
 #include "gsddmm/gsddmm.cu"
 #include "gsddmm/gsddmm_launch.cuh"
 
@@ -44,7 +44,9 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
 
     // Lambda to launch the kernel for a bucket of nodes with a given warp count
     auto launch_bucket = [&](const torch::Tensor& node_indices, int64_t num_nodes_bucket, auto warp_variant) {
-        if (num_nodes_bucket == 0) return;
+        if (num_nodes_bucket == 0) [[unlikely]] {
+            return;
+        }
 
         std::visit(
             [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto stages_c) {
@@ -86,6 +88,57 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
 
     // Heavy nodes
     launch_bucket(args.heavy_nodes, args.heavy_nodes.numel(), MakeIntVariant<32>(args.heavy_warps_per_block));
+}
+
+// Edge-block version
+template <LRO... Lros>
+void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
+    auto lro_variant = MakeEnumVariant<LRO, Lros...>(args.key);
+
+    // Lambda to launch the kernel for a bucket of nodes with a given warp count
+    auto launch = [D = args.D, E = args.E, &L = args.L, &R = args.R, &O = args.O, edge_nodes_idx = args.edge_nodes_idx, &stream = args.stream, lro_variant]() {
+        if (E == 0) [[unlikely]] {
+            return;
+        }
+
+        std::visit(
+            [E, &L, &R, &O, edge_nodes_idx, &stream](auto lro_c, auto idxInfo, auto typeInfo, auto d_c) {
+                constexpr GSDDMM_OP OP     = decltype(lro_c)::value.op;
+                constexpr GSDDMM_MEMBER LL = decltype(lro_c)::value.l;
+                constexpr GSDDMM_MEMBER RR = decltype(lro_c)::value.r;
+                using index_t              = typename decltype(idxInfo)::Type;
+                using torch_t              = typename decltype(typeInfo)::TorchType;
+                using cuda_t               = typename decltype(typeInfo)::CudaType;
+                constexpr size_t DC        = decltype(d_c)::value;
+
+                cuda_t const *L_ptr = reinterpret_cast<const cuda_t *>(L.data_ptr<torch_t>());
+                cuda_t const *R_ptr = reinterpret_cast<const cuda_t *>(R.data_ptr<torch_t>());
+                cuda_t *O_ptr       = reinterpret_cast<cuda_t *>(O.data_ptr<torch_t>());
+
+                auto kernel = GSDDMM_forward_edge_block<OP, LL, RR, DC, cuda_t, index_t, float>;
+
+                // constexpr size_t shmem = gsddmm_forward_edge_shmem_bytes<OP, LL, RR, DC, cuda_t, 0>();
+                // ensure_dynamic_shmem(kernel, shmem, "GSDDMM forward");
+
+                uint32_t grid_dim_x = static_cast<uint32_t>((static_cast<uint64_t>((1ull << 31) - 1ull) >= E) ? E : (1ull << 31) - 1ull);
+                uint32_t x_blocks = static_cast<uint32_t>(ceil_div<uint64_t>(E, grid_dim_x));
+                uint32_t grid_dim_y = static_cast<uint32_t>((static_cast<uint64_t>(65535 >= x_blocks) ? x_blocks : 65535));
+                uint32_t xy_blocks = static_cast<uint32_t>(ceil_div<uint64_t>(x_blocks, grid_dim_y));
+                uint32_t grid_dim_z = static_cast<uint32_t>((static_cast<uint64_t>(65535 >= xy_blocks) ? xy_blocks : 65535));
+
+                const dim3 blocks(grid_dim_x, grid_dim_y, grid_dim_z);
+                const dim3 threads(kWarpSize);
+
+                kernel<<<blocks, threads, 0, stream>>>(
+                    E, L_ptr, R_ptr, O_ptr, edge_nodes_idx
+                );
+            },
+            lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(at::kUInt64),
+            MakeTypeVariant<float, at::Half, at::BFloat16>(L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(D))
+        );
+    };
+
+    launch();
 }
 
 // The six ordered member pairs with lhs != rhs (same-member ops are dense-data

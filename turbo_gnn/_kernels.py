@@ -262,6 +262,122 @@ class GSDDMMKernel(TunableKernel):
         return _bench
 
 
+def _graph_edge_list(graph, by_src: bool = False) -> torch.Tensor:
+    """Return the graph's [E, 2] (src, dst) edge list, cached per direction.
+
+    The edge-parallel GSDDMM kernel consumes an explicit edge list instead of
+    the CSR. ``by_src=False`` builds it from the forward CSR (edges grouped by
+    destination, CSR order); ``by_src=True`` builds it from the backward CSR
+    (edges grouped by source, CSC order). The edge kernel's output rows follow
+    the chosen grouping.
+
+    Both directions are cached on the graph object, stamped with both CSRs'
+    data pointers and sizes, so a repartitioned graph (same CSR, new buckets)
+    still hits, while a mutated or re-created CSR rebuilds. Undirected graphs
+    alias the backward CSR to the forward one, so both directions share a
+    single list.
+    """
+    # Undirected graphs alias backward CSR to forward CSR: one list serves both.
+    if by_src and graph.backward_indptr.data_ptr() == graph.forward_indptr.data_ptr():
+        return _graph_edge_list(graph, by_src=False)
+
+    stamp = (
+        graph.forward_indptr.data_ptr(),
+        graph.forward_indices.data_ptr(),
+        graph.backward_indptr.data_ptr(),
+        graph.backward_indices.data_ptr(),
+        graph.forward_indptr.numel(),
+        graph.forward_indices.numel(),
+        graph.backward_indices.numel(),
+    )
+    cache_key = "_gsddmm_edge_list_src" if by_src else "_gsddmm_edge_list_dst"
+    cached = graph.__dict__.get(cache_key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+
+    indptr = graph.backward_indptr if by_src else graph.forward_indptr
+    indices = graph.backward_indices if by_src else graph.forward_indices
+    num_nodes = indptr.numel() - 1
+    signed_indptr = graph._to_signed_view(indptr)
+    degrees = signed_indptr[1:] - signed_indptr[:-1]
+    # Rows of the chosen CSR are destinations (forward) or sources (backward).
+    rows = torch.repeat_interleave(torch.arange(num_nodes, device=indptr.device, dtype=torch.int64), degrees)
+    cols = indices.to(torch.int64)
+    src, dst = (rows, cols) if by_src else (cols, rows)
+    # The binding reinterprets the buffer as ulonglong2, so it must be a
+    # uint64 tensor; the uint64 view keeps the same values bit-for-bit.
+    edge_list = torch.stack([src, dst], dim=1).contiguous().view(torch.uint64)
+
+    graph.__dict__[cache_key] = (stamp, edge_list)
+    return edge_list
+
+
+class GSDDMMEdgeKernel(TunableKernel):
+    """Tunable kernel for GSDDMM for edges (generalized sampled dense-dense matmul).
+
+    Computes a per-edge binary op over feature rows selected from source
+    nodes, destination nodes, or edges::
+
+        out[e] = op(lhs[sel_l], rhs[sel_r])   (elementwise; dot reduces the feature axis)
+
+    The (op, lhs_target, rhs_target) triple is fixed at construction (one
+    kernel instance per DGL-style op, e.g. ``u_sub_v`` == sub(src, dst)).
+
+    Unlike :class:`GSDDMMKernel` (one thread block per bucketed CSR row), this
+    kernel launches one warp per edge and reads an explicit ``[E, 2]`` edge
+    list of ``(src, dst)`` node-id pairs instead of walking the CSR. The edge
+    list is derived from the graph's CSR once per graph and cached on the
+    graph object, so repeated launches never rebuild it. Edges are grouped by
+    destination (forward CSR) when an operand reads the destination vertex,
+    and by source (backward CSR) otherwise — consecutive warps then share the
+    Src_V operand row, which is L2-friendly.
+    """
+
+    def __init__(self, op: str, lhs_target: str, rhs_target: str, **kwargs):
+        super().__init__()
+        self.op = op
+        self.lhs_target = lhs_target
+        # The binding instantiates Copy only with an edge-indexed (ignored) rhs;
+        # normalize here so any user-supplied rhs_target works for copy.
+        self.rhs_target = "edge" if op == "copy" else rhs_target
+
+    def _execute(self, graph, x, *, rhs=None, **kwargs):
+        if rhs is None:
+            if self.op != "copy":
+                raise ValueError(f"gsddmm: rhs is required for op={self.op!r}")
+            # Copy never reads R, but the binding validates its shape: [E, D].
+            rhs = x.new_empty((graph.forward_indices.numel(), x.shape[-1]))
+
+        # Group edges by source when no operand reads the destination vertex.
+        by_src = "dst" not in (self.lhs_target, self.rhs_target)
+        edge_list = _graph_edge_list(graph, by_src=by_src)
+        num_nodes = graph.forward_indptr.numel() - 1
+
+        return _C.gsddmm_forward_edge(
+            x,
+            rhs,
+            edge_list,
+            self.op,
+            self.lhs_target,
+            self.rhs_target,
+            num_nodes,
+        )
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return []
+
+    def get_tunable_forward_graph_params(self) -> list[TunableParam]:
+        return []
+
+    def make_forward_bench_fn(self, x, graph_repr, **kwargs):
+        rhs = kwargs.get("rhs")
+
+        def _bench():
+            return self._execute(graph_repr, x, rhs=rhs)
+
+        return _bench
+
+
 class GraphTransformerAggrKernel(TunableKernel):
     """Tunable kernel for fused multi-head graph transformer attention.
 

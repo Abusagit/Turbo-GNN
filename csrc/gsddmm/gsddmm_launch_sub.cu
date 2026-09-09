@@ -6,4 +6,6 @@ namespace gsddmm {
 
 void gsddmm_forward_launch_sub(const GsddmmLaunchArgs& args) { gsddmm_dispatch<GSDDMM_BINARY_LROS(Sub)>(args); }
 
+void gsddmm_forward_edge_launch_sub(const GsddmmLaunchArgsEdge& args) { gsddmm_dispatch_edge_block<GSDDMM_BINARY_LROS(Sub)>(args); }
+
 };  // namespace gsddmm

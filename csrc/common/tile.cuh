@@ -28,6 +28,9 @@ struct alignas(sizeof(num_type) * N) Vec {
             data[i] = num;
         }
     }
+    __device__ Vec(wide_t input_data) noexcept {
+        data = *reinterpret_cast<num_type const *>(&input_data);
+    }
     Vec(const Vec& other) noexcept            = default;
     Vec(Vec&& other) noexcept                 = default;
     Vec& operator=(const Vec& other) noexcept = default;
@@ -921,6 +924,15 @@ static_assert(std::is_trivially_destructible_v<VecFloat<4, float>>);
 
 // Operations with whole tiles
 
+template <size_t bytes>
+struct HintedAccessType {
+    using type = deduce_uint_type_t<bytes>;
+};
+template <>
+struct HintedAccessType<16> {
+    using type = ulonglong2;
+};
+
 template <size_t N, FloatingNum num_type, FloatingNum accum_t = float>
 struct TileOps {
    private:
@@ -956,16 +968,22 @@ struct TileOps {
     // Common
     template<MemoryHint hint = MemoryHint::NoHint>
     static __device__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
+        using access_t = typename HintedAccessType<TW * sizeof(num_type)>::type;
+        auto from_raw = [](access_t raw) -> vec_t {
+            vec_t out;
+            *reinterpret_cast<access_t *>(&out) = raw;
+            return out;
+        };
         if constexpr(hint == MemoryHint::AllCache) {
-            return __ldca(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
+            return from_raw(__ldca(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
         } else if constexpr(hint == MemoryHint::L2Only) {
-            return __ldcg(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
+            return from_raw(__ldcg(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
         } else if constexpr(hint == MemoryHint::Streaming) {
-            return __ldcs(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
+            return from_raw(__ldcs(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
         } else if constexpr(hint == MemoryHint::NoCache) {
-            return __ldcv(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
+            return from_raw(__ldcv(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
         } else if constexpr(hint == MemoryHint::ReadOnly) {
-            return __ldg(reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]));
+            return from_raw(__ldg(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
         } else {
             return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
         }
@@ -976,14 +994,15 @@ struct TileOps {
     template<MemoryHint hint = MemoryHint::NoHint>
     static __device__ void write(num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t src_val) {
         static_assert(hint == MemoryHint::NoHint || hint == MemoryHint::AllCache || hint == MemoryHint::L2Only || hint == MemoryHint::Streaming || hint == MemoryHint::NoCache, "Only AllCache, L2Only, Streaming, NoCache and NoHint options are available for stores.");
+        using access_t = typename HintedAccessType<TW * sizeof(num_type)>::type;
         if constexpr(hint == MemoryHint::AllCache) {
-            __stwb(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+            __stwb(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
         } else if constexpr(hint == MemoryHint::L2Only) {
-            __stcg(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+            __stcg(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
         } else if constexpr(hint == MemoryHint::Streaming) {
-            __stcs(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+            __stcs(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
         } else if constexpr(hint == MemoryHint::NoCache) {
-            __stwt(reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<wide_t const *>(&src_val));
+            __stwt(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
         } else {
             *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(&src_val);
         }

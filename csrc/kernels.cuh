@@ -44,6 +44,16 @@ torch::Tensor gsddmm_forward_cuda(
     uint32_t pipeline_stages       = 0
 );
 
+torch::Tensor gsddmm_forward_edge_blocks(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor edge_list,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N
+);
+
 at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);
 
 // ============================================================================

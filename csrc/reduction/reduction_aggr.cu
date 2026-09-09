@@ -98,7 +98,12 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
-    cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
+    // The block is 2D, (blockDim.x, blockDim.y) = (tile_x, node_y): threads with
+    // the same threadIdx.x in different y-rows scan DIFFERENT nodes' edge lists,
+    // so the pipeline slots must be private per thread -- index by the linear
+    // in-block thread id. The launcher allocates THREADS_PER_BLOCK slots' worth
+    // of shared memory, which covers blockDim.x * blockDim.y <= THREADS_PER_BLOCK.
+    cuda_t *my_dbuf = val_dbuf + (threadIdx.y * tile_dim + tid) * NUM_STAGES * TW;
 
     for (size_t fv = tid; fv < d_vec; fv += tile_dim) {
         const size_t base_f = fv * TW;
