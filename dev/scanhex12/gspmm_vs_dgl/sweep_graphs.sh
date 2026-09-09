@@ -9,11 +9,12 @@
 # already exists and is non-empty is skipped, so an interrupted sweep continues
 # where it stopped.
 #
-# EDGE_LIMIT is per dtype on purpose.  An [E, d] edge operand and its gradient
-# come to 2*E*d*sizeof(dtype), and both libraries hold one at once; past the
-# limit a graph measures only the ops that read no edge data (copy_u).  At
-# d = 64 that puts the fp32 cutoff around ten million edges and the fp16 one
-# around twice that, which is exactly where the T4's 15 GB runs out.
+# Past EDGE_LIMIT edges a graph measures only the ops that read no edge data
+# (copy_u).  An [E, d] operand and its gradient come to 2*E*d*sizeof(dtype) and
+# both libraries hold one at once, but the operands are not the whole cost -- the
+# reference gradients and DGL's own temporaries scale with E too, and at fp16 a
+# limit of 22M edges (half the fp32 one, as the arithmetic suggests) still ran a
+# 13M-edge graph out of memory.  Ten million holds for both dtypes.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,7 +44,7 @@ for graph in $GRAPHS; do
             echo "== skip $graph $dtype (have $(basename "$out"))"
             continue
         fi
-        if [ "$dtype" = "float32" ]; then limit=10000000; else limit=22000000; fi
+        limit=10000000
         echo "############ $graph $dtype  ($(date +%H:%M:%S), $(( ($(date +%s) - started) / 60 )) min in)"
         GRAPHS="$graph" DTYPE="$dtype" EDGE_LIMIT="${EDGE_LIMIT:-$limit}" "$HERE/run.sh" \
             || echo "!! failed: $graph $dtype"

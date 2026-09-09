@@ -7,7 +7,6 @@ passes with AMP support (``custom_fwd`` / ``custom_bwd``).
 
 from __future__ import annotations
 
-import contextlib
 import warnings
 from math import ceil
 
@@ -17,20 +16,6 @@ import turbo_gnn._C as _C
 
 WARP_SIZE = 32
 FOUR_BYTES_CONSTANT = 4
-
-# One extra stream per device, reused across calls: torch.cuda.Stream() creates
-# a fresh CUDA stream every time, and a backward pass that runs in a training
-# loop would then create one per iteration.
-_SIDE_STREAMS = {}
-
-
-def _side_stream(device):
-    idx = torch.cuda.current_device() if device.index is None else device.index
-    stream = _SIDE_STREAMS.get(idx)
-    if stream is None:
-        stream = torch.cuda.Stream(device=idx)
-        _SIDE_STREAMS[idx] = stream
-    return stream
 
 
 def _next_power_of_two(x):
@@ -636,29 +621,22 @@ class GSpMMFunction(torch.autograd.Function):
             if rhs_needs_grad:
                 grad_rhs = g_rhs
         else:
-            # The two gradients of a sum reduction are independent: the node one
-            # is this same g-SpMM walked on the transposed CSR, the edge one an
-            # edge-parallel scatter over the forward CSR, and neither reads what
-            # the other writes.  When both are wanted they go on two streams, so
-            # the edge scatter fills the SMs the transposed walk leaves idle.
-            overlap = lhs_needs_grad and rhs_needs_grad
-            main_stream = torch.cuda.current_stream(grad_out.device)
-            side_stream = None
-            if overlap:
-                side_stream = _side_stream(grad_out.device)
-                side_stream.wait_stream(main_stream)
-                # Allocated against the caller's stream, read on another one:
-                # the caching allocator has to be told before it can consider
-                # recycling them.
-                for tensor in (grad_out, lhs_t, rhs_t, edge_ptr, edge_idx):
-                    if tensor is not None and tensor.numel() > 0:
-                        tensor.record_stream(side_stream)
-
+            # The two gradients of a sum reduction are independent -- the node
+            # one is this same g-SpMM walked on the transposed CSR, the edge one
+            # an edge-parallel scatter over the forward CSR -- and they were once
+            # launched on two streams for that reason.  Measured on a T4 at
+            # d=64, that overlap is worth nothing: exactly 1.00x on tolokers-2,
+            # ogbn-arxiv and city-reviews (both kernels are already
+            # bandwidth-bound, so there is no idle capacity to fill), 0.85x on
+            # cora where the stream sync outweighs a 0.3 ms backward, and 0.73x
+            # on twitch-views, where the [E, d] edge gradient allocated against
+            # a side stream stops the caching allocator from reusing its block
+            # and every iteration pays a fresh 3.5 GB cudaMalloc.  So both run
+            # on the caller's stream.
             if rhs_needs_grad:
                 # Already in the operand dtype: this kernel writes every slot
                 # exactly once, so it has no float staging buffer to cast back.
-                with torch.cuda.stream(side_stream) if overlap else contextlib.nullcontext():
-                    grad_rhs = _C.gspmm_backward_edge(edge_ptr, edge_idx, grad_out, lhs_t, rhs_t, op, ctx.warps_per_block)
+                grad_rhs = _C.gspmm_backward_edge(edge_ptr, edge_idx, grad_out, lhs_t, rhs_t, op, ctx.warps_per_block)
 
             if lhs_needs_grad:
                 if bwd_edge_ptr is None:
@@ -706,9 +684,6 @@ class GSpMMFunction(torch.autograd.Function):
                     ctx.bwd_max_degree,
                 )
 
-            if overlap:
-                main_stream.wait_stream(side_stream)
-                grad_rhs.record_stream(main_stream)
 
         return (
             grad_lhs,

@@ -114,6 +114,15 @@ constexpr bool kGSpMMVectorize = false;
 // would be pure overhead.
 constexpr int64_t kGSpMMHeavySliceEdges = 1024;
 
+// ...and a large top degree is not enough by itself.  Measured on a T4 by
+// splitting a fixed edge mass across a varying number of hubs (d=32, fp16,
+// copy_u/sum): one hub holding all of it runs 3.0-5.2x faster sliced, five hubs
+// 1.37x, and the two paths break even where the top degree is about a
+// sixteenth of the whole edge list.  Below that the partials buffer and its
+// reduce pass are pure cost -- 4-7% on every real graph measured, sum and
+// min/max alike -- so the launcher slices only above it.
+constexpr int64_t kGSpMMHeavySliceShare = 16;
+
 // Edges one warp of the edge-gradient kernel walks before the grid stride.
 // Long enough to amortize the binary search that locates the first edge's
 // destination, short enough to keep tens of thousands of warps in flight.
@@ -185,10 +194,13 @@ std::vector<torch::Tensor> gspmm_forward(
         TORCH_CHECK(features_per_block * tiles_y <= 1024, "features_per_block * tiles_y must be <= 1024");
     }
 
-    // Slicing pays off only when some heavy node is far bigger than the rest.
-    // Every reducer can take it: a comparison reducer carries the winning edge
-    // position alongside each partial value, in slice_args.
-    const bool slice_heavy = (num_heavy > 0 && max_degree > kGSpMMHeavySliceEdges);
+    // Slicing pays off only when a handful of nodes hold the edge mass, so that
+    // the blocks drawing them set the makespan on their own.  Every reducer can
+    // take it: a comparison reducer carries the winning edge position alongside
+    // each partial value, in slice_args.
+    const bool slice_heavy =
+        (num_heavy > 0 && max_degree > kGSpMMHeavySliceEdges &&
+         static_cast<int64_t>(max_degree) * kGSpMMHeavySliceShare > edge_idx.numel());
 
     const torch::Tensor& val_ref = op_uses_lhs(bop) ? lhs : rhs;
 
@@ -200,9 +212,7 @@ std::vector<torch::Tensor> gspmm_forward(
 
     torch::Tensor slice_offsets;
     torch::Tensor slice_partials;
-    // Defined even when unused: the launch reads its data_ptr unconditionally,
-    // and an empty tensor yields the null the kernel expects.
-    torch::Tensor slice_args = torch::empty({0}, edge_ptr.options());
+    torch::Tensor slice_args;
     if (slice_heavy) {
         // Exclusive prefix sum of each heavy node's slice count, shaped like a
         // CSR row pointer so the kernel can binary-search it.  Its last entry
@@ -357,7 +367,7 @@ std::vector<torch::Tensor> gspmm_forward(
                         rhs_ptr,
                         emap_ptr,
                         slice_partials.data_ptr<float>(),
-                        index_ptr_mut<index_t>(slice_args),
+                        slice_args.defined() ? index_ptr_mut<index_t>(slice_args) : nullptr,
                         static_cast<size_t>(num_heavy),
                         d
                     );
@@ -371,7 +381,7 @@ std::vector<torch::Tensor> gspmm_forward(
                             index_ptr<index_t>(heavy_nodes),
                             index_ptr<index_t>(slice_offsets),
                             slice_partials.data_ptr<float>(),
-                            index_ptr<index_t>(slice_args),
+                            slice_args.defined() ? index_ptr<index_t>(slice_args) : nullptr,
                             out_ptr,
                             index_ptr_mut<index_t>(arg_eid),
                             static_cast<size_t>(num_heavy),
@@ -490,26 +500,30 @@ std::vector<torch::Tensor> gspmm_backward_arg(
                 auto *grad_rhs_ptr =
                     uses_rhs ? reinterpret_cast<grad_rhs_t *>(grad_rhs.data_ptr()) : static_cast<grad_rhs_t *>(nullptr);
 
-                // Grid-strided over the flat [N, d] output, so it is sized for
-                // the device and not for the node count.
-                const int sm_count    = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-                const int64_t total   = num_nodes * d;
-                const unsigned blocks = static_cast<unsigned>(std::max<int64_t>(
-                    std::min<int64_t>((total + threads - 1) / threads, static_cast<int64_t>(sm_count) * 32), 1
-                ));
+                // One block per node, and no wider than the row it walks: this
+                // scatter's work is d elements per node whatever the degree is,
+                // so a 256-thread block at d=64 would leave three quarters of
+                // itself idle.  Reshaping it further does not pay -- a grid
+                // strided over [N, d] measured 5-7% slower on every real graph
+                // (city-reviews 2.73 -> 2.91 ms), and so did the same kernel
+                // with rows along y.
+                const unsigned row_threads = static_cast<unsigned>(
+                    std::min<size_t>(threads, ((static_cast<size_t>(d) + kWarpSize - 1) / kWarpSize) * kWarpSize)
+                );
 
-                gspmm_backward_arg_kernel<BOP, BCAST, cuda_t, index_t, /*grad_t=*/float, grad_rhs_t>
-                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                        reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
-                        index_ptr<index_t>(arg_eid),
-                        index_ptr<index_t>(edge_idx),
-                        lhs_ptr,
-                        rhs_ptr,
-                        grad_lhs.data_ptr<float>(),
-                        grad_rhs_ptr,
-                        static_cast<size_t>(num_nodes),
-                        static_cast<size_t>(d)
-                    );
+                reduction_aggr_backward_typed<
+                    kGSpMMWarpsPerBlock, cuda_t, index_t, BOP, BCAST, /*ARG_IS_EDGE=*/true, /*grad_t=*/float, /*accum_t=*/float, grad_rhs_t
+                ><<<static_cast<unsigned>(num_nodes), row_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                    reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
+                    index_ptr<index_t>(arg_eid),
+                    grad_lhs.data_ptr<float>(),
+                    static_cast<size_t>(num_nodes),
+                    static_cast<size_t>(d),
+                    index_ptr<index_t>(edge_idx),
+                    lhs_ptr,
+                    rhs_ptr,
+                    grad_rhs_ptr
+                );
             }
         },
         MakeIndexVariant<int32_t, int64_t>(edge_idx.scalar_type()),

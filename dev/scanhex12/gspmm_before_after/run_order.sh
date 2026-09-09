@@ -14,6 +14,10 @@ export CUDA_HOME=/usr/local/cuda
 export NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK
 export PYTHONWARNINGS=ignore
 export TURBO_REPO="${TURBO_REPO:-$REPO}"
+# The partial extension is named after the checkout it is built from, and this
+# one is the repo itself: "Turbo-GNN" has a hyphen in it, which is not a C
+# identifier, so PYBIND11_MODULE would not compile.
+export TURBO_EXT_NAME="${TURBO_EXT_NAME:-turbo_bench_order_C}"
 
 PYTHON="${PYTHON:-$REPO/.venv/bin/python3}"
 BENCH_CMD="${BENCH_CMD:-$PYTHON $BENCH/harness/bench_wrapper.py}"

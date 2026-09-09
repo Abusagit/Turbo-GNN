@@ -144,12 +144,26 @@ def main() -> int:
     # order -- feeding it unsorted arrays silently corrupts the mul/div sum node
     # gradient (the only path that uses the map). Sort here, and carry eids along
     # so the exported edge operand keeps matching the CSR it is indexed by.
+    # Past ~20M edges this runs on the CPU: the int64 key and the argsort over it
+    # come to several times E * 8 bytes, and on ogbn-products (124M edges) that
+    # alone exhausted the 15 GB card before a single op had been timed.  It is a
+    # one-off per export, and host RAM is not the constraint here.
     def sort_rows(p_, i_, payload=None):
+        dev = p_.device
+        host = i_.numel() > 20_000_000
+        if host:
+            p_, i_ = p_.cpu(), i_.cpu()
+            payload = None if payload is None else payload.cpu()
         rows = torch.repeat_interleave(
             torch.arange(p_.numel() - 1, device=p_.device), (p_[1:] - p_[:-1]).long()
         )
         order = torch.argsort(rows * (p_.numel() - 1) + i_.long(), stable=True)
-        return i_[order], (None if payload is None else payload[order])
+        out_i = i_[order]
+        out_p = None if payload is None else payload[order]
+        if host:
+            out_i = out_i.to(dev)
+            out_p = None if out_p is None else out_p.to(dev)
+        return out_i, out_p
 
     indices, eids = sort_rows(indptr, indices, eids)
     bwd_indices, _ = sort_rows(bwd_indptr, bwd_indices)
