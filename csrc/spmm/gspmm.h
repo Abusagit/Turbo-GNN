@@ -34,14 +34,10 @@ std::vector<torch::Tensor> gspmm_forward(
     int max_degree                 = -1
 );
 
-// Backward of a min/max reduction: both gradients from one walk of the
-// *transposed* CSR (rows are sources), whose light/heavy buckets are passed in.
-// bwd_edge_map takes a backward-CSR position to the forward-CSR position that
-// arg_eid records and the edge operand is indexed by.  grad_lhs comes back in
-// the operand dtype; so does grad_rhs, cast from float when it broadcast.
 std::vector<torch::Tensor> gspmm_backward_arg(
     const torch::Tensor& grad_out,
     const torch::Tensor& arg_eid,
+    const torch::Tensor& edge_idx,
     const torch::Tensor& bwd_edge_ptr,
     const torch::Tensor& bwd_edge_idx,
     const torch::Tensor& bwd_edge_map,
@@ -70,5 +66,6 @@ torch::Tensor gspmm_backward_edge(
     int warps_per_block    = 8,
     int features_per_block = 32,
     int tiles_y            = 8,
-    int max_degree         = -1
+    int max_degree         = -1,
+    int pipeline_stages    = 0
 );

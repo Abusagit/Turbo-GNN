@@ -274,7 +274,11 @@ def _gspmm_apply(
     pipeline_stages: int,
 ) -> torch.Tensor:
     """Unpack the graph and hand off to :class:`GSpMMFunction`."""
-    edge_map = graph.backward_edge_map if (op in ("mul", "div") and reduce == "sum") else None
+    # min/max walk the transposed CSR in their backward and need the map for
+    # every op (it identifies the winning edge); sum needs it only where the
+    # node gradient reads the edge value.
+    needs_edge_map = reduce in ("min", "max") or (op in ("mul", "div") and reduce == "sum")
+    edge_map = graph.backward_edge_map if needs_edge_map else None
 
     return GSpMMFunction.apply(
         lhs,

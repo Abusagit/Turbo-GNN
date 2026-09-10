@@ -217,6 +217,24 @@ void check_backward_buckets(
     }
 }
 
+struct HeavySlices {
+    torch::Tensor offsets;
+    int64_t max_slices;
+};
+
+HeavySlices heavy_slice_offsets(const torch::Tensor& edge_ptr, const torch::Tensor& heavy_nodes, int64_t num_edges, int64_t slice_edges) {
+    const int64_t num_heavy = heavy_nodes.numel();
+    const auto heavy_long   = heavy_nodes.to(torch::kLong);
+    const auto degrees      = edge_ptr.index_select(0, heavy_long + 1) - edge_ptr.index_select(0, heavy_long);
+    const auto counts       = (degrees.to(torch::kLong) + (slice_edges - 1)).div(slice_edges, "trunc");
+
+    auto offsets = torch::zeros({num_heavy + 1}, edge_ptr.options());
+    offsets.slice(0, 1, num_heavy + 1).copy_(counts.cumsum(0));
+    return {offsets, num_heavy + (num_edges + slice_edges - 1) / slice_edges};
+}
+
+constexpr int64_t kGSpMMArgGatherMaxAvgDegree = 10;
+
 }  // namespace
 
 std::vector<torch::Tensor> gspmm_forward(
@@ -303,24 +321,13 @@ std::vector<torch::Tensor> gspmm_forward(
     torch::Tensor slice_partials;
     torch::Tensor slice_args;
     if (slice_heavy) {
-        // Exclusive prefix sum of each heavy node's slice count, shaped like a
-        // CSR row pointer so the kernel can binary-search it.  Its last entry
-        // is the total slice count, which the kernel reads on the device --
-        // fetching it here would mean a device-to-host sync per call.
-        const auto heavy_long = heavy_nodes.to(torch::kLong);
-        const auto degrees    = edge_ptr.index_select(0, heavy_long + 1) - edge_ptr.index_select(0, heavy_long);
-        const auto counts     = (degrees.to(torch::kLong) + (kGSpMMHeavySliceEdges - 1)).div(kGSpMMHeavySliceEdges, "trunc");
-
-        slice_offsets = torch::zeros({num_heavy + 1}, edge_ptr.options());
-        slice_offsets.slice(0, 1, num_heavy + 1).copy_(counts.cumsum(0));
-
-        // Σ ceil(deg / SLICE) <= num_heavy + E / SLICE, and that bound is
-        // known here, so the buffer can be sized without reading the real
-        // count back from the device.
-        const int64_t max_slices = num_heavy + (edge_idx.numel() + kGSpMMHeavySliceEdges - 1) / kGSpMMHeavySliceEdges;
-        slice_partials           = torch::empty({max_slices, layout.d}, out.options().dtype(torch::kFloat));
+        const HeavySlices slices = heavy_slice_offsets(edge_ptr, heavy_nodes, edge_idx.numel(), kGSpMMHeavySliceEdges);
+        slice_offsets            = slices.offsets;
+        // The partials buffer is sized from the bound, not the real count,
+        // which only the device knows.
+        slice_partials = torch::empty({slices.max_slices, layout.d}, out.options().dtype(torch::kFloat));
         if (tracks_arg) {
-            slice_args = torch::empty({max_slices, layout.d}, edge_ptr.options());
+            slice_args = torch::empty({slices.max_slices, layout.d}, edge_ptr.options());
         }
     }
 
@@ -501,9 +508,98 @@ std::vector<torch::Tensor> gspmm_forward(
     return {out, arg_eid};
 }
 
+namespace {
+
+std::vector<torch::Tensor> gspmm_backward_arg_scatter(
+    const torch::Tensor& grad_out,
+    const torch::Tensor& arg_eid,
+    const torch::Tensor& edge_idx,
+    const torch::Tensor& lhs,
+    const torch::Tensor& rhs,
+    BinaryOp bop,
+    bool bcast,
+    int warps_per_block
+) {
+    const int64_t num_nodes = grad_out.size(0);
+    const int64_t d         = grad_out.size(1);
+    const bool uses_lhs     = op_uses_lhs(bop);
+    const bool uses_rhs     = op_uses_rhs(bop);
+
+    const auto value_opts = grad_out.options();
+    const auto accum_opts = value_opts.dtype(torch::kFloat);
+
+    auto grad_lhs = uses_lhs ? torch::zeros({num_nodes, d}, accum_opts) : torch::empty({0}, value_opts);
+    auto grad_rhs = !uses_rhs ? torch::empty({0}, value_opts) : torch::zeros(rhs.sizes(), bcast ? accum_opts : value_opts);
+
+    std::visit(
+        [&](auto idxInfo, auto typeInfo, auto op_c, auto bcast_c) {
+            using index_t = typename decltype(idxInfo)::Type;
+            using torch_t = typename decltype(typeInfo)::TorchType;
+            using cuda_t  = typename decltype(typeInfo)::CudaType;
+
+            constexpr BinaryOp BOP = static_cast<BinaryOp>(decltype(op_c)::value);
+            constexpr bool BCAST   = decltype(bcast_c)::value;
+            using BOps             = BinaryOps<BOP>;
+
+            if constexpr (BCAST && !BOps::USE_RHS) {
+                return;
+            } else {
+                cuda_t const *lhs_ptr = nullptr;
+                cuda_t const *rhs_ptr = nullptr;
+                if constexpr (BOps::GRAD_USES_OPERANDS) {
+                    lhs_ptr = reinterpret_cast<cuda_t const *>(lhs.data_ptr<torch_t>());
+                    rhs_ptr = reinterpret_cast<cuda_t const *>(rhs.data_ptr<torch_t>());
+                }
+
+                using grad_rhs_t = std::conditional_t<BCAST, float, cuda_t>;
+                auto *grad_rhs_ptr =
+                    uses_rhs ? reinterpret_cast<grad_rhs_t *>(grad_rhs.data_ptr()) : static_cast<grad_rhs_t *>(nullptr);
+
+                const size_t threads       = static_cast<size_t>(warps_per_block) * kWarpSize;
+                const unsigned row_threads = static_cast<unsigned>(
+                    std::min<size_t>(threads, ((static_cast<size_t>(d) + kWarpSize - 1) / kWarpSize) * kWarpSize)
+                );
+
+                auto *grad_lhs_ptr = uses_lhs ? grad_lhs.data_ptr<float>() : nullptr;
+
+                reduction_aggr_backward_typed<
+                    kGSpMMWarpsPerBlock, cuda_t, index_t, BOP, BCAST, /*ARG_IS_EDGE=*/true, /*grad_t=*/float, /*accum_t=*/float, grad_rhs_t
+                ><<<static_cast<unsigned>(num_nodes), row_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                    reinterpret_cast<cuda_t const *>(grad_out.data_ptr<torch_t>()),
+                    index_ptr<index_t>(arg_eid),
+                    grad_lhs_ptr,
+                    static_cast<size_t>(num_nodes),
+                    static_cast<size_t>(d),
+                    index_ptr<index_t>(edge_idx),
+                    lhs_ptr,
+                    rhs_ptr,
+                    grad_rhs_ptr
+                );
+            }
+        },
+        MakeIndexVariant<int32_t, int64_t>(edge_idx.scalar_type()),
+        MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
+        MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
+        MakeBoolVariant<false, true>(bcast)
+    );
+
+    CUDA_KERNEL_CHECK();
+
+    if (uses_lhs) {
+        grad_lhs = grad_lhs.to(value_opts.dtype());
+    }
+    if (uses_rhs && bcast) {
+        grad_rhs = grad_rhs.to(value_opts.dtype());
+    }
+    return {grad_lhs, grad_rhs};
+}
+
+}  // namespace
+
 std::vector<torch::Tensor> gspmm_backward_arg(
     const torch::Tensor& grad_out,
     const torch::Tensor& arg_eid,
+    const torch::Tensor& edge_idx,
     const torch::Tensor& bwd_edge_ptr,
     const torch::Tensor& bwd_edge_idx,
     const torch::Tensor& bwd_edge_map,
@@ -541,6 +637,14 @@ std::vector<torch::Tensor> gspmm_backward_arg(
     const bool bcast    = deduce_rhs_broadcast(bop, rhs, d);
     if (uses_rhs) {
         TORCH_CHECK(rhs.size(0) == num_edges, "rhs must have one row per edge (", rhs.size(0), " vs ", num_edges, ")");
+    }
+    TORCH_CHECK(
+        edge_idx.numel() == num_edges && edge_idx.scalar_type() == bwd_edge_ptr.scalar_type(),
+        "edge_idx must be the forward CSR's column index, in the dtype of bwd_edge_ptr"
+    );
+
+    if (!(uses_rhs && num_edges <= kGSpMMArgGatherMaxAvgDegree * num_nodes)) {
+        return gspmm_backward_arg_scatter(grad_out, arg_eid, edge_idx, lhs, rhs, bop, bcast, warps_per_block);
     }
 
     const int64_t num_light = light_nodes.numel();
@@ -665,7 +769,8 @@ torch::Tensor gspmm_backward_edge(
     int warps_per_block,
     int features_per_block,
     int tiles_y,
-    int max_degree
+    int max_degree,
+    int pipeline_stages
 ) {
     const BinaryOp bop = binary_op_from_string(op);
 
@@ -697,19 +802,43 @@ torch::Tensor gspmm_backward_edge(
     // store, so no slot is left untouched.
     auto grad_rhs = torch::empty(rhs.sizes(), grad_opts);
 
-    BucketStreams streams(num_light > 0 && num_heavy > 0, {&edge_ptr, &edge_idx, &grad_out, &lhs, &rhs, &heavy_nodes, &grad_rhs});
+    // A hub's edges are cut into chunks with a block each.  Below the chunk
+    // width every heavy node is a single chunk and block i simply takes heavy
+    // node i; above it (or with the top degree unknown) the blocks find their
+    // chunk through a prefix sum of the chunk counts.  A dense (node, chunk)
+    // grid instead would launch, on a skewed graph, hundreds of thousands of
+    // blocks that exit at once -- measured at 0.5-0.7x on the edge gradient.
+    torch::Tensor slice_offsets;
+    int64_t heavy_blocks = num_heavy;
+    if (num_heavy > 0 && (max_degree < 0 || max_degree > kGSpMMHeavySliceEdges)) {
+        const HeavySlices slices = heavy_slice_offsets(edge_ptr, heavy_nodes, num_edges, kGSpMMHeavySliceEdges);
+        slice_offsets            = slices.offsets;
+        heavy_blocks             = slices.max_slices;
+    }
+
+    BucketStreams streams(
+        num_light > 0 && num_heavy > 0, {&edge_ptr, &edge_idx, &grad_out, &lhs, &rhs, &heavy_nodes, &slice_offsets, &grad_rhs}
+    );
 
     std::visit(
-        [&](auto idxInfo, auto typeInfo, auto op_c, auto bcast_c) {
+        [&](auto idxInfo, auto typeInfo, auto op_c, auto bcast_c, auto stages_c) {
             using index_t = typename decltype(idxInfo)::Type;
             using torch_t = typename decltype(typeInfo)::TorchType;
             using cuda_t  = typename decltype(typeInfo)::CudaType;
 
             constexpr BinaryOp BOP = static_cast<BinaryOp>(decltype(op_c)::value);
             constexpr bool BCAST   = decltype(bcast_c)::value;
+            constexpr int STAGES   = decltype(stages_c)::value;
             using BOps             = BinaryOps<BOP>;
 
-            // copy_u returned above, so it never reaches a launch.
+            // copy_u returned above, so it never reaches a launch.  The
+            // pipeline prefetches the node operand, which only mul and div
+            // read, so for the other ops the stage count is clamped to zero:
+            // all four values then name the same instantiation.  Pruning them
+            // with a `return` instead skipped the launch outright and left the
+            // gradient at whatever torch::empty had handed over -- which is
+            // what sub/sum at stages=2 was reading.
+            constexpr int EFF_STAGES = BOps::GRAD_USES_OPERANDS ? STAGES : 0;
             if constexpr (!BOps::USE_RHS) {
                 return;
             } else {
@@ -724,8 +853,17 @@ torch::Tensor gspmm_backward_edge(
 
                 if (num_light > 0) {
                     const LightShape shape = light_launch_shape(warps_per_block, d, BCAST, num_light);
-                    gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t>
-                        <<<shape.blocks, shape.block, 0, streams.main>>>(
+                    const size_t shmem_l   = gspmm_edge_grad_shmem_bytes<cuda_t, EFF_STAGES>(
+                        static_cast<size_t>(shape.block.x) * static_cast<size_t>(shape.block.y)
+                    );
+                    if constexpr (EFF_STAGES > 0) {
+                        ensure_dynamic_shmem(
+                            gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t, cuda_t, float, EFF_STAGES>, shmem_l,
+                            "gspmm backward edge light"
+                        );
+                    }
+                    gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t, cuda_t, float, EFF_STAGES>
+                        <<<shape.blocks, shape.block, shmem_l, streams.main>>>(
                             index_ptr<index_t>(light_nodes),
                             index_ptr<index_t>(edge_ptr),
                             index_ptr<index_t>(edge_idx),
@@ -739,23 +877,30 @@ torch::Tensor gspmm_backward_edge(
                 }
 
                 if (num_heavy > 0) {
-                    // One block per (node, chunk of kGSpMMHeavySliceEdges);
-                    // with the top degree unknown the blocks stride over the
-                    // chunks instead.
-                    const int64_t chunks = max_degree > 0
-                        ? std::min<int64_t>((max_degree + kGSpMMHeavySliceEdges - 1) / kGSpMMHeavySliceEdges, 65535)
-                        : 1;
-                    const dim3 grid_h(static_cast<unsigned>(num_heavy), static_cast<unsigned>(chunks));
+                    const dim3 grid_h(static_cast<unsigned>(std::min<int64_t>(heavy_blocks, 65535LL * 32)));
                     const dim3 block_h(BCAST ? static_cast<unsigned>(kWarpSize) : static_cast<unsigned>(features_per_block), static_cast<unsigned>(tiles_y));
-                    gspmm_backward_edge_heavy_kernel<BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges)>
-                        <<<grid_h, block_h, 0, streams.heavy>>>(
+                    const size_t shmem_h = gspmm_edge_grad_shmem_bytes<cuda_t, EFF_STAGES>(
+                        static_cast<size_t>(block_h.x) * static_cast<size_t>(block_h.y)
+                    );
+                    if constexpr (EFF_STAGES > 0) {
+                        ensure_dynamic_shmem(
+                            gspmm_backward_edge_heavy_kernel<
+                                BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), cuda_t, float, EFF_STAGES>,
+                            shmem_h, "gspmm backward edge heavy"
+                        );
+                    }
+                    gspmm_backward_edge_heavy_kernel<
+                        BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), cuda_t, float, EFF_STAGES>
+                        <<<grid_h, block_h, shmem_h, streams.heavy>>>(
                             index_ptr<index_t>(heavy_nodes),
+                            slice_offsets.defined() ? index_ptr<index_t>(slice_offsets) : nullptr,
                             index_ptr<index_t>(edge_ptr),
                             index_ptr<index_t>(edge_idx),
                             grad_out_ptr,
                             lhs_ptr,
                             rhs_ptr,
                             grad_rhs_ptr,
+                            static_cast<size_t>(num_heavy),
                             static_cast<size_t>(d)
                         );
                 }
@@ -764,7 +909,8 @@ torch::Tensor gspmm_backward_edge(
         MakeIndexVariant<int32_t, int64_t>(edge_ptr.scalar_type()),
         MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
-        MakeBoolVariant<false, true>(deduce_rhs_broadcast(bop, rhs, d))
+        MakeBoolVariant<false, true>(deduce_rhs_broadcast(bop, rhs, d)),
+        MakeIntVariant<0, 1, 2, 4>(pipeline_stages)
     );
 
     streams.join();

@@ -30,7 +30,10 @@
 //
 // Features outer, edges inner: grad_out[v, f] is loaded once per feature and
 // the stores of one warp land on d consecutive elements of one edge row.
-template <BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t, FloatingNum accum_t>
+template <
+    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t, FloatingNum accum_t,
+    int PIPELINE_STAGES = 0
+>
 __device__ __forceinline__ void gspmm_edge_grad_span(
     size_t v,
     index_t e_begin,
@@ -42,10 +45,15 @@ __device__ __forceinline__ void gspmm_edge_grad_span(
     cuda_t const *const __restrict__ lhs,
     cuda_t const *const __restrict__ rhs,
     grad_t *const __restrict__ grad_rhs,
-    size_t d
+    size_t d,
+    cuda_t *const dbuf = nullptr
 ) {
     using BOps        = BinaryOps<BOp>;
     const size_t base = v * d;
+
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0 && BOps::GRAD_USES_OPERANDS;
+    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
 
     if constexpr (RHS_BROADCAST) {
         // f_stride == kWarpSize and the callers are one full warp.
@@ -73,23 +81,43 @@ __device__ __forceinline__ void gspmm_edge_grad_span(
     } else {
         for (size_t f = fid; f < d; f += f_stride) {
             const accum_t g = static_cast<accum_t>(grad_out[base + f]);
-            for (index_t eid = e_begin; eid < e_end; ++eid) {
+
+            auto emit = [&](index_t eid, accum_t u_val) {
                 const size_t e_off = static_cast<size_t>(eid) * d + f;
-                accum_t u_val{};
                 accum_t e_val{};
                 if constexpr (BOps::GRAD_USES_OPERANDS) {
-                    u_val = static_cast<accum_t>(lhs[static_cast<size_t>(edge_idx[eid]) * d + f]);
                     e_val = static_cast<accum_t>(rhs[e_off]);
                 }
                 grad_rhs[e_off] = static_cast<grad_t>(BOps::grad_rhs(u_val, e_val, g));
+            };
+
+            if constexpr (USE_PIPELINE) {
+                pipelined_thread_edge_scan<1, NUM_STAGES, cuda_t, index_t>(
+                    e_begin, e_end, edge_idx, lhs, d, f, dbuf,
+                    [&](index_t /*src*/, index_t eid, cuda_t const *uslice) { emit(eid, static_cast<accum_t>(uslice[0])); }
+                );
+            } else {
+                for (index_t eid = e_begin; eid < e_end; ++eid) {
+                    accum_t u_val{};
+                    if constexpr (BOps::GRAD_USES_OPERANDS) {
+                        u_val = static_cast<accum_t>(lhs[static_cast<size_t>(edge_idx[eid]) * d + f]);
+                    }
+                    emit(eid, u_val);
+                }
             }
         }
     }
 }
 
-// Light bucket of the sum edge gradient: block (tile_x, node_y), one
-// destination per y-row, its whole in-edge list.
-template <BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t = cuda_t, FloatingNum accum_t = float>
+template <FloatingNum cuda_t, int STAGES>
+__host__ __device__ inline size_t gspmm_edge_grad_shmem_bytes(size_t threads) {
+    return (STAGES > 0) ? ((threads * static_cast<size_t>(STAGES) * sizeof(cuda_t) + 15) / 16) * 16 : 0;
+}
+
+template <
+    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t = cuda_t, FloatingNum accum_t = float,
+    int PIPELINE_STAGES = 0
+>
 __global__ void gspmm_backward_edge_light_kernel(
     index_t const *const __restrict__ light_nodes,
     index_t const *const __restrict__ edge_ptr,
@@ -101,55 +129,70 @@ __global__ void gspmm_backward_edge_light_kernel(
     size_t num_light,
     size_t d
 ) {
+    extern __shared__ __align__(16) uint8_t edge_light_raw[];
+    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
+    cuda_t *const dbuf = reinterpret_cast<cuda_t *>(edge_light_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
+
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
     if (i >= num_light) {
         return;  // a whole y-row leaves together, so the broadcast shuffles below stay full-warp
     }
     const index_t v = light_nodes[i];
-    gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t>(
-        static_cast<size_t>(v), edge_ptr[v], edge_ptr[v + 1], threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d
+    gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES>(
+        static_cast<size_t>(v), edge_ptr[v], edge_ptr[v + 1], threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf
     );
 }
 
-// Heavy bucket of the sum edge gradient: grid (heavy node, edge chunk), block
-// (features, tiles).  Nothing is reduced across edges here, so a hub's edge
-// list is simply cut into chunks of CHUNK_EDGES and every chunk gets a block of
-// its own -- the slicing the forward needs a partials buffer for comes free.
-// Blocks stride over the chunks, so any gridDim.y is correct; the launcher
-// sizes it from the largest degree it knows about.
 template <
     BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, size_t CHUNK_EDGES, FloatingNum grad_t = cuda_t,
-    FloatingNum accum_t = float
+    FloatingNum accum_t = float, int PIPELINE_STAGES = 0
 >
 __global__ void gspmm_backward_edge_heavy_kernel(
     index_t const *const __restrict__ heavy_nodes,
+    index_t const *const __restrict__ slice_offsets,
     index_t const *const __restrict__ edge_ptr,
     index_t const *const __restrict__ edge_idx,
     cuda_t const *const __restrict__ grad_out,
     cuda_t const *const __restrict__ lhs,
     cuda_t const *const __restrict__ rhs,
     grad_t *const __restrict__ grad_rhs,
+    size_t num_heavy,
     size_t d
 ) {
-    const index_t v         = heavy_nodes[blockIdx.x];
-    const index_t row_start = edge_ptr[v];
-    const index_t row_end   = edge_ptr[v + 1];
-    const size_t degree     = static_cast<size_t>(row_end - row_start);
+    extern __shared__ __align__(16) uint8_t edge_heavy_raw[];
+    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
+    cuda_t *const dbuf = reinterpret_cast<cuda_t *>(edge_heavy_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
 
     const size_t tiles = blockDim.y;
     const size_t tid   = threadIdx.y;
 
-    for (size_t chunk = blockIdx.y; chunk * CHUNK_EDGES < degree; chunk += gridDim.y) {
-        const size_t c_begin   = chunk * CHUNK_EDGES;
-        const size_t c_len     = min(CHUNK_EDGES, degree - c_begin);
-        const size_t per_tile  = (c_len + tiles - 1) / tiles;
-        const size_t t_begin   = min(tid * per_tile, c_len);
-        const size_t t_end     = min(t_begin + per_tile, c_len);
-        const index_t e_begin  = row_start + static_cast<index_t>(c_begin + t_begin);
-        const index_t e_end    = row_start + static_cast<index_t>(c_begin + t_end);
-        gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t>(
-            static_cast<size_t>(v), e_begin, e_end, threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d
+    // Edges [c_begin, c_begin + c_len) of heavy node i, split across the tiles.
+    auto process = [&](size_t i, size_t c_begin, size_t c_len) {
+        const index_t v         = heavy_nodes[i];
+        const index_t row_start = edge_ptr[v];
+        const size_t per_tile   = (c_len + tiles - 1) / tiles;
+        const size_t t_begin    = min(tid * per_tile, c_len);
+        const size_t t_end      = min(t_begin + per_tile, c_len);
+        gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES>(
+            static_cast<size_t>(v), row_start + static_cast<index_t>(c_begin + t_begin), row_start + static_cast<index_t>(c_begin + t_end),
+            threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf
         );
+    };
+
+    if (slice_offsets == nullptr) {
+        const index_t v = heavy_nodes[blockIdx.x];
+        process(blockIdx.x, 0, static_cast<size_t>(edge_ptr[v + 1] - edge_ptr[v]));
+        return;
+    }
+
+    const size_t total_slices = static_cast<size_t>(slice_offsets[num_heavy]);
+    for (size_t slice = blockIdx.x; slice < total_slices; slice += gridDim.x) {
+        const size_t i       = csr_row_of<index_t>(slice_offsets, num_heavy, slice);
+        const size_t chunk   = slice - static_cast<size_t>(slice_offsets[i]);
+        const index_t v      = heavy_nodes[i];
+        const size_t degree  = static_cast<size_t>(edge_ptr[v + 1] - edge_ptr[v]);
+        const size_t c_begin = chunk * CHUNK_EDGES;
+        process(i, c_begin, min(CHUNK_EDGES, degree - c_begin));
     }
 }
 
