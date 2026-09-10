@@ -610,7 +610,9 @@ std::vector<torch::Tensor> gspmm_backward_arg(
     const std::string& op,
     int warps_per_block,
     int features_per_block,
-    int tiles_y
+    int tiles_y,
+    int max_degree,
+    int pipeline_stages
 ) {
     const BinaryOp bop = binary_op_from_string(op);
 
@@ -666,20 +668,42 @@ std::vector<torch::Tensor> gspmm_backward_arg(
                   : bcast     ? torch::zeros(rhs.sizes(), accum_opts)
                               : torch::empty(rhs.sizes(), value_opts);
 
+    // Same gate as the forward, on the transposed CSR: a source hub holding a
+    // sixteenth of the edge list gets its out-edges cut into blocks of
+    // kGSpMMHeavySliceEdges, and the chunks' partial node gradients are folded
+    // by a second pass.  Below the gate every heavy source is one block.
+    // max_degree is the top *out*-degree; -1 means "unknown" and leaves
+    // slicing off.
+    const bool slice_heavy =
+        (num_heavy > 0 && max_degree > kGSpMMHeavySliceEdges && static_cast<int64_t>(max_degree) * kGSpMMHeavySliceShare > num_edges);
+
+    torch::Tensor slice_offsets;
+    torch::Tensor slice_partials;
+    if (slice_heavy) {
+        const HeavySlices slices = heavy_slice_offsets(bwd_edge_ptr, heavy_nodes, num_edges, kGSpMMHeavySliceEdges);
+        slice_offsets            = slices.offsets;
+        if (uses_lhs) {
+            // Sized from the bound, not the real count, which only the device knows.
+            slice_partials = torch::empty({slices.max_slices, d}, accum_opts);
+        }
+    }
+
     BucketStreams streams(
         num_light > 0 && num_heavy > 0,
-        {&grad_out, &arg_eid, &bwd_edge_ptr, &bwd_edge_idx, &bwd_edge_map, &lhs, &rhs, &heavy_nodes, &grad_lhs, &grad_rhs}
+        {&grad_out, &arg_eid, &bwd_edge_ptr, &bwd_edge_idx, &bwd_edge_map, &lhs, &rhs, &heavy_nodes, &grad_lhs, &grad_rhs, &slice_offsets,
+         &slice_partials}
     );
 
     // No reducer axis here: min and max share one gather.
     std::visit(
-        [&](auto idxInfo, auto typeInfo, auto op_c, auto bcast_c) {
+        [&](auto idxInfo, auto typeInfo, auto op_c, auto bcast_c, auto stages_c) {
             using index_t = typename decltype(idxInfo)::Type;
             using torch_t = typename decltype(typeInfo)::TorchType;
             using cuda_t  = typename decltype(typeInfo)::CudaType;
 
             constexpr BinaryOp BOP = static_cast<BinaryOp>(decltype(op_c)::value);
             constexpr bool BCAST   = decltype(bcast_c)::value;
+            constexpr int STAGES   = decltype(stages_c)::value;
             using BOps             = BinaryOps<BOP>;
 
             if constexpr (BCAST && !BOps::USE_RHS) {
@@ -703,8 +727,17 @@ std::vector<torch::Tensor> gspmm_backward_arg(
 
                 if (num_light > 0) {
                     const LightShape shape = light_launch_shape(warps_per_block, d, BCAST, num_light);
-                    gspmm_backward_arg_light_kernel<BOP, BCAST, cuda_t, index_t, grad_rhs_t>
-                        <<<shape.blocks, shape.block, 0, streams.main>>>(
+                    const size_t shmem_l   = gspmm_arg_grad_shmem_bytes<index_t, STAGES>(
+                        static_cast<size_t>(shape.block.x) * static_cast<size_t>(shape.block.y)
+                    );
+                    if constexpr (STAGES > 0) {
+                        ensure_dynamic_shmem(
+                            gspmm_backward_arg_light_kernel<BOP, BCAST, cuda_t, index_t, grad_rhs_t, float, STAGES>, shmem_l,
+                            "gspmm backward arg light"
+                        );
+                    }
+                    gspmm_backward_arg_light_kernel<BOP, BCAST, cuda_t, index_t, grad_rhs_t, float, STAGES>
+                        <<<shape.blocks, shape.block, shmem_l, streams.main>>>(
                             index_ptr<index_t>(light_nodes),
                             index_ptr<index_t>(bwd_edge_ptr),
                             index_ptr<index_t>(bwd_edge_idx),
@@ -722,9 +755,29 @@ std::vector<torch::Tensor> gspmm_backward_arg(
 
                 if (num_heavy > 0) {
                     const dim3 block_h(BCAST ? static_cast<unsigned>(kWarpSize) : static_cast<unsigned>(features_per_block), static_cast<unsigned>(tiles_y));
-                    gspmm_backward_arg_heavy_kernel<BOP, BCAST, cuda_t, index_t, grad_rhs_t>
-                        <<<static_cast<unsigned>(num_heavy), block_h, 0, streams.heavy>>>(
+                    // Sliced: sized for occupancy, the kernel grid-strides over
+                    // a chunk count only the device knows.  Unsliced: a block
+                    // per heavy source.
+                    unsigned grid_h = static_cast<unsigned>(num_heavy);
+                    if (slice_heavy) {
+                        const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+                        grid_h             = static_cast<unsigned>(std::max(sm_count * 16, 1));
+                    }
+                    const size_t shmem_h = gspmm_arg_grad_shmem_bytes<index_t, STAGES>(
+                        static_cast<size_t>(block_h.x) * static_cast<size_t>(block_h.y)
+                    );
+                    if constexpr (STAGES > 0) {
+                        ensure_dynamic_shmem(
+                            gspmm_backward_arg_heavy_kernel<
+                                BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), grad_rhs_t, float, STAGES>,
+                            shmem_h, "gspmm backward arg heavy"
+                        );
+                    }
+                    gspmm_backward_arg_heavy_kernel<
+                        BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), grad_rhs_t, float, STAGES>
+                        <<<grid_h, block_h, shmem_h, streams.heavy>>>(
                             index_ptr<index_t>(heavy_nodes),
+                            slice_offsets.defined() ? index_ptr<index_t>(slice_offsets) : nullptr,
                             index_ptr<index_t>(bwd_edge_ptr),
                             index_ptr<index_t>(bwd_edge_idx),
                             index_ptr<index_t>(bwd_edge_map),
@@ -734,15 +787,39 @@ std::vector<torch::Tensor> gspmm_backward_arg(
                             rhs_ptr,
                             grad_lhs_ptr,
                             grad_rhs_ptr,
+                            slice_partials.defined() ? slice_partials.data_ptr<float>() : nullptr,
+                            static_cast<size_t>(num_heavy),
                             static_cast<size_t>(d)
                         );
+
+                    if (slice_heavy && uses_lhs) {
+                        // Fold each hub's chunk partials in chunk order into
+                        // grad_lhs[u].  The forward's slice reducer, with the
+                        // sum reducer and no arg to carry.
+                        const unsigned reduce_threads = 256;
+                        const unsigned reduce_blocks  = static_cast<unsigned>(
+                            std::min<int64_t>((num_heavy * d + reduce_threads - 1) / reduce_threads, 65535)
+                        );
+                        gspmm_heavy_reduce_slices_kernel<cuda_t, index_t, ReductionOp::SUM>
+                            <<<std::max(reduce_blocks, 1u), reduce_threads, 0, streams.heavy>>>(
+                                index_ptr<index_t>(heavy_nodes),
+                                index_ptr<index_t>(slice_offsets),
+                                slice_partials.data_ptr<float>(),
+                                nullptr,
+                                grad_lhs_ptr,
+                                nullptr,
+                                static_cast<size_t>(num_heavy),
+                                static_cast<size_t>(d)
+                            );
+                    }
                 }
             }
         },
         MakeIndexVariant<int32_t, int64_t>(bwd_edge_ptr.scalar_type()),
         MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
-        MakeBoolVariant<false, true>(bcast)
+        MakeBoolVariant<false, true>(bcast),
+        MakeIntVariant<0, 1, 2, 4>(pipeline_stages)
     );
 
     streams.join();

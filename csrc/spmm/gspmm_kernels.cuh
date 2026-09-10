@@ -214,7 +214,18 @@ __global__ void gspmm_backward_edge_heavy_kernel(
 // the shuffles -- and the fold over the feature chunks is a plain accumulate
 // into a float slot that this warp alone owns, so it needs no atomic either,
 // only the zero fill the launcher provides.
-template <BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_rhs_t, FloatingNum accum_t>
+//
+// With PIPELINE_STAGES > 0 the one dependent gather of the loop, the winner
+// arg_eid[v, f] behind v = bwd_edge_idx[b], is prefetched PIPELINE_STAGES edges
+// ahead through a per-thread cp.async pipeline into dbuf (this thread's own
+// PIPELINE_STAGES index_t of shared memory).  grad_out and the operands are
+// only read on a hit, about one edge in avg-degree, and stay synchronous.  A
+// lane past d prefetches a clamped, in-bounds address and discards it, so the
+// trip count stays warp-uniform for the broadcast shuffles.
+template <
+    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_rhs_t, FloatingNum accum_t,
+    int PIPELINE_STAGES = 0
+>
 __device__ __forceinline__ accum_t gspmm_arg_grad_span(
     size_t u,
     index_t b_begin,
@@ -227,10 +238,13 @@ __device__ __forceinline__ accum_t gspmm_arg_grad_span(
     cuda_t const *const __restrict__ lhs,
     cuda_t const *const __restrict__ rhs,
     grad_rhs_t *const __restrict__ grad_rhs,
-    size_t d
+    size_t d,
+    index_t *const dbuf = nullptr
 ) {
     using BOps        = BinaryOps<BOp>;
     const bool active = f < d;
+
+    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
 
     accum_t u_val{};
     if constexpr (BOps::GRAD_USES_OPERANDS) {
@@ -240,21 +254,17 @@ __device__ __forceinline__ accum_t gspmm_arg_grad_span(
     }
 
     accum_t acc{};
-    for (index_t b = b_begin; b < b_end; ++b) {
-        const index_t v = bwd_edge_idx[b];
-        const index_t e = bwd_edge_map[b];
 
-        bool hit = false;
+    // One backward position: destination v, forward edge e, and whether e is
+    // the winner the forward recorded at (v, f).
+    auto consume = [&](index_t v, index_t e, bool won) {
+        const bool hit = active && won;
         accum_t g{};
         accum_t e_val{};
-        if (active) {
-            const size_t at = static_cast<size_t>(v) * d + f;
-            hit             = (arg_eid[at] == e);
-            if (hit) {
-                g = static_cast<accum_t>(grad_out[at]);
-                if constexpr (BOps::GRAD_USES_OPERANDS) {
-                    e_val = static_cast<accum_t>(RHS_BROADCAST ? rhs[static_cast<size_t>(e)] : rhs[static_cast<size_t>(e) * d + f]);
-                }
+        if (hit) {
+            g = static_cast<accum_t>(grad_out[static_cast<size_t>(v) * d + f]);
+            if constexpr (BOps::GRAD_USES_OPERANDS) {
+                e_val = static_cast<accum_t>(RHS_BROADCAST ? rhs[static_cast<size_t>(e)] : rhs[static_cast<size_t>(e) * d + f]);
             }
         }
 
@@ -274,15 +284,64 @@ __device__ __forceinline__ accum_t gspmm_arg_grad_span(
                 grad_rhs[static_cast<size_t>(e) * d + f] = static_cast<grad_rhs_t>(c);
             }
         }
+    };
+
+    if constexpr (PIPELINE_STAGES > 0) {
+        constexpr int NUM_STAGES = PIPELINE_STAGES;
+        const size_t f_c         = active ? f : d - 1;  // in-bounds address for an idle lane
+        const index_t num_b      = b_end - b_begin;
+
+        index_t v_buf[NUM_STAGES];
+        cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
+
+        auto prefetch = [&](index_t it) {
+            pipe.producer_acquire();
+            if (it < num_b) {
+                const index_t v           = bwd_edge_idx[b_begin + it];
+                v_buf[it % NUM_STAGES]    = v;
+                index_t const *const src  = arg_eid + static_cast<size_t>(v) * d + f_c;
+                cuda::memcpy_async(dbuf + it % NUM_STAGES, src, cuda::aligned_size_t<sizeof(index_t)>(sizeof(index_t)), pipe);
+            }
+            pipe.producer_commit();
+        };
+
+#pragma unroll
+        for (int s = 0; s < NUM_STAGES; ++s) {
+            prefetch(static_cast<index_t>(s));
+        }
+
+        for (index_t it = 0; it < num_b; ++it) {
+            cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
+            const index_t e = bwd_edge_map[b_begin + it];
+            consume(v_buf[it % NUM_STAGES], e, dbuf[it % NUM_STAGES] == e);
+            pipe.consumer_release();
+            prefetch(it + NUM_STAGES);
+        }
+    } else {
+        for (index_t b = b_begin; b < b_end; ++b) {
+            const index_t v = bwd_edge_idx[b];
+            const index_t e = bwd_edge_map[b];
+            const bool won  = active && (arg_eid[static_cast<size_t>(v) * d + f] == e);
+            consume(v, e, won);
+        }
     }
     return acc;
+}
+
+// Dynamic shared memory of the two min/max backward kernels: with the pipeline
+// on, STAGES prefetch slots of index_t per thread, else nothing.  The launcher
+// sizes its allocation with this same function.
+template <typename index_t, int STAGES>
+__host__ __device__ inline size_t gspmm_arg_grad_shmem_bytes(size_t threads) {
+    return (STAGES > 0) ? ((threads * static_cast<size_t>(STAGES) * sizeof(index_t) + 15) / 16) * 16 : 0;
 }
 
 // Light bucket of the min/max backward: block (tile_x, node_y), one source
 // per y-row, its whole out-edge list.  Feature chunks are the outer loop, so
 // the trip count is uniform across the row's threads.
 template <
-    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_rhs_t = cuda_t, FloatingNum accum_t = float
+    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_rhs_t = cuda_t, FloatingNum accum_t = float,
+    int PIPELINE_STAGES = 0
 >
 __global__ void gspmm_backward_arg_light_kernel(
     index_t const *const __restrict__ light_nodes,
@@ -300,6 +359,10 @@ __global__ void gspmm_backward_arg_light_kernel(
 ) {
     using BOps = BinaryOps<BOp>;
 
+    extern __shared__ __align__(16) uint8_t arg_light_raw[];
+    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
+    index_t *const dbuf = reinterpret_cast<index_t *>(arg_light_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
+
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
     if (i >= num_light) {
         return;  // a whole y-row leaves together, so the broadcast shuffles stay full-warp
@@ -310,8 +373,8 @@ __global__ void gspmm_backward_arg_light_kernel(
 
     for (size_t f0 = 0; f0 < d; f0 += blockDim.x) {
         const size_t f    = f0 + threadIdx.x;
-        const accum_t acc = gspmm_arg_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_rhs_t, accum_t>(
-            static_cast<size_t>(u), b_begin, b_end, f, bwd_edge_idx, bwd_edge_map, arg_eid, grad_out, lhs, rhs, grad_rhs, d
+        const accum_t acc = gspmm_arg_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_rhs_t, accum_t, PIPELINE_STAGES>(
+            static_cast<size_t>(u), b_begin, b_end, f, bwd_edge_idx, bwd_edge_map, arg_eid, grad_out, lhs, rhs, grad_rhs, d, dbuf
         );
         if constexpr (BOps::USE_LHS) {
             if (f < d) {
@@ -321,18 +384,32 @@ __global__ void gspmm_backward_arg_light_kernel(
     }
 }
 
-// Heavy bucket of the min/max backward: one block per source, block
-// (features, tiles); the tiles split the out-edge list and their partial node
-// gradients meet in a shared-memory tree, as in the forward's heavy kernel.
-// Shared memory holds one float per thread; the launcher keeps the block
-// within kGSpMMArgHeavyMaxThreads and tiles a power of two.
+// Heavy bucket of the min/max backward: block (features, tiles); the tiles
+// split an out-edge span and their partial node gradients meet in a
+// shared-memory tree, as in the forward's heavy kernel.  Shared memory holds
+// one float per thread for that tree; the launcher keeps the block within
+// kGSpMMArgHeavyMaxThreads and tiles a power of two.
+//
+// Two launch shapes, told apart by slice_offsets:
+//
+// - nullptr: block i owns heavy source i whole and writes grad_lhs[u] itself.
+// - otherwise a hub's out-edges are cut into chunks of CHUNK_EDGES with a block
+//   each, found through the exclusive prefix sum of chunk counts in
+//   slice_offsets (shaped like a CSR row pointer, last entry the total), and
+//   the blocks grid-stride over the chunks.  A chunk's node gradient goes to
+//   its own row of `partials`, which gspmm_heavy_reduce_slices_kernel<SUM>
+//   then folds per node in chunk order -- no atomics, so the result does not
+//   depend on which chunk finishes first.  The edge gradient needs no fold:
+//   every forward edge sits in exactly one chunk.
 inline constexpr size_t kGSpMMArgHeavyMaxThreads = 1024;
 
 template <
-    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_rhs_t = cuda_t, FloatingNum accum_t = float
+    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, size_t CHUNK_EDGES, FloatingNum grad_rhs_t = cuda_t,
+    FloatingNum accum_t = float, int PIPELINE_STAGES = 0
 >
 __global__ void gspmm_backward_arg_heavy_kernel(
     index_t const *const __restrict__ heavy_nodes,
+    index_t const *const __restrict__ slice_offsets,
     index_t const *const __restrict__ bwd_edge_ptr,
     index_t const *const __restrict__ bwd_edge_idx,
     index_t const *const __restrict__ bwd_edge_map,
@@ -342,47 +419,72 @@ __global__ void gspmm_backward_arg_heavy_kernel(
     cuda_t const *const __restrict__ rhs,
     cuda_t *const __restrict__ grad_lhs,
     grad_rhs_t *const __restrict__ grad_rhs,
+    accum_t *const __restrict__ partials,
+    size_t num_heavy,
     size_t d
 ) {
     using BOps = BinaryOps<BOp>;
-    __shared__ accum_t partials[kGSpMMArgHeavyMaxThreads];
+    __shared__ accum_t tree[kGSpMMArgHeavyMaxThreads];
 
-    const index_t u         = heavy_nodes[blockIdx.x];
-    const index_t row_start = bwd_edge_ptr[u];
-    const index_t row_end   = bwd_edge_ptr[u + 1];
-    const size_t degree     = static_cast<size_t>(row_end - row_start);
+    extern __shared__ __align__(16) uint8_t arg_heavy_raw[];
+    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
+    index_t *const dbuf = reinterpret_cast<index_t *>(arg_heavy_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
 
     const size_t fid     = threadIdx.x;
     const size_t tid     = threadIdx.y;
     const size_t F_BLOCK = blockDim.x;
     const size_t TILES_Y = blockDim.y;
 
-    const size_t per_tile  = (degree + TILES_Y - 1) / TILES_Y;
-    const size_t t_begin   = min(tid * per_tile, degree);
-    const size_t t_end     = min(t_begin + per_tile, degree);
-    const index_t b_begin  = row_start + static_cast<index_t>(t_begin);
-    const index_t b_end    = row_start + static_cast<index_t>(t_end);
+    // Out-edges [c_begin, c_begin + c_len) of heavy source i, split across the
+    // tiles; the span's node gradient for feature f leaves through store(f, val).
+    auto process = [&](size_t i, size_t c_begin, size_t c_len, auto&& store) {
+        const index_t u         = heavy_nodes[i];
+        const index_t row_start = bwd_edge_ptr[u];
+        const size_t per_tile   = (c_len + TILES_Y - 1) / TILES_Y;
+        const size_t t_begin    = min(tid * per_tile, c_len);
+        const size_t t_end      = min(t_begin + per_tile, c_len);
+        const index_t b_begin   = row_start + static_cast<index_t>(c_begin + t_begin);
+        const index_t b_end     = row_start + static_cast<index_t>(c_begin + t_end);
 
-    for (size_t f0 = 0; f0 < d; f0 += F_BLOCK) {
-        const size_t f    = f0 + fid;
-        const accum_t acc = gspmm_arg_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_rhs_t, accum_t>(
-            static_cast<size_t>(u), b_begin, b_end, f, bwd_edge_idx, bwd_edge_map, arg_eid, grad_out, lhs, rhs, grad_rhs, d
-        );
+        for (size_t f0 = 0; f0 < d; f0 += F_BLOCK) {
+            const size_t f    = f0 + fid;
+            const accum_t acc = gspmm_arg_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_rhs_t, accum_t, PIPELINE_STAGES>(
+                static_cast<size_t>(u), b_begin, b_end, f, bwd_edge_idx, bwd_edge_map, arg_eid, grad_out, lhs, rhs, grad_rhs, d, dbuf
+            );
 
-        if constexpr (BOps::USE_LHS) {
-            partials[tid * F_BLOCK + fid] = acc;
-            __syncthreads();
-            for (size_t offset = TILES_Y / 2; offset > 0; offset /= 2) {
-                if (tid < offset) {
-                    partials[tid * F_BLOCK + fid] += partials[(tid + offset) * F_BLOCK + fid];
+            if constexpr (BOps::USE_LHS) {
+                tree[tid * F_BLOCK + fid] = acc;
+                __syncthreads();
+                for (size_t offset = TILES_Y / 2; offset > 0; offset /= 2) {
+                    if (tid < offset) {
+                        tree[tid * F_BLOCK + fid] += tree[(tid + offset) * F_BLOCK + fid];
+                    }
+                    __syncthreads();
+                }
+                if (tid == 0 && f < d) {
+                    store(f, tree[fid]);
                 }
                 __syncthreads();
             }
-            if (tid == 0 && f < d) {
-                grad_lhs[static_cast<size_t>(u) * d + f] = static_cast<cuda_t>(partials[fid]);
-            }
-            __syncthreads();
         }
+    };
+
+    if (slice_offsets == nullptr) {
+        const index_t u = heavy_nodes[blockIdx.x];
+        process(blockIdx.x, 0, static_cast<size_t>(bwd_edge_ptr[u + 1] - bwd_edge_ptr[u]), [&](size_t f, accum_t val) {
+            grad_lhs[static_cast<size_t>(u) * d + f] = static_cast<cuda_t>(val);
+        });
+        return;
+    }
+
+    const size_t total_slices = static_cast<size_t>(slice_offsets[num_heavy]);
+    for (size_t slice = blockIdx.x; slice < total_slices; slice += gridDim.x) {
+        const size_t i       = csr_row_of<index_t>(slice_offsets, num_heavy, slice);
+        const size_t chunk   = slice - static_cast<size_t>(slice_offsets[i]);
+        const index_t u      = heavy_nodes[i];
+        const size_t degree  = static_cast<size_t>(bwd_edge_ptr[u + 1] - bwd_edge_ptr[u]);
+        const size_t c_begin = chunk * CHUNK_EDGES;
+        process(i, c_begin, min(CHUNK_EDGES, degree - c_begin), [&](size_t f, accum_t val) { partials[slice * d + f] = val; });
     }
 }
 

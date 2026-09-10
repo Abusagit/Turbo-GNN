@@ -48,7 +48,13 @@ std::vector<torch::Tensor> gspmm_backward_arg(
     const std::string& op,
     int warps_per_block    = 8,
     int features_per_block = 32,
-    int tiles_y            = 8
+    int tiles_y            = 8,
+    // Largest out-degree of the transposed CSR (bwd_edge_ptr), gating the
+    // heavy-bucket slicing exactly as max_degree does in gspmm_forward; -1
+    // means "unknown" and leaves slicing off.
+    int max_degree         = -1,
+    // cp.async prefetch depth of the arg_eid gather, 0 disables.
+    int pipeline_stages    = 0
 );
 
 // Gradient w.r.t. the edge operand of a sum reduction, walking the forward CSR

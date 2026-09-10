@@ -10,7 +10,12 @@ paths are invisible at that size:
 * the edge gradient's load balance only matters when one node holds a large
   share of the edges.
 
-So this module carries its own reference and a hub graph that reaches those.
+A third one hides at the other end: the min/max backward walks the transposed
+CSR only while the graph is sparse (E <= 10 N) and scatters over the winning
+edges otherwise, so a dense graph is needed to reach the scatter at all.
+
+So this module carries its own reference, a hub graph that reaches the first
+two and a dense graph that reaches the third.
 """
 
 import pytest
@@ -207,6 +212,50 @@ def hub_graph():
     return graph, num_nodes
 
 
+@pytest.fixture(scope="module")
+def source_hub_graph():
+    """Three sources of out-degree ~5000, everyone else ~3.
+
+    The mirror image of hub_graph: the hubs sit in the *transposed* CSR, which
+    is what the min/max backward walks, so this is the fixture that reaches its
+    sliced heavy path.  Sparse enough (E <= 10 N) to stay off the scatter
+    fallback.
+    """
+    device = "cuda"
+    num_nodes, hubs, hub_degree = 4000, 3, 5000
+    g = torch.Generator(device=device).manual_seed(0)
+
+    hub_src = torch.arange(hubs, device=device).repeat_interleave(hub_degree)
+    hub_dst = torch.randint(0, num_nodes, (hubs * hub_degree,), device=device, generator=g)
+    src = torch.randint(0, num_nodes, (num_nodes * 2,), device=device, generator=g)
+    dst = torch.randint(0, num_nodes, (num_nodes * 2,), device=device, generator=g)
+    loops = torch.arange(num_nodes, device=device)
+
+    edge_index = torch.stack([torch.cat([hub_src, src, loops]), torch.cat([hub_dst, dst, loops])])
+    graph = _build(edge_index, num_nodes, device)
+    num_edges = graph.forward_indices.numel()
+    assert graph.backward_max_degree > 1024, f"fixture does not reach the sliced path (backward_max_degree={graph.backward_max_degree})"
+    assert graph.backward_max_degree * 16 > num_edges, "fixture does not pass the slice share gate"
+    assert num_edges <= 10 * num_nodes, "fixture would take the scatter fallback"
+    return graph, num_nodes
+
+
+@pytest.fixture(scope="module")
+def dense_graph():
+    """Uniform, ~degree 25: above the average degree at which the min/max
+    backward switches from the transposed walk to the scatter over arg_eid."""
+    device = "cuda"
+    num_nodes, num_edges = 400, 9600
+    g = torch.Generator(device=device).manual_seed(0)
+    src = torch.randint(0, num_nodes, (num_edges,), device=device, generator=g)
+    dst = torch.randint(0, num_nodes, (num_edges,), device=device, generator=g)
+    loops = torch.arange(num_nodes, device=device)
+    edge_index = torch.stack([torch.cat([src, loops]), torch.cat([dst, loops])])
+    graph = _build(edge_index, num_nodes, device)
+    assert graph.forward_indices.numel() > 10 * num_nodes, "fixture does not reach the scatter path"
+    return graph, num_nodes
+
+
 def _operands(op, num_edges, num_nodes, d, dtype, broadcast, seed=1):
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = None
@@ -220,11 +269,11 @@ def _operands(op, num_edges, num_nodes, d, dtype, broadcast, seed=1):
     return x, e
 
 
-def _check_cell(graph, num_nodes, op, reduce, d, dtype, broadcast=False):
+def _check_cell(graph, num_nodes, op, reduce, d, dtype, broadcast=False, **gspmm_kwargs):
     indptr, indices = graph.forward_indptr, graph.forward_indices
     x, e = _operands(op, indices.numel(), num_nodes, d, dtype, broadcast)
 
-    out = gspmm(graph, x, e, op=op, reduce=reduce)
+    out = gspmm(graph, x, e, op=op, reduce=reduce, **gspmm_kwargs)
     ref, win = _forward_ref(indptr, indices, x, e, op, reduce, num_nodes, d, dtype)
     _assert_close(f"{op}/{reduce} d={d} forward", out, ref, dtype)
 
@@ -260,3 +309,55 @@ def test_high_degree_matches_torch_reference(hub_graph, op, reduce, d, dtype):
     """Same table on a graph whose top degree reaches the sliced heavy path."""
     graph, num_nodes = hub_graph
     _check_cell(graph, num_nodes, op, reduce, d, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("d", [1, 32, 65])
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("op", OPS)
+def test_dense_min_max_matches_torch_reference(dense_graph, op, reduce, d, dtype):
+    """The min/max backward on a graph dense enough for the scatter fallback."""
+    graph, num_nodes = dense_graph
+    _check_cell(graph, num_nodes, op, reduce, d, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("op", BROADCASTABLE_OPS)
+def test_dense_broadcast_min_max_matches_torch_reference(dense_graph, op, reduce, dtype):
+    graph, num_nodes = dense_graph
+    _check_cell(graph, num_nodes, op, reduce, 32, dtype, broadcast=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("d", [1, 32, 65])
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("op", OPS)
+def test_source_hub_min_max_matches_torch_reference(source_hub_graph, op, reduce, d, dtype):
+    """The min/max backward on a graph whose hubs are sources: its heavy
+    bucket is sliced across blocks and folded by the reduce pass."""
+    graph, num_nodes = source_hub_graph
+    _check_cell(graph, num_nodes, op, reduce, d, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("op", BROADCASTABLE_OPS)
+def test_source_hub_broadcast_min_max_matches_torch_reference(source_hub_graph, op, reduce, dtype):
+    graph, num_nodes = source_hub_graph
+    _check_cell(graph, num_nodes, op, reduce, 32, dtype, broadcast=True)
+
+
+@pytest.mark.parametrize("broadcast", [False, True])
+@pytest.mark.parametrize("pipeline_stages", [1, 2])
+@pytest.mark.parametrize("fixture", ["small_graph", "source_hub_graph"])
+@pytest.mark.parametrize("reduce", ["min", "max"])
+@pytest.mark.parametrize("op", OPS)
+def test_min_max_pipeline_matches_torch_reference(request, fixture, op, reduce, pipeline_stages, broadcast):
+    """The cp.async prefetch of the arg_eid gather in the min/max backward: on
+    the small graph and on the sliced source-hub graph, full-width and in the
+    warp-folded broadcast layout."""
+    if broadcast and op not in BROADCASTABLE_OPS:
+        pytest.skip("op has no broadcastable edge operand")
+    graph, num_nodes = request.getfixturevalue(fixture)
+    _check_cell(graph, num_nodes, op, reduce, 32, torch.float32, broadcast=broadcast, pipeline_stages=pipeline_stages)
