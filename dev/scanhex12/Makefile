@@ -9,7 +9,9 @@
 #   make dgl-one GRAPH=web-fraud   one graph, one dtype, in the foreground
 #   make before-after BEFORE=<ref> AFTER=<ref> BG=1   turbo vs turbo across two commits
 #   make summary                   markdown tables + per-graph diff against the archived results
-#   make plots                     redraw every chart from results/ and publish into dev/scanhex12/
+#   make plots                     per-cell charts from results/, published as fp32_forward.png etc.
+#   make plots-pergraph            one bar per graph (geomean), published as pergraph_fp32_backward.png etc.
+#   make plot-custom ARGS="--kind bwd --ops copy_u --reducers min,max"   one chart, your selection
 #   make tests                     the g-SpMM correctness suite through the partial-extension shim
 #   make prepare-graph NAMES="cora pubmed"   add graphs to the cache (runs under PYTHON_DGL)
 #
@@ -118,10 +120,10 @@ endef
 endif
 
 .PHONY: help snapshot need-snap no-sweep-running archive-results dgl-16graphs dgl-matrix dgl-products dgl-one \
-        before-after summary plots tests prepare-graph gpu
+        before-after summary plots plots-pergraph plot-custom tests prepare-graph gpu
 
 help:
-	@sed -n '2,21p' $(lastword $(MAKEFILE_LIST)) | sed 's/^# \{0,1\}//'
+	@sed -n '2,23p' $(lastword $(MAKEFILE_LIST)) | sed 's/^# \{0,1\}//'
 	@echo
 	@echo "current SNAP:      $(SNAP) -> $(SNAP_REAL)"
 	@echo "extension name:    $(EXT_NAME)"
@@ -210,8 +212,38 @@ summary:
 		done
 	done
 
+# Per-cell charts: one bar per (graph, op, reducer) at d=64, drawn from every
+# results_*_<tag>.json, then copied up here as fp32_forward.png etc.
 plots:
-	cd $(VS_DGL) && env PLOTS_ONLY=1 PYTHON_PLOT=$(PYTHON_PLOT) DTYPES="$(DTYPES)" STAGES_LIST="$(STAGES_LIST)" ./run_matrix.sh
+	cd $(VS_DGL) && env PLOTS_ONLY=1 PYTHON_PLOT=$(PYTHON_PLOT) DTYPES="$(DTYPES)" STAGES_LIST="$(STAGES_LIST)" REPEATS=$(REPEATS) ITERS=$(ITERS) ./run_matrix.sh
+
+# Per-graph charts: one bar per graph, geomean over its cells -- the readable
+# view at sixteen graphs.  Published as pergraph_fp32_backward.png etc.
+plots-pergraph:
+	cd $(VS_DGL)
+	n=0
+	for dtype in $(DTYPES); do
+		case $$dtype in float32) short=fp32;; *) short=fp16;; esac
+		for st in $(STAGES_LIST); do
+			tag="$${dtype}_bwd"; stem="$$short"
+			if [ "$$st" != 0 ]; then tag="$${tag}_st$$st"; stem="$${short}_stages$$st"; fi
+			ls results/results_*_$$tag.json >/dev/null 2>&1 || continue
+			for kind in fwd bwd fb; do
+				case $$kind in fwd) word=forward; label="forward";; bwd) word=backward; label="backward";; *) word=fwd_bwd; label="forward+backward";; esac
+				$(PYTHON_PLOT) plot.py results/results_*_$$tag.json --dim $(SUM_DIM) --kind $$kind --per-graph \
+					--title "g-SpMM: turbo_gnn против DGL по графам (d=$(SUM_DIM), $$dtype, $$label, stages=$$st)" \
+					--xlabel "Ускорение: dgl / turbo_gnn, geomean по клеткам графа ($$label)" \
+					-o results/pergraph_d$(SUM_DIM)_$${tag}_$$kind.png
+				cp -p results/pergraph_d$(SUM_DIM)_$${tag}_$$kind.png $(HERE)/pergraph_$${stem}_$$word.png; n=$$((n + 1))
+			done
+		done
+	done
+	echo "published $$n per-graph charts to $(HERE)"
+
+# One chart with your own selection: make plot-custom ARGS="--kind bwd --ops copy_u --reducers min,max"
+ARGS ?=
+plot-custom:
+	cd $(VS_DGL) && $(PYTHON_PLOT) plot.py results/results_*_$(firstword $(DTYPES))_bwd.json --dim $(SUM_DIM) $(ARGS) -o results/custom.png && echo "-> $(VS_DGL)/results/custom.png"
 
 # --- correctness -----------------------------------------------------------
 # The live tree, not the snapshot: this is the gate before taking one.
