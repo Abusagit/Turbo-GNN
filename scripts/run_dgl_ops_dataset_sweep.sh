@@ -2,10 +2,11 @@
 # Benchmark the 32 simple DGL gsddmm ops (via benchmark.py --aggr, raw dgl.ops
 # launched directly, no projections) on every dataset config under configs/datasets/.
 #
-# Per dataset: forward + backward sweeps over the 32 ops in each of 3 dtypes
-# (fp32, fp16, bf16) are written to out/dgl_gspmm/<dataset>_dgl_ops.csv
+# Per dataset, by default: forward + backward sweeps over the 32 ops in each of
+# 3 dtypes (fp32, fp16, bf16) are written to out/dgl_gspmm/<dataset>_dgl_ops.csv
 # (32 ops x 2 modes x 3 dtypes = 192 rows), plus a combined
-# out/dgl_gspmm/all_datasets_dgl_ops.csv at the end.
+# out/dgl_gspmm/all_datasets_dgl_ops.csv at the end. See SUBSETTING below to
+# run a single dtype / mode / dim / dataset.
 #
 # THE OP SET is exactly the overlap with run_cuda_gsddmm_dataset_sweep.sh
 # (see COMPARABILITY below); DGL's other simple ops are deliberately not
@@ -47,7 +48,7 @@
 # belong against reduction_aggr / spmm_aggr, NOT against gsddmm. Our gsddmm
 # kernels are forward-only, so only mode=forward rows have a counterpart; the
 # backward rows are reference data for when a gsddmm backward lands (set
-# MODES="forward" to skip them and halve the runtime).
+# MODES=forward to skip them and halve the runtime).
 #
 # Both scripts must also use the SAME FEATURE_DIMS ladder: a dataset that lands
 # at a different dim on each side is not comparable. Note the existing tables
@@ -56,29 +57,56 @@
 #
 # Env: CUDA_VISIBLE_DEVICES="0" TORCH_CUDA_ARCH_LIST="8.0". Assumes the full
 # 80 GB of GPU RAM is available; if a dataset OOMs, the feature dim is lowered
-# (256 -> 128 -> 64 -> 32) until ALL dtypes and BOTH modes succeed at the same
-# dim, so every dataset's CSV is self-consistent and comparable across
-# precisions. DGL itself accepts any feature dim, but this ladder is pinned to
-# {32, 64, 128, 256} -- the only dims the turbo_gnn kernels accept -- so both
-# sweeps can land on the same dim for the same dataset.
+# (256 -> 128 -> 64 -> 32) until EVERY dtype in $DTYPES and EVERY mode in
+# $MODES succeed at the same dim, so every dataset's CSV is self-consistent and
+# comparable across precisions. DGL itself accepts any feature dim, but this
+# ladder is pinned to {32, 64, 128, 256} -- the only dims the turbo_gnn kernels
+# accept -- so both sweeps can land on the same dim for the same dataset.
 #
 # PYTHON: DGL pins torch==2.4.0, so it cannot share the .venv built for the
 # turbo_gnn CUDA extension (see `make install-bench` vs `make install-dev`).
 # Point PY at a DGL-capable interpreter, e.g.:
 #   PY=~/micromamba/envs/graph_ml/bin/python bash scripts/run_dgl_ops_dataset_sweep.sh
 #
-# FILTER: run only a subset of the datasets with
-#   DATASETS="ogbn-arxiv cora" bash scripts/run_dgl_ops_dataset_sweep.sh
-# Entries match the dataset name with the same '-' -> '_' normalization the
-# script applies, so "city-reviews" and "city_reviews" both work. Use this to
-# retry the datasets a down download host (e.g. Zenodo) failed on without
-# re-benchmarking the ones that already succeeded: a filtered pass writes the
-# same per-dataset CSVs, so the combined table picks everything up.
+# SUBSETTING -- these are env-overridable:
+#   DTYPES        default "fp32 fp16 bf16"     e.g. DTYPES=fp16 for one precision
+#   MODES         default "forward backward"   e.g. MODES=forward (see above)
+#   FEATURE_DIMS  default "256 128 64 32"      e.g. FEATURE_DIMS=128 to pin a dim
+#   OUT_DIR       default out/dgl_gspmm        redirects CSVs, logs and overrides
+#   DATASETS      default "" (= all)           e.g. DATASETS="cora ogbn_arxiv"
+# DATASETS takes the dataset names as they appear in the CSV filenames (so
+# `ls out/dgl_gspmm/*.csv` lists the valid values), space- or comma-separated.
+# Entries get the same '-' -> '_' normalization the script applies to dataset
+# names, so "city-reviews" and "city_reviews" both work. An unrecognised name is
+# a hard error listing the valid ones, rather than a run that silently
+# benchmarks nothing. Use the filter to retry the datasets a down download host
+# (e.g. Zenodo) failed on without re-benchmarking the ones that already
+# succeeded: a filtered pass writes the same per-dataset CSVs, and the combined
+# table is rebuilt from every CSV present in OUT_DIR. That also means a
+# filtered run mixes the refreshed datasets with whatever was there before --
+# fine when only the datasets differ, misleading if DTYPES/MODES/FEATURE_DIMS
+# differed between the runs.
+#
+# Two traps when narrowing DTYPES/MODES -- which is why OUT_DIR is overridable:
+#   1. Each dataset's CSV is deleted and rewritten from scratch, so a
+#      DTYPES=fp16 run against the default OUT_DIR REPLACES a finished 192-row
+#      table with 64 fp16 rows. Point OUT_DIR elsewhere to keep both.
+#   2. The dim picked is the largest at which the SELECTED dtypes and modes
+#      fit. fp32 is the most memory-hungry dtype and backward needs more memory
+#      than forward, so an fp16-only or forward-only run can settle on a LARGER
+#      dim than a full run did, and those numbers are then not comparable with
+#      the full tables. Pin FEATURE_DIMS to the dim the full run used (the
+#      feature_dim column of its CSV) when you need to compare.
+#
+# So, a scratch fp16 forward-only run that touches nothing existing:
+#   DTYPES=fp16 MODES=forward FEATURE_DIMS=128 OUT_DIR=out/dgl_gspmm_fp16 \
+#       bash scripts/run_dgl_ops_dataset_sweep.sh
 #
 # DOWNLOADS: a (dtype, mode) run that dies with a download error (HTTP/gateway/
 # connection/zip) is retried up to 3 times with a short pause; a dataset that
 # still cannot be downloaded after 3 attempts fails and is skipped. Failures
-# that are NOT download errors are not retried.
+# that are NOT download errors are never rerun: an OOM drops the dataset to the
+# next smaller feature dim, anything else fails the dataset outright.
 #
 # DISK: the datasets download into data/ and are large (web-traffic 14G,
 # web-topics 9.2G, ogbn-products 4.2G, reddit+flickr ~2.6G, hm-* ~1.2G).
@@ -92,7 +120,7 @@
 #       graphmining.ai, whose DNS no longer resolves.
 #   secondary/lastfm_asia.yaml (LastFMAsia)    - same dead download host.
 #
-# Config overrides (generated into out/dgl_gspmm/.overrides/):
+# Config overrides (generated into $OUT_DIR/.overrides/):
 #   reddit   - root=data reuses the pre-seeded raw npz files and avoids PyG's
 #              flat data/processed/data.pt clashing with other root='data'
 #              datasets (AmazonBook's HeteroData cache poisoned it before).
@@ -108,7 +136,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 # Override to point at a DGL-capable interpreter (see PYTHON note above).
 PY="${PY:-.venv/bin/python3}"
-OUT_DIR="out/dgl_gspmm"
+OUT_DIR="${OUT_DIR:-out/dgl_gspmm}"
 LOG_DIR="$OUT_DIR/logs"
 OVERRIDE_DIR="$OUT_DIR/.overrides"
 mkdir -p "$OUT_DIR" "$LOG_DIR" "$OVERRIDE_DIR"
@@ -116,14 +144,24 @@ mkdir -p "$OUT_DIR" "$LOG_DIR" "$OVERRIDE_DIR"
 # Timing knobs -- MUST match run_cuda_gsddmm_dataset_sweep.sh (see TIMING above).
 WARMUP=5
 ITERS=20
-DTYPES="fp32 fp16 bf16"
-# Override with MODES="forward" to run only the rows our kernels can be
-# compared against (they have no backward pass).
-MODES="${MODES:-forward backward}"
-FEATURE_DIMS="256 128 64 32"
-# Optional subset filter -- see FILTER in the header. Normalized with the same
-# '-' -> '_' mapping applied to dataset names, so both spellings match.
-DATASETS="$(echo ${DATASETS:-} | tr -d "'" | tr '/-' '__')"
+# Commas are accepted as separators alongside spaces in all four lists.
+DTYPES="$(echo "${DTYPES:-fp32 fp16 bf16}" | tr ',' ' ')"
+MODES="$(echo "${MODES:-forward backward}" | tr ',' ' ')"
+# Feature dims to try, in order; pinned to the dims the turbo_gnn kernels
+# accept so both sweeps can land on the same dim (see above).
+FEATURE_DIMS="$(echo "${FEATURE_DIMS:-256 128 64 32}" | tr ',' ' ')"
+# Empty = every dataset. Normalized with the same '-' -> '_' mapping applied to
+# dataset names, so both spellings match.
+DATASETS="$(echo "${DATASETS:-}" | tr -d "'" | tr ',' ' ' | tr '/-' '__')"
+
+# Every dataset config the sweep considers. Declared once so the DATASETS
+# filter can be validated against it before any benchmarking starts.
+ALL_YAMLS=(
+    configs/datasets/main/*.yaml
+    configs/datasets/secondary/*.yaml
+    configs/datasets/graphland_remaining/*.yaml
+    configs/datasets/pyg_cora.yaml
+)
 
 # Dataset configs that can never be benchmarked (see header).
 SKIP_YAMLS=(
@@ -153,25 +191,25 @@ NUM_OPS="$(echo $ALL_OPS | wc -w)"
 # ---------------------------------------------------------------------------
 # Per-dataset config overrides (see header).
 # ---------------------------------------------------------------------------
-cat > "$OVERRIDE_DIR/reddit.yaml" <<'EOF'
+cat > "$OVERRIDE_DIR/reddit.yaml" <<'YAML'
 dataset:
   source: pyg
   name: reddit
   root: data
-EOF
-cat > "$OVERRIDE_DIR/flickr.yaml" <<'EOF'
+YAML
+cat > "$OVERRIDE_DIR/flickr.yaml" <<'YAML'
 dataset:
   source: pyg
   name: Flickr
   root: data/solo/flickr
-EOF
-cat > "$OVERRIDE_DIR/corafull.yaml" <<'EOF'
+YAML
+cat > "$OVERRIDE_DIR/corafull.yaml" <<'YAML'
 dataset:
   source: pyg
   name: CoraFull
   root: data/solo/corafull
   allow_random_split: true
-EOF
+YAML
 
 resolve_yaml() {
     # resolve_yaml <dataset name> <original yaml> -> yaml to actually use
@@ -187,6 +225,22 @@ is_skipped() {
     local yaml="$1" s
     for s in "${SKIP_YAMLS[@]}"; do
         [ "$yaml" = "$s" ] && return 0
+    done
+    return 1
+}
+
+yaml_name() {
+    # yaml_name <yaml> -- the dataset name as used for CSV/log filenames.
+    grep -m1 -oP 'name:\s*\K\S+' "$1" | tr -d "'\"" | tr '/-' '__'
+}
+
+is_selected() {
+    # is_selected <dataset name> -- true if DATASETS is empty (run all) or
+    # names this dataset.
+    [ -z "$DATASETS" ] && return 0
+    local d
+    for d in $DATASETS; do
+        [ "$1" = "$d" ] && return 0
     done
     return 1
 }
@@ -218,21 +272,67 @@ run_one() {
         > "$LOG_DIR/$2_dgl_ops_$3_$4_d$5.log" 2>&1
 }
 
-echo "benchmarking $NUM_OPS ops x $(echo $DTYPES | wc -w) dtypes x $(echo $MODES | wc -w) modes" \
-     "= $((NUM_OPS * $(echo $DTYPES | wc -w) * $(echo $MODES | wc -w))) rows per dataset," \
-     "${WARMUP} warmup / ${ITERS} timed iters (exact)"
+run_one_with_download_retry() {
+    # run_one_with_download_retry <yaml> <name> <mode> <dtype> <d>
+    # Up to 3 attempts, but ONLY when the failure is a download error (see
+    # DOWNLOADS in the header); any other failure returns immediately.
+    local attempt log="$LOG_DIR/$2_dgl_ops_$3_$4_d$5.log"
+    for attempt in 1 2 3; do
+        run_one "$@" && return 0
+        is_download_error "$log" || return 1
+        [ "$attempt" = 3 ] || {
+            echo "  $4/$3 download error at d=$5 (attempt $attempt/3) -- retrying"
+            sleep 15
+        }
+    done
+    return 1
+}
+
+# Reject an unknown DATASETS entry now: a filter that matches nothing would
+# otherwise look like a sweep that ran and found no work to do.
+AVAILABLE=""
+for yaml in "${ALL_YAMLS[@]}"; do
+    [ -f "$yaml" ] || continue
+    AVAILABLE="$AVAILABLE $(yaml_name "$yaml")"
+done
+if [ -n "$DATASETS" ]; then
+    unknown=""
+    for d in $DATASETS; do
+        case " $AVAILABLE " in
+            *" $d "*) ;;
+            *) unknown="$unknown $d" ;;
+        esac
+    done
+    if [ -n "$unknown" ]; then
+        echo "ERROR: unknown dataset(s) in DATASETS:$unknown" >&2
+        echo "Available dataset names:" >&2
+        for a in $AVAILABLE; do echo "    $a" >&2; done
+        exit 1
+    fi
+fi
+
+NUM_DTYPES="$(echo $DTYPES | wc -w)"
+NUM_MODES="$(echo $MODES | wc -w)"
+echo "benchmarking $NUM_OPS ops x $NUM_DTYPES dtypes [$DTYPES] x $NUM_MODES modes [$MODES]" \
+     "= $((NUM_OPS * NUM_DTYPES * NUM_MODES)) rows per dataset"
+echo "  dims tried: $FEATURE_DIMS | ${WARMUP} warmup / ${ITERS} timed iters (exact) | out: $OUT_DIR"
+if [ -n "$DATASETS" ]; then
+    echo "  datasets: $(echo $DATASETS | wc -w) selected [$DATASETS]"
+else
+    echo "  datasets: all $(echo $AVAILABLE | wc -w)"
+fi
 
 summary=""
 declare -A SEEN=()
-for yaml in configs/datasets/main/*.yaml configs/datasets/secondary/*.yaml \
-            configs/datasets/graphland_remaining/*.yaml configs/datasets/pyg_cora.yaml; do
+for yaml in "${ALL_YAMLS[@]}"; do
     [ -f "$yaml" ] || continue
+    name="$(yaml_name "$yaml")"
+    is_selected "$name" || continue
     if is_skipped "$yaml"; then
         echo "SKIP (unloadable): $yaml"
         summary="$summary\n$(basename "$yaml" .yaml): SKIPPED (unloadable)"
         continue
     fi
-    name="$(grep -m1 -oP 'name:\s*\K\S+' "$yaml" | tr -d "'\"" | tr '/-' '__')"
     csv="$OUT_DIR/${name}_dgl_ops.csv"
     if [ -n "${SEEN[$name]:-}" ]; then
         echo "SKIP (duplicate of ${SEEN[$name]}): $yaml"
@@ -241,44 +341,18 @@ for yaml in configs/datasets/main/*.yaml configs/datasets/secondary/*.yaml \
     SEEN[$name]="$yaml"
     yaml="$(resolve_yaml "$name" "$yaml")"
 
-    # Optional subset filter -- see FILTER in the header.
-    if [ -n "$DATASETS" ]; then
-        found=0
-        for want in $DATASETS; do
-            [ "$name" = "$want" ] && { found=1; break; }
-        done
-        [ "$found" = 1 ] || {
-            echo "SKIP (not in DATASETS): $yaml"
-            continue
-        }
-    fi
-
     rm -f "$csv"
     echo "================ $(date +%H:%M:%S)  $name  ($yaml) ================"
 
     ok_d=""
     for d in $FEATURE_DIMS; do
-        combo_ok=1
+        all_combos_ok=1
         retry_smaller=0
         for dt in $DTYPES; do
             for mode in $MODES; do
                 log="$LOG_DIR/${name}_dgl_ops_${mode}_${dt}_d${d}.log"
-                # Up to 3 attempts when the failure is a download error (see
-                # DOWNLOADS in the header); anything else fails immediately.
-                combo_ok_run=0
-                for attempt in 1 2 3; do
-                    if run_one "$yaml" "$name" "$mode" "$dt" "$d"; then
-                        combo_ok_run=1
-                        break
-                    fi
-                    is_download_error "$log" || break
-                    [ "$attempt" = 3 ] || {
-                        echo "  $dt/$mode download error at d=$d (attempt $attempt/3) -- retrying"
-                        sleep 15
-                    }
-                done
-                if [ "$combo_ok_run" != 1 ]; then
-                    combo_ok=0
+                if ! run_one_with_download_retry "$yaml" "$name" "$mode" "$dt" "$d"; then
+                    all_combos_ok=0
                     if is_oom "$log"; then
                         echo "  $dt/$mode OOM at d=$d -- retrying at a smaller feature dim"
                         retry_smaller=1
@@ -290,7 +364,7 @@ for yaml in configs/datasets/main/*.yaml configs/datasets/secondary/*.yaml \
                 echo "  ok: $dt/$mode d=$d"
             done
         done
-        if [ "$combo_ok" = 1 ]; then
+        if [ "$all_combos_ok" = 1 ]; then
             ok_d="$d"
             break
         fi
@@ -315,7 +389,6 @@ rm -f "$combined"
 first=1
 for csv in "$OUT_DIR"/*_dgl_ops.csv; do
     [ -f "$csv" ] || continue
-    case "$csv" in *all_datasets*) continue ;; esac
     if [ "$first" = 1 ]; then
         cat "$csv" > "$combined"
         first=0
