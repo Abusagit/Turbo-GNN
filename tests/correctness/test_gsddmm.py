@@ -203,6 +203,74 @@ def test_gsddmm_warps_match(light_warps, heavy_warps):
     assert torch.allclose(out, ref, **_tol(torch.float32))
 
 
+@pytest.mark.parametrize("overlap_buckets", [False, True])
+@pytest.mark.parametrize("pipeline_stages", [0, 2])
+@pytest.mark.parametrize("heavy_edges_per_block", [0, 1, 3, 8, 4096])
+@pytest.mark.parametrize(
+    "op,lhs_target,rhs_target", [("mul", "src", "dst"), ("dot", "edge", "src"), ("copy", "dst", "edge")]
+)
+def test_gsddmm_heavy_chunking_match(
+    op, lhs_target, rhs_target, heavy_edges_per_block, pipeline_stages, overlap_buckets
+):
+    # quantile 0.5 puts half the nodes (degree ~7-20) in the heavy bucket, so
+    # chunks of 1/3/8 edges split nodes into several blocks with a ragged tail,
+    # and 4096 degenerates to one block per node.
+    graph = _make_graph(quantile=0.5)
+    assert graph.heavy_nodes.numel() > 0
+    num_nodes = graph.forward_indptr.numel() - 1
+    num_edges = graph.forward_indices.numel()
+    lhs, rhs = _make_operands(lhs_target, rhs_target, op, num_nodes, num_edges, dim=64, dtype=torch.float32)
+
+    out = gsddmm(
+        graph,
+        lhs,
+        rhs,
+        op=op,
+        lhs_target=lhs_target,
+        rhs_target=rhs_target,
+        pipeline_stages=pipeline_stages,
+        heavy_edges_per_block=heavy_edges_per_block,
+        overlap_buckets=overlap_buckets,
+    )
+    ref = _reference(graph, lhs, rhs, op, lhs_target, rhs_target)
+    assert torch.allclose(out.double(), ref.double(), **_tol(torch.float32, op))
+
+
+def test_gsddmm_overlap_buckets_stream_ordering():
+    # The side-stream light launch must be joined back before anything the
+    # caller enqueues next: overwrite the output right after the call and check
+    # nothing from the light kernel lands afterwards.
+    graph = _make_graph(quantile=0.5)
+    num_nodes = graph.forward_indptr.numel() - 1
+    lhs = torch.randn(num_nodes, 64, device=DEVICE)
+    rhs = torch.randn(num_nodes, 64, device=DEVICE)
+    for _ in range(20):
+        out = gsddmm(graph, lhs, rhs, op="add", lhs_target="src", rhs_target="dst", overlap_buckets=True)
+        out.zero_()
+        torch.cuda.synchronize()
+        assert not out.any()
+
+
+def test_gsddmm_heavy_blocks_descriptors():
+    from turbo_gnn._kernels import _graph_heavy_blocks
+
+    graph = _make_graph(quantile=0.5)
+    indptr = graph.forward_indptr.long()
+    heavy = graph.heavy_nodes.long()
+    deg = indptr[heavy + 1] - indptr[heavy]
+    nodes, parts = _graph_heavy_blocks(graph, 4)
+    assert nodes.dtype == graph.heavy_nodes.dtype and parts.dtype == graph.heavy_nodes.dtype
+    assert nodes.numel() == int(torch.clamp((deg + 3) // 4, min=1).sum())
+    # every heavy node appears ceil(deg/4) times with chunk ids 0..k-1, and
+    # the chunks cover the node's edge list exactly once
+    for n in heavy[:10].tolist():
+        sel = parts[nodes.long() == n].long().sort().values
+        assert torch.equal(sel, torch.arange(sel.numel(), device=sel.device))
+    # cached: same object on repeat, new object for a new chunk size
+    assert _graph_heavy_blocks(graph, 4) is _graph_heavy_blocks(graph, 4)
+    assert _graph_heavy_blocks(graph, 8) is not _graph_heavy_blocks(graph, 4)
+
+
 @pytest.mark.parametrize("quantile", [-1, 0.5, 0.99])
 def test_gsddmm_bucketing_match(quantile):
     graph = _make_graph(quantile=quantile)

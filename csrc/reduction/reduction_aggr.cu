@@ -647,7 +647,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         dim3 block(features_per_block, tiles_y);
 
                         size_t shmem_size =
-                            (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                            ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
 
                         reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                             index_ptr<index_t>(heavy_nodes),
@@ -724,7 +724,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     dim3 block(features_per_block, tiles_y);
 
                     size_t shmem_size =
-                        (((size_t)tiles_y * (size_t)features_per_block * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                        ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
 
                     reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                         index_ptr<index_t>(heavy_nodes),

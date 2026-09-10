@@ -91,29 +91,51 @@ inline consteval size_t gsddmm_forward_shmem_bytes() {
            (PIPELINE_STAGES > 0 ? N_PER_BLOCK * Plan::NUM_EDGE_ROWS * (PIPELINE_STAGES + 1) * D_CONST * sizeof(cuda_t) : 0);
 }
 
+// Edge-block kernel launch limits (validated by the binding, baked into __launch_bounds__).
+inline constexpr size_t kGsddmmEdgeMaxWarpsPerBlock = 8;
+inline constexpr size_t kGsddmmEdgeMaxEdgesPerWarp  = kWarpSize;  // lane k caches edge k's (src, dst) pair
+
+// Dynamic shared memory requirement of GSDDMM_forward_edge_block per WARP (the
+// block needs warps_per_block times this). Every operand of the edge kernel is
+// gathered per edge (there is no shared Dst_V row across a warp's edge chunk), so
+// the ring buffer holds one L row and, unless the op is Copy, one R row per slot.
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, uint8_t PIPELINE_STAGES>
-inline consteval size_t gsddmm_forward_edge_shmem_bytes() {
-    // TODO: When transition to pipelines and asynchronous loads, change this code.
-    return 0;
+inline consteval size_t gsddmm_forward_edge_shmem_bytes_per_warp() {
+    constexpr size_t rows = GsddmmPlan<op, ll, rr>::USE_R ? 2 : 1;
+    return PIPELINE_STAGES > 0 ? rows * (PIPELINE_STAGES + 1) * D_CONST * sizeof(cuda_t) : 0;
 }
 
-// forward kernel: one thread block per (bucketed) CSR row node; each warp of the
-// block owns one edge at a time, lanes split the D_CONST features into vector tiles
+// forward kernel: one thread block per (bucketed) CSR row node -- or, when
+// block_part != nullptr, per edges_per_block-wide chunk of a node's edge list
+// (node_indices then lists the node of every block, block_part its chunk index;
+// this bounds a block's work by the chunk size instead of the node's degree).
+// Each warp of the block owns one edge at a time, lanes split the D_CONST
+// features into vector tiles.
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal ( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
-    index_t const *__restrict__ node_indices  // node indirection: node_i = node_indices[blockIdx.x]
+    index_t const *__restrict__ node_indices,  // node indirection: node_i = node_indices[blockIdx.x]
+    index_t const *__restrict__ block_part,    // nullptr, or chunk index of block blockIdx.x within its node's edge list
+    uint32_t edges_per_block                   // chunk width when block_part != nullptr
 );
 
-// Edge-block variant: one warp per edge, reading an explicit [E, 2] edge list
-// of (src, dst) node-id pairs (reinterpreted as ulonglong2) instead of the CSR.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
-__global__ void __launch_bounds__(kWarpSize) GSDDMM_forward_edge_block ( // no-format
+// Edge-block variant: reads an explicit [E, 2] edge list of (src, dst) node-id
+// pairs (reinterpreted as ulonglong2) instead of the CSR. Warp w (global warp
+// index over the grid, blockDim.y warps per block) owns the contiguous edge
+// chunk [w * edges_per_warp, (w + 1) * edges_per_warp), 1 <= edges_per_warp <=
+// kGsddmmEdgeMaxEdgesPerWarp. PIPELINE_STAGES == 0 gathers the operand rows with
+// direct wide loads; PIPELINE_STAGES >= 1 prefetches them that many edges ahead
+// with cp.async into a per-warp shared ring buffer (L and R rows in the same
+// stage). Defaults (stages 0, one edge per warp, one warp per block) reproduce
+// the original one-edge-per-block layout exactly.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float, size_t PIPELINE_STAGES = 0>
+__global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block ( // no-format
     uint64_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
-    ulonglong2 const *__restrict__ edge_nodes_idx
+    ulonglong2 const *__restrict__ edge_nodes_idx,
+    uint32_t edges_per_warp
 );
 
 };  // namespace gsddmm

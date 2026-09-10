@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -55,6 +56,14 @@ GSDDMM_MEMBER parse_member(const std::string& target, const char *which) {
 //              For op == "copy" R is never read (pass Edge) and L can not be Edge, it must be either Src_V or Dst_V.
 // pipeline_stages: cp.async prefetch depth for the per-edge rows, in {0, 1, 2, 3}
 //              (0 disables the pipeline).
+// heavy_block_parts / heavy_edges_per_block: heavy-node chunking. When given,
+//              heavy_nodes lists the node of every heavy BLOCK (a node repeated
+//              once per chunk) and heavy_block_parts[b] the chunk index of block
+//              b, which then owns edges [row_ptr[n] + part * K, +K) of node n,
+//              K = heavy_edges_per_block. Absent: one block per heavy node.
+// overlap_buckets: run the light bucket on a side stream concurrently with the
+//              heavy bucket on the current stream (joined before returning control
+//              of the current stream's order to the caller).
 // Returns:     [E, D] for elementwise ops, [E] for "dot" (input dtype).
 torch::Tensor gsddmm_forward_cuda(
     torch::Tensor L,
@@ -66,9 +75,12 @@ torch::Tensor gsddmm_forward_cuda(
     std::string rhs_target,
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
-    uint32_t light_warps_per_block = 4,
-    uint32_t heavy_warps_per_block = 32,
-    uint32_t pipeline_stages       = 0
+    uint32_t light_warps_per_block,
+    uint32_t heavy_warps_per_block,
+    uint32_t pipeline_stages,
+    std::optional<torch::Tensor> heavy_block_parts,
+    uint32_t heavy_edges_per_block,
+    bool overlap_buckets
 ) {
     const GSDDMM_OP op_enum        = parse_op(op);
     const GSDDMM_MEMBER lhs_member = parse_member(lhs_target, "lhs");
@@ -106,7 +118,7 @@ torch::Tensor gsddmm_forward_cuda(
     const int64_t D = L.size(1);
     TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
 
-    auto check_rows = [&](const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
+    auto check_rows = [N, E](const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
         if (member == GSDDMM_MEMBER::Edge) {
             TORCH_CHECK(t.size(0) == E, name, " is edge-indexed and must have E=", E, " rows, got ", t.size(0));
         } else {
@@ -119,6 +131,16 @@ torch::Tensor gsddmm_forward_cuda(
     torch::Tensor O = is_dot ? torch::empty({E}, L.options()) : torch::empty({E, D}, L.options());
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
+
+    const bool chunked = heavy_block_parts.has_value() && heavy_block_parts->numel() > 0;
+    if (chunked) {
+        TORCH_CHECK(heavy_edges_per_block > 0, "GSDDMM forward: heavy_edges_per_block must be > 0 when heavy_block_parts is given");
+        TORCH_CHECK(heavy_block_parts->is_cuda() && heavy_block_parts->scalar_type() == idx_dtype, "heavy_block_parts must be CUDA with the CSR index dtype");
+        TORCH_CHECK(
+            heavy_block_parts->numel() == heavy_nodes.numel(), "GSDDMM forward: heavy_block_parts (", heavy_block_parts->numel(),
+            ") and heavy_nodes (", heavy_nodes.numel(), ") must have one entry per heavy block"
+        );
+    }
 
     GsddmmLaunchArgs args{
         .L                     = L,
@@ -135,6 +157,9 @@ torch::Tensor gsddmm_forward_cuda(
         .light_warps_per_block = static_cast<uint16_t>(light_warps_per_block),
         .heavy_warps_per_block = static_cast<uint16_t>(heavy_warps_per_block),
         .pipeline_stages       = static_cast<uint8_t>(pipeline_stages),
+        .heavy_block_parts     = chunked ? &*heavy_block_parts : nullptr,
+        .heavy_edges_per_block = chunked ? heavy_edges_per_block : 0u,
+        .overlap_buckets       = overlap_buckets,
     };
 
     // One call per op, each resolved in its own translation unit.
@@ -166,8 +191,23 @@ torch::Tensor gsddmm_forward_cuda(
     return O;
 }
 
+// op / targets / L / R / D: as for gsddmm_forward_cuda. edge_list: [E, 2] uint64
+//              (src, dst) node-id pairs, contiguous, reinterpreted as ulonglong2.
+// pipeline_stages: cp.async prefetch depth of the per-edge operand rows, in
+//              {0, 1, 2, 3} (0 = direct loads). Only meaningful with edges_per_warp > 1.
+// edges_per_warp: contiguous edges each warp walks, in [1, kGsddmmEdgeMaxEdgesPerWarp].
+// warps_per_block: independent warps packed per thread block, in [1, kGsddmmEdgeMaxWarpsPerBlock].
 torch::Tensor gsddmm_forward_edge_blocks(
-    torch::Tensor L, torch::Tensor R, torch::Tensor edge_list, std::string op, std::string lhs_target, std::string rhs_target, uint64_t N
+    torch::Tensor L,
+    torch::Tensor R,
+    torch::Tensor edge_list,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t pipeline_stages = 0,
+    uint32_t edges_per_warp = 4,
+    uint32_t warps_per_block = 4
 ) {
     const GSDDMM_OP op_enum        = parse_op(op);
     const GSDDMM_MEMBER lhs_member = parse_member(lhs_target, "lhs");
@@ -202,7 +242,7 @@ torch::Tensor gsddmm_forward_edge_blocks(
     const uint64_t D = L.size(1);
     TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
 
-    auto check_rows = [&](const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
+    auto check_rows = [N, E](const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
         if (member == GSDDMM_MEMBER::Edge) {
             TORCH_CHECK(t.size(0) == E, name, " is edge-indexed and must have E=", E, " rows, got ", t.size(0));
         } else {
@@ -216,15 +256,28 @@ torch::Tensor gsddmm_forward_edge_blocks(
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
 
+    TORCH_CHECK(pipeline_stages <= 3, "GSDDMM forward (edge blocks): pipeline_stages must be in [0, 3], got ", pipeline_stages);
+    TORCH_CHECK(
+        edges_per_warp >= 1 && edges_per_warp <= kGsddmmEdgeMaxEdgesPerWarp, "GSDDMM forward (edge blocks): edges_per_warp must be in [1, ",
+        kGsddmmEdgeMaxEdgesPerWarp, "], got ", edges_per_warp
+    );
+    TORCH_CHECK(
+        warps_per_block >= 1 && warps_per_block <= kGsddmmEdgeMaxWarpsPerBlock, "GSDDMM forward (edge blocks): warps_per_block must be in [1, ",
+        kGsddmmEdgeMaxWarpsPerBlock, "], got ", warps_per_block
+    );
+
     GsddmmLaunchArgsEdge args{
-        .L              = L,
-        .R              = R,
-        .O              = O,
-        .edge_nodes_idx = reinterpret_cast<ulonglong2 const *>(edge_list.data_ptr<uint64_t>()),
-        .stream         = stream,
-        .E              = E,
-        .D              = D,
-        .key            = LRO{lhs_member, rhs_member, op_enum},
+        .L               = L,
+        .R               = R,
+        .O               = O,
+        .edge_nodes_idx  = reinterpret_cast<ulonglong2 const *>(edge_list.data_ptr<uint64_t>()),
+        .stream          = stream,
+        .E               = E,
+        .D               = D,
+        .key             = LRO{lhs_member, rhs_member, op_enum},
+        .pipeline_stages = static_cast<uint8_t>(pipeline_stages),
+        .edges_per_warp  = static_cast<uint8_t>(edges_per_warp),
+        .warps_per_block = static_cast<uint8_t>(warps_per_block),
     };
 
     // One call per op, each resolved in its own translation unit.
@@ -271,13 +324,17 @@ torch::Tensor gsddmm_forward_cuda(
     std::string rhs_target,
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
-    uint32_t light_warps_per_block = 4,
-    uint32_t heavy_warps_per_block = 32,
-    uint32_t pipeline_stages       = 0
+    uint32_t light_warps_per_block,
+    uint32_t heavy_warps_per_block,
+    uint32_t pipeline_stages,
+    std::optional<torch::Tensor> heavy_block_parts,
+    uint32_t heavy_edges_per_block,
+    bool overlap_buckets
 ) {
     return gsddmm::gsddmm_forward_cuda(
         std::move(L), std::move(R), std::move(row_ptr), std::move(col_idx), std::move(op), std::move(lhs_target), std::move(rhs_target),
-        std::move(light_nodes), std::move(heavy_nodes), light_warps_per_block, heavy_warps_per_block, pipeline_stages
+        std::move(light_nodes), std::move(heavy_nodes), light_warps_per_block, heavy_warps_per_block, pipeline_stages,
+        std::move(heavy_block_parts), heavy_edges_per_block, overlap_buckets
     );
 }
 
@@ -288,9 +345,13 @@ torch::Tensor gsddmm_forward_edge_blocks(
     std::string op,
     std::string lhs_target,
     std::string rhs_target,
-    uint64_t N
+    uint64_t N,
+    uint32_t pipeline_stages = 0,
+    uint32_t edges_per_warp = 4,
+    uint32_t warps_per_block = 4
 ) {
     return gsddmm::gsddmm_forward_edge_blocks(
-        std::move(L), std::move(R), std::move(edge_list), std::move(op), std::move(lhs_target), std::move(rhs_target), N
+        std::move(L), std::move(R), std::move(edge_list), std::move(op), std::move(lhs_target), std::move(rhs_target), N, pipeline_stages,
+        edges_per_warp, warps_per_block
     );
 }

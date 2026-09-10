@@ -26,6 +26,7 @@ from turbo_gnn._kernels import (
     GSDDMMKernel,
     ReductionAggrKernel,
     _graph_edge_list,
+    _graph_heavy_blocks,
 )
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
@@ -277,6 +278,8 @@ def gsddmm(
     light_warps_per_block: int = 4,
     heavy_warps_per_block: int = 32,
     pipeline_stages: int = 0,
+    heavy_edges_per_block: int = 0,
+    overlap_buckets: bool = False,
 ) -> torch.Tensor:
     """Generalized SDDMM: per-edge binary op over node/edge feature rows.
 
@@ -315,6 +318,15 @@ def gsddmm(
             GPU's opt-in shared memory per block (e.g. D=256, 32 heavy warps
             and both operands gathered per edge needs 192 KiB at stages=2);
             the kernel raises with the exact figures when it does.
+        heavy_edges_per_block: Split every heavy node into chunks of this many
+            edges and run one 32-warp block per chunk instead of one per node,
+            so the heavy launch's tail is bounded by the chunk rather than the
+            largest degree. 0 keeps one block per node. The per-block (node,
+            chunk) descriptors are built on first use and cached on the graph.
+        overlap_buckets: Run the light-node bucket on a side CUDA stream
+            concurrently with the heavy bucket on the current stream. The side
+            stream is forked from and joined back to the current stream with
+            events, so ordering for the caller is unchanged.
 
     Returns:
         ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"``, in CSR edge order.
@@ -326,6 +338,9 @@ def gsddmm(
             raise ValueError(f"gsddmm: rhs is required for op={op!r}")
         # Copy never reads R, but the binding validates its shape: [E, D].
         rhs = lhs.new_empty((graph.forward_indices.numel(), lhs.shape[-1]))
+    heavy_nodes, heavy_parts = graph.heavy_nodes, None
+    if heavy_edges_per_block > 0 and heavy_nodes.numel() > 0:
+        heavy_nodes, heavy_parts = _graph_heavy_blocks(graph, heavy_edges_per_block)
     return _C.gsddmm_forward(
         lhs,
         rhs,
@@ -335,10 +350,13 @@ def gsddmm(
         lhs_target,
         rhs_target,
         graph.light_nodes,
-        graph.heavy_nodes,
+        heavy_nodes,
         light_warps_per_block,
         heavy_warps_per_block,
         pipeline_stages,
+        heavy_parts,
+        heavy_edges_per_block,
+        overlap_buckets,
     )
 
 
@@ -350,6 +368,9 @@ def gsddmm_edge(
     op: str = "mul",
     lhs_target: str = "src",
     rhs_target: str = "dst",
+    pipeline_stages: int = 0,
+    edges_per_warp: int = 4,
+    warps_per_block: int = 4,
 ) -> torch.Tensor:
     """Generalized SDDMM, edge-parallel variant: per-edge binary op.
 
@@ -383,6 +404,15 @@ def gsddmm_edge(
         lhs_target: ``"src"``, ``"dst"``, or ``"edge"``.
         rhs_target: ``"src"``, ``"dst"``, or ``"edge"``. Forced to ``"edge"``
             for ``op="copy"`` (the value is irrelevant since rhs is unread).
+        pipeline_stages: cp.async prefetch depth of the operand rows, in
+            {0, 2, 3}. 0 gathers rows with direct loads; ``s >= 1`` copies
+            the rows of the next ``s`` edges of the warp's chunk into shared
+            memory while the current edge is computed. Only useful with
+            ``edges_per_warp > 1``.
+        edges_per_warp: contiguous edges each warp processes, in [1, 32].
+            The default 1 is the original one-edge-per-warp layout.
+        warps_per_block: independent warps per thread block, in [1, 8].
+            The default 1 is the original 32-thread block.
 
     Returns:
         ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"``. Edge order: CSR
@@ -407,6 +437,9 @@ def gsddmm_edge(
         lhs_target,
         rhs_target,
         graph.forward_indptr.numel() - 1,
+        pipeline_stages,
+        edges_per_warp,
+        warps_per_block,
     )
 
 

@@ -34,7 +34,13 @@ DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 FEATURE_DIMS = [32, 64, 128, 256]
 
 
-def _make_graph(num_nodes: int = 200, num_edges: int = 1500, quantile: float = 0.99, index_dtype: torch.dtype = torch.int32, seed: int = 0) -> AdjacencyForwardBackwardWithNodeBuckets:
+def _make_graph(
+    num_nodes: int = 200,
+    num_edges: int = 1500,
+    quantile: float = 0.99,
+    index_dtype: torch.dtype = torch.int32,
+    seed: int = 0,
+) -> AdjacencyForwardBackwardWithNodeBuckets:
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=DEVICE, generator=gen, dtype=torch.long)
     graph = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
@@ -44,7 +50,9 @@ def _make_graph(num_nodes: int = 200, num_edges: int = 1500, quantile: float = 0
     return graph
 
 
-def _make_unique_graph(num_nodes: int = 200, num_edges: int = 1500, index_dtype: torch.dtype = torch.int32, seed: int = 0) -> AdjacencyForwardBackwardWithNodeBuckets:
+def _make_unique_graph(
+    num_nodes: int = 200, num_edges: int = 1500, index_dtype: torch.dtype = torch.int32, seed: int = 0
+) -> AdjacencyForwardBackwardWithNodeBuckets:
     """Graph with no duplicate (src, dst) pairs, so CSR and CSC edge orders are
     related by a well-defined permutation."""
 
@@ -58,7 +66,9 @@ def _make_unique_graph(num_nodes: int = 200, num_edges: int = 1500, index_dtype:
     return graph
 
 
-def _make_operands(lhs_target: str, rhs_target: str, op: str, num_nodes: int, num_edges: int, dim: int, dtype: torch.dtype, seed=1) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_operands(
+    lhs_target: str, rhs_target: str, op: str, num_nodes: int, num_edges: int, dim: int, dtype: torch.dtype, seed=1
+) -> tuple[torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
 
     def rows(target):
@@ -90,7 +100,14 @@ def _grouped_src_dst(graph: AdjacencyForwardBackwardWithNodeBuckets, by_src: boo
     return graph.forward_indices.long(), rows  # CSR rows are destinations
 
 
-def _reference(graph: AdjacencyForwardBackwardWithNodeBuckets, lhs: torch.Tensor, rhs: torch.Tensor, op: str, lhs_target: str, rhs_target: str) -> torch.Tensor:
+def _reference(
+    graph: AdjacencyForwardBackwardWithNodeBuckets,
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    op: str,
+    lhs_target: str,
+    rhs_target: str,
+) -> torch.Tensor:
     if op == "copy":
         rhs_target = "edge"
     by_src = "dst" not in (lhs_target, rhs_target)
@@ -163,6 +180,133 @@ def test_gsddmm_edge_copy_fp32(lhs_target: str) -> None:
     ref = _reference(graph, lhs, None, "copy", lhs_target, "edge")
 
     assert torch.allclose(out, ref, **_tol(torch.float32))
+
+
+# =============================================================================
+# Kernel-config equivalence (pipeline stages / edges per warp / warps per block)
+# =============================================================================
+
+
+@pytest.mark.parametrize("warps_per_block", [1, 8])
+@pytest.mark.parametrize("edges_per_warp", [1, 3, 32])
+@pytest.mark.parametrize("pipeline_stages", [0, 1, 2, 3])
+@pytest.mark.parametrize(
+    "op,lhs_target,rhs_target", [("mul", "src", "dst"), ("dot", "edge", "src"), ("copy", "src", "edge")]
+)
+def test_gsddmm_edge_launch_configs_match(
+    op: str, lhs_target: str, rhs_target: str, pipeline_stages: int, edges_per_warp: int, warps_per_block: int
+) -> None:
+    # 1500 edges is not a multiple of 3 or 32, so the last warp's partial chunk
+    # (and, for warps_per_block=8, partially populated blocks) are exercised too.
+    graph = _make_graph()
+    num_nodes = graph.forward_indptr.numel() - 1
+    num_edges = graph.forward_indices.numel()
+    lhs, rhs = _make_operands(lhs_target, rhs_target, op, num_nodes, num_edges, dim=64, dtype=torch.float32)
+
+    out = gsddmm_edge(
+        graph,
+        lhs,
+        rhs,
+        op=op,
+        lhs_target=lhs_target,
+        rhs_target=rhs_target,
+        pipeline_stages=pipeline_stages,
+        edges_per_warp=edges_per_warp,
+        warps_per_block=warps_per_block,
+    )
+    ref = _reference(graph, lhs, rhs, op, lhs_target, rhs_target)
+
+    assert out.shape == ref.shape
+    assert torch.allclose(out.double(), ref.double(), **_tol(torch.float32, op)), (
+        f"max err {(out.double() - ref.double()).abs().max().item():.3e}"
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dim", FEATURE_DIMS)
+def test_gsddmm_edge_pipelined_dtypes_dims(dtype: torch.dtype, dim: int) -> None:
+    # Deepest pipeline with the widest chunk across every (dtype, D) tile shape:
+    # sub-16B tiles (D=32 fp16) make lanes read chunks other lanes copied.
+    graph = _make_graph()
+    num_nodes = graph.forward_indptr.numel() - 1
+    num_edges = graph.forward_indices.numel()
+    lhs, rhs = _make_operands("src", "edge", "add", num_nodes, num_edges, dim=dim, dtype=dtype)
+
+    out = gsddmm_edge(
+        graph,
+        lhs,
+        rhs,
+        op="add",
+        lhs_target="src",
+        rhs_target="edge",
+        pipeline_stages=3,
+        edges_per_warp=32,
+        warps_per_block=4,
+    )
+    ref = _reference(graph, lhs, rhs, "add", "src", "edge")
+
+    assert torch.allclose(out.double(), ref.double(), **_tol(dtype))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"pipeline_stages": 4},
+        {"edges_per_warp": 0},
+        {"edges_per_warp": 33},
+        {"warps_per_block": 0},
+        {"warps_per_block": 9},
+    ],
+)
+def test_gsddmm_edge_rejects_out_of_range_config(kwargs: dict) -> None:
+    graph = _make_graph()
+    num_nodes = graph.forward_indptr.numel() - 1
+    lhs = torch.randn(num_nodes, 64, device=DEVICE)
+    rhs = torch.randn(num_nodes, 64, device=DEVICE)
+
+    with pytest.raises(RuntimeError):
+        gsddmm_edge(graph, lhs, rhs, op="mul", lhs_target="src", rhs_target="dst", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "op,lhs_target,rhs_target",
+    [("mul", "src", "dst"), ("dot", "edge", "dst"), ("add", "src", "edge"), ("copy", "dst", "edge")],
+)
+@pytest.mark.parametrize("edges_per_warp", [1, 32])
+def test_gsddmm_edge_ungrouped_edge_list(op: str, lhs_target: str, rhs_target: str, edges_per_warp: int) -> None:
+    # The kernel caches the grouping-key node row across consecutive edges of a
+    # warp's chunk; that must be a pure optimization. Feed the binding a randomly
+    # permuted (ungrouped) edge list and compare against a reference built on
+    # the same permutation, so the cache is exercised with node ids that change
+    # at every edge as well as with the wrapper's grouped order.
+    graph = _make_graph()
+    num_nodes = graph.forward_indptr.numel() - 1
+    num_edges = graph.forward_indices.numel()
+    if op == "copy":
+        rhs_target = "edge"
+    lhs, rhs = _make_operands(lhs_target, rhs_target, op, num_nodes, num_edges, dim=64, dtype=torch.float32)
+
+    gen = torch.Generator(device=DEVICE).manual_seed(7)
+    perm = torch.randperm(num_edges, device=DEVICE, generator=gen)
+    # CUDA indexing is not implemented for uint64: permute the int64 view, then view back.
+    edge_list = _graph_edge_list(graph, by_src=False).view(torch.int64)[perm].contiguous().view(torch.uint64)
+    src = edge_list.view(torch.int64)[:, 0]
+    dst = edge_list.view(torch.int64)[:, 1]
+
+    def select(t, target):
+        return t[src] if target == "src" else t[dst] if target == "dst" else t
+
+    left = select(lhs, lhs_target)
+    if op == "copy":
+        ref = left
+    else:
+        right = select(rhs, rhs_target)
+        ref = {"mul": left * right, "add": left + right, "dot": (left * right).sum(-1)}[op]
+
+    out = turbo_gnn._C.gsddmm_forward_edge(
+        lhs, rhs, edge_list, op, lhs_target, rhs_target, num_nodes, 0, edges_per_warp, 4
+    )
+    assert torch.allclose(out.double(), ref.double(), **_tol(torch.float32, op))
 
 
 # =============================================================================

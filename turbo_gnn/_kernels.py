@@ -182,6 +182,37 @@ class GATv2AggrKernel(TunableKernel):
         return _bench
 
 
+def _graph_heavy_blocks(graph, edges_per_block: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-block (node, chunk) descriptors that split every heavy node into
+    ``edges_per_block``-wide edge chunks, cached on the graph object.
+
+    The node-bucketed CSR kernel runs one thread block per heavy node, so its
+    runtime is set by the single largest degree (SM active cycles max/avg of
+    1.5-2.4x on power-law graphs). With chunking, block ``b`` handles edges
+    ``[indptr[n] + part * K, +K)`` of node ``n = nodes[b]``, ``part = parts[b]``,
+    and the kernel's tail is bounded by ``K`` edges instead of the max degree.
+
+    Returns ``(nodes, parts)`` in the graph's index dtype. Cached per
+    ``(indptr, heavy bucket, K)`` -- a repartition invalidates it.
+    """
+    heavy = graph.heavy_nodes
+    stamp = (graph.forward_indptr.data_ptr(), heavy.data_ptr(), heavy.numel(), edges_per_block)
+    cache = graph.__dict__.setdefault("_gsddmm_heavy_blocks", {})
+    if stamp in cache:
+        return cache[stamp]
+
+    indptr = graph._to_signed_view(graph.forward_indptr)
+    h = graph._to_signed_view(heavy).long()
+    deg = (indptr[h + 1] - indptr[h]).long()
+    nblk = torch.clamp((deg + edges_per_block - 1) // edges_per_block, min=1)
+    nodes = torch.repeat_interleave(h, nblk)
+    first = torch.cumsum(nblk, 0) - nblk  # index of each node's first block
+    parts = torch.arange(int(nblk.sum().item()), device=h.device) - torch.repeat_interleave(first, nblk)
+    result = (nodes.to(heavy.dtype), parts.to(heavy.dtype))
+    cache[stamp] = result
+    return result
+
+
 class GSDDMMKernel(TunableKernel):
     """Tunable kernel for GSDDMM (generalized sampled dense-dense matmul).
 
@@ -203,6 +234,13 @@ class GSDDMMKernel(TunableKernel):
       Src/Edge row prefetch, in {0, 1, 2, 3} (0 disables the pipeline). Deeper
       pipelines buy more overlap but cost ``stages + 1`` shared-memory row
       slots per warp, so the whole range is searched.
+    - ``forward_heavy_edges_per_block``: split each heavy node into chunks of
+      this many edges, one block per chunk (0 = one block per node). Bounds
+      the heavy launch's tail by the chunk instead of the maximum degree; the
+      (node, chunk) descriptors are built once per graph and cached.
+    - ``forward_overlap_buckets``: run the light bucket on a side CUDA stream
+      concurrently with the heavy bucket (event fork/join around the pair), so
+      each launch's tail is filled by the other's blocks.
 
     Tunable graph parameter:
 
@@ -219,6 +257,8 @@ class GSDDMMKernel(TunableKernel):
         self.forward_light_warps = kwargs.get("light_warps_per_block", 4)
         self.forward_heavy_warps = kwargs.get("heavy_warps_per_block", 32)
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
+        self.forward_heavy_edges_per_block = kwargs.get("heavy_edges_per_block", 0)
+        self.forward_overlap_buckets = kwargs.get("overlap_buckets", False)
 
     def _execute(self, graph, x, *, rhs=None, **kwargs):
         if rhs is None:
@@ -226,6 +266,9 @@ class GSDDMMKernel(TunableKernel):
                 raise ValueError(f"gsddmm: rhs is required for op={self.op!r}")
             # Copy never reads R, but the binding validates its shape: [E, D].
             rhs = x.new_empty((graph.forward_indices.numel(), x.shape[-1]))
+        heavy_nodes, heavy_parts = graph.heavy_nodes, None
+        if self.forward_heavy_edges_per_block > 0 and heavy_nodes.numel() > 0:
+            heavy_nodes, heavy_parts = _graph_heavy_blocks(graph, self.forward_heavy_edges_per_block)
         return _C.gsddmm_forward(
             x,
             rhs,
@@ -235,10 +278,13 @@ class GSDDMMKernel(TunableKernel):
             self.lhs_target,
             self.rhs_target,
             graph.light_nodes,
-            graph.heavy_nodes,
+            heavy_nodes,
             self.forward_light_warps,
             self.forward_heavy_warps,
             self.forward_pipeline_stages,
+            heavy_parts,
+            self.forward_heavy_edges_per_block,
+            self.forward_overlap_buckets,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -246,6 +292,8 @@ class GSDDMMKernel(TunableKernel):
             TunableParam("forward_light_warps", [4], default=4),
             TunableParam("forward_heavy_warps", [32], default=32),
             TunableParam("forward_pipeline_stages", [0, 1, 2, 3], default=0),
+            TunableParam("forward_heavy_edges_per_block", [0, 512, 1024, 2048, 4096], default=0),
+            TunableParam("forward_overlap_buckets", [False, True], default=False),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -331,6 +379,19 @@ class GSDDMMEdgeKernel(TunableKernel):
     destination (forward CSR) when an operand reads the destination vertex,
     and by source (backward CSR) otherwise — consecutive warps then share the
     Src_V operand row, which is L2-friendly.
+
+    Tunable forward parameters:
+
+    - ``forward_edges_per_warp``: contiguous edges each warp walks, in
+      [1, 32]. 1 is the original one-edge-per-warp layout; larger chunks
+      amortize the edge-list load (one coalesced load per chunk) and are what
+      gives the pipeline something to prefetch.
+    - ``forward_pipeline_stages``: cp.async prefetch depth of the operand rows,
+      in {0, 1, 2, 3} (0 disables the pipeline). Costs ``stages + 1`` shared
+      row slots per operand per warp; pointless with ``edges_per_warp == 1``.
+    - ``forward_warps_per_block``: independent warps packed per thread block,
+      in {1, 2, 4, 8}. 32-thread blocks cap residency at 32 blocks/SM (half the
+      warp slots on sm_80); packing warps lifts that cap.
     """
 
     def __init__(self, op: str, lhs_target: str, rhs_target: str, **kwargs):
@@ -340,6 +401,9 @@ class GSDDMMEdgeKernel(TunableKernel):
         # The binding instantiates Copy only with an edge-indexed (ignored) rhs;
         # normalize here so any user-supplied rhs_target works for copy.
         self.rhs_target = "edge" if op == "copy" else rhs_target
+        self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
+        self.forward_edges_per_warp = kwargs.get("edges_per_warp", 4)
+        self.forward_warps_per_block = kwargs.get("warps_per_block", 4)
 
     def _execute(self, graph, x, *, rhs=None, **kwargs):
         if rhs is None:
@@ -361,10 +425,17 @@ class GSDDMMEdgeKernel(TunableKernel):
             self.lhs_target,
             self.rhs_target,
             num_nodes,
+            self.forward_pipeline_stages,
+            self.forward_edges_per_warp,
+            self.forward_warps_per_block,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
-        return []
+        return [
+            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
+            TunableParam("forward_edges_per_warp", [1, 4, 8, 16, 32], default=4),
+            TunableParam("forward_warps_per_block", [1, 2, 4, 8], default=4),
+        ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
         return []

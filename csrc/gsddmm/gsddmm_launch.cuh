@@ -51,7 +51,13 @@ struct GsddmmLaunchArgs {
     uint16_t light_warps_per_block;
     uint16_t heavy_warps_per_block;
     uint8_t pipeline_stages;
-    
+    // Heavy-node chunking (nullptr / 0 = one block per heavy node): heavy_nodes
+    // then lists the node of every heavy block and heavy_block_parts its chunk index.
+    const torch::Tensor *heavy_block_parts;
+    uint32_t heavy_edges_per_block;
+    // Run the light bucket on a pool stream forked from / joined back to `stream`
+    // while the heavy bucket runs on `stream` itself (see gsddmm_dispatch).
+    bool overlap_buckets;
 };
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
@@ -73,6 +79,9 @@ struct GsddmmLaunchArgsEdge {
     uint64_t E;
     uint64_t D;
     LRO key;
+    uint8_t pipeline_stages;  // cp.async prefetch depth per warp, 0 = direct loads
+    uint8_t edges_per_warp;   // contiguous edges per warp, 1..kGsddmmEdgeMaxEdgesPerWarp
+    uint8_t warps_per_block;  // independent warps packed per block, 1..kGsddmmEdgeMaxWarpsPerBlock
 };
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
