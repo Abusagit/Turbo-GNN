@@ -7,7 +7,7 @@
 // =============================================================================
 // Unified GATv2 Backward AL kernel (computes grad_a, grad_l, G)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -22,9 +22,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 ) {
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
@@ -274,7 +274,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 // =============================================================================
 // Unified GATv2 Backward R kernel (computes grad_r)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -288,9 +288,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
 ) {
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
@@ -447,7 +447,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     }
 }
 
-template <int grad_A_reduce_row_chunk_size, typename cuda_t>
+template <int grad_A_reduce_row_chunk_size, FloatingNum cuda_t>
 __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
     size_t N, size_t H, size_t D,
 
@@ -512,7 +512,7 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
 // =============================================================================
 // Undirected GATv2 backward: G computation kernel (extracts pass 1 of AL)
 // =============================================================================
-template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -524,9 +524,9 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 ) {
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
@@ -632,7 +632,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 // direction) in a single pass over forward CSR neighbors.
 // Requires G[j] to be pre-computed globally.
 // =============================================================================
-template <int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -647,9 +647,9 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
 ) {
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;

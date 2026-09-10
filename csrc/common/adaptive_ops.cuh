@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda/std/cmath>
+
 #include "common/misc.cuh"
 #include "common/traits.cuh"
 

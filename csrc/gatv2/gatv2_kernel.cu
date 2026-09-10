@@ -1,11 +1,12 @@
 #include "common.cuh"
+#include "common/misc.cuh"
 #include "gatv2/gatv2_backward.cu"
 #include "gatv2/gatv2_forward.cu"
 
 // =============================================================================
 // Undirected GATv2 backward impl: G kernel + fused ALR kernel + ReduceGradA
 // =============================================================================
-template <int D_CONST, typename cuda_t, typename index_t>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t>
 void GATv2Backward_CSR_Undirected_Impl(
     size_t N, size_t H, size_t D, const cuda_t *grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *d_l, int64_t stride_l_n,
     int64_t stride_l_h, const cuda_t *d_r, int64_t stride_r_n, int64_t stride_r_h, const index_t *d_row_ptr, const index_t *d_col_idx,
@@ -52,7 +53,7 @@ void GATv2Backward_CSR_Undirected_Impl(
     std::visit(
         [&](auto chunk_c) {
             constexpr int CHUNK = decltype(chunk_c)::value;
-            dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kWarpSize - 1) / kWarpSize, H);
+            dim3 grad_A_reduce_gridDim(ceil_div<int64_t>(N, CHUNK), ceil_div<int64_t>(D, kWarpSize), H);
             ReduceGradAKernel<CHUNK, cuda_t>
                 <<<grad_A_reduce_gridDim, grad_A_reduce_blockDim, shmem_gradA_reduce_size>>>(N, H, D, grad_a, d_grad_a_reduced);
         },
@@ -67,7 +68,7 @@ void GATv2Backward_CSR_Undirected_Impl(
 // =============================================================================
 
 // Legacy impl kept for reference; actual dispatch is in gatv2_backward_cuda below.
-template <int D_CONST, typename cuda_t, typename index_t>
+template <size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t>
 void GATv2Backward_CSR_Impl_UNUSED(
     // inputs
     size_t N, size_t H, size_t D,
@@ -120,7 +121,7 @@ void GATv2Backward_CSR_Impl_UNUSED(
     std::visit(
         [&](auto chunk_c) {
             constexpr int CHUNK = decltype(chunk_c)::value;
-            dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kWarpSize - 1) / kWarpSize, H);
+            dim3 grad_A_reduce_gridDim(ceil_div<int64_t>(N, CHUNK), ceil_div<int64_t>(D, kWarpSize), H);
             ReduceGradAKernel<CHUNK, cuda_t>
                 <<<grad_A_reduce_gridDim, grad_A_reduce_blockDim, shmem_gradA_reduce_size>>>(N, H, D, grad_a, d_grad_a_reduced);
         },
@@ -447,7 +448,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 [&](auto typeInfo, auto chunk_c) {
                     using cuda_t        = typename decltype(typeInfo)::CudaType;
                     constexpr int CHUNK = decltype(chunk_c)::value;
-                    dim3 grad_A_reduce_gridDim((N + CHUNK - 1) / CHUNK, (D + kWarpSize - 1) / kWarpSize, H);
+                    dim3 grad_A_reduce_gridDim(ceil_div<int64_t>(N, CHUNK), ceil_div<int64_t>(D, kWarpSize), H);
                     ReduceGradAKernel<CHUNK, cuda_t><<<grad_A_reduce_gridDim, grad_A_reduce_blockDim, shmem_gradA_reduce_size>>>(
                         N, H, D, d_grad_a, grad_a_reduced_f32.data_ptr<float>()
                     );

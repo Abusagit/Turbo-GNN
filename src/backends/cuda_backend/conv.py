@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import torch
 from torch import nn
@@ -8,6 +8,13 @@ from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import GATv2AggrKernel, gatv2_aggr
+from .gsddmm_aggr.utils import (
+    _GSDDMM_EDGE_PREFILLED_OPS,
+    _GSDDMM_NAME_TO_MEMBER,
+    _GSDDMM_PREFILLED_OPS,
+    GSDDMMEdgeKernel,
+    GSDDMMKernel,
+)
 from .gt_aggr.utils import GraphTransformerAggrKernel, graph_transformer_aggr
 from .reduction_aggr.utils import ReductionAggrKernel, reduction_aggr
 from .spmm_aggr.utils import spmm_aggr
@@ -232,6 +239,104 @@ class _CudaSpMMAggr(BaseAggr):
         )
 
 
+# ---------------------------------------------------------------------------
+# Raw turbo_gnn GSDDMM ops
+# ---------------------------------------------------------------------------
+
+#: Suffix marking the edge-parallel (one warp per edge) kernel variant.
+_GSDDMM_EDGE_SUFFIX = "_edge"
+
+
+class _GsddmmOpSpec(NamedTuple):
+    """Kernel arguments and operand layout behind a DGL-style gsddmm op name."""
+
+    op: str
+    lhs_target: str
+    rhs_target: str
+    edge_variant: bool
+    operand_kinds: tuple[str, ...]
+
+
+def is_gsddmm_op(name: str) -> bool:
+    """True if *name* is a turbo_gnn gsddmm op name (incl. ``_edge`` variants)."""
+    return name in _GSDDMM_PREFILLED_OPS or name in _GSDDMM_EDGE_PREFILLED_OPS
+
+
+def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
+    """Parse a turbo_gnn gsddmm op name into the kernel's constructor arguments.
+
+    Recognizes exactly the names :mod:`turbo_gnn.ops` generates — the binary
+    ``{lhs}_{op}_{rhs}`` ops over mixed member pairs (``u_add_v``, ``e_dot_v``,
+    ...), the ``copy_u`` / ``copy_v`` copies, and each of those with an
+    ``_edge`` suffix selecting the edge-parallel kernel. Membership is checked
+    against turbo_gnn's own op tables, so an op the library does not provide
+    is rejected here rather than at launch.
+
+    Args:
+        name (str): Op name, e.g. ``"u_sub_v"``, ``"copy_u"``, ``"e_mul_v_edge"``.
+
+    Returns:
+        _GsddmmOpSpec: Op, lhs/rhs targets ("src"/"dst"/"edge"), whether the
+            edge-parallel variant was requested, and the operand kinds
+            ("u"/"v": node features [N, D]; "e": edge features [E, D]) in the
+            order the wrapper takes them.
+
+    Raises:
+        KeyError: If *name* is not a turbo_gnn gsddmm op.
+    """
+    if name in _GSDDMM_EDGE_PREFILLED_OPS:
+        base, edge_variant = name[: -len(_GSDDMM_EDGE_SUFFIX)], True
+    elif name in _GSDDMM_PREFILLED_OPS:
+        base, edge_variant = name, False
+    else:
+        raise KeyError(f"Unknown turbo_gnn gsddmm op: {name!r}")
+
+    parts = base.split("_")
+    if parts[0] == "copy":
+        # copy_u / copy_v take a single operand; rhs is allocated by the op
+        # wrapper to satisfy the binding's shape check but never read.
+        return _GsddmmOpSpec("copy", _GSDDMM_NAME_TO_MEMBER[parts[1]], "edge", edge_variant, (parts[1],))
+
+    lhs, op, rhs = parts
+    return _GsddmmOpSpec(op, _GSDDMM_NAME_TO_MEMBER[lhs], _GSDDMM_NAME_TO_MEMBER[rhs], edge_variant, (lhs, rhs))
+
+
+class _CudaGsddmmOp(BaseAggr):
+    """Launch a turbo_gnn GSDDMM kernel directly (no projections).
+
+    ``forward(*operands, graph)`` mirrors the DGL raw-op wrapper so one
+    benchmarking path drives both backends. ``operand_kinds`` describes each
+    operand ("u"/"v": node features [N, D], "e": edge features [E, D]) so
+    callers can generate matching inputs; ``copy_*`` takes a single operand.
+
+    Feature dim D must be one of 32, 64, 128, 256, and both operands must
+    share a dtype (float32, float16 or bfloat16) — the kernels dispatch on it.
+
+    Forward-only: the kernels have no backward pass, so the returned tensor
+    carries no ``grad_fn``.
+    """
+
+    def __init__(self, op: str, **kwargs: Any) -> None:
+        super().__init__(conv_type=op)
+        spec = gsddmm_op_spec(op)
+        self.op = op
+        self.operand_kinds = spec.operand_kinds
+        self.edge_variant = spec.edge_variant
+        kernel_cls = GSDDMMEdgeKernel if spec.edge_variant else GSDDMMKernel
+        self.kernel = kernel_cls(
+            op=spec.op,
+            lhs_target=spec.lhs_target,
+            rhs_target=spec.rhs_target,
+            **kwargs,
+        )
+
+    def forward(self, *args: Any) -> torch.Tensor:
+        """Run the op; the last positional argument must be the graph."""
+        *operands, graph = args
+        rhs = operands[1] if len(operands) > 1 else None
+        return self.kernel(graph, operands[0], rhs=rhs)
+
+
 @BackendRegistry.register_backend("cuda")
 class CUDABackend(BaseBackend):
     """Backend that instantiates CUDA-based convolutions."""
@@ -301,6 +406,12 @@ class CUDABackend(BaseBackend):
         return conv
 
     def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        """Factory for CUDA aggregation-only callables.
+
+        Besides the named aggregations (min_aggr, gcn, gat_v2, ...), any
+        turbo_gnn gsddmm op name (u_add_v, e_dot_v, copy_u, and their
+        ``_edge`` edge-parallel variants) is launched directly.
+        """
         feature_dim = kwargs.pop("feature_dim", None)
         ct = conv_type.lower()
         match ct:
@@ -322,4 +433,9 @@ class CUDABackend(BaseBackend):
             case "gcn":
                 return _CudaSpMMAggr(norm_type="both")
             case _:
+                # Raw turbo_gnn gsddmm ops, launched directly (no wrappers).
+                if is_gsddmm_op(ct):
+                    # gsddmm is head-agnostic: it works on the flat [*, D] rows.
+                    kwargs.pop("heads", None)
+                    return _CudaGsddmmOp(ct, **kwargs)
                 raise KeyError(f"Unsupported conv_type for CUDA aggr: {conv_type}")

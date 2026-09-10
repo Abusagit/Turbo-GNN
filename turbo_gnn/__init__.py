@@ -6,6 +6,10 @@ Provides fused, autotunable CUDA kernels for common GNN operations:
 - **gatv2_aggr**: GATv2 attention-weighted aggregation (LeakyReLU + edge softmax).
 - **graph_transformer_aggr**: Fused multi-head graph attention (Q*K dot + edge softmax + V aggregation).
 - **spmm_aggr**: cuSPARSE-based SpMM with GCN/mean/sum normalization.
+- **gsddmm**: Per-edge binary ops (add/sub/mul/div/dot/copy) over node/edge
+  feature rows, plus DGL-style prefilled aliases (``u_sub_v``, ``copy_u``, ...).
+- **gsddmm_edge**: Edge-parallel gsddmm variant (one warp per edge over a cached
+  edge list), with matching ``*_edge`` aliases (``u_sub_v_edge``, ...).
 
 All kernels operate on CSR graphs wrapped in
 :class:`AdjacencyForwardBackwardWithNodeBuckets`, which stores forward and
@@ -25,15 +29,30 @@ Quick start::
 """
 
 from turbo_gnn._autotune import AutotuneConfig, TunableKernel, TunableParam, with_autotune
-from turbo_gnn._kernels import GATv2AggrKernel, GraphTransformerAggrKernel, ReductionAggrKernel
+from turbo_gnn._kernels import (
+    GATv2AggrKernel,
+    GraphTransformerAggrKernel,
+    GSDDMMEdgeKernel,
+    GSDDMMKernel,
+    ReductionAggrKernel,
+)
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 from turbo_gnn.ops import (
+    _GSDDMM_EDGE_PREFILLED_OPS,
+    _GSDDMM_PREFILLED_OPS,
     csr_SPMM_normalized,
     gatv2_aggr,
     graph_transformer_aggr,
+    gsddmm,
+    gsddmm_edge,
     reduction_aggr,
     spmm_aggr,
 )
+
+# DGL-style prefilled gsddmm ops (u_add_v, v_dot_u, copy_u, ...), generated in ops.py,
+# plus their edge-parallel ``*_edge`` variants.
+globals().update(_GSDDMM_PREFILLED_OPS)
+globals().update(_GSDDMM_EDGE_PREFILLED_OPS)
 
 __all__ = [
     "AdjacencyForwardBackwardWithNodeBuckets",
@@ -44,9 +63,15 @@ __all__ = [
     "ReductionAggrKernel",
     "GATv2AggrKernel",
     "GraphTransformerAggrKernel",
+    "GSDDMMKernel",
+    "GSDDMMEdgeKernel",
     "reduction_aggr",
     "gatv2_aggr",
     "graph_transformer_aggr",
     "spmm_aggr",
     "csr_SPMM_normalized",
+    "gsddmm",
+    "gsddmm_edge",
+    *_GSDDMM_PREFILLED_OPS,
+    *_GSDDMM_EDGE_PREFILLED_OPS,
 ]

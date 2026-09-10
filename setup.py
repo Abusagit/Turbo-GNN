@@ -221,6 +221,16 @@ if not SKIP_CUDA_BUILD:
                     "csrc/turbo_gnn.cpp",
                     "csrc/reduction/reduction_aggr.cu",
                     "csrc/reduction/reduction_aggr_base.cu",
+                    # The GSDDMM forward dispatch grid is sharded by op across
+                    # one translation unit each so nvcc compiles them in
+                    # parallel (see csrc/gsddmm/gsddmm_launch.cuh).
+                    "csrc/gsddmm/gsddmm_binding.cu",
+                    "csrc/gsddmm/gsddmm_launch_add.cu",
+                    "csrc/gsddmm/gsddmm_launch_sub.cu",
+                    "csrc/gsddmm/gsddmm_launch_mul.cu",
+                    "csrc/gsddmm/gsddmm_launch_div.cu",
+                    "csrc/gsddmm/gsddmm_launch_dot.cu",
+                    "csrc/gsddmm/gsddmm_launch_copy.cu",
                     "csrc/gatv2/gatv2_kernel.cu",
                     "csrc/gt/graph_transformer.cu",
                     "csrc/spmm/cusparse_spmm.cpp",

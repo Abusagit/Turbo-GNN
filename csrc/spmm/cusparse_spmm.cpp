@@ -36,7 +36,7 @@ static cudaDataType_t torch_to_cuda_dtype(c10::ScalarType dtype) {
 
 constexpr int BLOCK_DIM = 256;
 
-enum class NormType { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
+enum class NormType: uint8_t { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
 
 void launch_compute_degrees(
     const torch::Tensor& indptr, const torch::Tensor& indices, torch::Tensor& in_degrees, torch::Tensor& out_degrees, int block_dim
@@ -230,7 +230,7 @@ torch::Tensor csr_SPMM_normalized(
 
     // Handle workspace
     void *workspace          = nullptr;
-    size_t workspace_size    = 0;
+    // size_t workspace_size    = 0;
     bool need_free_workspace = false;
 
     cusparseOperation_t opA = do_transpose_a ? CUSPARSE_OPERATION_TRANSPOSE : CUSPARSE_OPERATION_NON_TRANSPOSE;
@@ -238,7 +238,7 @@ torch::Tensor csr_SPMM_normalized(
     if (cache && cache->workspace) {
         // Use cached workspace
         workspace      = cache->workspace;
-        workspace_size = cache->workspace_size;
+        // workspace_size = cache->workspace_size;
     } else {
         // Get required workspace size
         size_t required_size;
@@ -252,13 +252,13 @@ torch::Tensor csr_SPMM_normalized(
                 cudaMalloc(&cache->workspace, required_size);
                 cache->workspace_size = required_size;
                 workspace             = cache->workspace;
-                workspace_size        = required_size;
+                // workspace_size        = required_size;
             }
         } else {
             // Temporary workspace
             if (required_size > 0) {
                 cudaMalloc(&workspace, required_size);
-                workspace_size      = required_size;
+                // workspace_size      = required_size;
                 need_free_workspace = true;
             }
         }

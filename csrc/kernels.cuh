@@ -1,5 +1,6 @@
 #pragma once
 #include <torch/extension.h>
+#include <optional>
 
 #include <string>
 #include <tuple>
@@ -23,6 +24,41 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int tiles_y                     = 8,
     std::string reduce              = "min",
     int pipeline_stages             = 0
+);
+
+// ============================================================================
+// GSDDMM aggregation
+// ============================================================================
+
+torch::Tensor gsddmm_forward_cuda(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    uint32_t light_warps_per_block                 = 4,
+    uint32_t heavy_warps_per_block                 = 32,
+    uint32_t pipeline_stages                       = 0,
+    std::optional<torch::Tensor> heavy_block_parts = std::nullopt,
+    uint32_t heavy_edges_per_block                 = 0,
+    bool overlap_buckets                           = false
+);
+
+torch::Tensor gsddmm_forward_edge_blocks(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor edge_list,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t pipeline_stages = 0,
+    uint32_t edges_per_warp  = 1,
+    uint32_t warps_per_block = 1
 );
 
 at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);

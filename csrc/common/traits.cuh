@@ -143,34 +143,6 @@ struct IndexTypeInfo<uint64_t> {
     static constexpr c10::ScalarType ScalarType = c10::ScalarType::UInt64;
 };
 
-// Sentinel traits: universal "invalid index" for all types
-// For signed: -1. For unsigned: max value (all-ones bit pattern).
-// cast(-1) gives all-ones for both signed and unsigned.
-template <typename index_t>
-struct IndexSentinel {
-    static constexpr index_t INVALID = static_cast<index_t>(-1);
-    static __device__ __forceinline__ bool is_valid(index_t idx) { return idx != INVALID; }
-};
-
-// Runtime dispatch to compile-time index type
-template <typename... IndexTypes>
-std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {
-    std::variant<IndexTypeInfo<IndexTypes>...> result;
-    bool found = false;
-    (
-        [&] {
-            if (IndexTypeInfo<IndexTypes>::ScalarType == type) {
-                result.template emplace<IndexTypeInfo<IndexTypes>>();
-                found = true;
-            }
-        }(),
-        ...);
-    if (!found) {
-        throw std::runtime_error("Unsupported index scalar type");
-    }
-    return result;
-}
-
 // Is floating point trait
 
 template <typename T>
@@ -198,3 +170,58 @@ concept FloatingNum = is_floating_point_cuda_v<T>;
 
 template <typename T>
 inline constexpr bool is_half_fp_v = std::is_same_v<std::remove_cv_t<T>, half> || std::is_same_v<std::remove_cv_t<T>, nv_bfloat16>;
+
+// Is integer trait
+
+template <typename T>
+struct is_integral_cuda {
+   private:
+    // Strip const/volatile, but intentionally keep references/pointers
+    // so they correctly evaluate to false, matching std:: behavior.
+    using U = std::remove_cvref_t<T>;
+
+   public:
+    static constexpr bool value = std::is_integral_v<U> ||              // Standard: car, short, int, long long , e.t.c.
+                                  std::is_same_v<U, __int128> ||        // CUDA: i128
+                                  std::is_same_v<U, unsigned __int128>  // CUDA: ui128
+        ;
+};
+
+template <typename T>
+inline constexpr bool is_integral_cuda_v = is_integral_cuda<T>::value;
+
+template <typename T>
+concept IntegralNum = is_integral_cuda_v<T>;
+
+template <IntegralNum T>
+inline constexpr T ceil_div(T num, T den) {
+    return (num + den - 1) / den;
+}
+
+// Sentinel traits: universal "invalid index" for all types
+// For signed: -1. For unsigned: max value (all-ones bit pattern).
+// cast(-1) gives all-ones for both signed and unsigned.
+template <IntegralNum index_t>
+struct IndexSentinel {
+    static constexpr index_t INVALID = static_cast<index_t>(-1);
+    static __device__ __forceinline__ bool is_valid(index_t idx) { return idx != INVALID; }
+};
+
+// Runtime dispatch to compile-time index type
+template <typename... IndexTypes>
+std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {
+    std::variant<IndexTypeInfo<IndexTypes>...> result;
+    bool found = false;
+    (
+        [&] {
+            if (IndexTypeInfo<IndexTypes>::ScalarType == type) {
+                result.template emplace<IndexTypeInfo<IndexTypes>>();
+                found = true;
+            }
+        }(),
+        ...);
+    if (!found) {
+        throw std::runtime_error("Unsupported index scalar type");
+    }
+    return result;
+}

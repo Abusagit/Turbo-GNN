@@ -23,9 +23,9 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using Tile = TileOps<TW, cuda_t, accum_t>;
 
@@ -59,7 +59,7 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 // Q, K, V may be non-contiguous in N,H dims (e.g. from split/view).
 // logsumexp and Delta are [N, H].
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr_T,     // [N+1], CSR^T row pointers
@@ -81,9 +81,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
@@ -281,7 +281,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 //   Forward direction: dK[d] (local)
 //   Reverse direction: dQ[d], dV[d] (local, exploiting symmetric adjacency)
 // =============================================================================
-template <int D_CONST, typename cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirected_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr,  // [N+1], forward CSR row pointers
@@ -303,9 +303,8 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
     constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
-    constexpr int TILES            = (D_CONST + TW - 1) / TW;                                                // Total tiles count
-    constexpr int TILES_PER_THREAD = (TILES + TW_SELECTOR::threads_per_d - 1) / TW_SELECTOR::threads_per_d;  // Tiles per thread
-
+    constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
+    constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
 
