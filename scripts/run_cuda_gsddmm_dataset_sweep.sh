@@ -8,9 +8,10 @@
 #   - regular:  one CSR thread block per node, light/heavy degree buckets
 #   - `_edge`:  one warp per edge over an explicit [E, 2] edge list
 #
-# Per dataset: forward sweeps over 64 ops x 3 dtypes (fp32, fp16, bf16) are
-# written to out/cuda_gsddmm/<dataset>_cuda_gsddmm.csv (64 x 3 = 192 rows),
-# plus a combined out/cuda_gsddmm/all_datasets_cuda_gsddmm.csv at the end.
+# Per dataset, by default: forward sweeps over 64 ops x 3 dtypes (fp32, fp16,
+# bf16) written to out/cuda_gsddmm/<dataset>_cuda_gsddmm.csv (64 x 3 = 192
+# rows), plus a combined out/cuda_gsddmm/all_datasets_cuda_gsddmm.csv at the
+# end. See SUBSETTING below to run a single dtype.
 #
 # Forward only: the GSDDMM kernels have no backward pass, so their output is
 # detached and a --mode backward run would time an empty graph.
@@ -27,9 +28,39 @@
 #
 # Env: CUDA_VISIBLE_DEVICES="0" TORCH_CUDA_ARCH_LIST="8.0". Assumes the full
 # 80 GB of GPU RAM is available. The GSDDMM kernels only accept feature dim D
-# in {32, 64, 128, 256}, so on OOM the dim is lowered (128 -> 64 -> 32) until
-# ALL THREE dtypes succeed at the same dim, keeping every dataset's CSV
-# self-consistent and comparable across precisions.
+# in {32, 64, 128, 256}, so on OOM the dim is lowered (256 -> 128 -> 64 -> 32)
+# until EVERY dtype in $DTYPES succeeds at the same dim, keeping each dataset's
+# CSV self-consistent and comparable across precisions.
+#
+# SUBSETTING -- these three are env-overridable:
+#   DTYPES        default "fp32 fp16 bf16"  e.g. DTYPES=fp16 for one precision
+#   FEATURE_DIMS  default "256 128 64 32"   e.g. FEATURE_DIMS=128 to pin a dim
+#   OUT_DIR       default out/cuda_gsddmm   redirects CSVs, logs and overrides
+#   DATASETS      default "" (= all)        e.g. DATASETS="cora ogbn_arxiv"
+# DATASETS takes the dataset names as they appear in the CSV filenames (so
+# `ls out/cuda_gsddmm/*.csv` lists the valid values), space- or
+# comma-separated. An unrecognised name is a hard error listing the valid
+# ones, rather than a run that silently benchmarks nothing. Note the combined
+# table is still rebuilt from every CSV present in OUT_DIR, so after a
+# filtered run it mixes the refreshed datasets with whatever was there before
+# -- fine when only the kernels changed, misleading if DTYPES/FEATURE_DIMS
+# differed between the runs.
+# There is deliberately no --mode knob: these kernels have no backward, so the
+# sweep is always forward-only (see above).
+#
+# Two traps when narrowing DTYPES -- which is why OUT_DIR is overridable:
+#   1. Each dataset's CSV is deleted and rewritten from scratch, so a
+#      DTYPES=fp16 run against the default OUT_DIR REPLACES a finished 192-row
+#      table with 64 fp16 rows. Point OUT_DIR elsewhere to keep both.
+#   2. The dim picked is the largest at which the SELECTED dtypes fit. fp32 is
+#      the most memory-hungry of the three, so an fp16-only run can settle on a
+#      LARGER dim than a full run did, and those numbers are then not
+#      comparable with the 3-dtype tables. Pin FEATURE_DIMS to the dim the full
+#      run used (the feature_dim column of its CSV) when you need to compare.
+#
+# So, a scratch fp16-only run that touches nothing existing:
+#   DTYPES=fp16 FEATURE_DIMS=128 OUT_DIR=out/cuda_gsddmm_fp16 \
+#       bash scripts/run_cuda_gsddmm_dataset_sweep.sh
 #
 # DISK: the datasets download into data/ and are large (web-traffic 14G,
 # web-topics 9.2G, ogbn-products 4.2G, reddit+flickr ~2.6G, hm-* ~1.2G).
@@ -59,17 +90,28 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 PY=".venv/bin/python3"
-OUT_DIR="out/cuda_gsddmm"
+OUT_DIR="${OUT_DIR:-out/cuda_gsddmm}"
 LOG_DIR="$OUT_DIR/logs"
 OVERRIDE_DIR="$OUT_DIR/.overrides"
 mkdir -p "$OUT_DIR" "$LOG_DIR" "$OVERRIDE_DIR"
 
 WARMUP=5
 ITERS=20
-DTYPES="fp32 fp16 bf16"
+DTYPES="${DTYPES:-fp32 fp16 bf16}"
 # Feature dims to try, in order; the kernels reject anything outside
 # {32, 64, 128, 256}, so this is the whole usable fallback chain below 256.
-FEATURE_DIMS="256 128 64 32"
+FEATURE_DIMS="${FEATURE_DIMS:-256 128 64 32}"
+# Empty = every dataset. Commas are accepted as separators alongside spaces.
+DATASETS="$(echo "${DATASETS:-}" | tr ',' ' ')"
+
+# Every dataset config the sweep considers. Declared once so the DATASETS
+# filter can be validated against it before any benchmarking starts.
+ALL_YAMLS=(
+    configs/datasets/main/*.yaml
+    configs/datasets/secondary/*.yaml
+    configs/datasets/graphland_remaining/*.yaml
+    configs/datasets/pyg_cora.yaml
+)
 
 # Dataset configs that can never be benchmarked (see header).
 SKIP_YAMLS=(
@@ -148,6 +190,22 @@ is_skipped() {
     return 1
 }
 
+yaml_name() {
+    # yaml_name <yaml> -- the dataset name as used for CSV/log filenames.
+    grep -m1 -oP 'name:\s*\K\S+' "$1" | tr -d "'\"" | tr '/-' '__'
+}
+
+is_selected() {
+    # is_selected <dataset name> -- true if DATASETS is empty (run all) or
+    # names this dataset.
+    [ -z "$DATASETS" ] && return 0
+    local d
+    for d in $DATASETS; do
+        [ "$1" = "$d" ] && return 0
+    done
+    return 1
+}
+
 is_oom() {
     # is_oom <logfile> -- did this run die from a GPU OOM? Only an OOM is worth
     # retrying at a smaller feature dim; a dataset that fails to download, or a
@@ -167,19 +225,48 @@ run_dtype() {
         > "$LOG_DIR/$2_cuda_gsddmm_$3_d$4.log" 2>&1
 }
 
-echo "benchmarking $NUM_OPS ops x $(echo $DTYPES | wc -w) dtypes, ${WARMUP} warmup / ${ITERS} timed iters"
+# Reject an unknown DATASETS entry now: a filter that matches nothing would
+# otherwise look like a sweep that ran and found no work to do.
+AVAILABLE=""
+for yaml in "${ALL_YAMLS[@]}"; do
+    [ -f "$yaml" ] || continue
+    AVAILABLE="$AVAILABLE $(yaml_name "$yaml")"
+done
+if [ -n "$DATASETS" ]; then
+    unknown=""
+    for d in $DATASETS; do
+        case " $AVAILABLE " in
+            *" $d "*) ;;
+            *) unknown="$unknown $d" ;;
+        esac
+    done
+    if [ -n "$unknown" ]; then
+        echo "ERROR: unknown dataset(s) in DATASETS:$unknown" >&2
+        echo "Available dataset names:" >&2
+        for a in $AVAILABLE; do echo "    $a" >&2; done
+        exit 1
+    fi
+fi
+
+echo "benchmarking $NUM_OPS ops (forward only) x $(echo $DTYPES | wc -w) dtypes [$DTYPES]"
+echo "  dims tried: $FEATURE_DIMS | ${WARMUP} warmup / ${ITERS} timed iters | out: $OUT_DIR"
+if [ -n "$DATASETS" ]; then
+    echo "  datasets: $(echo $DATASETS | wc -w) selected [$DATASETS]"
+else
+    echo "  datasets: all $(echo $AVAILABLE | wc -w)"
+fi
 
 summary=""
 declare -A SEEN=()
-for yaml in configs/datasets/main/*.yaml configs/datasets/secondary/*.yaml \
-            configs/datasets/graphland_remaining/*.yaml configs/datasets/pyg_cora.yaml; do
+for yaml in "${ALL_YAMLS[@]}"; do
     [ -f "$yaml" ] || continue
+    name="$(yaml_name "$yaml")"
+    is_selected "$name" || continue
     if is_skipped "$yaml"; then
         echo "SKIP (unloadable): $yaml"
         summary="$summary\n$(basename "$yaml" .yaml): SKIPPED (unloadable)"
         continue
     fi
-    name="$(grep -m1 -oP 'name:\s*\K\S+' "$yaml" | tr -d "'\"" | tr '/-' '__')"
     csv="$OUT_DIR/${name}_cuda_gsddmm.csv"
     if [ -n "${SEEN[$name]:-}" ]; then
         echo "SKIP (duplicate of ${SEEN[$name]}): $yaml"

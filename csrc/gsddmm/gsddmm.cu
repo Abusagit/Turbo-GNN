@@ -367,18 +367,22 @@ __global__ void __launch_bounds__(kWarpSize) GSDDMM_forward_edge_block( // no-fo
         const size_t tile_idx = i * kWarpSize + lane_id;
         if constexpr (Plan::IS_DOT) {
             if (tile_idx < TILES) {
-                vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L_row, tile_idx);
-                vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R_row, tile_idx);
+                // vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L_row, tile_idx);
+                // vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R_row, tile_idx);
+                vec_t L_feats = Tile::read<Tile::MemoryHint::NoHint>(L_row, tile_idx);
+                vec_t R_feats = Tile::read<Tile::MemoryHint::NoHint>(R_row, tile_idx);
                 L_feats.dot_product_(&partial, R_feats);
             }
         } else {
             if (tile_idx < TILES) {
-                vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L_row, tile_idx);
+                // vec_t L_feats = Tile::read<Tile::MemoryHint::Streaming>(L_row, tile_idx);
+                vec_t L_feats = Tile::read<Tile::MemoryHint::NoHint>(L_row, tile_idx);
 
                 if constexpr (op == GSDDMM_OP::Copy) {
                     Tile::write<Tile::MemoryHint::NoCache>(O_row, tile_idx, L_feats);
                 } else {
-                    vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R_row, tile_idx);
+                    // vec_t R_feats = Tile::read<Tile::MemoryHint::Streaming>(R_row, tile_idx);
+                    vec_t R_feats = Tile::read<Tile::MemoryHint::NoHint>(R_row, tile_idx);
                     Tile::write<Tile::MemoryHint::NoCache>(O_row, tile_idx, VecOp::apply(L_feats, R_feats));
                 }
             }
