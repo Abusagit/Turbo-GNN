@@ -502,11 +502,17 @@ class GSpMMFunction(torch.autograd.Function):
     buckets and, for min/max, records the winning CSR edge position per output
     element.
 
-    Backward has two shapes:
+    Backward has two shapes, and both walk a CSR with the same light/heavy
+    node buckets (on two streams) as the forward:
 
-    - **min/max**: only the winning edge of each output element contributed, so
-      one scatter over the saved indices (``_C.gspmm_backward_arg``) yields both
-      gradients at once.
+    - **min/max**: only the winning edge of each output element contributed.
+      On a sparse graph ``_C.gspmm_backward_arg`` walks the *transposed* CSR:
+      a source's node gradient is the sum over its out-edges of the ones that
+      won, so it is written once per element with no atomics, and the edge
+      gradient falls out of the same walk; ``graph.backward_edge_map`` tells
+      which forward edge each transposed position is. On a dense graph that
+      walk tests too many edges and the launcher scatters over the winning
+      edges instead (one block per destination, atomics on the node gradient).
     - **sum**: every edge contributed, and the two gradients decouple. The node
       gradient is this same g-SpMM re-run on the *transposed* CSR; the edge
       gradient is ``_C.gspmm_backward_edge`` over the forward CSR. For ``mul``
@@ -577,7 +583,18 @@ class GSpMMFunction(torch.autograd.Function):
         )
 
         ctx.save_for_backward(
-            lhs_t, rhs_t, arg_eid, edge_ptr, edge_idx, bwd_edge_ptr, bwd_edge_idx, bwd_light, bwd_heavy, bwd_edge_map
+            lhs_t,
+            rhs_t,
+            arg_eid,
+            edge_ptr,
+            edge_idx,
+            light,
+            heavy,
+            bwd_edge_ptr,
+            bwd_edge_idx,
+            bwd_light,
+            bwd_heavy,
+            bwd_edge_map,
         )
         ctx.op = op
         ctx.reduce = reduce
@@ -585,6 +602,7 @@ class GSpMMFunction(torch.autograd.Function):
         ctx.features_per_block = features_per_block
         ctx.tiles_y = tiles_y
         ctx.pipeline_stages = pipeline_stages
+        ctx.max_degree = max_degree
         ctx.bwd_max_degree = bwd_max_degree
         return out
 
@@ -597,6 +615,8 @@ class GSpMMFunction(torch.autograd.Function):
             arg_eid,
             edge_ptr,
             edge_idx,
+            light,
+            heavy,
             bwd_edge_ptr,
             bwd_edge_idx,
             bwd_light,
@@ -611,13 +631,34 @@ class GSpMMFunction(torch.autograd.Function):
         grad_rhs = None
 
         if ctx.reduce in ("min", "max"):
-            g_lhs, g_rhs = _C.gspmm_backward_arg(grad_out, arg_eid, edge_idx, lhs_t, rhs_t, op, ctx.warps_per_block)
-            # Only the node gradient is staged in fp32 -- its scatter is
-            # atomicAdd-based, since several destinations can share a winning
-            # source.  The edge gradient already comes back in the operand
-            # dtype (see gspmm_backward_arg).
+            if bwd_edge_ptr is None or bwd_edge_map is None:
+                raise RuntimeError(
+                    f"gspmm(op='{op}', reduce='{ctx.reduce}') backward walks the transposed CSR. "
+                    "Pass the backward adjacency and graph.backward_edge_map through GSpMMFunction.apply."
+                )
+            # Both gradients come back in the operand dtype: the walk over the
+            # transpose writes every element exactly once (see
+            # gspmm_backward_arg), so nothing is staged in fp32 here.
+            g_lhs, g_rhs = _C.gspmm_backward_arg(
+                grad_out,
+                arg_eid,
+                edge_idx,
+                bwd_edge_ptr,
+                bwd_edge_idx,
+                bwd_edge_map,
+                lhs_t,
+                rhs_t,
+                bwd_light,
+                bwd_heavy,
+                op,
+                ctx.warps_per_block,
+                ctx.features_per_block,
+                ctx.tiles_y,
+                ctx.bwd_max_degree,
+                ctx.pipeline_stages,
+            )
             if lhs_needs_grad:
-                grad_lhs = g_lhs.to(lhs_t.dtype)
+                grad_lhs = g_lhs
             if rhs_needs_grad:
                 grad_rhs = g_rhs
         else:
@@ -636,7 +677,21 @@ class GSpMMFunction(torch.autograd.Function):
             if rhs_needs_grad:
                 # Already in the operand dtype: this kernel writes every slot
                 # exactly once, so it has no float staging buffer to cast back.
-                grad_rhs = _C.gspmm_backward_edge(edge_ptr, edge_idx, grad_out, lhs_t, rhs_t, op, ctx.warps_per_block)
+                grad_rhs = _C.gspmm_backward_edge(
+                    edge_ptr,
+                    edge_idx,
+                    grad_out,
+                    lhs_t,
+                    rhs_t,
+                    light,
+                    heavy,
+                    op,
+                    ctx.warps_per_block,
+                    ctx.features_per_block,
+                    ctx.tiles_y,
+                    ctx.max_degree,
+                    ctx.pipeline_stages,
+                )
 
             if lhs_needs_grad:
                 if bwd_edge_ptr is None:
@@ -683,7 +738,6 @@ class GSpMMFunction(torch.autograd.Function):
                     edge_map,
                     ctx.bwd_max_degree,
                 )
-
 
         return (
             grad_lhs,
