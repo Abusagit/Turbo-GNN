@@ -105,6 +105,54 @@ For one graph, or for the denser single-figure form:
     --sms 108 --memory-bandwidth-gbps 2039 --out profile.png
 ```
 
+## Building on the target machine
+
+`turbo_gnn._C` is a CUDA extension and has to be compiled where it runs. `setup.py` already
+defaults `TORCH_CUDA_ARCH_LIST` to `8.0 8.6 8.9 9.0`, and an A100 is **sm_80**, so no
+architecture flag is needed -- but building only the one you have is much faster:
+
+```bash
+TORCH_CUDA_ARCH_LIST=8.0 make install-dev        # A100
+TORCH_CUDA_ARCH_LIST=9.0 make install-dev        # H100
+```
+
+`install-dev` creates `.venv`, installs torch and the `[dev]` extras (PyG, ogb, pandas, ruff,
+pytest), builds the extension in place and runs the test suite.
+
+Two things that bite:
+
+* `PYTHON_BIN` defaults to `$HOME/micromamba/envs/graph_ml/bin/python`. If that interpreter is
+  not on the machine, point it at one that is -- 3.10 or 3.11:
+
+  ```bash
+  PYTHON_BIN=$(which python3.11) TORCH_CUDA_ARCH_LIST=8.0 make install-dev
+  ```
+
+* `CUDA_HOME` defaults to `/usr/local/cuda` and the torch wheel index is derived from
+  `nvcc --version`, so nvcc must be on the machine and match the driver. Check with
+  `nvcc --version` and `nvidia-smi`.
+
+Reference build here: python 3.11, torch 2.11.0+cu129, CUDA 12.9.
+
+### Verify
+
+```bash
+.venv/bin/python3 -c "import torch, turbo_gnn; from turbo_gnn.ops import graph_transformer_aggr; \
+    print(torch.cuda.get_device_name(0), torch.__version__)"
+```
+
+The built object is per interpreter version -- `turbo_gnn/_C.cpython-311-*.so` -- so a different
+python needs its own build.
+
+### After editing CUDA
+
+```bash
+CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=8.0 \
+    .venv/bin/pip3 install -e . --no-build-isolation
+```
+
+Recompiles only what changed; the full `install-dev` reinstalls the dependencies too.
+
 ## Datasets
 
 Normally they download on first use. Where egress is filtered they do not, and the failure
