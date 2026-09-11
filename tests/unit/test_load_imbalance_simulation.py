@@ -110,6 +110,4 @@ def test_concurrent_streams_start_light_after_latency():
 
 
 def test_hardware_bandwidth_conversion():
-    # Little's law: 100 bytes/ns held for 1 ns is 100 bytes outstanding, and a 4-byte
-    # x 10-element row means two fetches in flight.
     assert bandwidth_cap_from_hardware(100, 10, 4, 1) == 2
