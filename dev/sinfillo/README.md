@@ -159,7 +159,7 @@ Normally they download on first use. Where egress is filtered they do not, and t
 arrives as an SSL error under a DGL fallback. Fetch them from a machine with network:
 
 ```bash
-python3 scripts/download_datasets.py --datasets all --archive graphs.tar.gz
+python3 dev/sinfillo/download_datasets.py --datasets all --archive graphs.tar.gz
 # then on the GPU machine
 tar xzf graphs.tar.gz -C /path/to/Turbo-GNN/
 ```

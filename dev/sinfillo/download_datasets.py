@@ -8,7 +8,7 @@ downloads and unpacks the same archives, so it can be run somewhere with network
 resulting ``data/`` tree copied across.
 
     # on a machine with network
-    python3 scripts/download_datasets.py --datasets all --out data --archive graphs.tar.gz
+    python3 dev/sinfillo/download_datasets.py --datasets all --out data --archive graphs.tar.gz
 
     # then, on the machine with the GPU
     tar xzf graphs.tar.gz -C /path/to/Turbo-GNN/
