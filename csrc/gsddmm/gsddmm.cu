@@ -75,7 +75,8 @@ __device__ __forceinline__ void gsddmm_async_copy_rows_warp(
                 }
             }
             cuda::memcpy_async(
-                reinterpret_cast<chunk_t *>(dst) + i, reinterpret_cast<chunk_t const *>(src) + i, cuda::aligned_size_t<16>(sizeof(chunk_t)), pipe
+                reinterpret_cast<chunk_t *>(dst) + i, reinterpret_cast<chunk_t const *>(src) + i, cuda::aligned_size_t<16>(sizeof(chunk_t)),
+                pipe
             );
         }
     }
@@ -109,7 +110,9 @@ __device__ __forceinline__ void gsddmm_async_copy_rows_warp(
 // dbuf: this warp's private shared scratch, NUM_ROWS * (NUM_STAGES + 1) * D_CONST elements.
 // =============================================================================
 template <size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, typename AddrFn, typename ConsumeFn>
-__device__ __forceinline__ void gsddmm_pipelined_row_loop(size_t lane, size_t loop_iters, cuda_t *__restrict__ dbuf, AddrFn&& addr, ConsumeFn&& consume) {
+__device__ __forceinline__ void gsddmm_pipelined_row_loop(
+    size_t lane, size_t loop_iters, cuda_t *__restrict__ dbuf, AddrFn&& addr, ConsumeFn&& consume
+) {
     static_assert(NUM_STAGES >= 1, "The pipeline needs at least one stage in flight; PIPELINE_STAGES == 0 takes the direct-load loop");
     if (loop_iters == 0) [[unlikely]] {
         return;
@@ -203,7 +206,7 @@ __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
             srcs[r]             = row_bases[r] + row_id * D_CONST;
         }
     };
-    auto consume_it = [edge_of, consume_ = std::move(consume)](size_t it, cuda_t const *const (&rows)[NUM_ROWS]) {
+    auto consume_it = [edge_of, consume_ = std::move(consume)](size_t it, cuda_t const *const(&rows)[NUM_ROWS]) {
         consume_(static_cast<size_t>(edge_of(it)), rows);
     };
 
@@ -391,7 +394,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
 // (src, dst) pair lane k cached in my_pair (warp-wide shuffle broadcast, so all
 // lanes must reach this together); Edge rows are indexed by the edge position.
 template <GSDDMM_MEMBER m, size_t D_CONST, FloatingNum cuda_t>
-__device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(cuda_t const *__restrict__ base, const ulonglong2& my_pair, size_t k, uint64_t e) {
+__device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(
+    cuda_t const *__restrict__ base, const ulonglong2& my_pair, size_t k, uint64_t e
+) {
     if constexpr (m == GSDDMM_MEMBER::Src_V) {
         return base + D_CONST * __shfl_sync(FULL_WARP_MASK, my_pair.x, static_cast<int>(k));
     } else if constexpr (m == GSDDMM_MEMBER::Dst_V) {
@@ -423,12 +428,23 @@ __device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(cuda_t const *__
 // so the store of edge k already overlaps the copies of edges k+1..k+STAGES and
 // gains nothing from staging (sm_80 also has no async shared->global bulk copy;
 // that is sm_90+).
+//
+// Edge numbering: the traversal list may be grouped by SOURCE for locality (so a
+// warp's chunk shares the Src_V row) while the caller numbers edges by their
+// forward-CSR position. canonical_edge_idx bridges the two: slot k of the chunk
+// carries canonical edge id canonical_edge_idx[edge_base + k], which indexes BOTH
+// the Edge operand rows and the output row -- remapping only the store would pair
+// an edge-indexed operand with the wrong edge. Lane k caches its slot's id with
+// the same coalesced load pattern as the (src, dst) pair and broadcasts it with a
+// shuffle. nullptr means the traversal order already IS the canonical order, and
+// the id degenerates to the slot index (no load, no shuffle).
 // =============================================================================
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t, size_t PIPELINE_STAGES>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block( // no-format
     uint64_t E, // total edge count
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     ulonglong2 const * __restrict__ edge_nodes_idx,
+    unsigned long long const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 ) {
     static_assert(D_CONST % 32 == 0, "D_CONST must be a multiple of 32 so a warp covers the row an integral number of times");
@@ -450,9 +466,9 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
 
     // Every operand is gathered per edge here: slot 0 is the L row, slot 1 the
     // R row (absent for Copy, which never reads R).
-    constexpr size_t NUM_ROWS  = Plan::USE_R ? 2 : 1;
-    constexpr size_t L_SLOT    = 0;
-    constexpr size_t R_SLOT    = 1;
+    constexpr size_t NUM_ROWS   = Plan::USE_R ? 2 : 1;
+    constexpr size_t L_SLOT     = 0;
+    constexpr size_t R_SLOT     = 1;
     constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
     constexpr size_t NUM_STAGES = USE_PIPELINE ? static_cast<size_t>(PIPELINE_STAGES) : 1;  // only read when USE_PIPELINE
 
@@ -478,9 +494,23 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         my_pair = __ldcs(&edge_nodes_idx[edge_base + lane_id]);
     }
 
+    // Lane k also caches the canonical edge id of slot k, same access pattern. The
+    // pointer is grid-uniform, so the branch below never diverges and the shuffle
+    // inside canonical_of stays convergent.
+    const bool remap_edge_ids       = canonical_edge_idx != nullptr;
+    unsigned long long my_canonical = 0;
+    if (remap_edge_ids && lane_id < num_edges) {
+        my_canonical = __ldcs(&canonical_edge_idx[edge_base + lane_id]);
+    }
+
+    // Canonical edge id of slot k of this chunk (warp-uniform result).
+    auto canonical_of = [remap_edge_ids, my_canonical, edge_base](size_t k) -> uint64_t {
+        return remap_edge_ids ? __shfl_sync(FULL_WARP_MASK, my_canonical, static_cast<int>(k)) : edge_base + k;
+    };
+
     // Global row addresses of the operands for edge k of the chunk (warp-uniform).
-    auto edge_rows = [edge_base, my_pair, L, R](size_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
-        const uint64_t e = edge_base + k;
+    auto edge_rows = [canonical_of, my_pair, L, R](size_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
+        const uint64_t e = canonical_of(k);
         srcs[L_SLOT]     = gsddmm_edge_member_row<ll, D_CONST, cuda_t>(L, my_pair, k, e);
         if constexpr (Plan::USE_R) {
             srcs[R_SLOT] = gsddmm_edge_member_row<rr, D_CONST, cuda_t>(R, my_pair, k, e);
@@ -493,8 +523,8 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     // O is written once and never read back here, so the stores are streaming
     // (evict-first): the [E, D] output must not push the gathered node rows,
     // which ARE re-read by other edges, out of L2.
-    auto consume = [lane_id, edge_base, O](size_t k, cuda_t const *const(&rows)[NUM_ROWS]) {
-        const uint64_t e = edge_base + k;
+    auto consume = [lane_id, canonical_of, O](size_t k, cuda_t const *const(&rows)[NUM_ROWS]) {
+        const uint64_t e = canonical_of(k);
         if constexpr (!Plan::IS_DOT) {
             cuda_t *const O_row = O + e * D_CONST;  // elementwise ops write the edge's own row
 #pragma unroll
@@ -556,9 +586,12 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
 
         // edge_body(cache_c, k): op for edge k of the chunk; with cache_c true the
         // SHARED operand comes from shared_tiles instead of its own gathered row.
-        auto edge_body = [L, R, O, edge_base, shared_tiles, my_pair, lane_id](auto cache_c, size_t k) {
+        // shared_tiles is captured BY REFERENCE: it is filled below, after this
+        // closure is created, so a by-value capture would compute on the copy
+        // taken while the array was still uninitialized.
+        auto edge_body = [L, R, O, canonical_of, &shared_tiles, my_pair, lane_id](auto cache_c, size_t k) {
             constexpr bool USE_CACHE = decltype(cache_c)::value;
-            const uint64_t e         = edge_base + k;
+            const uint64_t e         = canonical_of(k);
             cuda_t const *l_row      = nullptr;
             cuda_t const *r_row      = nullptr;
             if constexpr (!(USE_CACHE && L_SHARED)) {

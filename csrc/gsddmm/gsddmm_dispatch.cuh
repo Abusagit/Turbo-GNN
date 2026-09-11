@@ -1,9 +1,9 @@
 #pragma once
 
+#include <ATen/cuda/CUDAEvent.h>
+
 #include <optional>
 #include <variant>
-
-#include <ATen/cuda/CUDAEvent.h>
 
 #include "common/traits.cuh"
 #include "gsddmm/gsddmm.cu"
@@ -109,7 +109,9 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
     }
 
     // Heavy nodes: one block per node, or per edges_per_block-wide chunk
-    launch_bucket(args.heavy_nodes, args.heavy_block_parts, args.heavy_edges_per_block, args.stream, MakeIntVariant<32>(args.heavy_warps_per_block));
+    launch_bucket(
+        args.heavy_nodes, args.heavy_block_parts, args.heavy_edges_per_block, args.stream, MakeIntVariant<32>(args.heavy_warps_per_block)
+    );
 
     // Light nodes: always one block per node
     launch_bucket(args.light_nodes, nullptr, 0, overlap ? *light_stream : args.stream, MakeIntVariant<4>(args.light_warps_per_block));
@@ -168,10 +170,12 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             const dim3 blocks(grid_dim_x, grid_dim_y, grid_dim_z);
             const dim3 threads(kWarpSize, args.warps_per_block);
 
-            kernel<<<blocks, threads, shmem, args.stream>>>(args.E, L_ptr, R_ptr, O_ptr, args.edge_nodes_idx, static_cast<uint32_t>(args.edges_per_warp));
+            kernel<<<blocks, threads, shmem, args.stream>>>(
+                args.E, L_ptr, R_ptr, O_ptr, args.edge_nodes_idx, args.canonical_edge_idx, static_cast<uint32_t>(args.edges_per_warp)
+            );
         },
-        lro_variant, MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-        MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
+        lro_variant, MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()),
+        MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)), MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
     );
 }
 

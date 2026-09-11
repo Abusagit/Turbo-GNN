@@ -8,8 +8,8 @@ Provides fused, autotunable CUDA kernels for common GNN operations:
 - **spmm_aggr**: cuSPARSE-based SpMM with GCN/mean/sum normalization.
 - **gsddmm**: Per-edge binary ops (add/sub/mul/div/dot/copy) over node/edge
   feature rows, plus DGL-style prefilled aliases (``u_sub_v``, ``copy_u``, ...).
-- **gsddmm_edge**: Edge-parallel gsddmm variant (one warp per edge over a cached
-  edge list), with matching ``*_edge`` aliases (``u_sub_v_edge``, ...).
+  Two CUDA kernels implement it; ``gsddmm`` times both once per graph and uses
+  the faster one, or pins one with ``variant="node"`` / ``variant="edge"``.
 
 All kernels operate on CSR graphs wrapped in
 :class:`AdjacencyForwardBackwardWithNodeBuckets`, which stores forward and
@@ -29,6 +29,7 @@ Quick start::
 """
 
 from turbo_gnn._autotune import AutotuneConfig, TunableKernel, TunableParam, with_autotune
+from turbo_gnn._gsddmm import EdgeBlockParams, GsddmmPlan, GsddmmSpec, NodeBlockParams, TraversalOrder
 from turbo_gnn._kernels import (
     GATv2AggrKernel,
     GraphTransformerAggrKernel,
@@ -49,8 +50,11 @@ from turbo_gnn.ops import (
     spmm_aggr,
 )
 
-# DGL-style prefilled gsddmm ops (u_add_v, v_dot_u, copy_u, ...), generated in ops.py,
-# plus their edge-parallel ``*_edge`` variants.
+# DGL-style prefilled gsddmm ops (u_add_v, v_dot_u, copy_u, ...), generated in
+# ops.py. The ``*_edge`` variants are bound here too, but deliberately left out
+# of __all__: they pin the edge-parallel kernel AND expose its traversal edge
+# order, which only the benchmarks and the correctness tests want. One op per
+# operation is the public surface; ``variant=`` picks the kernel.
 globals().update(_GSDDMM_PREFILLED_OPS)
 globals().update(_GSDDMM_EDGE_PREFILLED_OPS)
 
@@ -64,14 +68,16 @@ __all__ = [
     "GATv2AggrKernel",
     "GraphTransformerAggrKernel",
     "GSDDMMKernel",
-    "GSDDMMEdgeKernel",
+    "GsddmmPlan",
+    "GsddmmSpec",
+    "NodeBlockParams",
+    "EdgeBlockParams",
+    "TraversalOrder",
     "reduction_aggr",
     "gatv2_aggr",
     "graph_transformer_aggr",
     "spmm_aggr",
     "csr_SPMM_normalized",
     "gsddmm",
-    "gsddmm_edge",
     *_GSDDMM_PREFILLED_OPS,
-    *_GSDDMM_EDGE_PREFILLED_OPS,
 ]

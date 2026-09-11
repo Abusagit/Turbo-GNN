@@ -57,7 +57,9 @@ __device__ __forceinline__ void async_copy_slice_thread(cuda_t *dst, const cuda_
 // only inside the call (the slot is recycled on return).
 //
 // dbuf: this warp's private scratch, NUM_ROWS * NUM_STAGES * D_CONST elements.
-template <size_t WARPS_PER_BLOCK, size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, IntegralNum index_t, typename ConsumeFn>
+template <
+    size_t WARPS_PER_BLOCK, size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, IntegralNum index_t, typename ConsumeFn
+>
 __device__ __forceinline__ void pipelined_neighbor_row_loop(
     size_t warp_id, size_t lane, size_t num_neighbors, index_t edge_start, index_t const *__restrict__ col_idx,
     cuda_t const *__restrict__ const (&row_bases)[NUM_ROWS], int64_t const (&stride_n)[NUM_ROWS], int64_t const (&stride_h)[NUM_ROWS],

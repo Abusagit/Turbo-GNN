@@ -383,11 +383,15 @@ def test_gsddmm_isolated_nodes_produce_no_rows():
     assert torch.allclose(out, expected, **_tol(torch.float32))
 
 
+# These two operand combinations have no kernel. GsddmmSpec now rejects them in
+# Python (ValueError) before anything is allocated or launched; before the launch
+# plan existed they reached the CUDA dispatch and raised RuntimeError from a
+# TORCH_CHECK. Either rejection satisfies the intent of these tests.
 def test_gsddmm_same_member_rejected():
     graph = _make_graph()
     num_nodes = graph.forward_indptr.numel() - 1
     x = torch.randn(num_nodes, 64, device=DEVICE)
-    with pytest.raises(RuntimeError):
+    with pytest.raises((ValueError, RuntimeError)):
         gsddmm(graph, x, x, op="add", lhs_target="src", rhs_target="src")
 
 
@@ -395,7 +399,7 @@ def test_gsddmm_copy_edge_target_rejected():
     graph = _make_graph()
     num_edges = graph.forward_indices.numel()
     e = torch.randn(num_edges, 64, device=DEVICE)
-    with pytest.raises(RuntimeError):
+    with pytest.raises((ValueError, RuntimeError)):
         gsddmm(graph, e, None, op="copy", lhs_target="edge")
 
 

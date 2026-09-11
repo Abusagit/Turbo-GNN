@@ -611,11 +611,13 @@ def test_gsddmm_edge_isolated_nodes_produce_no_rows() -> None:
     assert torch.allclose(out, expected, **_tol(torch.float32))
 
 
+# Rejected in Python by GsddmmSpec (ValueError) before any launch; these used to
+# reach the CUDA dispatch and raise RuntimeError. Either satisfies the intent.
 def test_gsddmm_edge_same_member_rejected() -> None:
     graph = _make_graph()
     num_nodes = graph.forward_indptr.numel() - 1
     x = torch.randn(num_nodes, 64, device=DEVICE)
-    with pytest.raises(RuntimeError):
+    with pytest.raises((ValueError, RuntimeError)):
         gsddmm_edge(graph, x, x, op="add", lhs_target="src", rhs_target="src")
 
 
@@ -623,7 +625,7 @@ def test_gsddmm_edge_copy_edge_target_rejected() -> None:
     graph = _make_graph()
     num_edges = graph.forward_indices.numel()
     e = torch.randn(num_edges, 64, device=DEVICE)
-    with pytest.raises(RuntimeError):
+    with pytest.raises((ValueError, RuntimeError)):
         gsddmm_edge(graph, e, None, op="copy", lhs_target="edge")
 
 

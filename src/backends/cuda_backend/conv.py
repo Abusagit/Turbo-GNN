@@ -245,6 +245,10 @@ class _CudaSpMMAggr(BaseAggr):
 
 #: Suffix marking the edge-parallel (one warp per edge) kernel variant.
 _GSDDMM_EDGE_SUFFIX = "_edge"
+#: Suffix marking the auto-dispatching variant (time both kernels once per graph,
+#: then use the faster one). Benchmark-only spelling: it lets a sweep compare the
+#: dispatcher against either pinned kernel without touching scripts/benchmark.py.
+_GSDDMM_AUTO_SUFFIX = "_auto"
 
 
 class _GsddmmOpSpec(NamedTuple):
@@ -255,10 +259,13 @@ class _GsddmmOpSpec(NamedTuple):
     rhs_target: str
     edge_variant: bool
     operand_kinds: tuple[str, ...]
+    variant: str = "node"
 
 
 def is_gsddmm_op(name: str) -> bool:
-    """True if *name* is a turbo_gnn gsddmm op name (incl. ``_edge`` variants)."""
+    """True if *name* is a turbo_gnn gsddmm op name (incl. ``_edge``/``_auto``)."""
+    if name.endswith(_GSDDMM_AUTO_SUFFIX):
+        name = name[: -len(_GSDDMM_AUTO_SUFFIX)]
     return name in _GSDDMM_PREFILLED_OPS or name in _GSDDMM_EDGE_PREFILLED_OPS
 
 
@@ -273,32 +280,47 @@ def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
     is rejected here rather than at launch.
 
     Args:
-        name (str): Op name, e.g. ``"u_sub_v"``, ``"copy_u"``, ``"e_mul_v_edge"``.
+        name (str): Op name, e.g. ``"u_sub_v"``, ``"copy_u"``, ``"e_mul_v_edge"``,
+            ``"u_add_v_auto"``.
 
     Returns:
         _GsddmmOpSpec: Op, lhs/rhs targets ("src"/"dst"/"edge"), whether the
-            edge-parallel variant was requested, and the operand kinds
-            ("u"/"v": node features [N, D]; "e": edge features [E, D]) in the
-            order the wrapper takes them.
+            edge-parallel variant was requested, the operand kinds ("u"/"v":
+            node features [N, D]; "e": edge features [E, D]) in the order the
+            wrapper takes them, and the kernel variant to launch ("node" for a
+            bare name, "edge" for ``_edge``, "auto" for ``_auto``).
 
     Raises:
-        KeyError: If *name* is not a turbo_gnn gsddmm op.
+        KeyError: If *name* is not a turbo_gnn gsddmm op, or if ``_edge`` and
+            ``_auto`` are combined (one pins a kernel, the other chooses one).
     """
+    # "<op>_auto" selects the dispatcher over either pinned kernel; the base name
+    # still has to be a real op, so it is validated below like any other.
+    variant = "node"
+    if name.endswith(_GSDDMM_AUTO_SUFFIX):
+        name, variant = name[: -len(_GSDDMM_AUTO_SUFFIX)], "auto"
+
     if name in _GSDDMM_EDGE_PREFILLED_OPS:
         base, edge_variant = name[: -len(_GSDDMM_EDGE_SUFFIX)], True
+        if variant == "auto":
+            raise KeyError(f"gsddmm op {name + _GSDDMM_AUTO_SUFFIX!r}: '_edge' pins a kernel, '_auto' chooses one")
     elif name in _GSDDMM_PREFILLED_OPS:
         base, edge_variant = name, False
     else:
         raise KeyError(f"Unknown turbo_gnn gsddmm op: {name!r}")
+    if edge_variant:
+        variant = "edge"
 
     parts = base.split("_")
     if parts[0] == "copy":
         # copy_u / copy_v take a single operand; rhs is allocated by the op
         # wrapper to satisfy the binding's shape check but never read.
-        return _GsddmmOpSpec("copy", _GSDDMM_NAME_TO_MEMBER[parts[1]], "edge", edge_variant, (parts[1],))
+        return _GsddmmOpSpec("copy", _GSDDMM_NAME_TO_MEMBER[parts[1]], "edge", edge_variant, (parts[1],), variant)
 
     lhs, op, rhs = parts
-    return _GsddmmOpSpec(op, _GSDDMM_NAME_TO_MEMBER[lhs], _GSDDMM_NAME_TO_MEMBER[rhs], edge_variant, (lhs, rhs))
+    return _GsddmmOpSpec(
+        op, _GSDDMM_NAME_TO_MEMBER[lhs], _GSDDMM_NAME_TO_MEMBER[rhs], edge_variant, (lhs, rhs), variant
+    )
 
 
 class _CudaGsddmmOp(BaseAggr):
@@ -322,12 +344,17 @@ class _CudaGsddmmOp(BaseAggr):
         self.op = op
         self.operand_kinds = spec.operand_kinds
         self.edge_variant = spec.edge_variant
+        self.variant = spec.variant
+        # A bare name stays pinned to the CSR node-block kernel and "_edge" to the
+        # edge-parallel one, so existing sweep rows keep their meaning; "_auto"
+        # benchmarks the dispatcher.
         kernel_cls = GSDDMMEdgeKernel if spec.edge_variant else GSDDMMKernel
+        kernel_kwargs = dict(kwargs) if spec.edge_variant else {"variant": spec.variant, **kwargs}
         self.kernel = kernel_cls(
             op=spec.op,
             lhs_target=spec.lhs_target,
             rhs_target=spec.rhs_target,
-            **kwargs,
+            **kernel_kwargs,
         )
 
     def forward(self, *args: Any) -> torch.Tensor:

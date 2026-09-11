@@ -119,11 +119,55 @@ out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
                 norm_type="none", cu_sparse_algorithm_id=-1, block_dim=256)
 ```
 
+### GSDDMM: per-edge binary ops
+
+`gsddmm` applies a binary op per edge, taking each operand's row from the source node
+(`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). D must be one of
+32, 64, 128, 256; dtypes are fp32/fp16/bf16. Forward-only for now (no autograd).
+
+```python
+from turbo_gnn import gsddmm, u_add_v, copy_u
+
+out = gsddmm(graph, x, y, op="mul", lhs_target="src", rhs_target="dst")  # [E, D]
+out = gsddmm(graph, x, y, op="dot", lhs_target="src", rhs_target="dst")  # [E]
+
+# DGL-style aliases for every (lhs, op, rhs) combination, plus copy_u / copy_v
+out = u_add_v(graph, x, y)      # [E, D]
+out = copy_u(graph, x)          # [E, D]
+```
+
+Two CUDA kernels implement this — one thread block per bucketed CSR row, or one warp per
+chunk of an explicit edge list. Which is faster depends on the graph's geometry, the
+feature width and the dtype (on a 3136-cell A100 sweep, always picking the row-per-block
+kernel costs 1.40x geomean and up to 9x; always picking the edge kernel costs 1.04x and up
+to 1.9x). So `gsddmm` times the candidates **once per (graph, feature width, dtype, op)**,
+memoizes the verdict on the graph object, and uses the winner from then on. For an op with
+no `dst` operand the edge kernel's traversal order is a third candidate: grouping edges by
+source shares the source row across a warp's chunk, but then needs an index indirection to
+keep the output in forward-CSR order, which measured as a 5–23% win at D=128 and a 6–29%
+loss at D=32 — so it is timed rather than assumed. Output rows are always numbered by
+forward-CSR edge position, whichever candidate wins, so the choice cannot change results.
+
+```python
+out = gsddmm(graph, x, y, op="mul")                     # auto: probe once, then reuse
+out = gsddmm(graph, x, y, op="mul", variant="node")     # pin the row-per-block kernel
+out = gsddmm(graph, x, y, op="mul", variant="edge")     # pin the edge-parallel kernel
+```
+
+The probe costs two extra launches (~20 ms) on the first such call; pinning `variant`
+skips it entirely. `AutotuneConfig(measure_variant=False)` falls back to a geometry
+heuristic instead (1.01x geomean on the same sweep), and `share_variant_probe=True` lets
+ops with the same operand shape reuse one probe per graph (off by default, so a per-op
+measurement never depends on which op ran first). Parameters belonging to the other
+kernel are rejected when `variant` is pinned.
+
 ### Autotuning
 
-All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`) support
-autotuning, which grid-searches over kernel parameters (warps per block, edges per block,
-etc.) and graph repartitioning quantiles to find the fastest configuration.
+All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`, `gsddmm`)
+support autotuning, which grid-searches over kernel parameters (warps per block, edges per
+block, etc.) and graph repartitioning quantiles to find the fastest configuration. For
+`gsddmm` the search is staged: it picks the kernel variant first, then searches only that
+variant's parameters (the other variant's knobs would be dead axes).
 
 ```python
 from turbo_gnn import AutotuneConfig
@@ -136,9 +180,13 @@ config = AutotuneConfig(warmup=5, iters=20, tune_backward=True)
 out = graph_transformer_aggr(graph, x, Q=Q, K=K, V=V, scale=scale,
                               autotune=True, autotune_config=config)
 
-# Results are cached per graph + feature shape — subsequent calls are fast
+# Results are cached per graph + feature shape + dtype — subsequent calls are fast
 out = reduction_aggr(graph, X, reduce="min", autotune=True)  # cache hit
 ```
+
+The dtype is part of the cache key rather than something that gets searched: it is a
+property of the caller's tensors, and the best configuration genuinely differs between
+fp16 and fp32, so a graph tuned in one dtype does not hand its configuration to the other.
 
 `spmm_aggr` and `csr_SPMM_normalized` are cuSPARSE wrappers and do not support autotuning.
 

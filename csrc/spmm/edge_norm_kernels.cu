@@ -1,6 +1,6 @@
 #include "common.cuh"
 
-enum class NormType: uint8_t { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
+enum class NormType : uint8_t { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
 
 template <IntegralNum index_t>
 __global__ void compute_degrees_kernel(

@@ -25,9 +25,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     m.def(
-        "gsddmm_forward_edge", &gsddmm_forward_edge_blocks, "Generalized Sparse Dense-Dense matrpix multiplication implememnted by edges", py::arg("l"), py::arg("r"),
-        py::arg("edge_list"), py::arg("op"), py::arg("lhs_target"), py::arg("rhs_target"), py::arg("N"), py::arg("pipeline_stages") = 0,
-        py::arg("edges_per_warp") = 1, py::arg("warps_per_block") = 1
+        "gsddmm_forward_edge", &gsddmm_forward_edge_blocks, "Generalized Sparse Dense-Dense matrpix multiplication implememnted by edges",
+        py::arg("l"), py::arg("r"), py::arg("edge_list"), py::arg("op"), py::arg("lhs_target"), py::arg("rhs_target"), py::arg("N"),
+        py::arg("pipeline_stages") = 0, py::arg("edges_per_warp") = 1, py::arg("warps_per_block") = 1,
+        py::arg("canonical_edge_idx") = py::none()
     );
 
     // GATv2 aggregation

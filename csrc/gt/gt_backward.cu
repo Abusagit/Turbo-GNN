@@ -302,11 +302,11 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
 
     using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
 
-    constexpr int TW               = TW_SELECTOR::value;                                                     // Tile width
+    constexpr int TW               = TW_SELECTOR::value;                           // Tile width
     constexpr int TILES            = ceil_div(D_CONST, TW);                        // Total tiles count
     constexpr int TILES_PER_THREAD = ceil_div(TILES, TW_SELECTOR::threads_per_d);  // Tiles per thread
-    using AccumOps = AdOps<accum_t>;
-    using Tile     = TileOps<TW, cuda_t, accum_t>;
+    using AccumOps                 = AdOps<accum_t>;
+    using Tile                     = TileOps<TW, cuda_t, accum_t>;
 
     const int node_d = blockIdx.x;
     const int head_h = blockIdx.y;

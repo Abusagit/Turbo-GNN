@@ -1,8 +1,7 @@
-#include <torch/extension.h>
-#include <torch/torch.h>
-
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
+#include <torch/torch.h>
 
 #include <cstdint>
 #include <optional>
@@ -78,7 +77,8 @@ torch::Tensor gsddmm_forward_cuda(
     uint32_t light_warps_per_block,
     uint32_t heavy_warps_per_block,
     uint32_t pipeline_stages,
-    std::optional<torch::Tensor> heavy_block_parts,
+    std::optional<torch::Tensor>
+        heavy_block_parts,
     uint32_t heavy_edges_per_block,
     bool overlap_buckets
 ) {
@@ -135,7 +135,10 @@ torch::Tensor gsddmm_forward_cuda(
     const bool chunked = heavy_block_parts.has_value() && heavy_block_parts->numel() > 0;
     if (chunked) {
         TORCH_CHECK(heavy_edges_per_block > 0, "GSDDMM forward: heavy_edges_per_block must be > 0 when heavy_block_parts is given");
-        TORCH_CHECK(heavy_block_parts->is_cuda() && heavy_block_parts->scalar_type() == idx_dtype, "heavy_block_parts must be CUDA with the CSR index dtype");
+        TORCH_CHECK(
+            heavy_block_parts->is_cuda() && heavy_block_parts->scalar_type() == idx_dtype,
+            "heavy_block_parts must be CUDA with the CSR index dtype"
+        );
         TORCH_CHECK(
             heavy_block_parts->numel() == heavy_nodes.numel(), "GSDDMM forward: heavy_block_parts (", heavy_block_parts->numel(),
             ") and heavy_nodes (", heavy_nodes.numel(), ") must have one entry per heavy block"
@@ -197,6 +200,11 @@ torch::Tensor gsddmm_forward_cuda(
 //              {0, 1, 2, 3} (0 = direct loads). Only meaningful with edges_per_warp > 1.
 // edges_per_warp: contiguous edges each warp walks, in [1, kGsddmmEdgeMaxEdgesPerWarp].
 // warps_per_block: independent warps packed per thread block, in [1, kGsddmmEdgeMaxWarpsPerBlock].
+// canonical_edge_idx: optional [E] uint64 canonical edge id of every entry of
+//              edge_list. Applied to the Edge operand rows and to the output row,
+//              so a source-grouped edge_list (L2-friendly: consecutive warps share
+//              the Src_V row) can still produce output numbered by forward-CSR
+//              position. Omit when edge_list is already in the canonical order.
 torch::Tensor gsddmm_forward_edge_blocks(
     torch::Tensor L,
     torch::Tensor R,
@@ -205,9 +213,10 @@ torch::Tensor gsddmm_forward_edge_blocks(
     std::string lhs_target,
     std::string rhs_target,
     uint64_t N,
-    uint32_t pipeline_stages = 0,
-    uint32_t edges_per_warp = 4,
-    uint32_t warps_per_block = 4
+    uint32_t pipeline_stages                        = 0,
+    uint32_t edges_per_warp                         = 4,
+    uint32_t warps_per_block                        = 4,
+    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
 ) {
     const GSDDMM_OP op_enum        = parse_op(op);
     const GSDDMM_MEMBER lhs_member = parse_member(lhs_target, "lhs");
@@ -252,7 +261,8 @@ torch::Tensor gsddmm_forward_edge_blocks(
     check_rows(L, lhs_member, "L");
     check_rows(R, rhs_member, "R");
 
-    torch::Tensor O = is_dot ? torch::empty({static_cast<int64_t>(E)}, L.options()) : torch::empty({static_cast<int64_t>(E), static_cast<int64_t>(D)}, L.options());
+    torch::Tensor O = is_dot ? torch::empty({static_cast<int64_t>(E)}, L.options())
+                             : torch::empty({static_cast<int64_t>(E), static_cast<int64_t>(D)}, L.options());
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
 
@@ -266,18 +276,35 @@ torch::Tensor gsddmm_forward_edge_blocks(
         kGsddmmEdgeMaxWarpsPerBlock, "], got ", warps_per_block
     );
 
+    unsigned long long const *canonical_ptr = nullptr;
+    if (canonical_edge_idx.has_value()) {
+        const torch::Tensor& canonical = *canonical_edge_idx;
+        TORCH_CHECK(canonical.is_cuda(), "GSDDMM forward (edge blocks): canonical_edge_idx must be CUDA");
+        TORCH_CHECK(
+            canonical.scalar_type() == at::kUInt64, "GSDDMM forward (edge blocks): canonical_edge_idx must be uint64, got ",
+            canonical.scalar_type()
+        );
+        TORCH_CHECK(canonical.is_contiguous(), "GSDDMM forward (edge blocks): canonical_edge_idx must be contiguous");
+        TORCH_CHECK(
+            static_cast<uint64_t>(canonical.numel()) == E, "GSDDMM forward (edge blocks): canonical_edge_idx must have E=", E, " entries, got ",
+            canonical.numel()
+        );
+        canonical_ptr = reinterpret_cast<unsigned long long const *>(canonical.data_ptr<uint64_t>());
+    }
+
     GsddmmLaunchArgsEdge args{
-        .L               = L,
-        .R               = R,
-        .O               = O,
-        .edge_nodes_idx  = reinterpret_cast<ulonglong2 const *>(edge_list.data_ptr<uint64_t>()),
-        .stream          = stream,
-        .E               = E,
-        .D               = D,
-        .key             = LRO{lhs_member, rhs_member, op_enum},
-        .pipeline_stages = static_cast<uint8_t>(pipeline_stages),
-        .edges_per_warp  = static_cast<uint8_t>(edges_per_warp),
-        .warps_per_block = static_cast<uint8_t>(warps_per_block),
+        .L                  = L,
+        .R                  = R,
+        .O                  = O,
+        .edge_nodes_idx     = reinterpret_cast<ulonglong2 const *>(edge_list.data_ptr<uint64_t>()),
+        .canonical_edge_idx = canonical_ptr,
+        .stream             = stream,
+        .E                  = E,
+        .D                  = D,
+        .key                = LRO{lhs_member, rhs_member, op_enum},
+        .pipeline_stages    = static_cast<uint8_t>(pipeline_stages),
+        .edges_per_warp     = static_cast<uint8_t>(edges_per_warp),
+        .warps_per_block    = static_cast<uint8_t>(warps_per_block),
     };
 
     // One call per op, each resolved in its own translation unit.
@@ -327,7 +354,8 @@ torch::Tensor gsddmm_forward_cuda(
     uint32_t light_warps_per_block,
     uint32_t heavy_warps_per_block,
     uint32_t pipeline_stages,
-    std::optional<torch::Tensor> heavy_block_parts,
+    std::optional<torch::Tensor>
+        heavy_block_parts,
     uint32_t heavy_edges_per_block,
     bool overlap_buckets
 ) {
@@ -346,12 +374,13 @@ torch::Tensor gsddmm_forward_edge_blocks(
     std::string lhs_target,
     std::string rhs_target,
     uint64_t N,
-    uint32_t pipeline_stages = 0,
-    uint32_t edges_per_warp = 4,
-    uint32_t warps_per_block = 4
+    uint32_t pipeline_stages                        = 0,
+    uint32_t edges_per_warp                         = 4,
+    uint32_t warps_per_block                        = 4,
+    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
 ) {
     return gsddmm::gsddmm_forward_edge_blocks(
         std::move(L), std::move(R), std::move(edge_list), std::move(op), std::move(lhs_target), std::move(rhs_target), N, pipeline_stages,
-        edges_per_warp, warps_per_block
+        edges_per_warp, warps_per_block, std::move(canonical_edge_idx)
     );
 }

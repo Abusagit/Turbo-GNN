@@ -36,7 +36,7 @@ static cudaDataType_t torch_to_cuda_dtype(c10::ScalarType dtype) {
 
 constexpr int BLOCK_DIM = 256;
 
-enum class NormType: uint8_t { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
+enum class NormType : uint8_t { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
 
 void launch_compute_degrees(
     const torch::Tensor& indptr, const torch::Tensor& indices, torch::Tensor& in_degrees, torch::Tensor& out_degrees, int block_dim
@@ -229,7 +229,7 @@ torch::Tensor csr_SPMM_normalized(
     CHECK_CUSPARSE(cusparseCreateDnMat(&matC, m, n, n, out.data_ptr(), dense_dtype, CUSPARSE_ORDER_ROW));
 
     // Handle workspace
-    void *workspace          = nullptr;
+    void *workspace = nullptr;
     // size_t workspace_size    = 0;
     bool need_free_workspace = false;
 
@@ -237,7 +237,7 @@ torch::Tensor csr_SPMM_normalized(
 
     if (cache && cache->workspace) {
         // Use cached workspace
-        workspace      = cache->workspace;
+        workspace = cache->workspace;
         // workspace_size = cache->workspace_size;
     } else {
         // Get required workspace size

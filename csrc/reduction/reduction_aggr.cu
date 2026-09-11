@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
     using Tile          = TileOps<TW, cuda_t>;
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    const size_t i      = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
     if (i >= num_light) [[unlikely]] {
         return;
     }
@@ -647,7 +647,10 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         dim3 block(features_per_block, tiles_y);
 
                         size_t shmem_size =
-                            ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                            ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) +
+                                 15) /
+                                16) *
+                            16;
 
                         reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                             index_ptr<index_t>(heavy_nodes),
@@ -724,7 +727,10 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     dim3 block(features_per_block, tiles_y);
 
                     size_t shmem_size =
-                        ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) + 15) / 16) * 16;
+                        ((static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW * (sizeof(float) + sizeof(index_t)) +
+                             15) /
+                            16) *
+                        16;
 
                     reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                         index_ptr<index_t>(heavy_nodes),

@@ -125,7 +125,7 @@ class TestReductionAggrAutotune:
         # Retrieve the kernel singleton to inspect its cache
         kernel = ReductionAggrKernel._get_or_create(reduce="min")
         feat_dim = x.shape[-1]
-        cached = kernel._inline_cache.lookup(graph, feat_dim)
+        cached = kernel._inline_cache.lookup(graph, feat_dim, x.dtype)
         assert cached is not None, "Cache should be populated after first autotuned call"
 
         # Monkeypatch _inline_autotune to detect re-tuning
@@ -157,8 +157,8 @@ class TestReductionAggrAutotune:
         reduction_aggr(graph, x64, reduce="min", autotune=True, autotune_config=FAST_CONFIG)
 
         kernel = ReductionAggrKernel._get_or_create(reduce="min")
-        assert kernel._inline_cache.lookup(graph, 32) is not None
-        assert kernel._inline_cache.lookup(graph, 64) is not None
+        assert kernel._inline_cache.lookup(graph, 32, x32.dtype) is not None
+        assert kernel._inline_cache.lookup(graph, 64, x64.dtype) is not None
 
     @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
     def test_backward_with_autotune(self, index_dtype):
@@ -245,7 +245,7 @@ class TestGATv2AggrAutotune:
 
         kernel = GATv2AggrKernel._get_or_create()
         feat_dim = x.shape[-1]
-        cached = kernel._inline_cache.lookup(graph, feat_dim)
+        cached = kernel._inline_cache.lookup(graph, feat_dim, x.dtype)
         assert cached is not None, "GATv2 cache should be populated after first autotuned call"
 
         call_count = [0]
@@ -340,7 +340,7 @@ class TestGraphTransformerAggrAutotune:
 
         kernel = GraphTransformerAggrKernel._get_or_create()
         feat_dim = x.shape[-1]
-        cached = kernel._inline_cache.lookup(graph, feat_dim)
+        cached = kernel._inline_cache.lookup(graph, feat_dim, x.dtype)
         assert cached is not None, "GT cache should be populated after first autotuned call"
 
         call_count = [0]
@@ -573,7 +573,9 @@ class TestSingletonAndCacheIsolation:
         kernel_max = ReductionAggrKernel._get_or_create(reduce="max")
 
         feat_dim = x.shape[-1]
-        assert kernel_min._inline_cache.lookup(graph, feat_dim) is not None, "min kernel cache should be populated"
-        assert (
-            kernel_max._inline_cache.lookup(graph, feat_dim) is None
-        ), "max kernel cache should be empty (not autotuned)"
+        assert kernel_min._inline_cache.lookup(graph, feat_dim, x.dtype) is not None, (
+            "min kernel cache should be populated"
+        )
+        assert kernel_max._inline_cache.lookup(graph, feat_dim, x.dtype) is None, (
+            "max kernel cache should be empty (not autotuned)"
+        )

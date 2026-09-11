@@ -74,7 +74,11 @@ struct GsddmmLaunchArgsEdge {
     const torch::Tensor& L;
     const torch::Tensor& R;
     torch::Tensor& O;
-    ulonglong2 const * __restrict__ edge_nodes_idx;
+    ulonglong2 const *__restrict__ edge_nodes_idx;
+    // Nullable [E] canonical edge id of every traversal slot; indexes the Edge
+    // operand rows and the output row, so a source-grouped list can still emit
+    // forward-CSR-numbered output. nullptr: traversal order is canonical.
+    unsigned long long const *__restrict__ canonical_edge_idx;
     const at::cuda::CUDAStream& stream;
     uint64_t E;
     uint64_t D;

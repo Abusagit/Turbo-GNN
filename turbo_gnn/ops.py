@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import torch
 
-import turbo_gnn._C as _C
 from turbo_gnn._autotune import with_autotune
 from turbo_gnn._functions import (
     ReductionAggrFunction,
@@ -19,14 +18,19 @@ from turbo_gnn._functions import (
     csr_SPMM_normalized,
     gatv2_function,
 )
+from turbo_gnn._gsddmm import (
+    EdgeBlockParams,
+    GsddmmPlan,
+    GsddmmSpec,
+    NodeBlockParams,
+    resolve_plan,
+)
 from turbo_gnn._kernels import (
     GATv2AggrKernel,
     GraphTransformerAggrKernel,
     GSDDMMEdgeKernel,
     GSDDMMKernel,
     ReductionAggrKernel,
-    _graph_edge_list,
-    _graph_heavy_blocks,
 )
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
@@ -267,7 +271,60 @@ _GSDDMM_MEMBER_PAIRS = (
 )
 
 
-@with_autotune(GSDDMMKernel, init_params=("op", "lhs_target", "rhs_target"))
+#: Parameters only ``GSDDMM_forward_normal`` reads, and only ``GSDDMM_forward_edge_block``.
+_GSDDMM_NODE_ONLY_PARAMS = (
+    "light_warps_per_block",
+    "heavy_warps_per_block",
+    "heavy_edges_per_block",
+    "overlap_buckets",
+)
+_GSDDMM_EDGE_ONLY_PARAMS = ("edges_per_warp", "warps_per_block")
+
+
+def _gsddmm_launch_params(variant: str, given: dict[str, object]) -> tuple[NodeBlockParams, EdgeBlockParams]:
+    """Split caller-supplied kernel parameters into the two variants' dataclasses.
+
+    Parameters left as ``None`` fall back to the dataclass defaults, so "not
+    given" stays distinguishable from "given" and a pinned variant can reject
+    the other kernel's knobs instead of silently ignoring them.
+    """
+    supplied = {name: value for name, value in given.items() if value is not None}
+    if variant != "auto":
+        wrong = _GSDDMM_EDGE_ONLY_PARAMS if variant == "node" else _GSDDMM_NODE_ONLY_PARAMS
+        offenders = sorted(name for name in wrong if name in supplied)
+        if offenders:
+            raise ValueError(
+                f"gsddmm: {', '.join(offenders)} {'is' if len(offenders) == 1 else 'are'} not a parameter of the "
+                f"{variant!r} kernel; drop it or pass variant='auto'"
+            )
+    node = NodeBlockParams(
+        **{
+            key: supplied[name]
+            for key, name in (
+                ("light_warps", "light_warps_per_block"),
+                ("heavy_warps", "heavy_warps_per_block"),
+                ("pipeline_stages", "pipeline_stages"),
+                ("heavy_edges_per_block", "heavy_edges_per_block"),
+                ("overlap_buckets", "overlap_buckets"),
+            )
+            if name in supplied
+        }
+    )
+    edge = EdgeBlockParams(
+        **{
+            key: supplied[name]
+            for key, name in (
+                ("pipeline_stages", "pipeline_stages"),
+                ("edges_per_warp", "edges_per_warp"),
+                ("warps_per_block", "warps_per_block"),
+            )
+            if name in supplied
+        }
+    )
+    return node, edge
+
+
+@with_autotune(GSDDMMKernel, init_params=("op", "lhs_target", "rhs_target", "variant"))
 def gsddmm(
     graph: AdjacencyForwardBackwardWithNodeBuckets,
     lhs: torch.Tensor,
@@ -275,11 +332,14 @@ def gsddmm(
     op: str = "mul",
     lhs_target: str = "src",
     rhs_target: str = "dst",
-    light_warps_per_block: int = 4,
-    heavy_warps_per_block: int = 32,
-    pipeline_stages: int = 0,
-    heavy_edges_per_block: int = 0,
-    overlap_buckets: bool = False,
+    variant: str = "auto",
+    pipeline_stages: int | None = None,
+    light_warps_per_block: int | None = None,
+    heavy_warps_per_block: int | None = None,
+    heavy_edges_per_block: int | None = None,
+    overlap_buckets: bool | None = None,
+    edges_per_warp: int | None = None,
+    warps_per_block: int | None = None,
 ) -> torch.Tensor:
     """Generalized SDDMM: per-edge binary op over node/edge feature rows.
 
@@ -293,6 +353,16 @@ def gsddmm(
     (output ``[E, D]``). ``"copy"`` propagates ``lhs`` to the edges and never
     reads ``rhs``.
 
+    Two CUDA kernels implement this, with different work decompositions: one
+    thread block per bucketed CSR row, or one warp per chunk of an explicit
+    edge list. Which is faster depends on the graph's geometry, the feature
+    width and the dtype rather than on anything the caller knows, so by default
+    (``variant="auto"``) both are timed once per ``(graph, feature width, dtype,
+    op)`` and the faster one is used from then on; the verdict is memoized on
+    the graph object. That probe costs two extra launches (~20 ms) on the first
+    such call; pin ``variant`` to skip it. Either way **the output is numbered
+    by forward-CSR edge position**, so the choice cannot change results.
+
     Forward-only (no autograd): the CUDA kernel has no backward pass yet, so
     the output is detached from the autograd graph.
 
@@ -300,64 +370,65 @@ def gsddmm(
         graph: CSR graph with forward adjacency and light/heavy node buckets.
         lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
             ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
-        rhs: Right operand, same layout rules as ``lhs``. May be omitted for
-            ``op="copy"`` (it is never read by the kernel).
+        rhs: Right operand, same layout rules as ``lhs``. Ignored (and may be
+            omitted) for ``op="copy"``, which never reads it.
         op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
         lhs_target: ``"src"``, ``"dst"``, or ``"edge"``.
         rhs_target: ``"src"``, ``"dst"``, or ``"edge"``. Forced to ``"edge"``
             for ``op="copy"`` (the value is irrelevant since rhs is unread).
-        light_warps_per_block: Warps per block for the light-node bucket. Only
-            the counts instantiated by the binding are accepted (currently 4).
-        heavy_warps_per_block: Warps per block for the heavy-node bucket. Only
-            the counts instantiated by the binding are accepted (currently 32).
-        pipeline_stages: Async-copy pipeline stages for the per-edge Src/Edge
-            row prefetch, one of 0, 1, 2, 3. 0 disables the pipeline; stage
-            ``i + stages`` is prefetched while stage ``i`` is consumed, which
-            costs ``stages + 1`` shared-memory row slots per warp. A deep
-            pipeline on a wide D with two per-edge operands can exceed the
-            GPU's opt-in shared memory per block (e.g. D=256, 32 heavy warps
-            and both operands gathered per edge needs 192 KiB at stages=2);
-            the kernel raises with the exact figures when it does.
-        heavy_edges_per_block: Split every heavy node into chunks of this many
-            edges and run one 32-warp block per chunk instead of one per node,
-            so the heavy launch's tail is bounded by the chunk rather than the
-            largest degree. 0 keeps one block per node. The per-block (node,
-            chunk) descriptors are built on first use and cached on the graph.
-        overlap_buckets: Run the light-node bucket on a side CUDA stream
-            concurrently with the heavy bucket on the current stream. The side
-            stream is forked from and joined back to the current stream with
-            events, so ordering for the caller is unchanged.
+        variant: ``"auto"`` (default, measure once and cache), ``"node"`` to pin
+            the CSR node-block kernel, or ``"edge"`` to pin the edge-parallel
+            one. Pinning measures nothing.
+        pipeline_stages: Async-copy prefetch depth for the per-edge operand
+            rows, 0-3 (0 disables the pipeline); read by both kernels. Stage
+            ``i + stages`` is prefetched while stage ``i`` is consumed, costing
+            ``stages + 1`` shared-memory row slots per warp. A deep pipeline on
+            a wide D with two per-edge operands can exceed the GPU's opt-in
+            shared memory per block (e.g. D=256, 32 heavy warps and both
+            operands gathered per edge needs 192 KiB at stages=2); the kernel
+            raises with the exact figures when it does.
+        light_warps_per_block: *(node kernel)* Warps per block for the
+            light-node bucket. Only counts the binding instantiates are
+            accepted (currently 4).
+        heavy_warps_per_block: *(node kernel)* Warps per block for the
+            heavy-node bucket. Only counts the binding instantiates are
+            accepted (currently 32).
+        heavy_edges_per_block: *(node kernel)* Split every heavy node into
+            chunks of this many edges and run one 32-warp block per chunk
+            instead of one per node, so the heavy launch's tail is bounded by
+            the chunk rather than the largest degree. 0 keeps one block per
+            node. The per-block (node, chunk) descriptors are built on first
+            use and cached on the graph.
+        overlap_buckets: *(node kernel)* Run the light-node bucket on a side
+            CUDA stream concurrently with the heavy bucket on the current
+            stream. The side stream is forked from and joined back to the
+            current stream with events, so ordering for the caller is unchanged.
+        edges_per_warp: *(edge kernel)* Contiguous edges each warp walks, 1-32.
+        warps_per_block: *(edge kernel)* Independent warps packed per thread
+            block, 1-8.
 
     Returns:
         ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"``, in CSR edge order.
+
+    Raises:
+        ValueError: If a parameter belongs to a kernel other than the pinned
+            ``variant``, or if ``rhs`` is missing for an op that reads it.
     """
-    if op == "copy":
-        rhs_target = "edge"
-    if rhs is None:
-        if op != "copy":
-            raise ValueError(f"gsddmm: rhs is required for op={op!r}")
-        # Copy never reads R, but the binding validates its shape: [E, D].
-        rhs = lhs.new_empty((graph.forward_indices.numel(), lhs.shape[-1]))
-    heavy_nodes, heavy_parts = graph.heavy_nodes, None
-    if heavy_edges_per_block > 0 and heavy_nodes.numel() > 0:
-        heavy_nodes, heavy_parts = _graph_heavy_blocks(graph, heavy_edges_per_block)
-    return _C.gsddmm_forward(
-        lhs,
-        rhs,
-        graph.forward_indptr,
-        graph.forward_indices,
-        op,
-        lhs_target,
-        rhs_target,
-        graph.light_nodes,
-        heavy_nodes,
-        light_warps_per_block,
-        heavy_warps_per_block,
-        pipeline_stages,
-        heavy_parts,
-        heavy_edges_per_block,
-        overlap_buckets,
+    spec = GsddmmSpec(op=op, lhs_target=lhs_target, rhs_target=rhs_target)
+    node_params, edge_params = _gsddmm_launch_params(
+        variant,
+        {
+            "pipeline_stages": pipeline_stages,
+            "light_warps_per_block": light_warps_per_block,
+            "heavy_warps_per_block": heavy_warps_per_block,
+            "heavy_edges_per_block": heavy_edges_per_block,
+            "overlap_buckets": overlap_buckets,
+            "edges_per_warp": edges_per_warp,
+            "warps_per_block": warps_per_block,
+        },
     )
+    plan = resolve_plan(spec, graph, lhs, rhs, variant, node_params, edge_params)
+    return plan.launch(graph, lhs, rhs)
 
 
 @with_autotune(GSDDMMEdgeKernel, init_params=("op", "lhs_target", "rhs_target"))
@@ -419,28 +490,21 @@ def gsddmm_edge(
         (grouped by destination) when a ``"dst"`` operand is involved, CSC
         (grouped by source) otherwise.
     """
-    if op == "copy":
-        rhs_target = "edge"
-    if rhs is None:
-        if op != "copy":
-            raise ValueError(f"gsddmm_edge: rhs is required for op={op!r}")
-        # Copy never reads R, but the binding validates its shape: [E, D].
-        rhs = lhs.new_empty((graph.forward_indices.numel(), lhs.shape[-1]))
-    # Group edges by source when no operand reads the destination vertex.
-    by_src = "dst" not in (lhs_target, rhs_target)
-    edge_list = _graph_edge_list(graph, by_src=by_src)
-    return _C.gsddmm_forward_edge(
-        lhs,
-        rhs,
-        edge_list,
-        op,
-        lhs_target,
-        rhs_target,
-        graph.forward_indptr.numel() - 1,
-        pipeline_stages,
-        edges_per_warp,
-        warps_per_block,
+    spec = GsddmmSpec(op=op, lhs_target=lhs_target, rhs_target=rhs_target)
+    # Traversal order IS the output order here (canonical_output=False), which is
+    # what distinguishes this op from gsddmm(variant="edge").
+    plan = GsddmmPlan(
+        spec=spec,
+        variant="edge",
+        params=EdgeBlockParams(
+            pipeline_stages=pipeline_stages,
+            edges_per_warp=edges_per_warp,
+            warps_per_block=warps_per_block,
+        ),
+        traversal=spec.preferred_traversal,
+        canonical_output=False,
     )
+    return plan.launch(graph, lhs, rhs)
 
 
 def _make_gsddmm_op(op: str, lhs_target: str, rhs_target: str, edge_variant: bool = False):
@@ -465,10 +529,16 @@ def _make_gsddmm_op(op: str, lhs_target: str, rhs_target: str, edge_variant: boo
         if not edge_variant or "dst" in (lhs_target, rhs_target)
         else "CSC edge order (grouped by source)"
     )
+    kernel_note = (
+        "Pins the edge-parallel kernel and follows its traversal order; internal (benchmarks/tests)."
+        if edge_variant
+        else "Kernel chosen automatically (see :func:`gsddmm`); pass ``variant='node'``/``'edge'`` to pin one."
+    )
     _gsddmm_op.__doc__ = f"""{name}(graph, lhs, rhs): per-edge ``{op}`` of {lhs_target!r} and {rhs_target!r} rows.
 
     Alias for :func:`{base_fn.__name__}` with ``op={op!r}, lhs_target={lhs_target!r}, rhs_target={rhs_target!r}``.
     Returns ``[E]`` if op is "dot" else ``[E, D]``, in {order_note}. Forward-only (no autograd).
+    {kernel_note}
     """
     return _gsddmm_op
 
@@ -503,7 +573,9 @@ def _make_gsddmm_copy(lhs_target: str, edge_variant: bool = False):
 
 
 # DGL-style prefilled ops: u_sub_v(graph, x, y) == gsddmm(..., op="sub", lhs="src", rhs="dst").
-# The ``*_edge`` variants call gsddmm_edge (the edge-parallel kernel) instead.
+# One op per operation is the public surface, and it picks its kernel itself.
+# The ``*_edge`` variants call gsddmm_edge instead -- internal, kept for the
+# benchmarks and for the tests that compare the two decompositions directly.
 _GSDDMM_PREFILLED_OPS: dict[str, callable] = {}
 _GSDDMM_EDGE_PREFILLED_OPS: dict[str, callable] = {}
 for _ll, _rr in _GSDDMM_MEMBER_PAIRS:

@@ -130,11 +130,17 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
 // with cp.async into a per-warp shared ring buffer (L and R rows in the same
 // stage). Defaults (stages 0, one edge per warp, one warp per block) reproduce
 // the original one-edge-per-block layout exactly.
+//
+// canonical_edge_idx (nullable, [E]): canonical edge id of each traversal slot,
+// applied to the Edge operand rows AND the output row, so the list may be grouped
+// by source for locality while the output stays numbered by forward-CSR position.
+// nullptr: the traversal order is already the canonical one (slot index == id).
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float, size_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block ( // no-format
     uint64_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     ulonglong2 const *__restrict__ edge_nodes_idx,
+    unsigned long long const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 );
 

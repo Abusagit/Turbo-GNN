@@ -20,9 +20,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GraphAttentionForward
 
     constexpr size_t TW = TW_SELECTOR::value;  // Tile width
     static_assert(D_CONST % TW == 0, "Per-head features dim should be divisible by Tile width");
-    constexpr size_t TILES            = D_CONST / TW;                                 // Total tiles count
+    constexpr size_t TILES            = D_CONST / TW;                                                      // Total tiles count
     constexpr size_t TILES_PER_THREAD = ceil_div(TILES, static_cast<size_t>(TW_SELECTOR::threads_per_d));  // Tiles per thread
-    constexpr size_t ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                        // Accumulatores used by one thread
+    constexpr size_t ACCS_PER_THREAD  = TW * TILES_PER_THREAD;                                             // Accumulatores used by one thread
 
     using AccumOps = AdOps<accum_t>;
     using Tile     = TileOps<TW, cuda_t, accum_t>;
