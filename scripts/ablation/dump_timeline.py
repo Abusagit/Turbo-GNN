@@ -69,9 +69,8 @@ def write_csv(path: Path, result: SimulationResult, tick_ns: float | None) -> No
 def print_tail(result: SimulationResult, tick_ns: float | None, tail: int, every: int, exact: int = 20) -> None:
     """Print the last ticks, thinned by ``every`` except for the final ``exact`` of them.
 
-    The drain is the point of this, and on a long run it is over in a handful of ticks -- five,
-    on web-traffic -- so any thinning at all steps straight over it and reports a run that ended
-    at full occupancy. The last stretch is always printed tick by tick.
+    The drain can be five ticks long, so any thinning steps over it and reports a run that
+    ended at full occupancy.  The last stretch always prints tick by tick.
     """
     occupancy = result.sm_utilisation.mean(axis=1)
     names = sorted(result.active_blocks)

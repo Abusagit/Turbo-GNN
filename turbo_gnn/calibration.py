@@ -1,41 +1,16 @@
 """Fit the simulator's cost model to measured kernel times.
 
-The load-imbalance simulator charges a node ``alpha + beta * degree`` ticks (see
-:class:`turbo_gnn.simulation.CostModel`).  Assuming ``alpha = 2, beta = 1`` -- one tick for the
-neighbour, one for the node's own feature load, one for the output store -- is defensible for
-min-aggregation and wrong for everything else: GT and GATv2 read Q/K/V rows and attention
-parameters in the prologue and write a logsumexp in the epilogue, and the backward pass walks
-the neighbourhood twice.  Until those constants come from measurement, every simulated number
-is comparable only to other simulated numbers.
+A launch over a whole bucket costs ``t(N, E) = c + a * N + b * E`` nanoseconds, so regressing
+measured time on node and edge counts identifies all three.  The simulator's tick is one
+neighbour, so ``beta = 1``, ``alpha = a / b`` and ``ns_per_tick = b``.
 
-The fit
--------
-A kernel launch over a whole bucket costs a fixed amount to launch, plus a fixed amount per
-node, plus a fixed amount per edge::
+``c`` is launch overhead, which the simulator does not model but which must stay in the
+regression: without it the smallest graphs are pure overhead and drag ``alpha`` up.  Fitting is
+weighted by ``1 / t`` because measured times span four orders of magnitude, and coefficients
+are constrained non-negative.
 
-    t(N, E) = c + a * N + b * E      [nanoseconds]
-
-so regressing measured launch time on the graph's node and edge counts identifies all three.
-``c`` is a nuisance parameter -- launch and teardown overhead, which the simulator does not
-model -- but it has to be in the regression rather than absorbed: without it, the smallest
-graphs are pure overhead and drag ``a`` up by an order of magnitude.  Two useful things fall
-out of one regression:
-
-* ``alpha = a / b`` and ``beta = 1``, because the simulator's tick *is* one neighbour;
-* ``ns_per_tick = b``, which is the ``timestep_duration_ns`` the bandwidth cap needs and which
-  was previously a hand-typed 1.0.
-
-Fitting is weighted by ``1 / t`` by default.  Measured times in this project span four orders
-of magnitude (0.03 ms on cora to 385 ms on ogbn-products); an unweighted fit is a fit to
-ogbn-products alone.  Relative weighting asks instead that the model be within a fixed
-*percentage* on every graph, which is what makes it usable as a predictor.
-
-What the residuals mean
------------------------
-``a`` and ``b`` are constants, so the model has no notion of cache locality.  Anything the
-visit order buys through L2 reuse lands in the residual, and graphs whose working set dwarfs L2
-are exactly where the fit will be worst.  :attr:`FitResult.worst_graphs` reports them, and that
-list is a direct measure of how much of the real behaviour the simulator cannot see.
+``alpha`` and ``beta`` are constants with no notion of cache locality, so what a visit order
+buys through L2 reuse lands in the residual: see :attr:`FitResult.worst_graphs`.
 """
 
 from __future__ import annotations
@@ -119,12 +94,9 @@ class FitResult:
 
 
 def _nnls(design: np.ndarray, target: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """Least squares over a handful of non-negative coefficients.
+    """Least squares over a few non-negative coefficients, by enumerating the active set.
 
-    With three variables the active set can simply be enumerated -- all eight subsets of
-    coefficients pinned to zero -- which is exact and needs no solver.  Negative coefficients
-    are not merely ugly here: a negative per-node cost would mean that adding an isolated node
-    makes the kernel finish sooner.
+    A negative per-node cost would mean an isolated node makes the kernel finish sooner.
     """
     num_coefficients = design.shape[1]
     weighted_design = design * weights[:, None]
@@ -157,18 +129,15 @@ def fit_cost_model(
 
     Args:
         measurements: Timings for one (conv, pass, head dim) cell, on at least three graphs.
-        weighting: ``"relative"`` minimises percentage error (default, see module docstring);
-            ``"uniform"`` minimises absolute error and is dominated by the largest graph.
-        fit_launch_overhead: Fit the constant term.  Turning it off attributes launch overhead
-            to ``alpha``, which is what makes an uncorrected fit on small graphs go wrong.
+        weighting: ``"relative"`` minimises percentage error; ``"uniform"`` is dominated by the
+            largest graph.
+        fit_launch_overhead: Fit the constant term.  Off, launch overhead lands in ``alpha``.
 
     Returns:
-        FitResult: Fitted ``alpha``, the tick duration, and how well the three constants explain
-        the measurements.
+        FitResult: The fitted constants and how well they explain the measurements.
 
     Raises:
-        ValueError: Too few measurements, a non-positive time, or a degenerate fit whose
-            per-edge cost came out as zero (which leaves the tick undefined).
+        ValueError: Too few measurements, a non-positive time, or a zero per-edge cost.
     """
     num_coefficients = 3 if fit_launch_overhead else 2
     if len(measurements) < num_coefficients:
@@ -234,21 +203,14 @@ def fit_cost_model(
 def anchor_tick_ns(fit: FitResult, num_nodes: int, num_edges: int, baseline_ticks: int) -> float:
     """Tick duration that makes the simulator reproduce the measurement it was calibrated on.
 
-    ``ns_per_edge`` is an *aggregate* rate: the whole device retires one edge every ``b``
-    nanoseconds while thousands of blocks run at once.  The simulator's tick is a *per-block*
-    quantity -- one block advancing one neighbour -- and it then lets up to ``bandwidth_cap``
-    blocks advance per tick.  Using ``b`` directly as the tick therefore counts the machine's
-    parallelism twice and predicts a wall clock several times too short.
+    ``ns_per_edge`` is an aggregate rate over thousands of concurrent blocks, while the tick is
+    per-block, so using it directly counts the machine's parallelism twice.  Anchor it instead:
+    simulate the configuration that was measured and scale the tick so that run matches.  Every
+    other configuration is then in the same units, and the simulator predicts *changes* from a
+    measured baseline rather than absolute time from nothing.
 
-    Rather than model that parallelism from first principles (it is intra-block warps, memory
-    level parallelism and latency hiding all at once), anchor the tick empirically: simulate the
-    configuration that was actually measured, and scale the tick so that run reproduces the
-    measured time.  Every other configuration is then expressed in the same units, so the
-    simulator predicts *changes* from a measured baseline rather than absolute time from
-    nothing -- which is the only claim it can honestly support.
-
-    Launch overhead is excluded: the simulator does not model it, and it does not move with the
-    scheduling policy, so it belongs added back as a constant rather than smeared across ticks.
+    Launch overhead is excluded -- it does not move with the scheduling policy, so it is added
+    back as a constant instead of smeared across ticks.
 
     Args:
         fit: Calibration for the (conv, pass, head dim) being simulated.
@@ -342,11 +304,10 @@ _CELL_ROW = re.compile(
 
 
 def measurements_from_kernel_benchmark_summary(path: Path) -> list[Measurement]:
-    """Parse ``reports/kernel-benchmarks/summary.txt`` as written by ``benchmark_kernels.py``.
+    """Parse ``reports/kernel-benchmarks/summary.txt`` from ``benchmark_kernels.py``.
 
-    The baseline column is the one to fit: it is ``one_per_block`` in natural node order, which
-    is exactly the configuration the simulator reproduces as ``contiguous`` with one vertex per
-    block.  The ``best`` column is a different schedule on every row and would fit nothing.
+    Fits the baseline column -- ``one_per_block`` in natural order, which is what the simulator
+    reproduces as ``contiguous`` with one vertex per block.
     """
     measurements: list[Measurement] = []
     graph: str | None = None

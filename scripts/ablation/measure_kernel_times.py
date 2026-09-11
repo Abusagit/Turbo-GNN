@@ -41,13 +41,9 @@ from turbo_gnn.ops import gatv2_aggr, graph_transformer_aggr, reduction_aggr  # 
 DEFAULT_GRAPHS = ["Cora", "tolokers-2", "city-roads-L", "ogbn-arxiv", "twitch-views"]
 CONVS = ["gt", "gat_v2", "min_aggr"]
 
-# Off by default, and the reason is worth knowing before turning it on. Generated graphs were
-# meant to fill out the regression's design space, since the real graphs to hand cluster around
-# N ~ 150k. Measured, they cost 2-6 ns per edge against 0.36-1.55 for real graphs of every size
-# -- and no locality window fixes it, nor does it track the L2 working set. A real graph's edge
-# order is the product of how it was collected; a generated one has no such order, and the cost
-# model has no term for the difference, so mixing the two put 60%+ median error into cells that
-# fit to 15% on real graphs alone. Use these to explore, never to calibrate.
+# Off by default: measured, generated graphs cost 2-6 ns per edge against 0.36-1.55 for real
+# graphs of any size, and no locality window fixes it. Mixing them put 60%+ median error into
+# cells that fit to 15% on real graphs alone. Use these to explore, never to calibrate.
 DEFAULT_SYNTHETIC: list[str] = []
 
 
@@ -56,12 +52,8 @@ def synthetic_edge_index(
 ) -> torch.Tensor:
     """A power-law graph with the requested node count and average degree.
 
-    In-degrees follow the power law -- they are what the forward CSR rows are. Sources are drawn
-    from a window around the destination rather than uniformly, and that is not cosmetic.
-    With uniform sources every neighbour fetch misses L2, and these graphs measured 3 to 13
-    times more nanoseconds per edge than real graphs of the same size -- a difference the cost
-    model cannot express, so it lands wholly in the residual and wrecks the fit. A window
-    reproduces the locality a real graph gets from being stored in a sensible order.
+    Sources come from a window around the destination: with uniform sources every neighbour
+    fetch misses L2 and the graph measures several times slower per edge than a real one.
     """
     degrees = torch.as_tensor(make_powerlaw_degrees(num_nodes, avg_degree, exponent, seed))
     destinations = torch.repeat_interleave(torch.arange(num_nodes), degrees)
@@ -112,9 +104,8 @@ def make_call(conv: str, graph, num_nodes: int, heads: int, head_dim: int, devic
 def time_ms(call, backward: bool, warmup: int, iters: int) -> float:
     """Milliseconds per launch, measured with CUDA events.
 
-    The seed gradient is materialised rather than taken from ``out.sum().backward()``: that
-    route hands the kernel an expanded view with a zero stride, which the GATv2 backward
-    rejects outright.
+    The seed gradient is materialised: ``out.sum().backward()`` passes an expanded view with a
+    zero stride, which the GATv2 backward rejects.
     """
     seed = torch.ones_like(call()) if backward else None
 

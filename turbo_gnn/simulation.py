@@ -16,14 +16,9 @@ LaunchMode = Literal["single", "sequential", "concurrent"]
 class CostModel:
     """Thread-block lifetime as ``alpha + beta * degree`` ticks per node.
 
-    One tick is the time to process one neighbour, so ``beta`` is 1 by construction for a
-    calibrated model and ``alpha`` carries the prologue and epilogue: loading the node's own
-    feature row, and writing its output back to HBM.  ``alpha = 2, beta = 1`` reproduces the
-    original ``D + 2`` model exactly.
-
-    Real convolutions have a much heavier prologue than min-aggregation -- GT and GATv2 read
-    Q/K/V rows and attention parameters and write a logsumexp -- so ``alpha`` is fitted per
-    (conv, pass, head dim) by :mod:`turbo_gnn.calibration` rather than assumed.
+    One tick is one neighbour, so a calibrated model has ``beta = 1`` and ``alpha`` carries the
+    prologue and epilogue.  ``alpha = 2`` reproduces the original ``D + 2`` model; real values
+    come from :mod:`turbo_gnn.calibration` and differ per (conv, pass, head dim).
     """
 
     alpha: float = 2.0
@@ -170,15 +165,9 @@ def bandwidth_cap_from_hardware(
 ) -> int:
     """How many feature-row fetches the memory system keeps in flight at once.
 
-    By Little's law, a system delivering ``bandwidth`` at ``latency`` has
-    ``bandwidth * latency`` bytes outstanding at any moment; divided by the row size, that is
-    the number of blocks that can be making progress simultaneously -- which is exactly what
-    the simulator's per-tick cap means.
-
-    This deliberately does not involve the tick duration.  Sizing the cap as "rows per tick"
-    and then deriving the tick from a measured per-edge time counts the machine's parallelism
-    twice: the measurement is an aggregate rate over thousands of concurrent blocks, so the
-    concurrency is already inside it.
+    Little's law: ``bandwidth * latency`` bytes are outstanding at any moment, and divided by
+    the row size that is how many blocks can progress simultaneously.  Deliberately independent
+    of the tick -- deriving both from a measured rate would count concurrency twice.
     """
     if min(bandwidth_gbps, feature_dim, dtype_bytes, memory_latency_ns) <= 0:
         raise ValueError("bandwidth inputs must be positive")
@@ -288,12 +277,8 @@ def slices_per_node(degree: int, slice_size: int) -> int:
 def slice_size_for_blocks_per_sm(degrees: Sequence[int], blocks_per_sm: float, num_sms: int) -> int:
     """Slice size that fills the device with ``blocks_per_sm`` blocks per SM.
 
-    Ported from the measured result in the split-K work: sizing a slice from a degree statistic
-    does not transfer between graphs, because graphs wanting similar slices have similar heavy
-    *edge counts* rather than similar degrees.  Targeting a block count does transfer, and is
-    device-relative rather than tied to one card's SM count.
-
-    Returns 0, meaning "do not slice", for a non-positive target or an empty bucket.
+    Measured result from the split-K work: sizing from a degree statistic does not transfer
+    between graphs, targeting a block count does.  Returns 0 for "do not slice".
     """
     edges = int(np.asarray(degrees, dtype=np.int64).sum()) if len(degrees) else 0
     if blocks_per_sm <= 0 or edges <= 0 or num_sms <= 0:
@@ -310,13 +295,9 @@ def build_slice_merge(
 ) -> list[BlockSpec]:
     """The second launch that combines a sliced node's partial results.
 
-    Split-K's slice kernel stops before normalising and writes per-slice partial state; a merge
-    kernel then runs the same n-way reduction across a node's slices.  Its grid is one block per
-    heavy node, and each block reads one partial per slice, so a partial costs what a neighbour
-    costs and the node's merge is ``alpha + beta * slice_count``.
-
-    This is a separate launch, which is why :attr:`SimulationConfig.depends_on` exists: no merge
-    block may start until the last slice has retired.
+    One block per heavy node, reading one partial per slice, so a node's merge costs
+    ``alpha + beta * slice_count``.  It is a separate launch, hence
+    :attr:`SimulationConfig.depends_on`: no merge block starts until the last slice retires.
     """
     degree_array = _validate_degrees(degrees)
     if num_heads <= 0:
