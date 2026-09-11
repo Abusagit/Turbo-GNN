@@ -1,6 +1,7 @@
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, Dict, Literal, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, Literal, Mapping, Optional, Tuple
 
 import torch
 import torch_geometric.datasets as pyg_datasets
@@ -617,6 +618,32 @@ def _mask_from_indices_with_splits_creation(
 # ------------------------------- OGBN loaders -------------------------------- #
 
 
+@contextmanager
+def _torch_load_without_weights_only() -> Iterator[None]:
+    """Let ``torch.load`` read OGB's own preprocessed cache again.
+
+    PyTorch 2.6 flipped ``weights_only`` to True by default, and OGB's cached ``.pt`` files are
+    pickled objects rather than plain tensors, so loading one now fails with
+    ``UnpicklingError: Unsupported operand``.  The file is not untrusted input: OGB wrote it
+    itself, in this process's own cache directory, from a dataset this code downloaded.
+
+    Scoped to the dataset construction rather than set globally, so nothing else in the process
+    silently loses the check.
+    """
+    original = torch.load
+
+    @wraps(original)
+    def load(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("weights_only", False)
+        return original(*args, **kwargs)
+
+    torch.load = load
+    try:
+        yield
+    finally:
+        torch.load = original
+
+
 def load_ogbn(
     name: str,
     graph_backend: GraphBackendOption,
@@ -639,7 +666,8 @@ def load_ogbn(
 
     @ensure_cpu_device
     def _load_oggn_cpu():
-        return NodePropPredDataset(name=name, root=root)
+        with _torch_load_without_weights_only():
+            return NodePropPredDataset(name=name, root=root)
 
     dset = _load_oggn_cpu()
     split_idx = dset.get_idx_split()
