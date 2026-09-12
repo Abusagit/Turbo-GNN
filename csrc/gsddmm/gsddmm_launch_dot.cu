@@ -8,4 +8,10 @@ void gsddmm_forward_launch_dot(const GsddmmLaunchArgs& args) { gsddmm_dispatch<G
 
 void gsddmm_forward_edge_launch_dot(const GsddmmLaunchArgsEdge& args) { gsddmm_dispatch_edge_block<GSDDMM_BINARY_LROS(Dot)>(args); }
 
+void gsddmm_backward_launch_dot(const GsddmmBackwardLaunchArgs& args) { gsddmm_backward_dispatch<GSDDMM_BINARY_LROS(Dot)>(args); }
+
+void gsddmm_backward_edge_launch_dot(const GsddmmBackwardLaunchArgsEdge& args) {
+    gsddmm_backward_dispatch_edge_block<GSDDMM_BINARY_LROS(Dot)>(args);
+}
+
 };  // namespace gsddmm

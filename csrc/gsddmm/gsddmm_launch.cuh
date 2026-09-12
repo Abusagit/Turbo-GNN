@@ -98,4 +98,82 @@ void gsddmm_forward_edge_launch_div(const GsddmmLaunchArgsEdge& args);
 void gsddmm_forward_edge_launch_dot(const GsddmmLaunchArgsEdge& args);
 void gsddmm_forward_edge_launch_copy(const GsddmmLaunchArgsEdge& args);
 
+// =============================================================================
+// Backward
+// =============================================================================
+//
+// A call runs one pass per node operand (see GSDDMM_REDUCE in gsddmm.cuh): the
+// Dst pass walks the forward CSR, the Src pass the backward one. Both CSRs and
+// both bucket pairs are therefore passed in, and the dispatch launches only the
+// passes the member pair actually needs. dL / dR are pre-allocated by the
+// binding, so a launcher never allocates.
+struct GsddmmBackwardLaunchArgs {
+    const torch::Tensor& L;
+    const torch::Tensor& R;
+    const torch::Tensor& dO;
+    torch::Tensor& dL;
+    torch::Tensor& dR;
+    // Forward CSR (rows = destinations) and its node buckets: the Dst pass.
+    const torch::Tensor& row_ptr;
+    const torch::Tensor& col_idx;
+    const torch::Tensor& light_nodes;
+    const torch::Tensor& heavy_nodes;
+    // Backward CSR (rows = sources) and its buckets: the Src pass. Its slots are
+    // CSC positions, so canonical_edge_idx maps them onto dO's numbering (null
+    // only when the graph aliases its two CSRs, i.e. the orders coincide).
+    const torch::Tensor& row_ptr_T;
+    const torch::Tensor& col_idx_T;
+    const torch::Tensor& light_nodes_T;
+    const torch::Tensor& heavy_nodes_T;
+    unsigned long long const *__restrict__ canonical_edge_idx;
+    const at::cuda::CUDAStream& stream;
+    uint64_t N;
+    uint64_t D;
+    LRO key;
+    uint16_t light_warps_per_block;
+    uint16_t heavy_warps_per_block;
+};
+
+void gsddmm_backward_launch_add(const GsddmmBackwardLaunchArgs& args);
+void gsddmm_backward_launch_sub(const GsddmmBackwardLaunchArgs& args);
+void gsddmm_backward_launch_mul(const GsddmmBackwardLaunchArgs& args);
+void gsddmm_backward_launch_div(const GsddmmBackwardLaunchArgs& args);
+void gsddmm_backward_launch_dot(const GsddmmBackwardLaunchArgs& args);
+void gsddmm_backward_launch_copy(const GsddmmBackwardLaunchArgs& args);
+
+// Edge-parallel backward. Each pass traverses the edge list grouped by the node
+// it reduces, so that a warp's chunk shares its target row and the accumulation
+// collapses to one atomic per tile: the Dst pass takes edge_nodes_idx_dst (which
+// is already in canonical order), the Src pass edge_nodes_idx_src together with
+// canonical_edge_idx.
+//
+// Node gradients land in fp32 scratch (dL_f32 / dR_f32, zeroed by the binding,
+// which casts them back); an edge operand's gradient is a plain store straight
+// into dL / dR.
+struct GsddmmBackwardLaunchArgsEdge {
+    const torch::Tensor& L;
+    const torch::Tensor& R;
+    const torch::Tensor& dO;
+    torch::Tensor& dL;
+    torch::Tensor& dR;
+    torch::Tensor& dL_f32;
+    torch::Tensor& dR_f32;
+    ulonglong2 const *__restrict__ edge_nodes_idx_dst;
+    ulonglong2 const *__restrict__ edge_nodes_idx_src;
+    unsigned long long const *__restrict__ canonical_edge_idx;
+    const at::cuda::CUDAStream& stream;
+    uint64_t E;
+    uint64_t D;
+    LRO key;
+    uint8_t edges_per_warp;
+    uint8_t warps_per_block;
+};
+
+void gsddmm_backward_edge_launch_add(const GsddmmBackwardLaunchArgsEdge& args);
+void gsddmm_backward_edge_launch_sub(const GsddmmBackwardLaunchArgsEdge& args);
+void gsddmm_backward_edge_launch_mul(const GsddmmBackwardLaunchArgsEdge& args);
+void gsddmm_backward_edge_launch_div(const GsddmmBackwardLaunchArgsEdge& args);
+void gsddmm_backward_edge_launch_dot(const GsddmmBackwardLaunchArgsEdge& args);
+void gsddmm_backward_edge_launch_copy(const GsddmmBackwardLaunchArgsEdge& args);
+
 };  // namespace gsddmm

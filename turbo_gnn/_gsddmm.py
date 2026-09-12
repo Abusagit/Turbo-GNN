@@ -171,15 +171,20 @@ class GsddmmSpec:
 
     @property
     def backward_needs_operands(self) -> tuple[str, ...]:
-        """Which forward operands the (future) backward pass has to keep.
+        """Which forward operands the backward pass has to keep.
 
-        ``add``/``sub``/``copy`` have constant partials, so nothing is saved;
-        ``mul``/``div`` need the other operand; ``dot`` needs both.
+        ``add``/``sub``/``copy`` have constant partials (``dO``, ``-dO``), so
+        nothing is saved at all -- the win this property exists for.
+
+        Every other op is bilinear or worse, and each operand's gradient is
+        expressed through the *other* one (``mul``: ``dL = dO * R`` and
+        ``dR = dO * L``; ``div`` additionally divides by ``R`` itself), so a call
+        that may want both gradients needs both operands. Anything not listed
+        here is replaced by a stand-in row in the backward, which is only safe
+        because the kernels guard every operand read with the same predicate.
         """
         if self.op in ("add", "sub", "copy"):
             return ()
-        if self.op in ("mul", "div"):
-            return ("rhs",)
         return ("lhs", "rhs")
 
 
@@ -252,6 +257,12 @@ class GsddmmPlan:
     params: GsddmmParams
     traversal: TraversalOrder = TraversalOrder.CSR
     canonical_output: bool = True
+    #: Which backward kernel runs, chosen independently of the forward: the two
+    #: passes have different shapes (a reduction rather than a map), so the
+    #: forward's winner does not carry over. "node" reduces in fp32 registers
+    #: with one block per node -- deterministic, no atomics -- and is the default
+    #: for that reason; "edge" is load balanced but accumulates atomically.
+    backward_variant: GsddmmVariant = "node"
 
     def __post_init__(self) -> None:
         expected = _PARAMS_FOR_VARIANT.get(self.variant)
@@ -276,6 +287,36 @@ class GsddmmPlan:
         if self.variant == "node":
             return _launch_node(self.spec, graph, lhs, rhs, self.params)
         return _launch_edge(self.spec, graph, lhs, rhs, self.params, self.traversal, self.canonical_output)
+
+    def backward(
+        self, graph, lhs: torch.Tensor | None, rhs: torch.Tensor | None, d_out: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Gradients of the forward operands, as ``(d_lhs, d_rhs)``.
+
+        ``lhs``/``rhs`` may be None for the operands this op's backward does not
+        read (:attr:`GsddmmSpec.backward_needs_operands`); a stand-in row is
+        passed in their place. ``d_rhs`` is None for ``copy``, which has no right
+        operand.
+
+        Args:
+            graph: The same graph the forward ran on.
+            lhs: Forward left operand, or None when unused by the backward.
+            rhs: Forward right operand, or None when unused / absent.
+            d_out: Gradient of the output; ``[E, D]``, or ``[E]`` for ``dot``.
+
+        Returns:
+            ``(d_lhs, d_rhs)`` shaped like the forward operands.
+        """
+        lhs_arg = _backward_operand(self.spec, "lhs", graph, lhs, d_out)
+        rhs_arg = _backward_operand(self.spec, "rhs", graph, rhs, d_out)
+        d_out = d_out.contiguous()
+        if self.backward_variant == "node":
+            params = self.params if isinstance(self.params, NodeBlockParams) else NodeBlockParams()
+            d_lhs, d_rhs = _launch_backward_node(self.spec, graph, lhs_arg, rhs_arg, d_out, params)
+        else:
+            params = self.params if isinstance(self.params, EdgeBlockParams) else EdgeBlockParams()
+            d_lhs, d_rhs = _launch_backward_edge(self.spec, graph, lhs_arg, rhs_arg, d_out, params)
+        return d_lhs, (d_rhs if self.spec.uses_rhs else None)
 
     def backward_context(self, graph) -> dict[str, torch.Tensor]:
         """Index tensors this plan's backward pass will need, and nothing else.
@@ -368,12 +409,20 @@ def _graph_heavy_blocks(graph, edges_per_block: int) -> tuple[torch.Tensor, torc
 
 
 def _edge_list_is_canonical(graph, by_src: bool) -> bool:
-    """True when the ``by_src`` edge list is in forward-CSR edge order.
+    """True when the ``by_src`` *edge list* is in forward-CSR edge order.
 
     Trivially so for the destination-grouped list. Also so for the
-    source-grouped one on an undirected graph, where the backward CSR is aliased
-    to the forward CSR and :func:`_graph_edge_list` hands back the same tensor --
-    no remapping needed, and no permutation worth materializing.
+    source-grouped one on an undirected graph, because the backward CSR is
+    aliased to the forward CSR and :func:`_graph_edge_list` then hands back the
+    very same tensor -- so the forward kernel needs no remapping.
+
+    This is a statement about *which tensor the edge list is*, and only that. It
+    is NOT a statement that a CSC slot order equals the CSR edge order: an
+    undirected graph aliases its CSRs because the sparsity pattern is symmetric,
+    while row ``u`` of that shared CSR still lists ``u``'s incoming edges, whose
+    positions differ from those of its outgoing ones. Anything that walks a CSR
+    row and then reads per-edge data -- the backward's source-side pass -- needs
+    :func:`_graph_canonical_edge_idx` regardless of what this returns.
     """
     return (not by_src) or graph.backward_indptr.data_ptr() == graph.forward_indptr.data_ptr()
 
@@ -564,6 +613,106 @@ def _launch_edge(
 # =============================================================================
 # Variant selection
 # =============================================================================
+
+
+def _backward_operand(
+    spec: GsddmmSpec, which: str, graph, tensor: torch.Tensor | None, like: torch.Tensor
+) -> torch.Tensor:
+    """The operand to hand the backward binding, or a stand-in it never reads.
+
+    ``add``/``sub``/``copy`` have constant partials, so their backward reads
+    neither operand and nothing needs saving for it (see
+    :attr:`GsddmmSpec.backward_needs_operands`). The binding still validates the
+    operand shapes, so an unneeded one is passed as a single row expanded to the
+    right number -- ``D`` elements instead of ``N * D`` or ``E * D``. The kernels
+    guard every operand read with the same compile-time predicate, so the
+    stand-in's rows are never addressed.
+    """
+    if tensor is not None:
+        return tensor
+    target = spec.lhs_target if which == "lhs" else spec.rhs_target
+    rows = graph.forward_indices.numel() if target == "edge" else graph.forward_indptr.numel() - 1
+    feat_dim = like.shape[-1]
+    return like.new_empty((1, feat_dim)).expand(rows, feat_dim)
+
+
+def _launch_backward_node(
+    spec: GsddmmSpec,
+    graph,
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    d_out: torch.Tensor,
+    params: NodeBlockParams,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the node-parallel backward: one block per node, no atomics.
+
+    Both CSR directions and both bucket pairs go in; the dispatch drops whichever
+    pass the operand pair does not need.
+
+    A source-side gradient walks the backward CSR, whose slots are CSC positions,
+    so the canonical permutation always comes along. Note that an *undirected*
+    graph needs it just as much, even though it aliases its two CSRs: the aliasing
+    says the sparsity pattern is symmetric, not that the edge numbering is. Row
+    ``u`` of the forward CSR holds the edges whose destination is ``u``, while this
+    pass must sum over the edges whose source is ``u`` -- the reverse edges, which
+    sit at different positions and therefore carry different ``d_out`` rows.
+    """
+    canonical = _graph_canonical_edge_idx(graph) if graph.forward_indices.numel() > 0 else None
+    return _C.gsddmm_backward(
+        lhs,
+        rhs,
+        d_out,
+        graph.forward_indptr,
+        graph.forward_indices,
+        graph.backward_indptr,
+        graph.backward_indices,
+        spec.op,
+        spec.lhs_target,
+        spec.rhs_target,
+        graph.forward_light_nodes,
+        graph.forward_heavy_nodes,
+        graph.backward_light_nodes,
+        graph.backward_heavy_nodes,
+        canonical,
+        params.light_warps,
+        params.heavy_warps,
+    )
+
+
+def _launch_backward_edge(
+    spec: GsddmmSpec,
+    graph,
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    d_out: torch.Tensor,
+    params: EdgeBlockParams,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the edge-parallel backward: one warp per edge chunk, fp32 atomics.
+
+    Each pass walks the list grouped by the node it reduces, so a warp's chunk
+    usually shares its target row and the accumulation collapses to one atomic
+    per feature tile.
+    """
+    edge_list_dst = _graph_edge_list(graph, by_src=False)
+    edge_list_src = edge_list_dst
+    canonical = None
+    if spec.reads_src and not _edge_list_is_canonical(graph, by_src=True):
+        edge_list_src = _graph_edge_list(graph, by_src=True)
+        canonical = _graph_canonical_edge_idx(graph)
+    return _C.gsddmm_backward_edge(
+        lhs,
+        rhs,
+        d_out,
+        edge_list_dst,
+        edge_list_src,
+        canonical,
+        spec.op,
+        spec.lhs_target,
+        spec.rhs_target,
+        graph.forward_indptr.numel() - 1,
+        params.edges_per_warp,
+        params.warps_per_block,
+    )
 
 
 def _geometry_prefers_node(num_nodes: int, num_edges: int, feat_dim: int) -> bool:

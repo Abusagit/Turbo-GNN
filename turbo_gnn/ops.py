@@ -8,10 +8,13 @@ on first call, then caches the best configuration.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 from turbo_gnn._autotune import with_autotune
 from turbo_gnn._functions import (
+    GsddmmFunction,
     ReductionAggrFunction,
     _CudaSpMMConvFn,
     _FusedGraphAttention,
@@ -333,6 +336,7 @@ def gsddmm(
     lhs_target: str = "src",
     rhs_target: str = "dst",
     variant: str = "auto",
+    backward_variant: str = "node",
     pipeline_stages: int | None = None,
     light_warps_per_block: int | None = None,
     heavy_warps_per_block: int | None = None,
@@ -363,8 +367,11 @@ def gsddmm(
     such call; pin ``variant`` to skip it. Either way **the output is numbered
     by forward-CSR edge position**, so the choice cannot change results.
 
-    Forward-only (no autograd): the CUDA kernel has no backward pass yet, so
-    the output is detached from the autograd graph.
+    Differentiable in both operands. The backward has its own two kernels, picked
+    by ``backward_variant`` independently of the forward: it is a *reduction*
+    (each node's gradient sums over its incident edges) rather than a map, so the
+    forward's winner does not carry over. An operand read with ``"edge"`` gets a
+    per-edge gradient with no reduction at all.
 
     Args:
         graph: CSR graph with forward adjacency and light/heavy node buckets.
@@ -379,6 +386,12 @@ def gsddmm(
         variant: ``"auto"`` (default, measure once and cache), ``"node"`` to pin
             the CSR node-block kernel, or ``"edge"`` to pin the edge-parallel
             one. Pinning measures nothing.
+        backward_variant: ``"node"`` (default) reduces each node's gradient in
+            fp32 registers with one block per node -- deterministic and free of
+            atomics, which is why it is the default. ``"edge"`` is perfectly load
+            balanced (one warp per edge chunk) but accumulates atomically into an
+            fp32 buffer, so its result depends on atomic ordering and is only
+            deterministic up to fp32 rounding.
         pipeline_stages: Async-copy prefetch depth for the per-edge operand
             rows, 0-3 (0 disables the pipeline); read by both kernels. Stage
             ``i + stages`` is prefetched while stage ``i`` is consumed, costing
@@ -427,8 +440,13 @@ def gsddmm(
             "warps_per_block": warps_per_block,
         },
     )
+    if backward_variant not in ("node", "edge"):
+        raise ValueError(f"gsddmm: unknown backward_variant {backward_variant!r}; expected 'node' or 'edge'")
     plan = resolve_plan(spec, graph, lhs, rhs, variant, node_params, edge_params)
-    return plan.launch(graph, lhs, rhs)
+    plan = replace(plan, backward_variant=backward_variant)
+    # Resolving the plan may launch timing probes, which must stay outside the
+    # autograd graph; only the chosen kernel runs inside the Function.
+    return GsddmmFunction.apply(plan, graph, lhs, rhs)
 
 
 @with_autotune(GSDDMMEdgeKernel, init_params=("op", "lhs_target", "rhs_target"))

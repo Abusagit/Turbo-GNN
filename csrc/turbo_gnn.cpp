@@ -31,6 +31,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("canonical_edge_idx") = py::none()
     );
 
+    m.def(
+        "gsddmm_backward", &gsddmm_backward_cuda, "GSDDMM backward (node-parallel, fp32 register reduction, no atomics)", py::arg("l"),
+        py::arg("r"), py::arg("d_out"), py::arg("row_ptr"), py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("op"),
+        py::arg("lhs_target"), py::arg("rhs_target"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("light_nodes_T"),
+        py::arg("heavy_nodes_T"), py::arg("canonical_edge_idx") = py::none(), py::arg("light_warps_per_block") = 4,
+        py::arg("heavy_warps_per_block") = 32
+    );
+
+    m.def(
+        "gsddmm_backward_edge", &gsddmm_backward_edge_blocks, "GSDDMM backward (edge-parallel, fp32 atomic accumulation)", py::arg("l"),
+        py::arg("r"), py::arg("d_out"), py::arg("edge_list_dst"), py::arg("edge_list_src") = py::none(),
+        py::arg("canonical_edge_idx") = py::none(), py::arg("op") = "mul", py::arg("lhs_target") = "src", py::arg("rhs_target") = "dst",
+        py::arg("N") = 0, py::arg("edges_per_warp") = 4, py::arg("warps_per_block") = 4
+    );
+
     // GATv2 aggregation
     m.def(
         "gatv2_forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)", py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),

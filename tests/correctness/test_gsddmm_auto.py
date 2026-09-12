@@ -433,10 +433,19 @@ def test_cross_variant_parameters_are_rejected_when_pinned() -> None:
 
 @pytest.mark.parametrize(
     "op,expected",
-    [("add", ()), ("sub", ()), ("copy", ()), ("mul", ("rhs",)), ("div", ("rhs",)), ("dot", ("lhs", "rhs"))],
+    [
+        ("add", ()),
+        ("sub", ()),
+        ("copy", ()),
+        # Bilinear ops express each operand's gradient through the other, and a
+        # call may want both gradients, so both operands are kept.
+        ("mul", ("lhs", "rhs")),
+        ("div", ("lhs", "rhs")),
+        ("dot", ("lhs", "rhs")),
+    ],
 )
 def test_backward_needs_only_the_operands_with_nonconstant_partials(op: str, expected: tuple) -> None:
-    """Preparation for the backward pass: add/sub/copy save no feature tensors."""
+    """add/sub/copy have constant partials, so they save no feature tensors."""
     rhs_target = "edge" if op == "copy" else "dst"
     assert GsddmmSpec(op, "src", rhs_target).backward_needs_operands == expected
 

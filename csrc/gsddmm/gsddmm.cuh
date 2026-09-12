@@ -144,4 +144,136 @@ __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDM
     uint32_t edges_per_warp
 );
 
+// =============================================================================
+// GSDDMM backward
+// =============================================================================
+//
+// With O[e] = op(L[sel(ll)], R[sel(rr)]) and dO given, the per-edge partials are
+//
+//     add:   dL = dO,            dR = dO
+//     sub:   dL = dO,            dR = -dO
+//     mul:   dL = dO * R,        dR = dO * L
+//     div:   dL = dO / R,        dR = -dO * L / R^2
+//     copy:  dL = dO             (R is never read)
+//     dot:   dL = dO[e] * R,     dR = dO[e] * L        (dO is one scalar per edge)
+//
+// Each partial then lands on the row its operand was read from, which is what
+// makes the backward a *reduction* rather than a map:
+//
+//   - an Edge operand owns one row per edge, so its gradient is a plain store;
+//   - a Src_V operand's gradient sums over the node's OUTGOING edges, i.e. the
+//     rows of the backward (source-grouped) CSR;
+//   - a Dst_V operand's gradient sums over its INCOMING edges, i.e. the rows of
+//     the forward CSR.
+//
+// GSDDMM_REDUCE names which of those two node reductions a launch performs. Every
+// instantiated member pair holds at most one Src_V and one Dst_V operand, so the
+// passes a call needs follow from (ll, rr) alone and never write the same buffer:
+// (Src_V, Dst_V) runs both passes, a pair with an Edge operand runs the single
+// pass for its node operand and writes the edge gradient on the way through, and
+// Copy runs the one pass for its lhs.
+enum class GSDDMM_REDUCE : uint8_t {
+    Dst,  // walk the forward CSR, reduce per destination node
+    Src,  // walk the backward CSR, reduce per source node
+};
+
+// Compile-time operand routing for one backward pass.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce>
+struct GsddmmBackwardPlan {
+    using Fwd = GsddmmPlan<op, ll, rr>;
+
+    static constexpr GSDDMM_MEMBER SELF_MEMBER = (reduce == GSDDMM_REDUCE::Dst) ? GSDDMM_MEMBER::Dst_V : GSDDMM_MEMBER::Src_V;
+
+    // Which operand this pass reduces. Exactly one of the two can match, because
+    // the instantiated pairs never repeat a member.
+    static constexpr bool SELF_IS_LHS = (ll == SELF_MEMBER);
+    static constexpr bool SELF_IS_RHS = Fwd::USE_R && (rr == SELF_MEMBER);
+    static constexpr bool HAS_SELF    = SELF_IS_LHS || SELF_IS_RHS;
+    static_assert(!(SELF_IS_LHS && SELF_IS_RHS), "a member appears at most once per instantiated pair");
+
+    // The other operand, gathered per edge. For Copy there is none.
+    static constexpr bool HAS_OTHER      = Fwd::USE_R && HAS_SELF;
+    static constexpr GSDDMM_MEMBER OTHER = SELF_IS_LHS ? rr : ll;
+    static constexpr bool OTHER_IS_EDGE  = HAS_OTHER && (OTHER == GSDDMM_MEMBER::Edge);
+
+    // Mul/Div/Dot multiply by the other operand's row; Add/Sub/Copy have constant
+    // partials, so those passes are pure reductions of dO and read no operands.
+    static constexpr bool NEEDS_OTHER_ROW = HAS_OTHER && (op == GSDDMM_OP::Mul || op == GSDDMM_OP::Div || op == GSDDMM_OP::Dot);
+
+    // Div's denominator gradient is -dO * L / R^2. R is this pass's own row, so
+    // the -1/R^2 factor is constant across the sum and is applied once at the
+    // end instead of per edge -- the own row is read once per node, never per edge.
+    static constexpr bool NEEDS_SELF_ROW = (op == GSDDMM_OP::Div) && SELF_IS_RHS;
+    // Negated partials: sub's rhs, and div's rhs (through the factor above).
+    static constexpr bool NEGATE_SELF = SELF_IS_RHS && (op == GSDDMM_OP::Sub || op == GSDDMM_OP::Div);
+
+    // The edge operand's gradient is a plain per-edge store, written by this pass
+    // (the only one that runs when a pair has an Edge operand).
+    static constexpr bool WRITE_EDGE_GRAD = OTHER_IS_EDGE;
+    // ... and for Div it needs the edge row itself (dR = -dO * L / R^2 with R
+    // edge-indexed), so that row is read per edge even when SELF does not need it.
+    static constexpr bool NEEDS_OTHER_ROW_FOR_EDGE_GRAD = WRITE_EDGE_GRAD && (op == GSDDMM_OP::Div) && (OTHER == rr);
+
+    static constexpr bool READS_OTHER = NEEDS_OTHER_ROW || NEEDS_OTHER_ROW_FOR_EDGE_GRAD;
+    static constexpr bool IS_DOT      = Fwd::IS_DOT;
+};
+
+// Dynamic shared memory for one GSDDMM_backward_normal launch: one fp32 feature
+// row per warp, holding that warp's partial sum so warp 0 can reduce them (the
+// same layout the GT backward uses). A single warp per block needs none.
+template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum accum_t = float>
+inline consteval size_t gsddmm_backward_shmem_bytes() {
+    return N_PER_BLOCK > 1 ? N_PER_BLOCK * D_CONST * sizeof(accum_t) : 0;
+}
+
+// Node-parallel backward: one thread block per (bucketed) node of the CSR that
+// `reduce` selects, warps striding over that node's edges. The node's gradient is
+// accumulated in fp32 registers and written once, so this variant needs NO
+// atomics and no zeroed output -- it is the accurate, load-imbalanced choice.
+//
+// row_ptr/col_idx are the CSR for the pass direction: the forward CSR for
+// GSDDMM_REDUCE::Dst, the backward (source-grouped) CSR for ::Src. In the latter
+// case the slot walked is a CSC position, so canonical_edge_idx (required there,
+// unless the graph aliases its two CSRs) maps it to the forward-CSR edge id that
+// numbers dO and the Edge operand.
+//
+// d_self is the reduced node gradient, [N, D]. d_edge is the edge operand's
+// gradient, [E, D], written only when the pair has an Edge operand; pass nullptr
+// otherwise.
+//
+// Unlike the forward there is no heavy-node chunking here: splitting a node over
+// several blocks would make them all write its row, which is exactly what this
+// variant exists to avoid. Use the edge-parallel backward when the degree
+// distribution makes one-block-per-node the bottleneck.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_backward_normal ( // no-format
+    size_t N,
+    cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
+    cuda_t *__restrict__ d_self, cuda_t *__restrict__ d_edge,
+    index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
+    index_t const *__restrict__ node_indices,
+    unsigned long long const *__restrict__ canonical_edge_idx
+);
+
+// Edge-parallel backward: one warp per contiguous chunk of the explicit edge
+// list, mirroring GSDDMM_forward_edge_block. Perfectly load balanced, at the cost
+// of accumulating the node gradient with atomics -- into an fp32 buffer
+// (d_self_f32, zero-initialized by the caller, cast back on the host), because
+// fp16/bf16 atomics would both contend and lose the reduction's precision.
+//
+// The edge list is grouped by the node being reduced, so a warp's chunk usually
+// shares its target row: one warp ballot (as in the forward's shared-row cache)
+// decides that, the chunk is then summed in registers, and the warp issues ONE
+// atomicAdd per feature tile instead of one per edge. Mixed chunks fall back to
+// per-edge atomics.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block ( // no-format
+    uint64_t E,
+    cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
+    accum_t *__restrict__ d_self_f32, cuda_t *__restrict__ d_edge,
+    ulonglong2 const *__restrict__ edge_nodes_idx,
+    unsigned long long const *__restrict__ canonical_edge_idx,
+    uint32_t edges_per_warp
+);
+
 };  // namespace gsddmm

@@ -427,3 +427,38 @@ def csr_SPMM_normalized(
     )
 
     return out
+
+
+class GsddmmFunction(torch.autograd.Function):
+    """Autograd wrapper around a resolved :class:`turbo_gnn._gsddmm.GsddmmPlan`.
+
+    The plan decides which forward kernel runs and which backward variant pairs
+    with it, and it is stashed on ``ctx`` as-is -- it is frozen, hashable and
+    holds no tensors, so the backward reconstructs nothing.
+
+    Only the operands whose partials actually need them are saved: ``add``,
+    ``sub`` and ``copy`` have constant partials and so save no feature tensors at
+    all (see ``GsddmmSpec.backward_needs_operands``), which is the difference
+    between keeping one and two ``[E, D]`` activations alive per op in a layer.
+    """
+
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(ctx, plan, graph, lhs, rhs):
+        out = plan.launch(graph, lhs, rhs)
+        needed = plan.spec.backward_needs_operands
+        ctx.plan = plan
+        # The graph is not an autograd input, so it rides on ctx rather than
+        # through save_for_backward.
+        ctx.graph = graph
+        ctx.save_for_backward(lhs if "lhs" in needed else None, rhs if "rhs" in needed else None)
+        return out
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, grad_out):
+        lhs, rhs = ctx.saved_tensors
+        d_lhs, d_rhs = ctx.plan.backward(ctx.graph, lhs, rhs, grad_out)
+        # forward(plan, graph, lhs, rhs): the first two take no gradient.
+        needs_lhs, needs_rhs = ctx.needs_input_grad[2], ctx.needs_input_grad[3]
+        return None, None, (d_lhs if needs_lhs else None), (d_rhs if needs_rhs else None)

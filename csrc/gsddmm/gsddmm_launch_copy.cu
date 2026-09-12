@@ -8,4 +8,8 @@ void gsddmm_forward_launch_copy(const GsddmmLaunchArgs& args) { gsddmm_dispatch<
 
 void gsddmm_forward_edge_launch_copy(const GsddmmLaunchArgsEdge& args) { gsddmm_dispatch_edge_block<GSDDMM_COPY_LROS>(args); }
 
+void gsddmm_backward_launch_copy(const GsddmmBackwardLaunchArgs& args) { gsddmm_backward_dispatch<GSDDMM_COPY_LROS>(args); }
+
+void gsddmm_backward_edge_launch_copy(const GsddmmBackwardLaunchArgsEdge& args) { gsddmm_backward_dispatch_edge_block<GSDDMM_COPY_LROS>(args); }
+
 };  // namespace gsddmm

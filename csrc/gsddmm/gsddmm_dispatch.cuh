@@ -179,6 +179,152 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
     );
 }
 
+// Compile-time tag for one backward pass direction.
+template <GSDDMM_REDUCE reduce>
+using ReduceTag = std::integral_constant<GSDDMM_REDUCE, reduce>;
+
+// Node-parallel backward: instantiates GSDDMM_backward_normal over Lros x the
+// dtype / index / D / warps grid, for each pass the member pair needs.
+//
+// There is no pipeline-stage axis here (the backward gathers one row per edge
+// with direct loads), which keeps this grid at a quarter of the forward's.
+template <LRO... Lros>
+void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
+    auto lro_variant = MakeEnumVariant<LRO, Lros...>(args.key);
+
+    // One (bucket, direction) launch. warp_variant fixes the block's warp count.
+    auto launch_bucket = [&](const torch::Tensor& node_indices, auto reduce_c, auto warp_variant) {
+        const int64_t num_blocks = node_indices.numel();
+        if (num_blocks == 0) [[unlikely]] {
+            return;
+        }
+
+        std::visit(
+            [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+                constexpr GSDDMM_OP OP         = decltype(lro_c)::value.op;
+                constexpr GSDDMM_MEMBER LL     = decltype(lro_c)::value.l;
+                constexpr GSDDMM_MEMBER RR     = decltype(lro_c)::value.r;
+                constexpr GSDDMM_REDUCE REDUCE = decltype(reduce_c)::value;
+                using Plan                     = GsddmmBackwardPlan<OP, LL, RR, REDUCE>;
+
+                // Pairs without an operand on this side have no pass; skipping
+                // here keeps the kernel (and its static_assert) uninstantiated.
+                if constexpr (Plan::HAS_SELF) {
+                    using index_t         = typename decltype(idxInfo)::Type;
+                    using torch_t         = typename decltype(typeInfo)::TorchType;
+                    using cuda_t          = typename decltype(typeInfo)::CudaType;
+                    constexpr size_t DC   = decltype(d_c)::value;
+                    constexpr size_t W    = decltype(warp_c)::value;
+                    constexpr bool IS_SRC = REDUCE == GSDDMM_REDUCE::Src;
+
+                    cuda_t const *L_ptr  = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
+                    cuda_t const *R_ptr  = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
+                    cuda_t const *dO_ptr = reinterpret_cast<const cuda_t *>(args.dO.data_ptr<torch_t>());
+                    // This pass reduces one operand and, when the pair has an
+                    // edge operand, stores the other's per-edge gradient.
+                    torch::Tensor& self_out = Plan::SELF_IS_LHS ? args.dL : args.dR;
+                    torch::Tensor& edge_out = Plan::SELF_IS_LHS ? args.dR : args.dL;
+                    cuda_t *self_ptr        = reinterpret_cast<cuda_t *>(self_out.data_ptr<torch_t>());
+                    cuda_t *edge_ptr        = Plan::WRITE_EDGE_GRAD ? reinterpret_cast<cuda_t *>(edge_out.data_ptr<torch_t>()) : nullptr;
+
+                    auto kernel = GSDDMM_backward_normal<OP, LL, RR, REDUCE, W, DC, cuda_t, index_t, float>;
+
+                    constexpr size_t shmem = gsddmm_backward_shmem_bytes<W, DC, float>();
+                    ensure_dynamic_shmem(kernel, shmem, "GSDDMM backward");
+
+                    dim3 blocks(static_cast<unsigned>(num_blocks));
+                    dim3 threads(kWarpSize, W);
+
+                    kernel<<<blocks, threads, shmem, args.stream>>>(
+                        static_cast<size_t>(args.N), L_ptr, R_ptr, dO_ptr, self_ptr, edge_ptr,
+                        index_ptr<index_t>(IS_SRC ? args.row_ptr_T : args.row_ptr), index_ptr<index_t>(IS_SRC ? args.col_idx_T : args.col_idx),
+                        index_ptr<index_t>(node_indices), IS_SRC ? args.canonical_edge_idx : nullptr
+                    );
+                }
+            },
+            lro_variant, MakeIndexVariant<int32_t, int64_t>(args.row_ptr.scalar_type()),
+            MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+            warp_variant
+        );
+    };
+
+    // Dst pass over the forward CSR, then Src pass over the backward CSR. Each
+    // writes a different operand's gradient, so they are independent.
+    launch_bucket(args.heavy_nodes, ReduceTag<GSDDMM_REDUCE::Dst>{}, MakeIntVariant<32>(args.heavy_warps_per_block));
+    launch_bucket(args.light_nodes, ReduceTag<GSDDMM_REDUCE::Dst>{}, MakeIntVariant<4>(args.light_warps_per_block));
+    launch_bucket(args.heavy_nodes_T, ReduceTag<GSDDMM_REDUCE::Src>{}, MakeIntVariant<32>(args.heavy_warps_per_block));
+    launch_bucket(args.light_nodes_T, ReduceTag<GSDDMM_REDUCE::Src>{}, MakeIntVariant<4>(args.light_warps_per_block));
+}
+
+// Edge-parallel backward: instantiates GSDDMM_backward_edge_block over Lros x the
+// dtype / D grid and launches one grid of ceil(E / edges_per_warp) warps per pass.
+template <LRO... Lros>
+void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& args) {
+    if (args.E == 0) [[unlikely]] {
+        return;
+    }
+
+    auto lro_variant = MakeEnumVariant<LRO, Lros...>(args.key);
+
+    auto launch_pass = [&](auto reduce_c) {
+        std::visit(
+            [&](auto lro_c, auto typeInfo, auto d_c) {
+                constexpr GSDDMM_OP OP         = decltype(lro_c)::value.op;
+                constexpr GSDDMM_MEMBER LL     = decltype(lro_c)::value.l;
+                constexpr GSDDMM_MEMBER RR     = decltype(lro_c)::value.r;
+                constexpr GSDDMM_REDUCE REDUCE = decltype(reduce_c)::value;
+                using Plan                     = GsddmmBackwardPlan<OP, LL, RR, REDUCE>;
+
+                if constexpr (Plan::HAS_SELF) {
+                    using torch_t         = typename decltype(typeInfo)::TorchType;
+                    using cuda_t          = typename decltype(typeInfo)::CudaType;
+                    constexpr size_t DC   = decltype(d_c)::value;
+                    constexpr bool IS_SRC = REDUCE == GSDDMM_REDUCE::Src;
+
+                    cuda_t const *L_ptr     = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
+                    cuda_t const *R_ptr     = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
+                    cuda_t const *dO_ptr    = reinterpret_cast<const cuda_t *>(args.dO.data_ptr<torch_t>());
+                    torch::Tensor& self_f32 = Plan::SELF_IS_LHS ? args.dL_f32 : args.dR_f32;
+                    torch::Tensor& edge_out = Plan::SELF_IS_LHS ? args.dR : args.dL;
+                    float *self_ptr         = self_f32.data_ptr<float>();
+                    cuda_t *edge_ptr        = Plan::WRITE_EDGE_GRAD ? reinterpret_cast<cuda_t *>(edge_out.data_ptr<torch_t>()) : nullptr;
+
+                    auto kernel = GSDDMM_backward_edge_block<OP, LL, RR, REDUCE, DC, cuda_t, float>;
+
+                    // Grouped by the reduced node: the Src pass walks the
+                    // source-grouped list and remaps its slots to canonical ids.
+                    ulonglong2 const *edges             = IS_SRC ? args.edge_nodes_idx_src : args.edge_nodes_idx_dst;
+                    unsigned long long const *canonical = IS_SRC ? args.canonical_edge_idx : nullptr;
+
+                    const uint64_t num_warps  = ceil_div<uint64_t>(args.E, args.edges_per_warp);
+                    const uint64_t num_blocks = ceil_div<uint64_t>(num_warps, args.warps_per_block);
+
+                    constexpr uint64_t kMaxGridX  = (1ull << 31) - 1ull;
+                    constexpr uint64_t kMaxGridYZ = 65535ull;
+                    const uint32_t grid_dim_x     = static_cast<uint32_t>(num_blocks < kMaxGridX ? num_blocks : kMaxGridX);
+                    const uint64_t x_blocks       = ceil_div<uint64_t>(num_blocks, grid_dim_x);
+                    const uint32_t grid_dim_y     = static_cast<uint32_t>(x_blocks < kMaxGridYZ ? x_blocks : kMaxGridYZ);
+                    const uint64_t xy_blocks      = ceil_div<uint64_t>(x_blocks, grid_dim_y);
+                    const uint32_t grid_dim_z     = static_cast<uint32_t>(xy_blocks < kMaxGridYZ ? xy_blocks : kMaxGridYZ);
+                    TORCH_CHECK(xy_blocks <= kMaxGridYZ, "GSDDMM backward (edge blocks): edge list too large for the launch grid");
+
+                    const dim3 blocks(grid_dim_x, grid_dim_y, grid_dim_z);
+                    const dim3 threads(kWarpSize, args.warps_per_block);
+
+                    kernel<<<blocks, threads, 0, args.stream>>>(
+                        args.E, L_ptr, R_ptr, dO_ptr, self_ptr, edge_ptr, edges, canonical, static_cast<uint32_t>(args.edges_per_warp)
+                    );
+                }
+            },
+            lro_variant, MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()),
+            MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D))
+        );
+    };
+
+    launch_pass(ReduceTag<GSDDMM_REDUCE::Dst>{});
+    launch_pass(ReduceTag<GSDDMM_REDUCE::Src>{});
+}
+
 // The six ordered member pairs with lhs != rhs (same-member ops are dense-data
 // ops, rejected by GsddmmPlan's static_assert), for one binary op.
 #define GSDDMM_BINARY_LROS(OP)                                      \

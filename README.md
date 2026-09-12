@@ -161,6 +161,31 @@ ops with the same operand shape reuse one probe per graph (off by default, so a 
 measurement never depends on which op ran first). Parameters belonging to the other
 kernel are rejected when `variant` is pinned.
 
+`gsddmm` is differentiable in both operands, and the backward has its own two kernels,
+selected by `backward_variant` independently of the forward — it is a *reduction* (each
+node's gradient sums over its incident edges) rather than a map, so the forward's winner
+says nothing about it. An operand read per edge (`"edge"`) needs no reduction at all and
+gets a plain per-edge gradient.
+
+```python
+out = gsddmm(graph, x, y, op="mul")                            # backward_variant="node"
+out = gsddmm(graph, x, y, op="mul", backward_variant="edge")   # load-balanced, atomic
+out.backward(grad)
+```
+
+- `"node"` (default) gives one block per bucketed node and reduces in fp32 registers, so
+  it uses **no atomics** and is deterministic. It inherits the forward's load imbalance,
+  and deliberately has no heavy-node chunking: splitting a node across blocks would make
+  them all write its row, which is the thing this variant exists to avoid.
+- `"edge"` gives one warp per edge chunk and is perfectly load balanced, accumulating into
+  an fp32 buffer with `atomicAdd` (cast back on return). Because the edge list is grouped
+  by the node being reduced, a warp whose chunk shares its target row issues **one** atomic
+  per feature tile instead of one per edge. Its result is deterministic only up to fp32
+  atomic ordering.
+
+`add`, `sub` and `copy` have constant partials, so their backward saves **no** feature
+tensors — the difference between keeping one and two `[E, D]` activations alive per op.
+
 ### Autotuning
 
 All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`, `gsddmm`)
