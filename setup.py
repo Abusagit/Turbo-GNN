@@ -224,6 +224,7 @@ if not SKIP_CUDA_BUILD:
                     "csrc/gatv2/gatv2_kernel.cu",
                     "csrc/gt/graph_transformer.cu",
                     "csrc/spmm/cusparse_spmm.cpp",
+                    "csrc/spmm/gspmm.cu",
                     "csrc/spmm/edge_norm_kernels.cu",
                 ],
                 include_dirs=[os.path.join(this_dir, "csrc")] + _extra_include,
