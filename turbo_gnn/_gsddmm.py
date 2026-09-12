@@ -23,8 +23,8 @@ Two invariants hold this module together:
    :func:`_graph_canonical_edge_idx`) maps its traversal slots back to canonical
    ids, for the ``Edge`` operand reads as well as the output store.
 2. **Only the selected kernel's parameters travel.** A resolved
-   :class:`GsddmmPlan` carries exactly one variant's parameter dataclass, so no
-   dead argument reaches ``_C``, and :meth:`GsddmmPlan.backward_context` names
+   :class:`GsddmmLaunchPlan` carries exactly one variant's parameter dataclass, so no
+   dead argument reaches ``_C``, and :meth:`GsddmmLaunchPlan.backward_context` names
    exactly the tensors that variant's backward pass will need.
 """
 
@@ -233,7 +233,7 @@ _PARAMS_FOR_VARIANT: dict[str, type] = {"node": NodeBlockParams, "edge": EdgeBlo
 
 
 @dataclass(frozen=True)
-class GsddmmPlan:
+class GsddmmLaunchPlan:
     """A resolved GSDDMM launch: one kernel, its own parameters, nothing else.
 
     Frozen and hashable, so the future ``torch.autograd.Function`` can stash it
@@ -319,11 +319,12 @@ class GsddmmPlan:
         return d_lhs, (d_rhs if self.spec.uses_rhs else None)
 
     def backward_context(self, graph) -> dict[str, torch.Tensor]:
-        """Index tensors this plan's backward pass will need, and nothing else.
+        """Index tensors this plan's backward launch reads, and nothing else.
 
-        No backward kernel exists yet; this is the contract it will consume (and
-        what a ``GsddmmFunction`` would hand to ``ctx.save_for_backward``), kept
-        next to the forward so the two cannot drift apart. Pair it with
+        The backward kernels exist and run (see :meth:`backward`); this names
+        the graph tensors they touch so a ``torch.autograd.Function`` can save
+        exactly the backward's inputs, kept next to the forward launch so the
+        two cannot drift. Pair it with
         :attr:`GsddmmSpec.backward_needs_operands` for the feature tensors --
         which for ``add``/``sub``/``copy`` is nothing at all.
 
@@ -748,7 +749,7 @@ def _default_traversal(spec: GsddmmSpec, feat_dim: int) -> TraversalOrder:
     return spec.preferred_traversal if feat_dim > 32 else TraversalOrder.CSR
 
 
-def _time_plan(plan: GsddmmPlan, graph, lhs, rhs, warmup: int, iters: int) -> float:
+def _time_plan(plan: GsddmmLaunchPlan, graph, lhs, rhs, warmup: int, iters: int) -> float:
     """Time one candidate in ms/iter; a candidate that cannot launch scores +inf.
 
     A candidate can legitimately fail to launch (a deep pipeline at ``D=256``
@@ -762,7 +763,7 @@ def _time_plan(plan: GsddmmPlan, graph, lhs, rhs, warmup: int, iters: int) -> fl
         return float("inf")
 
 
-def _plan_cache_keys(plan: GsddmmPlan, graph) -> frozenset[str]:
+def _plan_cache_keys(plan: GsddmmLaunchPlan, graph) -> frozenset[str]:
     """Per-graph caches the given plan reads on every launch."""
     if plan.variant == "node":
         return frozenset()
@@ -799,7 +800,7 @@ def select_variant(
     iters: int | None = None,
     force: bool = False,
     canonical_output: bool = True,
-) -> GsddmmPlan:
+) -> GsddmmLaunchPlan:
     """Pick the faster kernel for this workload, measuring once per graph.
 
     The candidates (both kernels, and both traversal orders where they differ --
@@ -832,7 +833,7 @@ def select_variant(
         canonical_output: Passed through to the resulting plan.
 
     Returns:
-        The resolved :class:`GsddmmPlan`.
+        The resolved :class:`GsddmmLaunchPlan`.
     """
     node_params = node_params or NodeBlockParams()
     edge_params = edge_params or EdgeBlockParams()
@@ -869,8 +870,8 @@ def select_variant(
 
     variant, traversal = choice
     if variant == "node":
-        return GsddmmPlan(spec, "node", node_params)
-    return GsddmmPlan(
+        return GsddmmLaunchPlan(spec, "node", node_params)
+    return GsddmmLaunchPlan(
         spec=spec,
         variant="edge",
         params=edge_params,
@@ -927,9 +928,9 @@ def _measure_variant(
 
     pre_existing = frozenset(graph.__dict__.keys())
 
-    candidates = [(GsddmmPlan(spec, "node", node_params), "node", TraversalOrder.CSR)]
+    candidates = [(GsddmmLaunchPlan(spec, "node", node_params), "node", TraversalOrder.CSR)]
     for traversal in dict.fromkeys((spec.preferred_traversal, TraversalOrder.CSR)):
-        plan = GsddmmPlan(spec, "edge", edge_params, traversal, canonical_output)
+        plan = GsddmmLaunchPlan(spec, "edge", edge_params, traversal, canonical_output)
         candidates.append((plan, "edge", traversal))
 
     # Interleave the repeats rather than finishing one candidate before starting
@@ -975,16 +976,16 @@ def resolve_plan(
     *,
     config=None,
     canonical_output: bool = True,
-) -> GsddmmPlan:
+) -> GsddmmLaunchPlan:
     """Turn a caller's request into a launchable plan.
 
     ``variant="node"`` / ``"edge"`` pin a kernel and measure nothing;
     ``"auto"`` delegates to :func:`select_variant`.
     """
     if variant == "node":
-        return GsddmmPlan(spec, "node", node_params or NodeBlockParams())
+        return GsddmmLaunchPlan(spec, "node", node_params or NodeBlockParams())
     if variant == "edge":
-        return GsddmmPlan(
+        return GsddmmLaunchPlan(
             spec,
             "edge",
             edge_params or EdgeBlockParams(),

@@ -414,7 +414,7 @@ class CUDABackend(BaseBackend):
                     **kwargs,
                 )
             case "max_aggr":
-                return _CudaSimpleAggrConv(
+                conv = _CudaSimpleAggrConv(
                     aggr_type="max",
                     **kwargs,
                 )
@@ -422,19 +422,19 @@ class CUDABackend(BaseBackend):
                 heads = kwargs.pop("heads")
                 conv = _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
             case "sum_aggr":
-                return _CudaSpMMConv(
+                conv = _CudaSpMMConv(
                     norm_type="none",
                     cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
                     block_dim=kwargs.get("block_dim", 256),
                 )
             case "mean_aggr":
-                return _CudaSpMMConv(
+                conv = _CudaSpMMConv(
                     norm_type="right",
                     cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
                     block_dim=kwargs.get("block_dim", 256),
                 )
             case "gcn":
-                return _CudaSpMMConv(
+                conv = _CudaSpMMConv(
                     norm_type="both",
                     cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
                     block_dim=kwargs.get("block_dim", 256),

@@ -3,7 +3,7 @@
 import turbo_gnn._C as gsddmm_cuda
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
-    GsddmmPlan,
+    GsddmmLaunchPlan,
     GsddmmSpec,
     NodeBlockParams,
     TraversalOrder,
@@ -28,7 +28,7 @@ __all__ = [
     "EdgeBlockParams",
     "GSDDMMEdgeKernel",
     "GSDDMMKernel",
-    "GsddmmPlan",
+    "GsddmmLaunchPlan",
     "GsddmmSpec",
     "NodeBlockParams",
     "TraversalOrder",

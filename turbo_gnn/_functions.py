@@ -430,7 +430,7 @@ def csr_SPMM_normalized(
 
 
 class GsddmmFunction(torch.autograd.Function):
-    """Autograd wrapper around a resolved :class:`turbo_gnn._gsddmm.GsddmmPlan`.
+    """Autograd wrapper around a resolved :class:`turbo_gnn._gsddmm.GsddmmLaunchPlan`.
 
     The plan decides which forward kernel runs and which backward variant pairs
     with it, and it is stashed on ``ctx`` as-is -- it is frozen, hashable and

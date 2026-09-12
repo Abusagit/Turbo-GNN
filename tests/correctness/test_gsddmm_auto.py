@@ -24,7 +24,7 @@ from turbo_gnn import gsddmm, gsddmm_edge
 from turbo_gnn._autotune import AutotuneConfig
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
-    GsddmmPlan,
+    GsddmmLaunchPlan,
     GsddmmSpec,
     NodeBlockParams,
     TraversalOrder,
@@ -171,7 +171,7 @@ def test_variants_agree_on_undirected_graph(op: str) -> None:
     for variant in ("edge", "auto"):
         got = gsddmm(graph, lhs, rhs_arg, op=op, lhs_target="src", rhs_target="edge", variant=variant)
         assert torch.equal(reference, got)
-    plan = GsddmmPlan(GsddmmSpec(op, "src", "edge"), "edge", EdgeBlockParams(), TraversalOrder.CSC)
+    plan = GsddmmLaunchPlan(GsddmmSpec(op, "src", "edge"), "edge", EdgeBlockParams(), TraversalOrder.CSC)
     assert not plan.remaps_edge_ids(graph), "aliased CSRs need no canonical-id array"
 
 
@@ -412,11 +412,11 @@ def test_autotune_matches_reference_and_reports_its_choice() -> None:
 
 @pytest.mark.parametrize("variant,params_cls", [("node", NodeBlockParams), ("edge", EdgeBlockParams)])
 def test_plan_carries_only_its_own_parameters(variant: str, params_cls: type) -> None:
-    plan = GsddmmPlan(GsddmmSpec("mul", "src", "dst"), variant, params_cls())
+    plan = GsddmmLaunchPlan(GsddmmSpec("mul", "src", "dst"), variant, params_cls())
     assert isinstance(plan.params, params_cls)
     other = EdgeBlockParams if params_cls is NodeBlockParams else NodeBlockParams
     with pytest.raises(TypeError):
-        GsddmmPlan(GsddmmSpec("mul", "src", "dst"), variant, other())
+        GsddmmLaunchPlan(GsddmmSpec("mul", "src", "dst"), variant, other())
 
 
 def test_cross_variant_parameters_are_rejected_when_pinned() -> None:
@@ -454,18 +454,18 @@ def test_backward_context_holds_only_the_chosen_kernel_inputs() -> None:
     graph = _make_graph()
     spec = GsddmmSpec("mul", "src", "dst")
 
-    node_ctx = GsddmmPlan(spec, "node", NodeBlockParams()).backward_context(graph)
+    node_ctx = GsddmmLaunchPlan(spec, "node", NodeBlockParams()).backward_context(graph)
     assert node_ctx["forward_indptr"] is graph.forward_indptr
     # src operand -> the gradient reduces over outgoing edges -> backward CSR.
     assert "backward_indptr" in node_ctx
     assert not any(key.startswith("edge_list") for key in node_ctx)
 
-    edge_plan = GsddmmPlan(spec, "edge", EdgeBlockParams(), TraversalOrder.CSR)
+    edge_plan = GsddmmLaunchPlan(spec, "edge", EdgeBlockParams(), TraversalOrder.CSR)
     edge_ctx = edge_plan.backward_context(graph)
     assert set(edge_ctx) == {"edge_list"}, "the edge kernel reads no CSR"
 
     # A source-grouped traversal also needs the permutation back to canonical ids.
-    remapped = GsddmmPlan(GsddmmSpec("mul", "src", "edge"), "edge", EdgeBlockParams(), TraversalOrder.CSC)
+    remapped = GsddmmLaunchPlan(GsddmmSpec("mul", "src", "edge"), "edge", EdgeBlockParams(), TraversalOrder.CSC)
     assert set(remapped.backward_context(graph)) == {"edge_list", "canonical_edge_idx"}
 
 

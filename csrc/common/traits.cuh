@@ -4,7 +4,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <variant>
 
 template <typename T>
@@ -46,40 +48,56 @@ struct TTypeTraits<at::BFloat16> {
 template <typename TorchT>
 using ToCudaType = typename TTypeTraits<TorchT>::CudaType;
 
-template <int... Values>
-std::variant<std::integral_constant<int, Values>...> MakeIntVariant(int value) {
-    std::variant<std::integral_constant<int, Values>...> result;
+// Runtime -> compile-time dispatch: returns a Variant whose active alternative
+// matches the runtime key. Alternatives expose their key as either ::value
+// (std::integral_constant) or ::ScalarType (the info structs below); what() is
+// evaluated only on failure, so building the message costs nothing on the
+// dispatch path.
+template <typename Variant, typename Key, typename MsgFn>
+Variant MakeVariantOf(Key key, MsgFn&& what) {
+    Variant result;
     bool found = false;
-    (
-        [&] {
-            if (value == Values) {
-                result.template emplace<std::integral_constant<int, Values>>();
-                found = true;
-            }
-        }(),
-        ...);
+    [&]<size_t... I>(std::index_sequence<I...>) {
+        (
+            [&] {
+                using Alt = std::variant_alternative_t<I, Variant>;
+                bool matched;
+                if constexpr (requires { Alt::value; }) {
+                    matched = Alt::value == key;
+                } else {
+                    static_assert(requires { Alt::ScalarType; }, "MakeVariantOf alternatives must expose ::value or ::ScalarType");
+                    matched = Alt::ScalarType == key;
+                }
+                if (matched) {
+                    result.template emplace<I>();
+                    found = true;
+                }
+            }(),
+            ...);
+    }(std::make_index_sequence<std::variant_size_v<Variant>>{});
     if (!found) {
-        throw std::runtime_error("Wrong int value: " + std::to_string(value));
+        throw std::runtime_error(what());
     }
     return result;
 }
 
+template <int... Values>
+std::variant<std::integral_constant<int, Values>...> MakeIntVariant(int value) {
+    return MakeVariantOf<std::variant<std::integral_constant<int, Values>...>>(value, [&] {
+        return "Wrong int value: " + std::to_string(value);
+    });
+}
+
 template <bool... Values>
 std::variant<std::integral_constant<bool, Values>...> MakeBoolVariant(bool value) {
-    std::variant<std::integral_constant<bool, Values>...> result;
-    bool found = false;
-    (
-        [&] {
-            if (value == Values) {
-                result.template emplace<std::integral_constant<bool, Values>>();
-                found = true;
-            }
-        }(),
-        ...);
-    if (!found) {
-        throw std::runtime_error("Wrong bool value");
-    }
-    return result;
+    return MakeVariantOf<std::variant<std::integral_constant<bool, Values>...>>(value, [] { return "Wrong bool value"; });
+}
+
+// Runtime -> compile-time for an enum: the returned variant's active
+// alternative carries the matching enumerator as a template argument.
+template <typename EnumT, EnumT... Values>
+std::variant<std::integral_constant<EnumT, Values>...> MakeEnumVariant(EnumT value) {
+    return MakeVariantOf<std::variant<std::integral_constant<EnumT, Values>...>>(value, [] { return "enum value not in the dispatch set"; });
 }
 
 template <typename T>
@@ -93,20 +111,7 @@ struct TTypeInfo {
 
 template <typename... T>
 inline std::variant<TTypeInfo<T>...> MakeTypeVariant(at::ScalarType type) {
-    std::variant<TTypeInfo<T>...> result;
-    bool found = false;
-    (
-        [&] {
-            if (TTypeInfo<T>::ScalarType == type) {
-                result.template emplace<TTypeInfo<T>>();
-                found = true;
-            }
-        }(),
-        ...);
-    if (!found) {
-        throw std::runtime_error("Unsupported scalar type");
-    }
-    return result;
+    return MakeVariantOf<std::variant<TTypeInfo<T>...>>(type, [] { return "Unsupported scalar type"; });
 }
 
 // =============================================================================
@@ -210,18 +215,5 @@ struct IndexSentinel {
 // Runtime dispatch to compile-time index type
 template <typename... IndexTypes>
 std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {
-    std::variant<IndexTypeInfo<IndexTypes>...> result;
-    bool found = false;
-    (
-        [&] {
-            if (IndexTypeInfo<IndexTypes>::ScalarType == type) {
-                result.template emplace<IndexTypeInfo<IndexTypes>>();
-                found = true;
-            }
-        }(),
-        ...);
-    if (!found) {
-        throw std::runtime_error("Unsupported index scalar type");
-    }
-    return result;
+    return MakeVariantOf<std::variant<IndexTypeInfo<IndexTypes>...>>(type, [] { return "Unsupported index scalar type"; });
 }

@@ -62,13 +62,11 @@ struct GsddmmLaunchArgs {
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
 // covers the member pairs that op is instantiated for and raises from
-// MakeEnumVariant on any other pair.
-void gsddmm_forward_launch_add(const GsddmmLaunchArgs& args);
-void gsddmm_forward_launch_sub(const GsddmmLaunchArgs& args);
-void gsddmm_forward_launch_mul(const GsddmmLaunchArgs& args);
-void gsddmm_forward_launch_div(const GsddmmLaunchArgs& args);
-void gsddmm_forward_launch_dot(const GsddmmLaunchArgs& args);
-void gsddmm_forward_launch_copy(const GsddmmLaunchArgs& args);
+// MakeEnumVariant on any other pair. The declarations are X-macro'd over the
+// op list so they cannot drift from the routing switches or the shards.
+#define XX(ENUM, name) void gsddmm_forward_launch_##name(const GsddmmLaunchArgs& args);
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
 
 struct GsddmmLaunchArgsEdge {
     const torch::Tensor& L;
@@ -90,13 +88,11 @@ struct GsddmmLaunchArgsEdge {
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
 // covers the member pairs that op is instantiated for and raises from
-// MakeEnumVariant on any other pair.
-void gsddmm_forward_edge_launch_add(const GsddmmLaunchArgsEdge& args);
-void gsddmm_forward_edge_launch_sub(const GsddmmLaunchArgsEdge& args);
-void gsddmm_forward_edge_launch_mul(const GsddmmLaunchArgsEdge& args);
-void gsddmm_forward_edge_launch_div(const GsddmmLaunchArgsEdge& args);
-void gsddmm_forward_edge_launch_dot(const GsddmmLaunchArgsEdge& args);
-void gsddmm_forward_edge_launch_copy(const GsddmmLaunchArgsEdge& args);
+// MakeEnumVariant on any other pair. The declarations are X-macro'd over the
+// op list so they cannot drift from the routing switches or the shards.
+#define XX(ENUM, name) void gsddmm_forward_edge_launch_##name(const GsddmmLaunchArgsEdge& args);
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
 
 // =============================================================================
 // Backward
@@ -134,12 +130,9 @@ struct GsddmmBackwardLaunchArgs {
     uint16_t heavy_warps_per_block;
 };
 
-void gsddmm_backward_launch_add(const GsddmmBackwardLaunchArgs& args);
-void gsddmm_backward_launch_sub(const GsddmmBackwardLaunchArgs& args);
-void gsddmm_backward_launch_mul(const GsddmmBackwardLaunchArgs& args);
-void gsddmm_backward_launch_div(const GsddmmBackwardLaunchArgs& args);
-void gsddmm_backward_launch_dot(const GsddmmBackwardLaunchArgs& args);
-void gsddmm_backward_launch_copy(const GsddmmBackwardLaunchArgs& args);
+#define XX(ENUM, name) void gsddmm_backward_launch_##name(const GsddmmBackwardLaunchArgs& args);
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
 
 // Edge-parallel backward. Each pass traverses the edge list grouped by the node
 // it reduces, so that a warp's chunk shares its target row and the accumulation
@@ -169,11 +162,8 @@ struct GsddmmBackwardLaunchArgsEdge {
     uint8_t warps_per_block;
 };
 
-void gsddmm_backward_edge_launch_add(const GsddmmBackwardLaunchArgsEdge& args);
-void gsddmm_backward_edge_launch_sub(const GsddmmBackwardLaunchArgsEdge& args);
-void gsddmm_backward_edge_launch_mul(const GsddmmBackwardLaunchArgsEdge& args);
-void gsddmm_backward_edge_launch_div(const GsddmmBackwardLaunchArgsEdge& args);
-void gsddmm_backward_edge_launch_dot(const GsddmmBackwardLaunchArgsEdge& args);
-void gsddmm_backward_edge_launch_copy(const GsddmmBackwardLaunchArgsEdge& args);
+#define XX(ENUM, name) void gsddmm_backward_edge_launch_##name(const GsddmmBackwardLaunchArgsEdge& args);
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
 
 };  // namespace gsddmm

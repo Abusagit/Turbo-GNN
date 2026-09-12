@@ -86,19 +86,21 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
 
 // Edge-parallel GSDDMM backward: one warp per edge chunk, node gradients
 // accumulated with atomics in fp32 and cast back. Returns {dL, dR}.
+// op / lhs_target / rhs_target / N carry the operation's meaning, so they take
+// no defaults: a caller that omits one silently gets a different computation.
 std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     torch::Tensor l,
     torch::Tensor r,
     torch::Tensor d_out,
     torch::Tensor edge_list_dst,
-    std::optional<torch::Tensor> edge_list_src      = std::nullopt,
-    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt,
-    std::string op                                  = "mul",
-    std::string lhs_target                          = "src",
-    std::string rhs_target                          = "dst",
-    uint64_t N                                      = 0,
-    uint32_t edges_per_warp                         = 4,
-    uint32_t warps_per_block                        = 4
+    std::optional<torch::Tensor> edge_list_src,
+    std::optional<torch::Tensor> canonical_edge_idx,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t edges_per_warp  = 4,
+    uint32_t warps_per_block = 4
 );
 
 at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);

@@ -288,7 +288,7 @@ class GSDDMMKernel(TunableKernel):
 
     #: Subclasses may pin the variant; see :class:`GSDDMMEdgeKernel`.
     _PINNED_VARIANT: ClassVar[str | None] = None
-    #: Number output rows by forward-CSR edge position (see :class:`GsddmmPlan`).
+    #: Number output rows by forward-CSR edge position (see :class:`GsddmmLaunchPlan`).
     _CANONICAL_OUTPUT: ClassVar[bool] = True
 
     def __init__(

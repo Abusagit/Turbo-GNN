@@ -20,25 +20,6 @@
 
 namespace gsddmm {
 
-// Runtime -> compile-time for the (lhs, rhs, op) triple: returns a variant whose
-// active alternative carries the matching LRO as a template argument. Values not
-// in the dispatch set are a hard error -- there is no kernel for them.
-template <typename EnumT, EnumT... Values>
-std::variant<std::integral_constant<EnumT, Values>...> MakeEnumVariant(EnumT value) {
-    std::variant<std::integral_constant<EnumT, Values>...> result;
-    bool found = false;
-    (
-        [&] {
-            if (value == Values) {
-                result.template emplace<std::integral_constant<EnumT, Values>>();
-                found = true;
-            }
-        }(),
-        ...);
-    TORCH_CHECK(found, "GSDDMM: enum value not in the dispatch set");
-    return result;
-}
-
 // Instantiates GSDDMM_forward_normal over Lros x the dtype / index / D / warps /
 // stages grid and launches the light and heavy node buckets of args.
 template <LRO... Lros>
@@ -341,4 +322,4 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
     LRO{GSDDMM_MEMBER::Src_V, GSDDMM_MEMBER::Edge, GSDDMM_OP::Copy}, \
     LRO{GSDDMM_MEMBER::Dst_V, GSDDMM_MEMBER::Edge, GSDDMM_OP::Copy}
 
-};  // namespace gsddmm
+}  // namespace gsddmm

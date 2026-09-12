@@ -29,7 +29,7 @@ Quick start::
 """
 
 from turbo_gnn._autotune import AutotuneConfig, TunableKernel, TunableParam, with_autotune
-from turbo_gnn._gsddmm import EdgeBlockParams, GsddmmPlan, GsddmmSpec, NodeBlockParams, TraversalOrder
+from turbo_gnn._gsddmm import EdgeBlockParams, GsddmmLaunchPlan, GsddmmSpec, NodeBlockParams, TraversalOrder
 from turbo_gnn._kernels import (
     GATv2AggrKernel,
     GraphTransformerAggrKernel,
@@ -68,7 +68,7 @@ __all__ = [
     "GATv2AggrKernel",
     "GraphTransformerAggrKernel",
     "GSDDMMKernel",
-    "GsddmmPlan",
+    "GsddmmLaunchPlan",
     "GsddmmSpec",
     "NodeBlockParams",
     "EdgeBlockParams",

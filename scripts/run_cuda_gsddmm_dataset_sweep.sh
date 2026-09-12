@@ -1,100 +1,82 @@
 #!/bin/bash
 # Benchmark all 64 turbo_gnn GSDDMM ops (our own CUDA kernels, no DGL) via
 # benchmark.py --backend cuda --aggr on every dataset config under
-# configs/datasets/.
-#
-# Ops = the 32 DGL-style gsddmm names turbo_gnn generates, each in BOTH
-# implementations:
-#   - regular:  one CSR thread block per node, light/heavy degree buckets
-#   - `_edge`:  one warp per edge over an explicit [E, 2] edge list
-#
-# Per dataset, by default: forward + backward sweeps over 64 ops x 3 dtypes
-# (fp32, fp16, bf16) written to out/cuda_gsddmm/<dataset>_cuda_gsddmm.csv
-# (64 ops x 2 modes x 3 dtypes = 384 rows), plus a combined
-# out/cuda_gsddmm/all_datasets_cuda_gsddmm.csv at the end. See SUBSETTING below
-# to run a single dtype / mode.
+# configs/datasets/: the 32 DGL-style names x BOTH implementations -- regular
+# (one CSR thread block per node, light/heavy degree buckets) and `_edge` (one
+# warp per edge over an explicit [E, 2] edge list). By default, forward +
+# backward sweeps over 64 ops x 3 dtypes (fp32, fp16, bf16) per dataset go to
+# out/cuda_gsddmm/<dataset>_cuda_gsddmm.csv (64 ops x 2 modes x 3 dtypes = 384
+# rows), plus a combined all_datasets_cuda_gsddmm.csv at the end.
 #
 # MODES: a forward row times the forward kernel alone; a backward row times
-# out.backward(grad) -- the forward still runs, once and untimed, to build the
-# graph. The op name pins a kernel family for BOTH modes: a bare name times the
-# CSR node-block kernel forward and the node-parallel backward (deterministic,
-# no atomics); `_edge` times the edge-parallel kernel forward and the
-# edge-parallel backward (load balanced, fp32 atomics). Join against the DGL
-# sweep (run_dgl_ops_dataset_sweep.sh) on (dataset, conv_type, dtype,
-# feature_dim, mode): every DGL op maps to one bare-name and one `_edge` row.
+# out.backward(grad) (the forward still runs, once and untimed, to build the
+# graph). The op name pins a kernel family for BOTH modes: a bare name runs the
+# CSR node-block forward + node-parallel backward (deterministic, no atomics),
+# `_edge` the edge-parallel forward + backward (load balanced, fp32 atomics).
+# Join against the DGL sweep (run_dgl_ops_dataset_sweep.sh) on (dataset,
+# conv_type, dtype, feature_dim, mode): every DGL op maps to one bare-name and
+# one `_edge` row.
 #
-# NOTE on `_edge` forward rows: they run gsddmm(variant="edge") -- the
-# canonical-output edge kernel -- not the legacy traversal-order gsddmm_edge.
-# The two launch identically whenever an operand reads the destination vertex;
-# on the no-`dst` ops over directed graphs they differ only by the canonical-id
-# remap, which is the numbering the backward needs anyway. The legacy numbering
-# cannot serve mode=backward at all (its d_out would be CSC-ordered while the
-# backward kernels read by forward-CSR position), so it cannot be what this
-# sweep times. Expect near-identical timings either way, but keep the switch in
-# mind when comparing `_edge` forward rows against CSVs collected before the
-# backward landed. Backward also needs more memory than forward (gradient
+# `_edge` forward rows run gsddmm(variant="edge") -- the canonical-output edge
+# kernel, not the legacy traversal-order gsddmm_edge. The two launch
+# identically whenever an operand reads the destination vertex; on the no-`dst`
+# ops over directed graphs they differ only by the canonical-id remap the
+# backward needs anyway (the legacy numbering cannot serve backward: its d_out
+# would be CSC-ordered while the backward kernels read by forward-CSR position).
+# Timings are near-identical (only pre-backward CSVs, which ran the legacy
+# kernel, could differ). Backward also needs more memory than forward (gradient
 # buffers, plus the operands mul/div/dot save -- add/sub/copy save none), which
 # the OOM ladder accounts for.
 #
 # --dtype (not --amp) sets the precision: --amp only wraps the call in
 # torch.autocast, which does not reach custom C++/CUDA ops, so the operands
-# themselves must be materialized in the target dtype for the kernel to
-# dispatch on it.
+# must be materialized in the target dtype for the kernel to dispatch on it.
 #
-# --exact-iters makes --warmup/--iters mean *iterations* (5 warmup, 20 timed).
-# Without it, benchmark.py delegates to triton.testing.do_bench, whose
-# warmup/rep are MILLISECONDS. Note the tradeoff: do_bench also flushes L2
-# between reps, so exact-iters numbers are more susceptible to cache reuse.
+# --exact-iters makes --warmup/--iters mean *iterations* (5 warmup, 20 timed);
+# without it benchmark.py delegates to triton.testing.do_bench, whose
+# warmup/rep are MILLISECONDS -- but do_bench flushes L2 between reps, so
+# exact-iters numbers are more susceptible to cache reuse.
 #
-# Env: CUDA_VISIBLE_DEVICES="0" TORCH_CUDA_ARCH_LIST="8.0". Assumes the full
-# 80 GB of GPU RAM is available. The GSDDMM kernels only accept feature dim D
-# in {32, 64, 128, 256}, so on OOM the dim is lowered (256 -> 128 -> 64 -> 32)
-# until EVERY (dtype, mode) combination in $DTYPES x $MODES succeeds at the
-# same dim, keeping each dataset's CSV self-consistent and comparable across
-# precisions.
+# Env: CUDA_VISIBLE_DEVICES="0" TORCH_CUDA_ARCH_LIST="8.0"; assumes the full
+# 80 GB of GPU RAM. The GSDDMM kernels only accept feature dim D in {32, 64,
+# 128, 256}, so on OOM the dim is lowered (256 -> 128 -> 64 -> 32) until EVERY
+# (dtype, mode) in $DTYPES x $MODES succeeds at the same dim, keeping each
+# dataset's CSV self-consistent across precisions.
 #
-# SUBSETTING -- these are env-overridable:
-#   DTYPES        default "fp32 fp16 bf16"     e.g. DTYPES=fp16 for one precision
-#   MODES         default "forward backward"   e.g. MODES=forward to halve the
-#                                              runtime (the pre-backward sweep)
-#   FEATURE_DIMS  default "256 128 64 32"      e.g. FEATURE_DIMS=128 to pin a dim
-#   OUT_DIR       default out/cuda_gsddmm      redirects CSVs, logs and overrides
-#   DATASETS      default "" (= all)          e.g. DATASETS="cora ogbn_arxiv"
-# DATASETS takes the dataset names as they appear in the CSV filenames (so
-# `ls out/cuda_gsddmm/*.csv` lists the valid values), space- or
-# comma-separated. An unrecognised name is a hard error listing the valid
-# ones, rather than a run that silently benchmarks nothing. Note the combined
-# table is still rebuilt from every CSV present in OUT_DIR, so after a
-# filtered run it mixes the refreshed datasets with whatever was there before
-# -- fine when only the kernels changed, misleading if DTYPES/FEATURE_DIMS/MODES
-# differed between the runs.
-# Two traps when narrowing DTYPES/MODES -- which is why OUT_DIR is overridable:
+# SUBSETTING -- env-overridable: DTYPES (default "fp32 fp16 bf16"), MODES
+# (default "forward backward"), FEATURE_DIMS (default "256 128 64 32"), OUT_DIR
+# (default out/cuda_gsddmm; redirects CSVs, logs and overrides), DATASETS
+# (default "" = all, e.g. "cora ogbn_arxiv"; names as they appear in the CSV
+# filenames, space- or comma-separated; an unrecognised name is a hard error
+# listing the valid ones rather than silently benchmarking nothing).
+#
+# Filtered-run traps -- which is why OUT_DIR is overridable:
 #   1. Each dataset's CSV is deleted and rewritten from scratch, so a
 #      DTYPES=fp16 run against the default OUT_DIR REPLACES a finished 384-row
 #      table with 64 fp16 rows. Point OUT_DIR elsewhere to keep both.
 #   2. The dim picked is the largest at which the SELECTED dtypes and modes
-#      fit. fp32 is the most memory-hungry dtype and backward needs more
-#      memory than forward, so an fp16-only or forward-only run can settle on a
-#      LARGER dim than a full run did, and those numbers are then not
-#      comparable with the full tables. Pin FEATURE_DIMS to the dim the full
-#      run used (the feature_dim column of its CSV) when you need to compare.
+#      fit (fp32 and backward are the memory-hungry cases), so an fp16-only or
+#      forward-only run can settle on a LARGER dim than a full run -- pin
+#      FEATURE_DIMS to the full run's feature_dim column to compare.
+#   3. The combined table is still rebuilt from every CSV in OUT_DIR, so a
+#      filtered run mixes refreshed datasets with whatever was there before --
+#      fine when only the kernels changed, misleading if DTYPES/FEATURE_DIMS/
+#      MODES differed between the runs.
 #
-# So, a scratch fp16 forward-only run that touches nothing existing:
+# A scratch fp16 forward-only run that touches nothing existing:
 #   DTYPES=fp16 MODES=forward FEATURE_DIMS=128 OUT_DIR=out/cuda_gsddmm_fp16 \
 #       bash scripts/run_cuda_gsddmm_dataset_sweep.sh
 #
 # DISK: the datasets download into data/ and are large (web-traffic 14G,
-# web-topics 9.2G, ogbn-products 4.2G, reddit+flickr ~2.6G, hm-* ~1.2G).
-# Budget ~40 GB of free space before a full sweep; a full disk fails the
-# remaining datasets in a way that looks like a download error.
+# web-topics 9.2G, ogbn-products 4.2G, reddit+flickr ~2.6G, hm-* ~1.2G);
+# budget ~40 GB free before a full sweep -- a full disk fails the remaining
+# datasets looking like a download error.
 #
-# Skipped dataset configs (cannot be loaded at all -- same three the DGL
-# sweep skips; these are dataset-loading failures, not backend limitations):
-#   secondary/amazon_ratings.yaml (AmazonBook) - PyG returns heterogeneous
-#       HeteroData; load_single_graph expects a homogeneous graph.
-#   secondary/facebook.yaml (FacebookPagePage) - PyG downloads from
-#       graphmining.ai, whose DNS no longer resolves.
-#   secondary/lastfm_asia.yaml (LastFMAsia)    - same dead download host.
+# Skipped dataset configs (cannot be loaded -- same three the DGL sweep skips;
+# dataset-loading failures, not backend limitations): amazon_ratings
+# (AmazonBook; PyG returns heterogeneous HeteroData, load_single_graph expects
+# homogeneous); facebook (FacebookPagePage) and lastfm_asia (LastFMAsia; PyG
+# downloads from graphmining.ai, whose DNS no longer resolves).
 #
 # Config overrides (generated into out/cuda_gsddmm/.overrides/):
 #   reddit   - root=data reuses the pre-seeded raw npz files and avoids PyG's

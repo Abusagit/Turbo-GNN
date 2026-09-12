@@ -40,6 +40,21 @@ struct GsddmmVecOp {
     }
 };
 
+// Tile decomposition shared by all four GSDDMM kernels: the warp-per-row
+// validity checks, the tile width (SelectTW), and the derived trip counts.
+template <size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t>
+struct GsddmmRowShape {
+    static_assert(D_CONST % 32 == 0, "D_CONST must be a multiple of 32 so a warp covers the row an integral number of times");
+    static_assert(std::popcount(D_CONST / 32) == 1, "D_CONST / 32 must be a power of two for the tile decomposition");
+    static_assert((D_CONST * sizeof(cuda_t)) % 16 == 0, "Row width in bytes must be a multiple of 16 for wide copies");
+    static constexpr size_t TW = SelectTW<D_CONST, cuda_t>::value;
+    static_assert(D_CONST % TW == 0, "Feature dim should be divisible by Tile width");
+    static constexpr size_t TILES            = D_CONST / TW;
+    static constexpr size_t TILES_PER_THREAD = ceil_div(TILES, kWarpSize);
+    using Tile  = TileOps<TW, cuda_t, accum_t>;
+    using vec_t = typename Tile::vec_t;
+};
+
 // Lane-parallel cp.async of NUM_ROWS operand rows into one ring-buffer slot.
 // The NUM_ROWS * (row bytes / 16) 16-byte chunks are spread over the warp as
 // ONE flat chunk index, so e.g. an L+R pair of 256-byte rows costs a single
@@ -224,21 +239,15 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
     index_t const *__restrict__ node_indices,
     index_t const *__restrict__ block_part, uint32_t edges_per_block
 ) {
-    static_assert(D_CONST % 32 == 0, "D_CONST must be a multiple of 32 so a warp covers the row an integral number of times");
-    static_assert(std::popcount(D_CONST / 32) == 1, "D_CONST / 32 must be a power of two for the tile decomposition");
-    static_assert((D_CONST * sizeof(cuda_t)) % 16 == 0, "Row width in bytes must be a multiple of 16 for wide copies");
+    using Plan  = GsddmmPlan<op, ll, rr>;
+    using Shape = GsddmmRowShape<D_CONST, cuda_t, accum_t>;
 
-    using Plan = GsddmmPlan<op, ll, rr>;
+    constexpr size_t TW               = Shape::TW;
+    constexpr size_t TILES            = Shape::TILES;
+    constexpr size_t TILES_PER_THREAD = Shape::TILES_PER_THREAD;
 
-    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
-
-    constexpr size_t TW = TW_SELECTOR::value;  // Tile width
-    static_assert(D_CONST % TW == 0, "Feature dim should be divisible by Tile width");
-    constexpr size_t TILES            = D_CONST / TW;
-    constexpr size_t TILES_PER_THREAD = ceil_div(TILES, kWarpSize);
-
-    using Tile  = TileOps<TW, cuda_t, accum_t>;
-    using vec_t = typename Tile::vec_t;
+    using Tile  = Shape::Tile;
+    using vec_t = Shape::vec_t;
     using VecOp = GsddmmVecOp<op, TW, cuda_t>;
 
     static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
@@ -447,21 +456,15 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     unsigned long long const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 ) {
-    static_assert(D_CONST % 32 == 0, "D_CONST must be a multiple of 32 so a warp covers the row an integral number of times");
-    static_assert(std::popcount(D_CONST / 32) == 1, "D_CONST / 32 must be a power of two for the tile decomposition");
-    static_assert((D_CONST * sizeof(cuda_t)) % 16 == 0, "Row width in bytes must be a multiple of 16 for wide copies");
+    using Plan  = GsddmmPlan<op, ll, rr>;
+    using Shape = GsddmmRowShape<D_CONST, cuda_t, accum_t>;
 
-    using Plan = GsddmmPlan<op, ll, rr>;
+    constexpr size_t TW               = Shape::TW;
+    constexpr size_t TILES            = Shape::TILES;
+    constexpr size_t TILES_PER_THREAD = Shape::TILES_PER_THREAD;
 
-    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
-
-    constexpr size_t TW = TW_SELECTOR::value;  // Tile width
-    static_assert(D_CONST % TW == 0, "Feature dim should be divisible by Tile width");
-    constexpr size_t TILES            = D_CONST / TW;
-    constexpr size_t TILES_PER_THREAD = ceil_div(TILES, kWarpSize);
-
-    using Tile  = TileOps<TW, cuda_t, accum_t>;
-    using vec_t = typename Tile::vec_t;
+    using Tile  = Shape::Tile;
+    using vec_t = Shape::vec_t;
     using VecOp = GsddmmVecOp<op, TW, cuda_t>;
 
     // Every operand is gathered per edge here: slot 0 is the L row, slot 1 the
@@ -748,6 +751,16 @@ __device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_tile(cuda_t cons
     }
 }
 
+// (1/v)^2, elementwise: one division per element instead of two (x/v/v), and
+// unlike x/(v*v) it cannot overflow the intermediate square in half precision.
+template <size_t TW, FloatingNum cuda_t>
+__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_recip_sq(VecFloat<TW, cuda_t> v) {
+    VecFloat<TW, cuda_t> r(cuda_t(1));
+    r.div_(v);
+    r.mul_(r);
+    return r;
+}
+
 // =============================================================================
 // Node-parallel GSDDMM backward. See gsddmm.cuh for the partials and for which
 // passes a given member pair needs.
@@ -770,19 +783,16 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
     index_t const *__restrict__ node_indices,
     unsigned long long const *__restrict__ canonical_edge_idx
 ) {
-    static_assert(D_CONST % 32 == 0, "D_CONST must be a multiple of 32 so a warp covers the row an integral number of times");
-    static_assert(std::popcount(D_CONST / 32) == 1, "D_CONST / 32 must be a power of two for the tile decomposition");
-
     using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
     static_assert(Plan::HAS_SELF, "this pass has no operand to reduce; the host must not launch it");
+    using Shape = GsddmmRowShape<D_CONST, cuda_t, accum_t>;
 
-    constexpr size_t TW = SelectTW<D_CONST, cuda_t>::value;
-    static_assert(D_CONST % TW == 0, "Feature dim should be divisible by Tile width");
-    constexpr size_t TILES            = D_CONST / TW;
-    constexpr size_t TILES_PER_THREAD = ceil_div(TILES, kWarpSize);
+    constexpr size_t TW               = Shape::TW;
+    constexpr size_t TILES            = Shape::TILES;
+    constexpr size_t TILES_PER_THREAD = Shape::TILES_PER_THREAD;
 
-    using Tile       = TileOps<TW, cuda_t, accum_t>;
-    using vec_t      = typename Tile::vec_t;
+    using Tile       = Shape::Tile;
+    using vec_t      = Shape::vec_t;
     using GradOp     = GsddmmGradOp<op, Plan::SELF_IS_LHS, TW, cuda_t>;
     using EdgeGradOp = GsddmmGradOp<op, !Plan::SELF_IS_LHS, TW, cuda_t>;
 
@@ -869,8 +879,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
                     vec_t g_edge = EdgeGradOp::apply(d_out, node_row);
                     if constexpr (op == GSDDMM_OP::Div && Plan::OTHER == rr) {
                         // The edge operand is the denominator: -dO * self / edge^2.
-                        g_edge.div_(other);
-                        g_edge.div_(other);
+                        g_edge.mul_(gsddmm_recip_sq(other));
                         g_edge.neg_();
                     } else if constexpr (op == GSDDMM_OP::Sub && Plan::OTHER == rr) {
                         g_edge.neg_();
@@ -922,8 +931,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
             vec_t out = gsddmm_accum_to_vec<TW, cuda_t, accum_t>(acc[t]);
             if constexpr (Plan::NEEDS_SELF_ROW) {
                 // -1/self^2: constant over the sum, so applied once, here.
-                out.div_(self_tiles[t]);
-                out.div_(self_tiles[t]);
+                out.mul_(gsddmm_recip_sq(self_tiles[t]));
             }
             if constexpr (Plan::NEGATE_SELF) {
                 out.neg_();
@@ -961,18 +969,16 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     unsigned long long const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 ) {
-    static_assert(D_CONST % 32 == 0, "D_CONST must be a multiple of 32 so a warp covers the row an integral number of times");
-    static_assert(std::popcount(D_CONST / 32) == 1, "D_CONST / 32 must be a power of two for the tile decomposition");
-
     using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
     static_assert(Plan::HAS_SELF, "this pass has no operand to reduce; the host must not launch it");
+    using Shape = GsddmmRowShape<D_CONST, cuda_t, accum_t>;
 
-    constexpr size_t TW               = SelectTW<D_CONST, cuda_t>::value;
-    constexpr size_t TILES            = D_CONST / TW;
-    constexpr size_t TILES_PER_THREAD = ceil_div(TILES, kWarpSize);
+    constexpr size_t TW               = Shape::TW;
+    constexpr size_t TILES            = Shape::TILES;
+    constexpr size_t TILES_PER_THREAD = Shape::TILES_PER_THREAD;
 
-    using Tile       = TileOps<TW, cuda_t, accum_t>;
-    using vec_t      = typename Tile::vec_t;
+    using Tile       = Shape::Tile;
+    using vec_t      = Shape::vec_t;
     using GradOp     = GsddmmGradOp<op, Plan::SELF_IS_LHS, TW, cuda_t>;
     using EdgeGradOp = GsddmmGradOp<op, !Plan::SELF_IS_LHS, TW, cuda_t>;
 
@@ -1043,8 +1049,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     // factor cannot be deferred past the atomic and is applied
                     // per edge from the (broadcast) self row.
                     const vec_t self_row = Tile::read((Plan::SELF_IS_LHS ? L : R) + self_node * D_CONST, v);
-                    contrib.div_(self_row);
-                    contrib.div_(self_row);
+                    contrib.mul_(gsddmm_recip_sq(self_row));
                 }
                 if constexpr (Plan::NEGATE_SELF) {
                     contrib.neg_();
@@ -1062,8 +1067,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     }
                     vec_t g_edge = EdgeGradOp::apply(d_out, node_row);
                     if constexpr (op == GSDDMM_OP::Div && Plan::OTHER == rr) {
-                        g_edge.div_(other);
-                        g_edge.div_(other);
+                        g_edge.mul_(gsddmm_recip_sq(other));
                         g_edge.neg_();
                     } else if constexpr (op == GSDDMM_OP::Sub && Plan::OTHER == rr) {
                         g_edge.neg_();

@@ -57,6 +57,11 @@ __device__ __forceinline__ void async_copy_slice_thread(cuda_t *dst, const cuda_
 // only inside the call (the slot is recycled on return).
 //
 // dbuf: this warp's private scratch, NUM_ROWS * NUM_STAGES * D_CONST elements.
+//
+// Slot addresses are computed from the running iteration, never read from a
+// pointer array: an array indexed by a runtime slot is demoted to local memory
+// (measured: 19M local loads, 4x the instruction count), which is also why the
+// consume()d neighbor id is recomputed instead of buffered per slot.
 template <
     size_t WARPS_PER_BLOCK, size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, IntegralNum index_t, typename ConsumeFn
 >
@@ -70,30 +75,17 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
         return;
     }
 
-    cuda_t *rows[NUM_ROWS][NUM_STAGES];
-#pragma unroll
-    for (size_t r = 0; r < NUM_ROWS; ++r) {
-#pragma unroll
-        for (size_t s = 0; s < NUM_STAGES; ++s) {
-            rows[r][s] = dbuf + (r * NUM_STAGES + s) * D_CONST;
-        }
-    }
-
-    index_t neighbor_idx_buf[NUM_STAGES];
-
     cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-    auto prefetch = [&pipe, loop_iters, warp_id, col_idx, edge_start, &neighbor_idx_buf, &row_bases, &stride_n, &stride_h, head_h, &rows,
-                        lane](size_t it) {
+    auto prefetch = [&pipe, loop_iters, warp_id, col_idx, edge_start, row_bases, stride_n, stride_h, head_h, dbuf, lane](size_t it) {
         pipe.producer_acquire();
         if (it < loop_iters) {
-            const size_t k                    = warp_id + it * WARPS_PER_BLOCK;
-            const index_t nb                  = col_idx[edge_start + static_cast<index_t>(k)];
-            neighbor_idx_buf[it % NUM_STAGES] = nb;
+            const size_t k   = warp_id + it * WARPS_PER_BLOCK;
+            const index_t nb = col_idx[edge_start + static_cast<index_t>(k)];
 #pragma unroll
             for (size_t r = 0; r < NUM_ROWS; ++r) {
                 const cuda_t *src = row_bases[r] + nb * stride_n[r] + head_h * stride_h[r];
-                async_copy_row_warp<D_CONST, cuda_t>(rows[r][it % NUM_STAGES], src, pipe, lane);
+                async_copy_row_warp<D_CONST, cuda_t>(dbuf + (r * NUM_STAGES + it % NUM_STAGES) * D_CONST, src, pipe, lane);
             }
         }
         pipe.producer_commit();
@@ -114,10 +106,11 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
         cuda_t const *cur_rows[NUM_ROWS];
 #pragma unroll
         for (size_t r = 0; r < NUM_ROWS; ++r) {
-            cur_rows[r] = rows[r][slot];
+            cur_rows[r] = dbuf + (r * NUM_STAGES + slot) * D_CONST;
         }
 
-        consume(neighbor_idx_buf[slot], cur_rows);
+        const size_t k = warp_id + iter * WARPS_PER_BLOCK;
+        consume(col_idx[edge_start + static_cast<index_t>(k)], cur_rows);
 
         // All lanes must finish reading the slot before prefetch() reuses it.
         __syncwarp();

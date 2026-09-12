@@ -23,7 +23,7 @@ from turbo_gnn._functions import (
 )
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
-    GsddmmPlan,
+    GsddmmLaunchPlan,
     GsddmmSpec,
     NodeBlockParams,
     resolve_plan,
@@ -515,7 +515,7 @@ def gsddmm_edge(
     spec = GsddmmSpec(op=op, lhs_target=lhs_target, rhs_target=rhs_target)
     # Traversal order IS the output order here (canonical_output=False), which is
     # what distinguishes this op from gsddmm(variant="edge").
-    plan = GsddmmPlan(
+    plan = GsddmmLaunchPlan(
         spec=spec,
         variant="edge",
         params=EdgeBlockParams(

@@ -30,7 +30,7 @@ import pytest
 import torch
 
 from turbo_gnn import gsddmm
-from turbo_gnn._gsddmm import EdgeBlockParams, GsddmmPlan, GsddmmSpec, NodeBlockParams, _edge_endpoints
+from turbo_gnn._gsddmm import EdgeBlockParams, GsddmmLaunchPlan, GsddmmSpec, NodeBlockParams, _edge_endpoints
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 if not torch.cuda.is_available():
@@ -281,9 +281,9 @@ def test_plan_carries_an_independent_backward_variant():
     """The forward and backward kernels are chosen separately: the backward is a
     reduction, so the forward's winner says nothing about it."""
     spec = GsddmmSpec("mul", "src", "dst")
-    plan = GsddmmPlan(spec, "edge", EdgeBlockParams())
+    plan = GsddmmLaunchPlan(spec, "edge", EdgeBlockParams())
     assert plan.backward_variant == "node", "the deterministic backward is the default"
-    plan_node = GsddmmPlan(spec, "node", NodeBlockParams(), backward_variant="edge")
+    plan_node = GsddmmLaunchPlan(spec, "node", NodeBlockParams(), backward_variant="edge")
     assert plan_node.variant == "node" and plan_node.backward_variant == "edge"
 
 

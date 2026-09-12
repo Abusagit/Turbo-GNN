@@ -26,12 +26,10 @@ namespace gsddmm {
 namespace {
 
 GSDDMM_OP parse_op(const std::string& op) {
-    if (op == "add") return GSDDMM_OP::Add;
-    if (op == "sub") return GSDDMM_OP::Sub;
-    if (op == "mul") return GSDDMM_OP::Mul;
-    if (op == "div") return GSDDMM_OP::Div;
-    if (op == "dot") return GSDDMM_OP::Dot;
-    if (op == "copy") return GSDDMM_OP::Copy;
+#define XX(ENUM, name) \
+    if (op == #name) return GSDDMM_OP::ENUM;
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
     TORCH_CHECK(false, "GSDDMM: unsupported op '", op, "'; supported: add, sub, mul, div, dot, copy");
 }
 
@@ -40,6 +38,25 @@ GSDDMM_MEMBER parse_member(const std::string& target, const char *which) {
     if (target == "dst" || target == "v") return GSDDMM_MEMBER::Dst_V;
     if (target == "edge" || target == "e") return GSDDMM_MEMBER::Edge;
     TORCH_CHECK(false, "GSDDMM: unsupported ", which, " target '", target, "'; supported: src, dst, edge");
+}
+
+// An operand's row count is implied by its member: edge-indexed operands have
+// one row per edge, node-indexed one per node. Shared by all four entry points.
+void check_rows(int64_t N, int64_t E, const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
+    if (member == GSDDMM_MEMBER::Edge) {
+        TORCH_CHECK(t.size(0) == E, name, " is edge-indexed and must have E=", E, " rows, got ", t.size(0));
+    } else {
+        TORCH_CHECK(t.size(0) == N, name, " is node-indexed and must have N=", N, " rows, got ", t.size(0));
+    }
+}
+
+// [E, 2] uint64 (src, dst) pair list, contiguous so it can be reinterpreted as
+// ulonglong2 rows: is_contiguous also pins stride(0) to 2, which those 16-byte
+// pair loads rely on -- stride(1) == 1 alone would not.
+void check_edge_list(const torch::Tensor& t, const char *name) {
+    TORCH_CHECK(t.is_cuda() && t.dim() == 2 && t.size(1) == 2, name, " must be a CUDA [E, 2] list of node-id pairs");
+    TORCH_CHECK(t.scalar_type() == at::kUInt64, name, " must be uint64");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
 }  // namespace
@@ -118,15 +135,8 @@ torch::Tensor gsddmm_forward_cuda(
     const int64_t D = L.size(1);
     TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
 
-    auto check_rows = [N, E](const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
-        if (member == GSDDMM_MEMBER::Edge) {
-            TORCH_CHECK(t.size(0) == E, name, " is edge-indexed and must have E=", E, " rows, got ", t.size(0));
-        } else {
-            TORCH_CHECK(t.size(0) == N, name, " is node-indexed and must have N=", N, " rows, got ", t.size(0));
-        }
-    };
-    check_rows(L, lhs_member, "L");
-    check_rows(R, rhs_member, "R");
+    check_rows(N, E, L, lhs_member, "L");
+    check_rows(N, E, R, rhs_member, "R");
 
     torch::Tensor O = is_dot ? torch::empty({E}, L.options()) : torch::empty({E, D}, L.options());
 
@@ -167,24 +177,12 @@ torch::Tensor gsddmm_forward_cuda(
 
     // One call per op, each resolved in its own translation unit.
     switch (op_enum) {
-        case GSDDMM_OP::Add:
-            gsddmm_forward_launch_add(args);
-            break;
-        case GSDDMM_OP::Sub:
-            gsddmm_forward_launch_sub(args);
-            break;
-        case GSDDMM_OP::Mul:
-            gsddmm_forward_launch_mul(args);
-            break;
-        case GSDDMM_OP::Div:
-            gsddmm_forward_launch_div(args);
-            break;
-        case GSDDMM_OP::Dot:
-            gsddmm_forward_launch_dot(args);
-            break;
-        case GSDDMM_OP::Copy:
-            gsddmm_forward_launch_copy(args);
-            break;
+#define XX(ENUM, name) \
+    case GSDDMM_OP::ENUM: \
+        gsddmm_forward_launch_##name(args); \
+        break;
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
         default:
             TORCH_CHECK(false, "GSDDMM forward: op '", op, "' has no launcher");
     }
@@ -227,8 +225,7 @@ torch::Tensor gsddmm_forward_edge_blocks(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(L.device().index());
 
     TORCH_CHECK(L.is_cuda() && R.is_cuda(), "L and R must be CUDA");
-    TORCH_CHECK(edge_list.is_cuda() && edge_list.stride(1) == 1, "Edge list should lay on CUDA device and be contigous by the second dim.");
-    TORCH_CHECK(edge_list.dim() == 2 && edge_list.size(1) == 2, "Edge list must be a list of pairs of node indices.")
+    check_edge_list(edge_list, "edge_list");
     TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
@@ -236,35 +233,20 @@ torch::Tensor gsddmm_forward_edge_blocks(
     TORCH_CHECK(R.dtype() == L.dtype(), "L and R must have the same dtype");
     TORCH_CHECK(L.stride(1) == 1 && R.stride(1) == 1, "Feature dim (D) must be contiguous for L and R");
 
-    const auto idx_dtype = edge_list.scalar_type();
-    TORCH_CHECK(is_supported_index_type(idx_dtype), "row_ptr must be int32, int64, uint32, or uint64");
-    // Only the index types listed in the dispatch (gsddmm_dispatch.cuh) are
-    // instantiated; extend MakeIndexVariant there (at the cost of compile time)
-    // to support more.
-    TORCH_CHECK(
-        idx_dtype == at::kInt || idx_dtype == at::kUInt32 || idx_dtype == at::kLong || idx_dtype == at::kUInt64,
-        "GSDDMM forward: row_ptr must be int32 or int64 (the instantiated index types)"
-    );
-
     const uint64_t E = edge_list.size(0);
     TORCH_CHECK(E <= (1ull << 63ull) - 1ull, "Too many edges. This kernel supports only up to 2^63 - 1 edges.");
     const uint64_t D = L.size(1);
     TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
 
-    auto check_rows = [N, E](const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
-        if (member == GSDDMM_MEMBER::Edge) {
-            TORCH_CHECK(t.size(0) == E, name, " is edge-indexed and must have E=", E, " rows, got ", t.size(0));
-        } else {
-            TORCH_CHECK(t.size(0) == N, name, " is node-indexed and must have N=", N, " rows, got ", t.size(0));
-        }
-    };
-    check_rows(L, lhs_member, "L");
-    check_rows(R, rhs_member, "R");
+    check_rows(static_cast<int64_t>(N), static_cast<int64_t>(E), L, lhs_member, "L");
+    check_rows(static_cast<int64_t>(N), static_cast<int64_t>(E), R, rhs_member, "R");
 
     torch::Tensor O = is_dot ? torch::empty({static_cast<int64_t>(E)}, L.options())
                              : torch::empty({static_cast<int64_t>(E), static_cast<int64_t>(D)}, L.options());
 
-    TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
+    TORCH_CHECK(
+        D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward (edge blocks): unsupported feature dim D=", D, "; supported: 32, 64, 128, 256"
+    );
 
     TORCH_CHECK(pipeline_stages <= 3, "GSDDMM forward (edge blocks): pipeline_stages must be in [0, 3], got ", pipeline_stages);
     TORCH_CHECK(
@@ -309,24 +291,12 @@ torch::Tensor gsddmm_forward_edge_blocks(
 
     // One call per op, each resolved in its own translation unit.
     switch (op_enum) {
-        case GSDDMM_OP::Add:
-            gsddmm_forward_edge_launch_add(args);
-            break;
-        case GSDDMM_OP::Sub:
-            gsddmm_forward_edge_launch_sub(args);
-            break;
-        case GSDDMM_OP::Mul:
-            gsddmm_forward_edge_launch_mul(args);
-            break;
-        case GSDDMM_OP::Div:
-            gsddmm_forward_edge_launch_div(args);
-            break;
-        case GSDDMM_OP::Dot:
-            gsddmm_forward_edge_launch_dot(args);
-            break;
-        case GSDDMM_OP::Copy:
-            gsddmm_forward_edge_launch_copy(args);
-            break;
+#define XX(ENUM, name) \
+    case GSDDMM_OP::ENUM: \
+        gsddmm_forward_edge_launch_##name(args); \
+        break;
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
         default:
             TORCH_CHECK(false, "GSDDMM forward edge: op '", op, "' has no launcher");
     }
@@ -368,15 +338,8 @@ int64_t check_backward_operands(
     TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM backward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
 
-    auto check_rows = [N, E](const torch::Tensor& t, GSDDMM_MEMBER member, const char *name) {
-        if (member == GSDDMM_MEMBER::Edge) {
-            TORCH_CHECK(t.size(0) == E, name, " is edge-indexed and must have E=", E, " rows, got ", t.size(0));
-        } else {
-            TORCH_CHECK(t.size(0) == N, name, " is node-indexed and must have N=", N, " rows, got ", t.size(0));
-        }
-    };
-    check_rows(L, lhs_member, "L");
-    check_rows(R, rhs_member, "R");
+    check_rows(N, E, L, lhs_member, "L");
+    check_rows(N, E, R, rhs_member, "R");
 
     // dot reduces the feature axis, so its output -- and its gradient -- is [E].
     if (op_enum == GSDDMM_OP::Dot) {
@@ -502,24 +465,12 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
     };
 
     switch (op_enum) {
-        case GSDDMM_OP::Add:
-            gsddmm_backward_launch_add(args);
-            break;
-        case GSDDMM_OP::Sub:
-            gsddmm_backward_launch_sub(args);
-            break;
-        case GSDDMM_OP::Mul:
-            gsddmm_backward_launch_mul(args);
-            break;
-        case GSDDMM_OP::Div:
-            gsddmm_backward_launch_div(args);
-            break;
-        case GSDDMM_OP::Dot:
-            gsddmm_backward_launch_dot(args);
-            break;
-        case GSDDMM_OP::Copy:
-            gsddmm_backward_launch_copy(args);
-            break;
+#define XX(ENUM, name) \
+    case GSDDMM_OP::ENUM: \
+        gsddmm_backward_launch_##name(args); \
+        break;
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
         default:
             TORCH_CHECK(false, "GSDDMM backward: op '", op, "' has no launcher");
     }
@@ -564,11 +515,6 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     at::cuda::CUDAGuard device_guard(L.device());
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(L.device().index());
 
-    auto check_edge_list = [](const torch::Tensor& t, const char *name) {
-        TORCH_CHECK(t.is_cuda() && t.dim() == 2 && t.size(1) == 2, name, " must be a CUDA [E, 2] list of node-id pairs");
-        TORCH_CHECK(t.scalar_type() == at::kUInt64, name, " must be uint64");
-        TORCH_CHECK(t.stride(1) == 1, name, " must be contiguous in its second dim");
-    };
     check_edge_list(edge_list_dst, "edge_list_dst");
 
     const int64_t E = edge_list_dst.size(0);
@@ -642,24 +588,12 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     };
 
     switch (op_enum) {
-        case GSDDMM_OP::Add:
-            gsddmm_backward_edge_launch_add(args);
-            break;
-        case GSDDMM_OP::Sub:
-            gsddmm_backward_edge_launch_sub(args);
-            break;
-        case GSDDMM_OP::Mul:
-            gsddmm_backward_edge_launch_mul(args);
-            break;
-        case GSDDMM_OP::Div:
-            gsddmm_backward_edge_launch_div(args);
-            break;
-        case GSDDMM_OP::Dot:
-            gsddmm_backward_edge_launch_dot(args);
-            break;
-        case GSDDMM_OP::Copy:
-            gsddmm_backward_edge_launch_copy(args);
-            break;
+#define XX(ENUM, name) \
+    case GSDDMM_OP::ENUM: \
+        gsddmm_backward_edge_launch_##name(args); \
+        break;
+#include "gsddmm/gsddmm_ops.inc"
+#undef XX
         default:
             TORCH_CHECK(false, "GSDDMM backward edge: op '", op, "' has no launcher");
     }
@@ -677,7 +611,7 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     return {dL, dR};
 }
 
-};  // namespace gsddmm
+}  // namespace gsddmm
 
 // Global-scope entry point matching the declaration in kernels.cuh, which the
 // pybind module binds; the implementation lives in namespace gsddmm. Default
@@ -718,7 +652,7 @@ torch::Tensor gsddmm_forward_edge_blocks(
     uint32_t pipeline_stages,
     uint32_t edges_per_warp,
     uint32_t warps_per_block,
-    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
+    std::optional<torch::Tensor> canonical_edge_idx
 ) {
     return gsddmm::gsddmm_forward_edge_blocks(
         std::move(L), std::move(R), std::move(edge_list), std::move(op), std::move(lhs_target), std::move(rhs_target), N, pipeline_stages,
@@ -741,9 +675,9 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
     torch::Tensor heavy_nodes,
     torch::Tensor light_nodes_T,
     torch::Tensor heavy_nodes_T,
-    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt,
-    uint32_t light_warps_per_block                  = 4,
-    uint32_t heavy_warps_per_block                  = 32
+    std::optional<torch::Tensor> canonical_edge_idx,
+    uint32_t light_warps_per_block,
+    uint32_t heavy_warps_per_block
 ) {
     return gsddmm::gsddmm_backward_cuda(
         std::move(L), std::move(R), std::move(dO), std::move(row_ptr), std::move(col_idx), std::move(row_ptr_T), std::move(col_idx_T),
@@ -757,14 +691,14 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     torch::Tensor R,
     torch::Tensor dO,
     torch::Tensor edge_list_dst,
-    std::optional<torch::Tensor> edge_list_src      = std::nullopt,
-    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt,
-    std::string op                                  = "mul",
-    std::string lhs_target                          = "src",
-    std::string rhs_target                          = "dst",
-    uint64_t N                                      = 0,
-    uint32_t edges_per_warp                         = 4,
-    uint32_t warps_per_block                        = 4
+    std::optional<torch::Tensor> edge_list_src,
+    std::optional<torch::Tensor> canonical_edge_idx,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t edges_per_warp,
+    uint32_t warps_per_block
 ) {
     return gsddmm::gsddmm_backward_edge_blocks(
         std::move(L), std::move(R), std::move(dO), std::move(edge_list_dst), std::move(edge_list_src), std::move(canonical_edge_idx),
