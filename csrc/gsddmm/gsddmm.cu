@@ -1114,4 +1114,4 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     }
 }
 
-};  // namespace gsddmm
+}  // namespace gsddmm

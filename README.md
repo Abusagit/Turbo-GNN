@@ -123,7 +123,8 @@ out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
 
 `gsddmm` applies a binary op per edge, taking each operand's row from the source node
 (`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). D must be one of
-32, 64, 128, 256; dtypes are fp32/fp16/bf16. Forward-only for now (no autograd).
+32, 64, 128, 256; dtypes are fp32/fp16/bf16. Differentiable in both operands — the
+backward's two kernels are picked by `backward_variant` (see below).
 
 ```python
 from turbo_gnn import gsddmm, u_add_v, copy_u
@@ -273,22 +274,39 @@ Merges one or more training YAMLs, builds dataset/model, attaches hooks (metrics
 
 ### `benchmark.py` — Microbenchmark a single conv layer
 
-Creates a random graph (or loads one from a dataset YAML), instantiates a conv, and times forward or forward+backward using CUDA events.
+Creates a random graph (or loads one from a dataset YAML), instantiates a conv — or, with
+`--aggr`, a raw op — and times the forward or the backward pass using CUDA events. In
+backward mode the forward runs once, untimed, to build the autograd graph; the timed loop
+calls `out.backward(grad)`.
 
 ```
---layer         Conv type: gcn, mean_aggr, gat_v2, gt, ... (required)
+--layer         Conv type: gcn, mean_aggr, gat_v2, gt, ... (required). With --aggr may be a
+                comma-separated op list, e.g. 'u_add_v,u_add_v_edge,copy_u'
 --backend       Backend name (required)
+--aggr          Launch a raw aggregation op (backend.create_aggr) instead of a conv: for
+                dgl, any dgl.ops gspmm/gsddmm name; for cuda, any turbo_gnn gsddmm name
+                (incl. the _edge edge-parallel variants). Operands are generated automatically.
 --dataset       Dataset YAML path (optional; if omitted, generates a random graph)
 --num-nodes     Nodes in random graph (default: 20000)
 --avg-degree    Average degree (default: 10)
 --feature_dim   Feature dimension (default: 128)
 --heads         Attention heads for gat_v2/gt (default: 1)
---mode          forward | train (default: forward)
+--mode          forward | backward (default: forward)
 --iters         Timing iterations (default: 100)
 --warmup        Warmup iterations (default: 20)
---amp           none | bf16 | fp16 (default: none)
+--amp           none | bf16 | fp16 (default: none); wraps the call in torch.autocast
+--dtype         fp32 | fp16 | bf16 (default: fp32); materializes the inputs in that
+                precision so custom CUDA kernels dispatch on it (--amp does not reach them)
+--exact-iters   Issue exactly --warmup + --iters calls instead of triton.testing.do_bench
+                (whose warmup/rep are milliseconds); use under a kernel profiler such as ncu
 --json-out      Optional path to write JSON result
+--csv-out       Optional CSV to append results to (header written on first use)
 --device        CUDA device index (default: 0)
+--pipeline-stages              Forward cp.async pipeline stage count for CUDA convs (default: 0)
+--backward-pipeline-stages     Backward cp.async pipeline stage count for CUDA convs (default: 0)
+--autotune      Autotune kernel/graph params (incl. pipeline stages) via grid search first
+--autotune-warmup              Autotune warmup iters per trial (default: 5)
+--autotune-iters               Autotune timed iters per trial (default: 15)
 ```
 
 ### `validate.py` — Validate a trained checkpoint

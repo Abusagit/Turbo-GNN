@@ -12,7 +12,6 @@ from .gsddmm_aggr.utils import (
     _GSDDMM_EDGE_PREFILLED_OPS,
     _GSDDMM_NAME_TO_MEMBER,
     _GSDDMM_PREFILLED_OPS,
-    GSDDMMEdgeKernel,
     GSDDMMKernel,
 )
 from .gt_aggr.utils import GraphTransformerAggrKernel, graph_transformer_aggr
@@ -288,7 +287,9 @@ def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
             edge-parallel variant was requested, the operand kinds ("u"/"v":
             node features [N, D]; "e": edge features [E, D]) in the order the
             wrapper takes them, and the kernel variant to launch ("node" for a
-            bare name, "edge" for ``_edge``, "auto" for ``_auto``).
+            bare name, "edge" for ``_edge``, "auto" for ``_auto``). The consumer
+            (:class:`_CudaGsddmmOp`) pins the backward to the same family:
+            ``_edge`` also means the edge-parallel backward kernel.
 
     Raises:
         KeyError: If *name* is not a turbo_gnn gsddmm op, or if ``_edge`` and
@@ -324,7 +325,7 @@ def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
 
 
 class _CudaGsddmmOp(BaseAggr):
-    """Launch a turbo_gnn GSDDMM kernel directly (no projections).
+    """Launch a turbo_gnn GSDDMM op directly (no projections).
 
     ``forward(*operands, graph)`` mirrors the DGL raw-op wrapper so one
     benchmarking path drives both backends. ``operand_kinds`` describes each
@@ -334,8 +335,22 @@ class _CudaGsddmmOp(BaseAggr):
     Feature dim D must be one of 32, 64, 128, 256, and both operands must
     share a dtype (float32, float16 or bfloat16) — the kernels dispatch on it.
 
-    Forward-only: the kernels have no backward pass, so the returned tensor
-    carries no ``grad_fn``.
+    Differentiable: ``forward`` routes through ``GSDDMMKernel.forward``, so the
+    output carries a ``grad_fn`` and ``--mode backward`` times the reduction
+    kernels. The name suffix pins a kernel *family* used in both directions --
+    a bare name runs the CSR node-block kernel forward and the node-parallel
+    (deterministic, no atomics) backward; ``_edge`` runs the edge-parallel
+    kernel forward, in canonical CSR edge order, and the edge-parallel
+    (load-balanced, fp32 atomics) backward; ``_auto`` dispatches the forward
+    between the two and keeps the default node-parallel backward.
+
+    ``_edge`` is therefore *not* the legacy traversal-order ``gsddmm_edge``:
+    these two launch identically whenever an operand reads the destination
+    vertex, and differ only by the canonical-id remap on the no-``dst`` ops over
+    directed graphs -- the numbering the backward needs anyway. The legacy
+    numbering cannot serve ``--mode backward`` (its ``d_out`` would be
+    CSC-ordered while the backward kernels read by forward-CSR position), which
+    is why the sweep rows now measure the canonical edge kernel.
     """
 
     def __init__(self, op: str, **kwargs: Any) -> None:
@@ -345,23 +360,23 @@ class _CudaGsddmmOp(BaseAggr):
         self.operand_kinds = spec.operand_kinds
         self.edge_variant = spec.edge_variant
         self.variant = spec.variant
-        # A bare name stays pinned to the CSR node-block kernel and "_edge" to the
-        # edge-parallel one, so existing sweep rows keep their meaning; "_auto"
-        # benchmarks the dispatcher.
-        kernel_cls = GSDDMMEdgeKernel if spec.edge_variant else GSDDMMKernel
-        kernel_kwargs = dict(kwargs) if spec.edge_variant else {"variant": spec.variant, **kwargs}
-        self.kernel = kernel_cls(
+        # The suffix pins the family for BOTH passes: "node" for a bare name,
+        # "edge" for "_edge" (canonical output -- see the class docstring), and
+        # "_auto" benchmarks the forward dispatcher with the default backward.
+        self.kernel = GSDDMMKernel(
             op=spec.op,
             lhs_target=spec.lhs_target,
             rhs_target=spec.rhs_target,
-            **kernel_kwargs,
+            variant=spec.variant,
+            backward_variant="edge" if spec.edge_variant else "node",
+            **kwargs,
         )
 
     def forward(self, *args: Any) -> torch.Tensor:
         """Run the op; the last positional argument must be the graph."""
         *operands, graph = args
         rhs = operands[1] if len(operands) > 1 else None
-        return self.kernel(graph, operands[0], rhs=rhs)
+        return self.kernel.forward(graph, operands[0], rhs)
 
 
 @BackendRegistry.register_backend("cuda")

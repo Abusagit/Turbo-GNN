@@ -479,8 +479,12 @@ def gsddmm_edge(
     edge order) so consecutive warps share the Src_V operand row. The output
     rows follow the chosen grouping.
 
-    Forward-only (no autograd): the CUDA kernel has no backward pass yet, so
-    the output is detached from the autograd graph.
+    Forward-only, on purpose: this op's output (and its ``Edge`` operand) are
+    numbered by traversal order, while the backward kernels read ``d_out`` and
+    number edge gradients by forward-CSR position, so a grad graph built here
+    would compute silently wrong gradients. ``gsddmm(..., variant="edge")`` is
+    the same edge-parallel kernel with canonical output -- use that when you
+    need gradients.
 
     Args:
         graph: CSR graph; its forward (dst-grouped) or backward (src-grouped)

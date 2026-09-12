@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from dataclasses import replace
+from typing import TYPE_CHECKING, ClassVar
 
 from turbo_gnn._autotune import TunableKernel, TunableParam
-from turbo_gnn._functions import ReductionAggrFunction, _FusedGraphAttention, gatv2_function
+from turbo_gnn._functions import GsddmmFunction, ReductionAggrFunction, _FusedGraphAttention, gatv2_function
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
     GsddmmSpec,
+    GsddmmVariant,
     GsddmmVariantChoice,
     NodeBlockParams,
     _graph_canonical_edge_idx,
@@ -17,6 +19,9 @@ from turbo_gnn._gsddmm import (
     resolve_plan,
     select_variant,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 # Re-exported for callers that import the per-graph caches from here (the
 # research backends and the correctness tests); they live in _gsddmm now,
@@ -262,6 +267,23 @@ class GSDDMMKernel(TunableKernel):
     node buckets):
 
     - ``forward_huge_degree_threshold_quantile``: light/heavy partition.
+
+    Backward: ``backward_variant`` (default ``"node"``) picks which of the two
+    reduction kernels ``.backward()`` runs, independently of ``variant`` -- the
+    backward is a reduction rather than a map, so the forward's winner does not
+    carry over. It is declared as a tunable (its own axis, searched only when
+    tuning backward); the backward's other knobs are shared with the forward and
+    read from the same attributes.
+
+    Two ways to run the forward:
+
+    - ``forward(graph, lhs, rhs)`` -- the differentiable entry. It resolves the
+      plan from this kernel's current parameters, stamps ``backward_variant`` on
+      it and runs it inside :class:`~turbo_gnn._functions.GsddmmFunction`, so
+      the output carries a ``grad_fn`` and ``.backward()`` dispatches the
+      selected backward kernel.
+    - ``__call__`` / ``_execute`` -- the raw launches (detached output), which is
+      what the autotuner and the variant probes time.
     """
 
     #: Subclasses may pin the variant; see :class:`GSDDMMEdgeKernel`.
@@ -275,6 +297,7 @@ class GSDDMMKernel(TunableKernel):
         lhs_target: str,
         rhs_target: str,
         variant: GsddmmVariantChoice = "auto",
+        backward_variant: GsddmmVariant = "node",
         **kwargs,
     ):
         super().__init__()
@@ -288,6 +311,9 @@ class GSDDMMKernel(TunableKernel):
         elif variant not in ("auto", "node", "edge"):
             raise ValueError(f"gsddmm: unknown variant {variant!r}; expected 'auto', 'node' or 'edge'")
         self.variant = variant
+        if backward_variant not in ("node", "edge"):
+            raise ValueError(f"gsddmm: unknown backward_variant {backward_variant!r}; expected 'node' or 'edge'")
+        self.backward_variant = backward_variant
 
         # Node-block knobs.
         self.forward_light_warps = kwargs.get("light_warps_per_block", 4)
@@ -374,6 +400,25 @@ class GSDDMMKernel(TunableKernel):
     def _execute(self, graph, x, *, rhs=None, **kwargs):
         return self._plan(graph, x, rhs).launch(graph, x, rhs)
 
+    def forward(self, graph, lhs: torch.Tensor, rhs: torch.Tensor | None = None) -> torch.Tensor:
+        """Differentiable launch, in canonical (forward-CSR) edge order.
+
+        The counterpart of :meth:`_execute`, which stays raw so timing probes
+        never pay autograd bookkeeping. This resolves the same plan from this
+        kernel's current parameters -- variant probes included, and they stay
+        outside the autograd graph -- stamps ``backward_variant`` on it, and
+        runs it inside :class:`turbo_gnn._functions.GsddmmFunction`, so the
+        output carries a ``grad_fn`` and ``.backward()`` dispatches the
+        reduction kernel selected by ``backward_variant``.
+
+        Well-defined because the plan's output is canonical: the backward
+        kernels read ``d_out`` -- and number edge gradients -- by forward-CSR
+        position. That is also why :class:`GSDDMMEdgeKernel` refuses this
+        method: its traversal-order numbering cannot serve as ``d_out``.
+        """
+        plan = replace(self._plan(graph, lhs, rhs), backward_variant=self.backward_variant)
+        return GsddmmFunction.apply(plan, graph, lhs, rhs)
+
     # ---- tunable parameter declarations ----
 
     @staticmethod
@@ -432,6 +477,19 @@ class GSDDMMKernel(TunableKernel):
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
         return self._variant_graph_params("node" if self.variant == "auto" else self.variant)
+
+    def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
+        """The backward's own axis: which of the two reduction kernels runs.
+
+        Everything else the backward kernels read is shared with the forward and
+        already declared under its names (the node-parallel backward reads the
+        same ``forward_light_warps`` / ``forward_heavy_warps``; the edge-parallel
+        one the same ``forward_edges_per_warp`` / ``forward_warps_per_block``),
+        so declaring those again would be a dead axis. This getter is what makes
+        ``kernel_params`` in the benchmark CSV name the kernel behind a
+        ``--mode backward`` row.
+        """
+        return [TunableParam("backward_variant", ["node", "edge"], default="node")]
 
     # ---- autotuning ----
 
@@ -498,10 +556,24 @@ class GSDDMMEdgeKernel(GSDDMMKernel):
     destination vertex, and its ``Edge`` operand is indexed the same way.
     Anything that has to line up with the CSR kernel wants
     :class:`GSDDMMKernel`, whose output is always in forward-CSR edge order.
+
+    Forward-only by construction: its numbering is exactly what the backward
+    kernels cannot consume (they read ``d_out`` and number edge gradients by
+    forward-CSR position), so :meth:`forward` refuses rather than returning a
+    graph whose backward would be silently wrong. ``GSDDMMKernel(variant=
+    "edge")`` is the differentiable edge-parallel op.
     """
 
     _PINNED_VARIANT: ClassVar[str | None] = "edge"
     _CANONICAL_OUTPUT: ClassVar[bool] = False
+
+    def forward(self, graph, lhs: torch.Tensor, rhs: torch.Tensor | None = None) -> torch.Tensor:
+        """Refused on purpose; see the class docstring."""
+        raise NotImplementedError(
+            "GSDDMMEdgeKernel numbers its output by traversal order, which has no correct "
+            "backward (d_out would be CSC-ordered while the backward kernels read by "
+            "forward-CSR position); use GSDDMMKernel(variant='edge') when you need gradients"
+        )
 
 
 class GraphTransformerAggrKernel(TunableKernel):

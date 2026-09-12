@@ -39,7 +39,7 @@ struct alignas(sizeof(num_type) * N) Vec {
     __device__ num_type& operator[](size_t n) noexcept { return data[n]; }
 
     __device__ void store_zero_() noexcept { *reinterpret_cast<wide_t *>(data) = 0; }
-    static constexpr __device__ vec_t get_zero() { return vec_t{}; };
+    static constexpr __device__ vec_t get_zero() { return vec_t{}; }
 
     // Loads N scalars to this vector
     constexpr __device__ void load_scalars(num_type const *const __restrict__ src) noexcept {
@@ -362,7 +362,7 @@ struct alignas(sizeof(num_type) * N) VecFloat: Vec<N, num_type> {
         return src0;
     }
     constexpr __device__ vec_t& operator-=(vec_t other) noexcept {
-        if constexpr (can_be_packed_new) {
+        if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
@@ -450,7 +450,7 @@ struct alignas(sizeof(num_type) * N) VecFloat: Vec<N, num_type> {
         return src0;
     }
     constexpr __device__ vec_t& operator/=(vec_t other) {
-        if constexpr (can_be_packed_new) {
+        if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll

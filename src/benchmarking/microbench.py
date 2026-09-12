@@ -49,8 +49,7 @@ def measure_memory(func):
     peak_memory = torch.cuda.max_memory_allocated() / 1024**2
 
     memory_allocated = end_memory - start_memory
-    # return result, memory_allocated, peak_memory
-    return result, peak_memory, peak_memory
+    return result, memory_allocated, peak_memory
 
 
 def _time_exact(fn: Callable[[], Any], warmup: int, iters: int) -> float:

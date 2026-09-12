@@ -57,8 +57,8 @@ torch::Tensor gsddmm_forward_edge_blocks(
     std::string rhs_target,
     uint64_t N,
     uint32_t pipeline_stages                        = 0,
-    uint32_t edges_per_warp                         = 1,
-    uint32_t warps_per_block                        = 1,
+    uint32_t edges_per_warp                         = 4,
+    uint32_t warps_per_block                        = 4,
     std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
 );
 

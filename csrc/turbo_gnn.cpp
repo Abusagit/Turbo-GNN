@@ -18,16 +18,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     m.def(
-        "gsddmm_forward", &gsddmm_forward_cuda, "Generalized Sparse Dense-Dense matrpix multiplication", py::arg("l"), py::arg("r"),
+        "gsddmm_forward", &gsddmm_forward_cuda, "Generalized Sampled Dense-Dense matrix multiplication", py::arg("l"), py::arg("r"),
         py::arg("row_ptr"), py::arg("col_idx"), py::arg("op"), py::arg("lhs_target"), py::arg("rhs_target"), py::arg("light_nodes"),
         py::arg("heavy_nodes"), py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 32, py::arg("pipeline_stages") = 0,
         py::arg("heavy_block_parts") = py::none(), py::arg("heavy_edges_per_block") = 0, py::arg("overlap_buckets") = false
     );
 
     m.def(
-        "gsddmm_forward_edge", &gsddmm_forward_edge_blocks, "Generalized Sparse Dense-Dense matrpix multiplication implememnted by edges",
+        "gsddmm_forward_edge", &gsddmm_forward_edge_blocks, "Generalized Sampled Dense-Dense matrpix multiplication implemented by edges",
         py::arg("l"), py::arg("r"), py::arg("edge_list"), py::arg("op"), py::arg("lhs_target"), py::arg("rhs_target"), py::arg("N"),
-        py::arg("pipeline_stages") = 0, py::arg("edges_per_warp") = 1, py::arg("warps_per_block") = 1,
+        py::arg("pipeline_stages"), py::arg("edges_per_warp"), py::arg("warps_per_block"),
         py::arg("canonical_edge_idx") = py::none()
     );
 

@@ -8,13 +8,33 @@
 #   - regular:  one CSR thread block per node, light/heavy degree buckets
 #   - `_edge`:  one warp per edge over an explicit [E, 2] edge list
 #
-# Per dataset, by default: forward sweeps over 64 ops x 3 dtypes (fp32, fp16,
-# bf16) written to out/cuda_gsddmm/<dataset>_cuda_gsddmm.csv (64 x 3 = 192
-# rows), plus a combined out/cuda_gsddmm/all_datasets_cuda_gsddmm.csv at the
-# end. See SUBSETTING below to run a single dtype.
+# Per dataset, by default: forward + backward sweeps over 64 ops x 3 dtypes
+# (fp32, fp16, bf16) written to out/cuda_gsddmm/<dataset>_cuda_gsddmm.csv
+# (64 ops x 2 modes x 3 dtypes = 384 rows), plus a combined
+# out/cuda_gsddmm/all_datasets_cuda_gsddmm.csv at the end. See SUBSETTING below
+# to run a single dtype / mode.
 #
-# Forward only: the GSDDMM kernels have no backward pass, so their output is
-# detached and a --mode backward run would time an empty graph.
+# MODES: a forward row times the forward kernel alone; a backward row times
+# out.backward(grad) -- the forward still runs, once and untimed, to build the
+# graph. The op name pins a kernel family for BOTH modes: a bare name times the
+# CSR node-block kernel forward and the node-parallel backward (deterministic,
+# no atomics); `_edge` times the edge-parallel kernel forward and the
+# edge-parallel backward (load balanced, fp32 atomics). Join against the DGL
+# sweep (run_dgl_ops_dataset_sweep.sh) on (dataset, conv_type, dtype,
+# feature_dim, mode): every DGL op maps to one bare-name and one `_edge` row.
+#
+# NOTE on `_edge` forward rows: they run gsddmm(variant="edge") -- the
+# canonical-output edge kernel -- not the legacy traversal-order gsddmm_edge.
+# The two launch identically whenever an operand reads the destination vertex;
+# on the no-`dst` ops over directed graphs they differ only by the canonical-id
+# remap, which is the numbering the backward needs anyway. The legacy numbering
+# cannot serve mode=backward at all (its d_out would be CSC-ordered while the
+# backward kernels read by forward-CSR position), so it cannot be what this
+# sweep times. Expect near-identical timings either way, but keep the switch in
+# mind when comparing `_edge` forward rows against CSVs collected before the
+# backward landed. Backward also needs more memory than forward (gradient
+# buffers, plus the operands mul/div/dot save -- add/sub/copy save none), which
+# the OOM ladder accounts for.
 #
 # --dtype (not --amp) sets the precision: --amp only wraps the call in
 # torch.autocast, which does not reach custom C++/CUDA ops, so the operands
@@ -29,37 +49,38 @@
 # Env: CUDA_VISIBLE_DEVICES="0" TORCH_CUDA_ARCH_LIST="8.0". Assumes the full
 # 80 GB of GPU RAM is available. The GSDDMM kernels only accept feature dim D
 # in {32, 64, 128, 256}, so on OOM the dim is lowered (256 -> 128 -> 64 -> 32)
-# until EVERY dtype in $DTYPES succeeds at the same dim, keeping each dataset's
-# CSV self-consistent and comparable across precisions.
+# until EVERY (dtype, mode) combination in $DTYPES x $MODES succeeds at the
+# same dim, keeping each dataset's CSV self-consistent and comparable across
+# precisions.
 #
-# SUBSETTING -- these three are env-overridable:
-#   DTYPES        default "fp32 fp16 bf16"  e.g. DTYPES=fp16 for one precision
-#   FEATURE_DIMS  default "256 128 64 32"   e.g. FEATURE_DIMS=128 to pin a dim
-#   OUT_DIR       default out/cuda_gsddmm   redirects CSVs, logs and overrides
-#   DATASETS      default "" (= all)        e.g. DATASETS="cora ogbn_arxiv"
+# SUBSETTING -- these are env-overridable:
+#   DTYPES        default "fp32 fp16 bf16"     e.g. DTYPES=fp16 for one precision
+#   MODES         default "forward backward"   e.g. MODES=forward to halve the
+#                                              runtime (the pre-backward sweep)
+#   FEATURE_DIMS  default "256 128 64 32"      e.g. FEATURE_DIMS=128 to pin a dim
+#   OUT_DIR       default out/cuda_gsddmm      redirects CSVs, logs and overrides
+#   DATASETS      default "" (= all)          e.g. DATASETS="cora ogbn_arxiv"
 # DATASETS takes the dataset names as they appear in the CSV filenames (so
 # `ls out/cuda_gsddmm/*.csv` lists the valid values), space- or
 # comma-separated. An unrecognised name is a hard error listing the valid
 # ones, rather than a run that silently benchmarks nothing. Note the combined
 # table is still rebuilt from every CSV present in OUT_DIR, so after a
 # filtered run it mixes the refreshed datasets with whatever was there before
-# -- fine when only the kernels changed, misleading if DTYPES/FEATURE_DIMS
+# -- fine when only the kernels changed, misleading if DTYPES/FEATURE_DIMS/MODES
 # differed between the runs.
-# There is deliberately no --mode knob: these kernels have no backward, so the
-# sweep is always forward-only (see above).
-#
-# Two traps when narrowing DTYPES -- which is why OUT_DIR is overridable:
+# Two traps when narrowing DTYPES/MODES -- which is why OUT_DIR is overridable:
 #   1. Each dataset's CSV is deleted and rewritten from scratch, so a
-#      DTYPES=fp16 run against the default OUT_DIR REPLACES a finished 192-row
+#      DTYPES=fp16 run against the default OUT_DIR REPLACES a finished 384-row
 #      table with 64 fp16 rows. Point OUT_DIR elsewhere to keep both.
-#   2. The dim picked is the largest at which the SELECTED dtypes fit. fp32 is
-#      the most memory-hungry of the three, so an fp16-only run can settle on a
+#   2. The dim picked is the largest at which the SELECTED dtypes and modes
+#      fit. fp32 is the most memory-hungry dtype and backward needs more
+#      memory than forward, so an fp16-only or forward-only run can settle on a
 #      LARGER dim than a full run did, and those numbers are then not
-#      comparable with the 3-dtype tables. Pin FEATURE_DIMS to the dim the full
+#      comparable with the full tables. Pin FEATURE_DIMS to the dim the full
 #      run used (the feature_dim column of its CSV) when you need to compare.
 #
-# So, a scratch fp16-only run that touches nothing existing:
-#   DTYPES=fp16 FEATURE_DIMS=128 OUT_DIR=out/cuda_gsddmm_fp16 \
+# So, a scratch fp16 forward-only run that touches nothing existing:
+#   DTYPES=fp16 MODES=forward FEATURE_DIMS=128 OUT_DIR=out/cuda_gsddmm_fp16 \
 #       bash scripts/run_cuda_gsddmm_dataset_sweep.sh
 #
 # DISK: the datasets download into data/ and are large (web-traffic 14G,
@@ -98,6 +119,9 @@ mkdir -p "$OUT_DIR" "$LOG_DIR" "$OVERRIDE_DIR"
 WARMUP=5
 ITERS=20
 DTYPES="${DTYPES:-fp32 fp16 bf16}"
+# Benchmark modes: forward times the forward kernel alone, backward times
+# out.backward(grad) (the forward runs once, untimed, to build the graph).
+MODES="$(echo "${MODES:-forward backward}" | tr ',' ' ')"
 # Feature dims to try, in order; the kernels reject anything outside
 # {32, 64, 128, 256}, so this is the whole usable fallback chain below 256.
 FEATURE_DIMS="${FEATURE_DIMS:-256 128 64 32}"
@@ -213,16 +237,16 @@ is_oom() {
     grep -qiE "OutOfMemoryError|out of memory" "$1"
 }
 
-run_dtype() {
-    # run_dtype <yaml> <name> <dtype> <d>
+run_one() {
+    # run_one <yaml> <name> <mode> <dtype> <d>
     # `yes |` auto-answers OGB's interactive download confirmation prompt.
     yes | "$PY" scripts/benchmark.py \
         --layer "$OPS" --backend cuda --aggr \
-        --dataset "$1" --feature_dim "$4" --mode forward \
+        --dataset "$1" --feature_dim "$5" --mode "$3" \
         --warmup "$WARMUP" --iters "$ITERS" --exact-iters \
-        --dtype "$3" \
+        --dtype "$4" \
         --csv-out "$OUT_DIR/$2_cuda_gsddmm.csv" \
-        > "$LOG_DIR/$2_cuda_gsddmm_$3_d$4.log" 2>&1
+        > "$LOG_DIR/$2_cuda_gsddmm_$3_$4_d$5.log" 2>&1
 }
 
 # Reject an unknown DATASETS entry now: a filter that matches nothing would
@@ -248,7 +272,10 @@ if [ -n "$DATASETS" ]; then
     fi
 fi
 
-echo "benchmarking $NUM_OPS ops (forward only) x $(echo $DTYPES | wc -w) dtypes [$DTYPES]"
+NUM_DTYPES="$(echo $DTYPES | wc -w)"
+NUM_MODES="$(echo $MODES | wc -w)"
+echo "benchmarking $NUM_OPS ops x $NUM_DTYPES dtypes [$DTYPES] x $NUM_MODES modes [$MODES]"
+echo "  = $((NUM_OPS * NUM_DTYPES * NUM_MODES)) rows per dataset"
 echo "  dims tried: $FEATURE_DIMS | ${WARMUP} warmup / ${ITERS} timed iters | out: $OUT_DIR"
 if [ -n "$DATASETS" ]; then
     echo "  datasets: $(echo $DATASETS | wc -w) selected [$DATASETS]"
@@ -280,23 +307,25 @@ for yaml in "${ALL_YAMLS[@]}"; do
 
     ok_d=""
     for d in $FEATURE_DIMS; do
-        all_dtypes_ok=1
+        all_combos_ok=1
         retry_smaller=0
         for dt in $DTYPES; do
-            log="$LOG_DIR/${name}_cuda_gsddmm_${dt}_d${d}.log"
-            if ! run_dtype "$yaml" "$name" "$dt" "$d"; then
-                all_dtypes_ok=0
-                if is_oom "$log"; then
-                    echo "  $dt OOM at d=$d -- retrying at a smaller feature dim"
-                    retry_smaller=1
-                else
-                    echo "  $dt failed at d=$d, not an OOM (see $log)"
+            for mode in $MODES; do
+                log="$LOG_DIR/${name}_cuda_gsddmm_${mode}_${dt}_d${d}.log"
+                if ! run_one "$yaml" "$name" "$mode" "$dt" "$d"; then
+                    all_combos_ok=0
+                    if is_oom "$log"; then
+                        echo "  $dt/$mode OOM at d=$d -- retrying at a smaller feature dim"
+                        retry_smaller=1
+                    else
+                        echo "  $dt/$mode failed at d=$d, not an OOM (see $log)"
+                    fi
+                    break 2
                 fi
-                break
-            fi
-            echo "  ok: $dt d=$d"
+                echo "  ok: $dt/$mode d=$d"
+            done
         done
-        if [ "$all_dtypes_ok" = 1 ]; then
+        if [ "$all_combos_ok" = 1 ]; then
             ok_d="$d"
             break
         fi

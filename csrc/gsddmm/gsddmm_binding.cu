@@ -213,9 +213,9 @@ torch::Tensor gsddmm_forward_edge_blocks(
     std::string lhs_target,
     std::string rhs_target,
     uint64_t N,
-    uint32_t pipeline_stages                        = 0,
-    uint32_t edges_per_warp                         = 4,
-    uint32_t warps_per_block                        = 4,
+    uint32_t pipeline_stages,
+    uint32_t edges_per_warp,
+    uint32_t warps_per_block,
     std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
 ) {
     const GSDDMM_OP op_enum        = parse_op(op);
@@ -715,9 +715,9 @@ torch::Tensor gsddmm_forward_edge_blocks(
     std::string lhs_target,
     std::string rhs_target,
     uint64_t N,
-    uint32_t pipeline_stages                        = 0,
-    uint32_t edges_per_warp                         = 4,
-    uint32_t warps_per_block                        = 4,
+    uint32_t pipeline_stages,
+    uint32_t edges_per_warp,
+    uint32_t warps_per_block,
     std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
 ) {
     return gsddmm::gsddmm_forward_edge_blocks(

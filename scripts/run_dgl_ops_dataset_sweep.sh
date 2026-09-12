@@ -45,10 +45,10 @@
 # `<op>_edge` (edge-parallel). DGL's copy_e is excluded (copying edge rows onto
 # edges is a memcpy, so turbo_gnn does not generate it), and the 24 gspmm
 # aggregations (copy_*_<reduce>, u_*_e_<reduce>) are excluded because they
-# belong against reduction_aggr / spmm_aggr, NOT against gsddmm. Our gsddmm
-# kernels are forward-only, so only mode=forward rows have a counterpart; the
-# backward rows are reference data for when a gsddmm backward lands (set
-# MODES=forward to skip them and halve the runtime).
+# belong against reduction_aggr / spmm_aggr, NOT against gsddmm. Both modes have
+# cuda counterparts now: a bare-name row maps to the node-parallel backward
+# (deterministic, no atomics) and an `_edge` row to the edge-parallel backward
+# (load balanced, fp32 atomics).
 #
 # Both scripts must also use the SAME FEATURE_DIMS ladder: a dataset that lands
 # at a different dim on each side is not comparable. Note the existing tables
