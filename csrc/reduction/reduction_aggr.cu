@@ -1,6 +1,9 @@
-#include <cstdint>
+#include "reduction/reduction_aggr_kernels.cuh"
 
-#include "common.cuh"
+template <ReductionOp Op, typename = void>
+struct PackedIdentity {
+    static constexpr uint64_t value = 0;
+};
 
 // Per-thread pipelined scan over edges [start, end): each edge contributes the
 // TW-wide slice X[edge_idx[eid]*d + base_f : +TW]. Per-thread (not per-warp)
@@ -611,6 +614,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_bac
         }
     }
 }
+template <ReductionOp Op>
+struct PackedIdentity<Op, std::void_t<decltype(ReductionOps<Op>::PACKED_IDENTITY)>> {
+    static constexpr uint64_t value = ReductionOps<Op>::PACKED_IDENTITY;
+};
 
 template <ReductionOp Op>
 void reduction_aggr_forward_partitioned_cuda_impl(
@@ -707,7 +714,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 cuda_t const *X_ptr = reinterpret_cast<const cuda_t *>(X.data_ptr<torch_t>());
                 cuda_t *out_ptr     = reinterpret_cast<cuda_t *>(out.data_ptr<torch_t>());
 
-                if constexpr (sizeof(index_t) <= 4) {
+                if constexpr (sizeof(index_t) <= 4 && ROps::TRACKS_ARG) {
                     // 32-bit: user can choose packed atomics or 2D
                     if (use_2d_kernel) {
                         // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
@@ -732,7 +739,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             d
                         );
                     } else {
-                        constexpr uint64_t PACKED_INIT = ROps::PACKED_IDENTITY;
+                        constexpr uint64_t PACKED_INIT = PackedIdentity<Op>::value;
 
                         auto packed = at::full(
                             {num_heavy, d}, static_cast<int64_t>(PACKED_INIT), at::TensorOptions().dtype(torch::kInt64).device(X.device())
@@ -789,7 +796,9 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         );
                     }
                 } else {
-                    // 64-bit: must use 2D (packing doesn't fit)
+                    // Must use 2D: either 64-bit indices (packing doesn't fit),
+                    // or an accumulating reducer, which has no order-preserving
+                    // (value, index) uint64 packing to atomically fold over.
                     // constexpr size_t TW = (sizeof(cuda_t) <= 2) ? 2 : 1;
                     constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
@@ -844,6 +853,11 @@ void reduction_aggr_forward_partitioned_cuda(
         );
     } else if (reduce == "max") {
         reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::MAX>(
+            edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
+            use_2d_kernel, features_per_block, tiles_y, pipeline_stages
+        );
+    } else if (reduce == "sum") {
+        reduction_aggr_forward_partitioned_cuda_impl<ReductionOp::SUM>(
             edge_ptr, edge_idx, X, light_nodes, heavy_nodes, max_degree, out, arg_idx, warps_per_block, edges_per_block_heavy_nodes,
             use_2d_kernel, features_per_block, tiles_y, pipeline_stages
         );
