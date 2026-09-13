@@ -212,6 +212,28 @@ struct IndexSentinel {
     static __device__ __forceinline__ bool is_valid(index_t idx) { return idx != INVALID; }
 };
 
+// index_t -> the CUDA 2-vector holding an (src, dst) node-id pair of that width.
+// The edge kernels cache one pair per lane with a single aligned vector load, so
+// the pair must be the hardware type (uint2 is 8-byte aligned, ulonglong2
+// 16-byte) rather than a struct of two index_t. Keyed on the WIDTH alone: the
+// members are only ever read and cast, so signedness does not matter here, and
+// keying on width keeps the edge dispatch at two alternatives instead of four.
+template <IntegralNum T, size_t Bytes = sizeof(T)>
+struct IndexPair;
+
+template <IntegralNum T>
+struct IndexPair<T, 4> {
+    using type = uint2;
+};
+
+template <IntegralNum T>
+struct IndexPair<T, 8> {
+    using type = ulonglong2;
+};
+
+template <IntegralNum T>
+using index_pair_t = typename IndexPair<T>::type;
+
 // Runtime dispatch to compile-time index type
 template <typename... IndexTypes>
 std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {

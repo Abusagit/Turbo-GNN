@@ -15,6 +15,18 @@ import torch
 import turbo_gnn
 from turbo_gnn import gsddmm, gsddmm_edge
 from turbo_gnn._kernels import _graph_edge_list
+
+
+def _signed(t: torch.Tensor) -> torch.Tensor:
+    """Signed view of an index tensor, so it can be indexed and compared.
+
+    The edge list and canonical index carry the graph's CSR index dtype, which
+    may be unsigned, and CUDA indexing is not implemented for uint32/uint64.
+    """
+    signed = {torch.uint32: torch.int32, torch.uint64: torch.int64}.get(t.dtype, t.dtype)
+    return t.view(signed)
+
+
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 if not torch.cuda.is_available():
@@ -288,10 +300,12 @@ def test_gsddmm_edge_ungrouped_edge_list(op: str, lhs_target: str, rhs_target: s
 
     gen = torch.Generator(device=DEVICE).manual_seed(7)
     perm = torch.randperm(num_edges, device=DEVICE, generator=gen)
-    # CUDA indexing is not implemented for uint64: permute the int64 view, then view back.
-    edge_list = _graph_edge_list(graph, by_src=False).view(torch.int64)[perm].contiguous().view(torch.uint64)
-    src = edge_list.view(torch.int64)[:, 0]
-    dst = edge_list.view(torch.int64)[:, 1]
+    # CUDA indexing is not implemented for the unsigned index dtypes: permute the
+    # signed view, then view back into the graph's own dtype.
+    base = _graph_edge_list(graph, by_src=False)
+    edge_list = _signed(base)[perm].contiguous().view(base.dtype)
+    src = _signed(edge_list)[:, 0].long()
+    dst = _signed(edge_list)[:, 1].long()
 
     def select(t, target):
         return t[src] if target == "src" else t[dst] if target == "dst" else t
@@ -473,21 +487,23 @@ def test_edge_list_values() -> None:
 
     # dst-grouped: from the forward CSR
     edge_list = _graph_edge_list(graph, by_src=False)
-    assert edge_list.dtype == torch.uint64
+    # The kernels are templated on the graph's index dtype and reinterpret the
+    # list as the matching CUDA pair type, so the list must carry that dtype.
+    assert edge_list.dtype == graph.index_dtype
     assert edge_list.dim() == 2 and edge_list.size(1) == 2
     assert edge_list.is_contiguous()
     src, dst = _grouped_src_dst(graph, by_src=False)
     expected = torch.stack([src, dst], dim=1)
     # First element of each pair is the source, second is the destination.
-    assert torch.equal(edge_list.view(torch.int64), expected)
+    assert torch.equal(_signed(edge_list).long(), expected)
 
     # src-grouped: from the backward CSR
     edge_list = _graph_edge_list(graph, by_src=True)
-    assert edge_list.dtype == torch.uint64
+    assert edge_list.dtype == graph.index_dtype
     assert edge_list.is_contiguous()
     src, dst = _grouped_src_dst(graph, by_src=True)
     expected = torch.stack([src, dst], dim=1)
-    assert torch.equal(edge_list.view(torch.int64), expected)
+    assert torch.equal(_signed(edge_list).long(), expected)
 
 
 def test_edge_list_cache_repartitioned_graph() -> None:

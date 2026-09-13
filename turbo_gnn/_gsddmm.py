@@ -409,6 +409,24 @@ def _graph_heavy_blocks(graph, edges_per_block: int) -> tuple[torch.Tensor, torc
     return result
 
 
+def _as_graph_index_dtype(t: torch.Tensor, graph) -> torch.Tensor:
+    """Cast an int64 index tensor to the graph's CSR index dtype.
+
+    The edge-parallel kernels are templated on that dtype and reinterpret the
+    edge list as the matching CUDA pair type (``uint2``/``ulonglong2``), so a
+    32-bit graph moves 8 bytes per pair instead of 16 and broadcasts each id with
+    one shuffle instead of two. The unsigned dtypes go through their signed
+    counterpart because ``Tensor.to`` does not support uint32/uint64 targets --
+    the bit pattern is identical for the non-negative ids stored here, which is
+    the same trick :meth:`AdjacencyForwardBackwardWithNodeBuckets._to_signed_view`
+    uses in the other direction.
+    """
+    target = graph.index_dtype
+    signed = {torch.uint32: torch.int32, torch.uint64: torch.int64}.get(target, target)
+    out = t.to(signed)
+    return out if signed is target else out.view(target)
+
+
 def _edge_list_is_canonical(graph, by_src: bool) -> bool:
     """True when the ``by_src`` *edge list* is in forward-CSR edge order.
 
@@ -470,16 +488,17 @@ def _graph_edge_list(graph, by_src: bool = False) -> torch.Tensor:
     rows = torch.repeat_interleave(torch.arange(num_nodes, device=indptr.device, dtype=torch.int64), degrees)
     cols = indices.to(torch.int64)
     src, dst = (rows, cols) if by_src else (cols, rows)
-    # The binding reinterprets the buffer as ulonglong2, so it must be a
-    # uint64 tensor; the uint64 view keeps the same values bit-for-bit.
-    edge_list = torch.stack([src, dst], dim=1).contiguous().view(torch.uint64)
+    # The binding reinterprets the buffer as index_pair_t<index_t>, so its dtype
+    # must be the graph's index dtype -- and contiguous, which pins stride(0) to
+    # 2 as those one-pair-per-lane vector loads require.
+    edge_list = _as_graph_index_dtype(torch.stack([src, dst], dim=1), graph).contiguous()
 
     graph.__dict__[cache_key] = (stamp, edge_list)
     return edge_list
 
 
 def _graph_canonical_edge_idx(graph) -> torch.Tensor:
-    """uint64 ``[E]``: forward-CSR edge position of each source-grouped edge.
+    """``[E]`` in the graph's index dtype: forward-CSR edge position of each source-grouped edge.
 
     This is the bridge that lets ``GSDDMM_forward_edge_block`` traverse the
     L2-friendly source-grouped list while numbering its ``Edge`` operand reads
@@ -509,7 +528,8 @@ def _graph_canonical_edge_idx(graph) -> torch.Tensor:
 
     canonical = torch.empty_like(order_csr)
     canonical[order_csc] = order_csr
-    canonical = canonical.contiguous().view(torch.uint64)
+    # Same dtype rule as the edge list: the kernels type it as index_t.
+    canonical = _as_graph_index_dtype(canonical, graph).contiguous()
 
     graph.__dict__[_CANONICAL_IDX_KEY] = (stamp, canonical)
     return canonical
@@ -690,9 +710,12 @@ def _launch_backward_edge(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the edge-parallel backward: one warp per edge chunk, fp32 atomics.
 
-    Each pass walks the list grouped by the node it reduces, so a warp's chunk
-    usually shares its target row and the accumulation collapses to one atomic
-    per feature tile.
+    Each pass walks the list grouped by the node it reduces, so a warp's chunk is
+    usually a single run of edges sharing a target row: the warp then sums the
+    whole chunk in registers and flushes it with one set of atomics.
+
+    ``pipeline_stages`` is the same knob as the forward's -- the cp.async prefetch
+    depth of the per-edge rows (the dO row and the other operand's).
     """
     edge_list_dst = _graph_edge_list(graph, by_src=False)
     edge_list_src = edge_list_dst
@@ -711,6 +734,7 @@ def _launch_backward_edge(
         spec.lhs_target,
         spec.rhs_target,
         graph.forward_indptr.numel() - 1,
+        params.pipeline_stages,
         params.edges_per_warp,
         params.warps_per_block,
     )
@@ -777,10 +801,11 @@ def _plan_cache_keys(plan: GsddmmLaunchPlan, graph) -> frozenset[str]:
 def _release_edge_caches(graph, keep: frozenset[str]) -> None:
     """Drop edge-variant scratch the probe materialized but the winner won't read.
 
-    An edge list is 16 B/edge and the canonical index another 8 B/edge (1.8 GB
-    and 0.9 GB on a 114 M-edge graph), and the probe may build both directions,
-    so everything the winner does not read is worth releasing. Caches that
-    predate the probe are left alone -- their owner asked for them.
+    An edge list is 2 and the canonical index 1 index element per edge -- 16 and
+    8 B/edge on a 64-bit graph (1.8 GB and 0.9 GB on a 114 M-edge one), half that
+    on a 32-bit one -- and the probe may build both directions, so everything the
+    winner does not read is worth releasing. Caches that predate the probe are
+    left alone -- their owner asked for them.
     """
     for key in (_EDGE_LIST_DST_KEY, _EDGE_LIST_SRC_KEY, _CANONICAL_IDX_KEY):
         if key not in keep:

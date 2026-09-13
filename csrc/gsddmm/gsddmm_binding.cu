@@ -50,13 +50,32 @@ void check_rows(int64_t N, int64_t E, const torch::Tensor& t, GSDDMM_MEMBER memb
     }
 }
 
-// [E, 2] uint64 (src, dst) pair list, contiguous so it can be reinterpreted as
-// ulonglong2 rows: is_contiguous also pins stride(0) to 2, which those 16-byte
-// pair loads rely on -- stride(1) == 1 alone would not.
-void check_edge_list(const torch::Tensor& t, const char *name) {
+// [E, 2] (src, dst) pair list in one of the supported index dtypes, contiguous
+// so it can be reinterpreted as index_pair_t<index_t> rows: is_contiguous also
+// pins stride(0) to 2, which those one-pair-per-lane vector loads rely on --
+// stride(1) == 1 alone would not.
+//
+// The dtype is an argument rather than a fixed uint64 because the kernels are
+// templated on it: a 32-bit graph then moves 8 bytes per pair instead of 16 and
+// broadcasts each id with one shuffle instead of two. All of a call's index
+// tensors must agree, so the expected type is passed in and checked here.
+void check_edge_list(const torch::Tensor& t, at::ScalarType expected, const char *name) {
     TORCH_CHECK(t.is_cuda() && t.dim() == 2 && t.size(1) == 2, name, " must be a CUDA [E, 2] list of node-id pairs");
-    TORCH_CHECK(t.scalar_type() == at::kUInt64, name, " must be uint64");
+    TORCH_CHECK(
+        t.scalar_type() == expected, name, " must have the same index dtype as the graph's CSR (", expected, "), got ", t.scalar_type()
+    );
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+// [E] canonical edge ids, same dtype rule as the edge list.
+void check_canonical_idx(const torch::Tensor& t, at::ScalarType expected, int64_t E, const char *ctx) {
+    TORCH_CHECK(t.is_cuda(), ctx, ": canonical_edge_idx must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), ctx, ": canonical_edge_idx must be contiguous");
+    TORCH_CHECK(
+        t.scalar_type() == expected, ctx, ": canonical_edge_idx must have the same index dtype as the graph's CSR (", expected, "), got ",
+        t.scalar_type()
+    );
+    TORCH_CHECK(t.numel() == E, ctx, ": canonical_edge_idx must have E=", E, " entries, got ", t.numel());
 }
 
 }  // namespace
@@ -225,7 +244,11 @@ torch::Tensor gsddmm_forward_edge_blocks(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(L.device().index());
 
     TORCH_CHECK(L.is_cuda() && R.is_cuda(), "L and R must be CUDA");
-    check_edge_list(edge_list, "edge_list");
+    // No CSR is passed to this entry point, so the edge list itself defines the
+    // index dtype every other index tensor of the call must match.
+    TORCH_CHECK(is_supported_index_type(edge_list.scalar_type()), "edge_list must be int32, uint32, int64 or uint64");
+    const at::ScalarType edge_idx_dtype = edge_list.scalar_type();
+    check_edge_list(edge_list, edge_idx_dtype, "edge_list");
     TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
@@ -258,28 +281,20 @@ torch::Tensor gsddmm_forward_edge_blocks(
         kGsddmmEdgeMaxWarpsPerBlock, "], got ", warps_per_block
     );
 
-    unsigned long long const *canonical_ptr = nullptr;
+    void const *canonical_ptr = nullptr;
     if (canonical_edge_idx.has_value()) {
         const torch::Tensor& canonical = *canonical_edge_idx;
-        TORCH_CHECK(canonical.is_cuda(), "GSDDMM forward (edge blocks): canonical_edge_idx must be CUDA");
-        TORCH_CHECK(
-            canonical.scalar_type() == at::kUInt64, "GSDDMM forward (edge blocks): canonical_edge_idx must be uint64, got ",
-            canonical.scalar_type()
-        );
-        TORCH_CHECK(canonical.is_contiguous(), "GSDDMM forward (edge blocks): canonical_edge_idx must be contiguous");
-        TORCH_CHECK(
-            static_cast<uint64_t>(canonical.numel()) == E, "GSDDMM forward (edge blocks): canonical_edge_idx must have E=", E, " entries, got ",
-            canonical.numel()
-        );
-        canonical_ptr = reinterpret_cast<unsigned long long const *>(canonical.data_ptr<uint64_t>());
+        check_canonical_idx(canonical, edge_idx_dtype, static_cast<int64_t>(E), "GSDDMM forward (edge blocks)");
+        canonical_ptr = canonical.data_ptr();
     }
 
     GsddmmLaunchArgsEdge args{
         .L                  = L,
         .R                  = R,
         .O                  = O,
-        .edge_nodes_idx     = reinterpret_cast<ulonglong2 const *>(edge_list.data_ptr<uint64_t>()),
+        .edge_nodes_idx     = edge_list.data_ptr(),
         .canonical_edge_idx = canonical_ptr,
+        .edge_index_dtype   = edge_idx_dtype,
         .stream             = stream,
         .E                  = E,
         .D                  = D,
@@ -416,13 +431,11 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
         );
     }
 
-    unsigned long long const *canonical_ptr = nullptr;
+    void const *canonical_ptr = nullptr;
     if (canonical_edge_idx.has_value() && canonical_edge_idx->numel() > 0) {
-        const torch::Tensor& canonical = *canonical_edge_idx;
-        TORCH_CHECK(canonical.is_cuda() && canonical.is_contiguous(), "GSDDMM backward: canonical_edge_idx must be CUDA and contiguous");
-        TORCH_CHECK(canonical.scalar_type() == at::kUInt64, "GSDDMM backward: canonical_edge_idx must be uint64");
-        TORCH_CHECK(static_cast<int64_t>(canonical.numel()) == E, "GSDDMM backward: canonical_edge_idx must have E=", E, " entries");
-        canonical_ptr = reinterpret_cast<unsigned long long const *>(canonical.data_ptr<uint64_t>());
+        // Typed as the CSR's index_t by the dispatch, so it must carry that dtype.
+        check_canonical_idx(*canonical_edge_idx, idx_dtype, E, "GSDDMM backward");
+        canonical_ptr = canonical_edge_idx->data_ptr();
     } else if (passes.src && E > 0) {
         // The source pass walks the backward CSR, whose slots are CSC positions,
         // so it cannot address dO without the permutation. This holds even for an
@@ -483,13 +496,17 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
 // Edge-parallel backward. Perfectly load balanced, at the cost of accumulating
 // each node gradient with atomics into an fp32 buffer that is cast back here.
 //
-// edge_list_dst: [E, 2] uint64 (src, dst) pairs in forward-CSR (destination
-//              grouped) order -- the destination-side pass.
+// edge_list_dst: [E, 2] (src, dst) pairs in forward-CSR (destination grouped)
+//              order -- the destination-side pass. Its index dtype (int32 /
+//              uint32 / int64 / uint64) types the kernel; every other index
+//              tensor of the call must match it.
 // edge_list_src: the same edges grouped by source, plus canonical_edge_idx
 //              mapping its slots to forward-CSR ids -- the source-side pass.
 //              Required only when a source-side gradient is needed; pass the
 //              dst-grouped list (and no permutation) for a graph whose orders
 //              coincide.
+// pipeline_stages: cp.async prefetch depth of the per-edge rows, in {0, 1, 2, 3}
+//              (0 = direct loads). Only meaningful with edges_per_warp > 1.
 // Returns:     {dL, dR}, as for gsddmm_backward_cuda.
 std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     torch::Tensor L,
@@ -504,6 +521,7 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     std::string lhs_target,
     std::string rhs_target,
     uint64_t N,
+    uint32_t pipeline_stages,
     uint32_t edges_per_warp,
     uint32_t warps_per_block
 ) {
@@ -515,7 +533,9 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     at::cuda::CUDAGuard device_guard(L.device());
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(L.device().index());
 
-    check_edge_list(edge_list_dst, "edge_list_dst");
+    TORCH_CHECK(is_supported_index_type(edge_list_dst.scalar_type()), "edge_list_dst must be int32, uint32, int64 or uint64");
+    const at::ScalarType edge_idx_dtype = edge_list_dst.scalar_type();
+    check_edge_list(edge_list_dst, edge_idx_dtype, "edge_list_dst");
 
     const int64_t E = edge_list_dst.size(0);
     const int64_t D = check_backward_operands(L, R, dO, op_enum, lhs_member, rhs_member, static_cast<int64_t>(N), E);
@@ -528,26 +548,22 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
         warps_per_block >= 1 && warps_per_block <= kGsddmmEdgeMaxWarpsPerBlock,
         "GSDDMM backward (edge blocks): warps_per_block must be in [1, ", kGsddmmEdgeMaxWarpsPerBlock, "], got ", warps_per_block
     );
+    TORCH_CHECK(pipeline_stages <= 3, "GSDDMM backward (edge blocks): pipeline_stages must be in [0, 3], got ", pipeline_stages);
 
-    // The source pass needs its own grouping; without one it would lose the
-    // shared-row ballot that keeps atomic traffic down, and without the
-    // permutation it could not address dO at all.
-    torch::Tensor src_list                  = edge_list_dst;
-    unsigned long long const *canonical_ptr = nullptr;
+    // The source pass needs its own grouping; without one a warp's chunk would
+    // straddle target nodes, splitting it into many one-edge runs and one set of
+    // atomics per edge -- and without the permutation it could not address dO.
+    torch::Tensor src_list    = edge_list_dst;
+    void const *canonical_ptr = nullptr;
     if (passes.src) {
         if (edge_list_src.has_value() && edge_list_src->numel() > 0) {
-            check_edge_list(*edge_list_src, "edge_list_src");
+            check_edge_list(*edge_list_src, edge_idx_dtype, "edge_list_src");
             TORCH_CHECK(edge_list_src->size(0) == E, "GSDDMM backward (edge blocks): both edge lists must cover the same E");
             src_list = *edge_list_src;
         }
         if (canonical_edge_idx.has_value() && canonical_edge_idx->numel() > 0) {
-            const torch::Tensor& canonical = *canonical_edge_idx;
-            TORCH_CHECK(
-                canonical.is_cuda() && canonical.is_contiguous() && canonical.scalar_type() == at::kUInt64,
-                "GSDDMM backward (edge blocks): canonical_edge_idx must be a contiguous CUDA uint64 tensor"
-            );
-            TORCH_CHECK(canonical.numel() == E, "GSDDMM backward (edge blocks): canonical_edge_idx must have E=", E, " entries");
-            canonical_ptr = reinterpret_cast<unsigned long long const *>(canonical.data_ptr<uint64_t>());
+            check_canonical_idx(*canonical_edge_idx, edge_idx_dtype, E, "GSDDMM backward (edge blocks)");
+            canonical_ptr = canonical_edge_idx->data_ptr();
         } else {
             TORCH_CHECK(
                 src_list.data_ptr() == edge_list_dst.data_ptr(),
@@ -576,13 +592,15 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
         .dR                 = dR,
         .dL_f32             = dL_f32,
         .dR_f32             = dR_f32,
-        .edge_nodes_idx_dst = reinterpret_cast<ulonglong2 const *>(edge_list_dst.data_ptr<uint64_t>()),
-        .edge_nodes_idx_src = reinterpret_cast<ulonglong2 const *>(src_list.data_ptr<uint64_t>()),
+        .edge_nodes_idx_dst = edge_list_dst.data_ptr(),
+        .edge_nodes_idx_src = src_list.data_ptr(),
         .canonical_edge_idx = canonical_ptr,
+        .edge_index_dtype   = edge_idx_dtype,
         .stream             = stream,
         .E                  = static_cast<uint64_t>(E),
         .D                  = static_cast<uint64_t>(D),
         .key                = LRO{lhs_member, rhs_member, op_enum},
+        .pipeline_stages    = static_cast<uint8_t>(pipeline_stages),
         .edges_per_warp     = static_cast<uint8_t>(edges_per_warp),
         .warps_per_block    = static_cast<uint8_t>(warps_per_block),
     };
@@ -697,11 +715,12 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     std::string lhs_target,
     std::string rhs_target,
     uint64_t N,
+    uint32_t pipeline_stages,
     uint32_t edges_per_warp,
     uint32_t warps_per_block
 ) {
     return gsddmm::gsddmm_backward_edge_blocks(
         std::move(L), std::move(R), std::move(dO), std::move(edge_list_dst), std::move(edge_list_src), std::move(canonical_edge_idx),
-        std::move(op), std::move(lhs_target), std::move(rhs_target), N, edges_per_warp, warps_per_block
+        std::move(op), std::move(lhs_target), std::move(rhs_target), N, pipeline_stages, edges_per_warp, warps_per_block
     );
 }

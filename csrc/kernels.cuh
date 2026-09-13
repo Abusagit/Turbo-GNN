@@ -99,6 +99,7 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     std::string lhs_target,
     std::string rhs_target,
     uint64_t N,
+    uint32_t pipeline_stages = 0,
     uint32_t edges_per_warp  = 4,
     uint32_t warps_per_block = 4
 );

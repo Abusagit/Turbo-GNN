@@ -43,7 +43,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "gsddmm_backward_edge", &gsddmm_backward_edge_blocks, "GSDDMM backward (edge-parallel, fp32 atomic accumulation)", py::arg("l"),
         py::arg("r"), py::arg("d_out"), py::arg("edge_list_dst"), py::arg("edge_list_src") = py::none(),
         py::arg("canonical_edge_idx") = py::none(), py::arg("op"), py::arg("lhs_target"), py::arg("rhs_target"), py::arg("N"),
-        py::arg("edges_per_warp") = 4, py::arg("warps_per_block") = 4
+        py::arg("pipeline_stages") = 0, py::arg("edges_per_warp") = 4, py::arg("warps_per_block") = 4
     );
 
     // GATv2 aggregation

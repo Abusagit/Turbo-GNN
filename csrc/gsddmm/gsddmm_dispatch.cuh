@@ -13,9 +13,9 @@
 // The templated GSDDMM forward dispatch grid, instantiated once per op shard.
 //
 // Include this from a gsddmm_launch_<op>.cu only -- every inclusion compiles
-// (LRO count) x (2 index types) x (3 dtypes) x (4 feature dims) x (2 warp
-// counts) x (4 pipeline depths) kernels. gsddmm_binding.cu deliberately does
-// not include it.
+// (LRO count) x (4 index types) x (3 dtypes) x (4 feature dims) x (warp counts)
+// x (4 pipeline depths) kernels, for each of the four kernel families.
+// gsddmm_binding.cu deliberately does not include it.
 // =============================================================================
 
 namespace gsddmm {
@@ -104,8 +104,10 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
 }
 
 // Edge-block version: instantiates GSDDMM_forward_edge_block over Lros x the
-// dtype / D / stages grid (the edge list is always ulonglong2, so there is no
-// index-type axis) and launches one grid over ceil(E / edges_per_warp) warps.
+// dtype / index / D / stages grid and launches one grid over
+// ceil(E / edges_per_warp) warps. The index axis types the edge list and every
+// id the kernel derives from it, so a 32-bit graph reads half the index bytes
+// and shuffles half the words of a 64-bit one.
 template <LRO... Lros>
 void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
     if (args.E == 0) [[unlikely]] {
@@ -115,10 +117,12 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
     auto lro_variant = MakeEnumVariant<LRO, Lros...>(args.key);
 
     std::visit(
-        [&](auto lro_c, auto typeInfo, auto d_c, auto stages_c) {
+        [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto stages_c) {
             constexpr GSDDMM_OP OP     = decltype(lro_c)::value.op;
             constexpr GSDDMM_MEMBER LL = decltype(lro_c)::value.l;
             constexpr GSDDMM_MEMBER RR = decltype(lro_c)::value.r;
+            using index_t              = typename decltype(idxInfo)::Type;
+            using pair_t               = index_pair_t<index_t>;
             using torch_t              = typename decltype(typeInfo)::TorchType;
             using cuda_t               = typename decltype(typeInfo)::CudaType;
             constexpr size_t DC        = decltype(d_c)::value;
@@ -128,7 +132,7 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             cuda_t const *R_ptr = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
             cuda_t *O_ptr       = reinterpret_cast<cuda_t *>(args.O.data_ptr<torch_t>());
 
-            auto kernel = GSDDMM_forward_edge_block<OP, LL, RR, DC, cuda_t, float, STAGES>;
+            auto kernel = GSDDMM_forward_edge_block<OP, LL, RR, DC, cuda_t, index_t, float, STAGES>;
 
             const size_t shmem = args.warps_per_block * gsddmm_forward_edge_shmem_bytes_per_warp<OP, LL, RR, DC, cuda_t, STAGES>();
             ensure_dynamic_shmem(kernel, shmem, "GSDDMM forward (edge blocks)");
@@ -152,11 +156,13 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             const dim3 threads(kWarpSize, args.warps_per_block);
 
             kernel<<<blocks, threads, shmem, args.stream>>>(
-                args.E, L_ptr, R_ptr, O_ptr, args.edge_nodes_idx, args.canonical_edge_idx, static_cast<uint32_t>(args.edges_per_warp)
+                static_cast<index_t>(args.E), L_ptr, R_ptr, O_ptr, reinterpret_cast<pair_t const *>(args.edge_nodes_idx),
+                reinterpret_cast<index_t const *>(args.canonical_edge_idx), static_cast<uint32_t>(args.edges_per_warp)
             );
         },
-        lro_variant, MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()),
-        MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)), MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
+        lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
+        MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+        MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
     );
 }
 
@@ -219,7 +225,7 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
                     kernel<<<blocks, threads, shmem, args.stream>>>(
                         static_cast<size_t>(args.N), L_ptr, R_ptr, dO_ptr, self_ptr, edge_ptr,
                         index_ptr<index_t>(IS_SRC ? args.row_ptr_T : args.row_ptr), index_ptr<index_t>(IS_SRC ? args.col_idx_T : args.col_idx),
-                        index_ptr<index_t>(node_indices), IS_SRC ? args.canonical_edge_idx : nullptr
+                        index_ptr<index_t>(node_indices), IS_SRC ? reinterpret_cast<index_t const *>(args.canonical_edge_idx) : nullptr
                     );
                 }
             },
@@ -238,7 +244,8 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
 }
 
 // Edge-parallel backward: instantiates GSDDMM_backward_edge_block over Lros x the
-// dtype / D grid and launches one grid of ceil(E / edges_per_warp) warps per pass.
+// dtype / index / D / stages grid and launches one grid of
+// ceil(E / edges_per_warp) warps per pass.
 template <LRO... Lros>
 void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& args) {
     if (args.E == 0) [[unlikely]] {
@@ -249,7 +256,7 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
 
     auto launch_pass = [&](auto reduce_c) {
         std::visit(
-            [&](auto lro_c, auto typeInfo, auto d_c) {
+            [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto stages_c) {
                 constexpr GSDDMM_OP OP         = decltype(lro_c)::value.op;
                 constexpr GSDDMM_MEMBER LL     = decltype(lro_c)::value.l;
                 constexpr GSDDMM_MEMBER RR     = decltype(lro_c)::value.r;
@@ -257,9 +264,12 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                 using Plan                     = GsddmmBackwardPlan<OP, LL, RR, REDUCE>;
 
                 if constexpr (Plan::HAS_SELF) {
+                    using index_t         = typename decltype(idxInfo)::Type;
+                    using pair_t          = index_pair_t<index_t>;
                     using torch_t         = typename decltype(typeInfo)::TorchType;
                     using cuda_t          = typename decltype(typeInfo)::CudaType;
                     constexpr size_t DC   = decltype(d_c)::value;
+                    constexpr int STAGES  = decltype(stages_c)::value;
                     constexpr bool IS_SRC = REDUCE == GSDDMM_REDUCE::Src;
 
                     cuda_t const *L_ptr     = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
@@ -270,12 +280,19 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     float *self_ptr         = self_f32.data_ptr<float>();
                     cuda_t *edge_ptr        = Plan::WRITE_EDGE_GRAD ? reinterpret_cast<cuda_t *>(edge_out.data_ptr<torch_t>()) : nullptr;
 
-                    auto kernel = GSDDMM_backward_edge_block<OP, LL, RR, REDUCE, DC, cuda_t, float>;
+                    auto kernel = GSDDMM_backward_edge_block<OP, LL, RR, REDUCE, DC, cuda_t, index_t, float, STAGES>;
+
+                    // Per-warp shared memory: the atomic-flush staging row plus,
+                    // when pipelined, the cp.async ring (gsddmm.cuh).
+                    const size_t shmem =
+                        args.warps_per_block *
+                        gsddmm_backward_edge_shmem_bytes_per_warp<OP, LL, RR, REDUCE, DC, cuda_t, float, static_cast<uint8_t>(STAGES)>();
+                    ensure_dynamic_shmem(kernel, shmem, "GSDDMM backward (edge blocks)");
 
                     // Grouped by the reduced node: the Src pass walks the
                     // source-grouped list and remaps its slots to canonical ids.
-                    ulonglong2 const *edges             = IS_SRC ? args.edge_nodes_idx_src : args.edge_nodes_idx_dst;
-                    unsigned long long const *canonical = IS_SRC ? args.canonical_edge_idx : nullptr;
+                    void const *edges     = IS_SRC ? args.edge_nodes_idx_src : args.edge_nodes_idx_dst;
+                    void const *canonical = IS_SRC ? args.canonical_edge_idx : nullptr;
 
                     const uint64_t num_warps  = ceil_div<uint64_t>(args.E, args.edges_per_warp);
                     const uint64_t num_blocks = ceil_div<uint64_t>(num_warps, args.warps_per_block);
@@ -292,13 +309,15 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     const dim3 blocks(grid_dim_x, grid_dim_y, grid_dim_z);
                     const dim3 threads(kWarpSize, args.warps_per_block);
 
-                    kernel<<<blocks, threads, 0, args.stream>>>(
-                        args.E, L_ptr, R_ptr, dO_ptr, self_ptr, edge_ptr, edges, canonical, static_cast<uint32_t>(args.edges_per_warp)
+                    kernel<<<blocks, threads, shmem, args.stream>>>(
+                        static_cast<index_t>(args.E), L_ptr, R_ptr, dO_ptr, self_ptr, edge_ptr, reinterpret_cast<pair_t const *>(edges),
+                        reinterpret_cast<index_t const *>(canonical), static_cast<uint32_t>(args.edges_per_warp)
                     );
                 }
             },
-            lro_variant, MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D))
+            lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
+            MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
         );
     };
 

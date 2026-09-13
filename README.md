@@ -98,6 +98,12 @@ graph_i32 = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
 ).to("cuda")
 ```
 
+`index_dtype` is not only a cuSPARSE constraint: the edge-parallel `gsddmm` kernels are
+templated on it and derive their `(src, dst)` pair type from it, so a 32-bit graph moves
+8 bytes per edge of index traffic instead of 16 (and 4 instead of 8 for the canonical-id
+permutation), and broadcasts each id with one warp shuffle instead of two. Prefer
+`torch.int32` whenever the node and edge counts fit it.
+
 ### Kernel calls
 
 ```python
@@ -180,9 +186,14 @@ out.backward(grad)
   them all write its row, which is the thing this variant exists to avoid.
 - `"edge"` gives one warp per edge chunk and is perfectly load balanced, accumulating into
   an fp32 buffer with `atomicAdd` (cast back on return). Because the edge list is grouped
-  by the node being reduced, a warp whose chunk shares its target row issues **one** atomic
-  per feature tile instead of one per edge. Its result is deterministic only up to fp32
-  atomic ordering.
+  by the node being reduced, a chunk is a short sequence of **runs** of edges sharing a
+  target row — usually exactly one — and the warp sums each run in registers, so it issues
+  one set of atomics per run rather than per edge, and reads the reduced node's own row
+  once per run rather than once or twice per edge. The atomics are staged through shared
+  memory so each is one contiguous 128-byte request instead of 32 scattered sectors. Its
+  result is deterministic only up to fp32 atomic ordering.
+  `pipeline_stages` applies here too: it prefetches each edge's `d_out` and other-operand
+  rows that many edges ahead with `cp.async`, as the forward edge kernel does.
 
 `add`, `sub` and `copy` have constant partials, so their backward saves **no** feature
 tensors — the difference between keeping one and two `[E, D]` activations alive per op.

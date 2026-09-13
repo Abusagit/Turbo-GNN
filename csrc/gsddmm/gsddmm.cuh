@@ -130,7 +130,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
 );
 
 // Edge-block variant: reads an explicit [E, 2] edge list of (src, dst) node-id
-// pairs (reinterpreted as ulonglong2) instead of the CSR. Warp w (global warp
+// pairs (reinterpreted as index_pair_t<index_t>) instead of the CSR. Warp w (global
 // index over the grid, blockDim.y warps per block) owns the contiguous edge
 // chunk [w * edges_per_warp, (w + 1) * edges_per_warp), 1 <= edges_per_warp <=
 // kGsddmmEdgeMaxEdgesPerWarp. PIPELINE_STAGES == 0 gathers the operand rows with
@@ -143,12 +143,19 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
 // applied to the Edge operand rows AND the output row, so the list may be grouped
 // by source for locality while the output stays numbered by forward-CSR position.
 // nullptr: the traversal order is already the canonical one (slot index == id).
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
+//
+// index_t is the graph's own (unsigned) index width -- the same type that bounds
+// the CSR -- and it types the edge list, the canonical ids, E, and every id the
+// kernel derives from them. A 32-bit graph therefore reads 8 bytes per pair
+// instead of 16, 4 bytes per canonical id instead of 8, and broadcasts each id
+// with ONE shuffle instead of two. Only byte offsets are widened to size_t:
+// node_id * D_CONST overflows 32 bits long before a node id does.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block ( // no-format
-    uint64_t E,
+    index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
-    ulonglong2 const *__restrict__ edge_nodes_idx,
-    unsigned long long const *__restrict__ canonical_edge_idx,
+    index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
+    index_t const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 );
 
@@ -224,6 +231,26 @@ struct GsddmmBackwardPlan {
 
     static constexpr bool READS_OTHER = NEEDS_OTHER_ROW || NEEDS_OTHER_ROW_FOR_EDGE_GRAD;
     static constexpr bool IS_DOT      = Fwd::IS_DOT;
+
+    // The reduced operand's own row is needed by Div's -1/self^2 factor and by
+    // the edge operand's gradient (where the node row is its "other" operand).
+    static constexpr bool KEEP_SELF_ROW = NEEDS_SELF_ROW || (WRITE_EDGE_GRAD && (op == GSDDMM_OP::Mul || op == GSDDMM_OP::Div || op == GSDDMM_OP::Dot));
+
+    // Rows the edge-parallel backward gathers PER EDGE, and so the width of its
+    // cp.async ring: the edge's dO row -- Dot's dO is one scalar per edge, not a
+    // row -- plus the other operand's row when the partial reads it. The reduced
+    // node's own row is deliberately NOT here: it is constant over a run of
+    // edges sharing that node, so it is read once per run into registers
+    // (KEEP_SELF_ROW) instead of being prefetched per edge.
+    // Zero only for a pass this pair does not have (HAS_SELF false), which the
+    // dispatch never launches; the kernel asserts it is nonzero for the ones it
+    // does. The assert cannot live here: the dispatch forms this Plan for every
+    // (pair, direction) combination and only then drops the ones without a SELF.
+    static constexpr size_t NUM_EDGE_ROWS = (IS_DOT ? 0 : 1) + (READS_OTHER ? 1 : 0);
+
+    // Slot of each per-edge row inside the rows[] array (-1: not gathered).
+    static constexpr int DO_SLOT    = IS_DOT ? -1 : 0;
+    static constexpr int OTHER_SLOT = READS_OTHER ? (IS_DOT ? 0 : 1) : -1;
 };
 
 // Dynamic shared memory for one GSDDMM_backward_normal launch: one fp32 feature
@@ -232,6 +259,25 @@ struct GsddmmBackwardPlan {
 template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum accum_t = float>
 inline consteval size_t gsddmm_backward_shmem_bytes() {
     return N_PER_BLOCK > 1 ? N_PER_BLOCK * D_CONST * sizeof(accum_t) : 0;
+}
+
+// Dynamic shared memory of GSDDMM_backward_edge_block per WARP. Two buffers,
+// laid out back to back inside each warp's slice (so a warp finds both from
+// warp_id alone, without needing blockDim.y):
+//
+//   [0, D_CONST * sizeof(accum_t))   flush scratch: one accum_t feature row,
+//       the staging buffer that turns the atomic flush from 32 sectors per
+//       request into 4 (see the kernel).
+//   [.., + ring)                     the cp.async ring for the per-edge rows,
+//       empty when PIPELINE_STAGES == 0.
+//
+// The flush row comes first and is a multiple of 16 bytes (D_CONST >= 32,
+// sizeof(accum_t) >= 4), so the ring stays 16-byte aligned for cp.async and the
+// per-warp stride does too.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
+inline consteval size_t gsddmm_backward_edge_shmem_bytes_per_warp() {
+    using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
+    return D_CONST * sizeof(accum_t) + pipelined_ring_elems(PIPELINE_STAGES, Plan::NUM_EDGE_ROWS, D_CONST) * sizeof(cuda_t);
 }
 
 // Node-parallel backward: one thread block per (bucketed) node of the CSR that
@@ -260,7 +306,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_backward_norma
     cuda_t *__restrict__ d_self, cuda_t *__restrict__ d_edge,
     index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
     index_t const *__restrict__ node_indices,
-    unsigned long long const *__restrict__ canonical_edge_idx
+    index_t const *__restrict__ canonical_edge_idx
 );
 
 // Edge-parallel backward: one warp per contiguous chunk of the explicit edge
@@ -269,18 +315,31 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_backward_norma
 // (d_self_f32, zero-initialized by the caller, cast back on the host), because
 // fp16/bf16 atomics would both contend and lose the reduction's precision.
 //
-// The edge list is grouped by the node being reduced, so a warp's chunk usually
-// shares its target row: one warp ballot (as in the forward's shared-row cache)
-// decides that, the chunk is then summed in registers, and the warp issues ONE
-// atomicAdd per feature tile instead of one per edge. Mixed chunks fall back to
-// per-edge atomics.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float>
+// The edge list is grouped by the node being reduced, so a warp's chunk is a
+// short sequence of RUNS of edges sharing a target row -- usually exactly one.
+// The warp walks the chunk in runs, sums each run in fp32 registers, and issues
+// its atomics once per run instead of once per edge. A run's target node being
+// fixed also means that node's own row -- which Div's -1/self^2 factor and the
+// edge operand's gradient both need -- is read once per run into registers
+// rather than once or twice per edge.
+//
+// The atomics go through a per-warp shared staging row so that each one is a
+// 128-byte, 4-sector request: the accumulator is blocked by lane, which is what
+// makes the operand loads 16-byte wide and is simultaneously the worst possible
+// shape for a scalar atomic (32 sectors per request, 4 bytes used of each). See
+// the kernel body.
+//
+// PIPELINE_STAGES prefetches the per-edge rows (the dO row and the other
+// operand's) that many edges ahead with cp.async, exactly as the forward edge
+// kernel does; 0 takes the direct-load path. index_t types the edge list and
+// every id, as in the forward.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block ( // no-format
-    uint64_t E,
+    index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
     accum_t *__restrict__ d_self_f32, cuda_t *__restrict__ d_edge,
-    ulonglong2 const *__restrict__ edge_nodes_idx,
-    unsigned long long const *__restrict__ canonical_edge_idx,
+    index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
+    index_t const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 );
 

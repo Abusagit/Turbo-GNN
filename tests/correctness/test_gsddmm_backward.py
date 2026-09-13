@@ -247,6 +247,73 @@ def test_backward_variants_agree(op, lhs_target, rhs_target):
         torch.testing.assert_close(d_rhs_node, d_rhs_edge, **_TOL[torch.float32])
 
 
+#: Launch shapes that change how the edge-parallel backward decomposes a chunk.
+#: ``edges_per_warp=1`` makes every chunk a single run (one flush, no run
+#: boundary); ``32`` makes a chunk span many target nodes on this random graph,
+#: so the warp crosses several run boundaries and reloads the reduced node's row
+#: at each. ``pipeline_stages`` walks the cp.async ring depth, including rings
+#: shallower than the chunk.
+EDGE_CHUNK_SHAPES = [(1, 1), (4, 4), (32, 8)]
+
+#: One member pair per distinct backward routing: a plain node/node reduction, a
+#: Div whose denominator is the reduced operand (the per-edge -1/self^2 factor),
+#: a pair with an Edge operand (a per-edge gradient store alongside the sum), the
+#: Div that needs both, the scalar-dO Dot, and Copy's single pass.
+EDGE_BACKWARD_ROUTINGS = [
+    ("mul", "src", "dst"),
+    ("div", "src", "dst"),
+    ("div", "src", "edge"),
+    ("div", "edge", "dst"),
+    ("dot", "src", "dst"),
+    ("copy", "src", "edge"),
+]
+
+
+@pytest.mark.parametrize("pipeline_stages", [0, 1, 2, 3])
+@pytest.mark.parametrize("edges_per_warp,warps_per_block", EDGE_CHUNK_SHAPES)
+@pytest.mark.parametrize("op,lhs_target,rhs_target", EDGE_BACKWARD_ROUTINGS)
+def test_edge_backward_over_chunk_shapes_and_pipeline_depths(
+    op, lhs_target, rhs_target, edges_per_warp, warps_per_block, pipeline_stages
+):
+    """The edge-parallel backward must agree with autograd for every chunk shape.
+
+    Its per-chunk work depends on the launch parameters in two ways the default
+    shape does not exercise: the chunk is walked in *runs* of edges sharing a
+    reduced node (one set of atomics and one read of that node's row per run), and
+    the per-edge rows may be prefetched through a cp.async ring. A wide chunk on a
+    random graph crosses run boundaries mid-ring, which is where the two interact.
+
+    ``variant="edge"`` is pinned as well as ``backward_variant`` because the plan
+    carries one parameter object: a node forward would hand the backward a default
+    ``EdgeBlockParams`` and the parameters here would be silently ignored.
+    """
+    graph = _make_graph()
+    lhs, rhs, d_out = _operands(graph, op, lhs_target, rhs_target, 64, torch.float32)
+    d_lhs_ref, d_rhs_ref = _reference_grads(graph, lhs, rhs, d_out, op, lhs_target, rhs_target)
+
+    lhs_arg = lhs.detach().clone().requires_grad_(True)
+    rhs_arg = None if op == "copy" else rhs.detach().clone().requires_grad_(True)
+    out = gsddmm(
+        graph,
+        lhs_arg,
+        rhs_arg,
+        op=op,
+        lhs_target=lhs_target,
+        rhs_target=rhs_target,
+        variant="edge",
+        backward_variant="edge",
+        pipeline_stages=pipeline_stages,
+        edges_per_warp=edges_per_warp,
+        warps_per_block=warps_per_block,
+    )
+    out.backward(d_out)
+
+    what = f"{op}({lhs_target},{rhs_target}) epw={edges_per_warp} wpb={warps_per_block} stages={pipeline_stages}"
+    _assert_close(lhs_arg.grad, d_lhs_ref, torch.float32, f"d_lhs for {what}")
+    if rhs_arg is not None:
+        _assert_close(rhs_arg.grad, d_rhs_ref, torch.float32, f"d_rhs for {what}")
+
+
 @pytest.mark.parametrize(
     "op,expect_saved", [("add", False), ("sub", False), ("copy", False), ("mul", True), ("div", True), ("dot", True)]
 )

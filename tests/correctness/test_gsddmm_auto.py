@@ -36,6 +36,14 @@ from turbo_gnn._gsddmm import (
 )
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
+
+def _signed_long(t: torch.Tensor) -> torch.Tensor:
+    """int64 copy of an index tensor: it carries the graph's CSR index dtype,
+    which may be unsigned, and CUDA indexing needs a signed one."""
+    signed = {torch.uint32: torch.int32, torch.uint64: torch.int64}.get(t.dtype, t.dtype)
+    return t.view(signed).long()
+
+
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
 
@@ -206,7 +214,7 @@ def test_public_aliases_dispatch_automatically() -> None:
 def test_canonical_edge_idx_is_a_permutation() -> None:
     graph = _make_graph()
     num_edges = graph.forward_indices.numel()
-    canonical = _graph_canonical_edge_idx(graph).view(torch.int64)
+    canonical = _signed_long(_graph_canonical_edge_idx(graph))
     assert canonical.numel() == num_edges
     assert torch.equal(torch.sort(canonical).values, torch.arange(num_edges, device=DEVICE))
 
@@ -214,9 +222,9 @@ def test_canonical_edge_idx_is_a_permutation() -> None:
 def test_canonical_edge_idx_maps_endpoints_consistently() -> None:
     """Slot k and canonical id ``canonical[k]`` must be the same edge."""
     graph = _make_graph()
-    canonical = _graph_canonical_edge_idx(graph).view(torch.int64)
-    csc = _graph_edge_list(graph, by_src=True).view(torch.int64)
-    csr = _graph_edge_list(graph, by_src=False).view(torch.int64)
+    canonical = _signed_long(_graph_canonical_edge_idx(graph))
+    csc = _signed_long(_graph_edge_list(graph, by_src=True))
+    csr = _signed_long(_graph_edge_list(graph, by_src=False))
     assert torch.equal(csc, csr[canonical]), "canonical ids must preserve each edge's (src, dst)"
 
 
@@ -238,7 +246,7 @@ def test_legacy_edge_op_keeps_traversal_order() -> None:
     canonical = gsddmm(graph, x, None, op="copy", lhs_target="src")
     legacy = gsddmm_edge(graph, x, None, op="copy", lhs_target="src")
     assert not torch.equal(canonical, legacy), "legacy op should follow traversal order"
-    canonical_idx = _graph_canonical_edge_idx(graph).view(torch.int64)
+    canonical_idx = _signed_long(_graph_canonical_edge_idx(graph))
     assert torch.equal(canonical[canonical_idx], legacy)
 
 
@@ -253,7 +261,7 @@ def test_legacy_edge_op_indexes_edge_operands_by_traversal_slot() -> None:
     lhs, rhs = _operands(graph, "src", "edge", 64, torch.float32)
     canonical = gsddmm(graph, lhs, rhs, op="mul", lhs_target="src", rhs_target="edge")
     legacy = gsddmm_edge(graph, lhs, rhs, op="mul", lhs_target="src", rhs_target="edge")
-    canonical_idx = _graph_canonical_edge_idx(graph).view(torch.int64)
+    canonical_idx = _signed_long(_graph_canonical_edge_idx(graph))
     assert not torch.equal(canonical[canonical_idx], legacy)
     # Re-index the caller's edge rows into traversal order and they agree again.
     reordered = gsddmm_edge(graph, lhs, rhs[canonical_idx], op="mul", lhs_target="src", rhs_target="edge")

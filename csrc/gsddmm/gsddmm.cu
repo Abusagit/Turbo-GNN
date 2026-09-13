@@ -253,6 +253,15 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
         // with L/R/O restrict-qualified the compiler then hoists the next edge's
         // loads above the current edge's stores, keeping two edges' worth of
         // requests in flight per warp instead of one.
+        // Counter left as size_t, unlike pipelined_row_loop's 32-bit trip count
+        // and unlike the edge kernels' chunk counters. Narrowing it here was
+        // measured to make things WORSE: it frees just enough register pressure
+        // for ptxas to drop from 34-40 registers into the 32-register bucket
+        // (100% occupancy for a 1024-thread block), which it then pays a 4-16
+        // byte spill to stay in -- 9 of the 10 D=256 configs that spill at all
+        // stop spilling when this is a size_t. The occupancy trade may well be
+        // worth taking, but it belongs in __launch_bounds__'s second argument
+        // with a timing run behind it, not as a side effect of an index width.
         const size_t loop_iters = (num_edges > warp_id) ? ceil_div(num_edges - warp_id, N_PER_BLOCK) : 0;
 #pragma unroll 2
         for (size_t it = 0; it < loop_iters; ++it) {
@@ -274,16 +283,20 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
 // Row of operand `m` for edge k of this warp's chunk. Node ids come from the
 // (src, dst) pair lane k cached in my_pair (warp-wide shuffle broadcast, so all
 // lanes must reach this together); Edge rows are indexed by the edge position.
-template <GSDDMM_MEMBER m, size_t D_CONST, FloatingNum cuda_t>
+//
+// The shuffle moves an index_t, so a 32-bit graph pays one SHFL where a 64-bit
+// one pays two. The row OFFSET is always computed in size_t: D_CONST is a
+// size_t, so the multiply widens before it can overflow a 32-bit id.
+template <GSDDMM_MEMBER m, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t>
 __device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(
-    cuda_t const *__restrict__ base, const ulonglong2& my_pair, size_t k, uint64_t e
+    cuda_t const *__restrict__ base, const index_pair_t<index_t>& my_pair, uint32_t k, std::make_unsigned_t<index_t> e
 ) {
     if constexpr (m == GSDDMM_MEMBER::Src_V) {
-        return base + D_CONST * __shfl_sync(FULL_WARP_MASK, my_pair.x, static_cast<int>(k));
+        return base + D_CONST * static_cast<size_t>(__shfl_sync(FULL_WARP_MASK, my_pair.x, static_cast<int>(k)));
     } else if constexpr (m == GSDDMM_MEMBER::Dst_V) {
-        return base + D_CONST * __shfl_sync(FULL_WARP_MASK, my_pair.y, static_cast<int>(k));
+        return base + D_CONST * static_cast<size_t>(__shfl_sync(FULL_WARP_MASK, my_pair.y, static_cast<int>(k)));
     } else if constexpr (m == GSDDMM_MEMBER::Edge) {
-        return base + D_CONST * e;
+        return base + D_CONST * static_cast<size_t>(e);
     } else {
         static_assert(!sizeof(cuda_t), "Unreachable branch");
         __builtin_unreachable();
@@ -320,15 +333,19 @@ __device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(
 // shuffle. nullptr means the traversal order already IS the canonical order, and
 // the id degenerates to the slot index (no load, no shuffle).
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block( // no-format
-    uint64_t E, // total edge count
+    index_t E, // total edge count
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
-    ulonglong2 const * __restrict__ edge_nodes_idx,
-    unsigned long long const *__restrict__ canonical_edge_idx,
+    index_pair_t<index_t> const * __restrict__ edge_nodes_idx,
+    index_t const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 ) {
-    using Plan  = GsddmmPlan<op, ll, rr>;
+    // Node and edge ids are non-negative, so they ride in index_t's unsigned form:
+    // that is what index_pair_t already holds, and it keeps the id arithmetic one
+    // width instead of promoting a signed index_t to 64 bits at every step.
+    using eidx_t = std::make_unsigned_t<index_t>;
+    using Plan   = GsddmmPlan<op, ll, rr>;
     using Shape = GsddmmRowShape<D_CONST, cuda_t, accum_t>;
 
     constexpr size_t TW               = Shape::TW;
@@ -353,18 +370,25 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     const size_t lane_id = threadIdx.x;
     const size_t warp_id = threadIdx.y;
 
-    const uint64_t block_linear = (static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
-    const uint64_t global_warp  = block_linear * blockDim.y + warp_id;
-    const uint64_t edge_base    = global_warp * edges_per_warp;
+    // The grid is sized to ceil(E / edges_per_warp) warps, so a warp index fits
+    // index_t whenever E does -- the whole chunk walk is therefore index_t-wide,
+    // not unconditionally 64-bit.
+    const eidx_t block_linear = static_cast<eidx_t>((static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x);
+    const eidx_t global_warp  = block_linear * static_cast<eidx_t>(blockDim.y) + static_cast<eidx_t>(warp_id);
+    const eidx_t edge_base    = global_warp * static_cast<eidx_t>(edges_per_warp);
     // Warp-uniform exit: there is no block-level synchronization in this kernel.
-    if (edge_base >= E) [[unlikely]] {
+    const eidx_t num_total = static_cast<eidx_t>(E);
+    if (edge_base >= num_total) [[unlikely]] {
         return;
     }
-    const size_t num_edges = static_cast<size_t>((E - edge_base < edges_per_warp) ? (E - edge_base) : edges_per_warp);
+    // At most kGsddmmEdgeMaxEdgesPerWarp (32), so the chunk-local counter and
+    // every loop over it are 32-bit no matter how wide index_t is -- the rule
+    // pipelined_row_loop states for its own trip count, applied here.
+    const uint32_t num_edges = static_cast<uint32_t>((num_total - edge_base < edges_per_warp) ? (num_total - edge_base) : edges_per_warp);
 
     // Lane k caches the (src, dst) pair of edge edge_base + k. The chunk is unique
     // to this warp, so the load is streamed past L1.
-    ulonglong2 my_pair{};
+    index_pair_t<index_t> my_pair{};
     if (lane_id < num_edges) {
         my_pair = __ldcs(&edge_nodes_idx[edge_base + lane_id]);
     }
@@ -372,23 +396,23 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     // Lane k also caches the canonical edge id of slot k, same access pattern. The
     // pointer is grid-uniform, so the branch below never diverges and the shuffle
     // inside canonical_of stays convergent.
-    const bool remap_edge_ids       = canonical_edge_idx != nullptr;
-    unsigned long long my_canonical = 0;
+    const bool remap_edge_ids = canonical_edge_idx != nullptr;
+    eidx_t my_canonical       = 0;
     if (remap_edge_ids && lane_id < num_edges) {
-        my_canonical = __ldcs(&canonical_edge_idx[edge_base + lane_id]);
+        my_canonical = static_cast<eidx_t>(__ldcs(&canonical_edge_idx[edge_base + lane_id]));
     }
 
     // Canonical edge id of slot k of this chunk (warp-uniform result).
-    auto canonical_of = [remap_edge_ids, my_canonical, edge_base](size_t k) -> uint64_t {
-        return remap_edge_ids ? __shfl_sync(FULL_WARP_MASK, my_canonical, static_cast<int>(k)) : edge_base + k;
+    auto canonical_of = [remap_edge_ids, my_canonical, edge_base](uint32_t k) -> eidx_t {
+        return remap_edge_ids ? __shfl_sync(FULL_WARP_MASK, my_canonical, static_cast<int>(k)) : edge_base + static_cast<eidx_t>(k);
     };
 
     // Global row addresses of the operands for edge k of the chunk (warp-uniform).
-    auto edge_rows = [canonical_of, my_pair, L, R](size_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
-        const uint64_t e = canonical_of(k);
-        srcs[L_SLOT]     = gsddmm_edge_member_row<ll, D_CONST, cuda_t>(L, my_pair, k, e);
+    auto edge_rows = [canonical_of, my_pair, L, R](uint32_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
+        const eidx_t e = canonical_of(k);
+        srcs[L_SLOT]   = gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e);
         if constexpr (Plan::USE_R) {
-            srcs[R_SLOT] = gsddmm_edge_member_row<rr, D_CONST, cuda_t>(R, my_pair, k, e);
+            srcs[R_SLOT] = gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e);
         }
     };
 
@@ -398,10 +422,10 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     // O is written once and never read back here, so the stores are streaming
     // (evict-first): the [E, D] output must not push the gathered node rows,
     // which ARE re-read by other edges, out of L2.
-    auto consume = [lane_id, canonical_of, O](size_t k, cuda_t const *const(&rows)[NUM_ROWS]) {
-        const uint64_t e = canonical_of(k);
+    auto consume = [lane_id, canonical_of, O](uint32_t k, cuda_t const *const(&rows)[NUM_ROWS]) {
+        const eidx_t e = canonical_of(k);
         if constexpr (!Plan::IS_DOT) {
-            cuda_t *const O_row = O + e * D_CONST;  // elementwise ops write the edge's own row
+            cuda_t *const O_row = O + static_cast<size_t>(e) * D_CONST;  // elementwise ops write the edge's own row
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
                 const size_t tile_idx = lane_id + kWarpSize * t;
@@ -439,7 +463,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         // gsddmm_forward_edge_shmem_bytes_per_warp); warps are laid out back to back.
         extern __shared__ __align__(16) uint8_t sh_raw[];
         cuda_t *const my_dbuf = reinterpret_cast<cuda_t *>(sh_raw) + warp_id * pipelined_ring_elems(NUM_STAGES, NUM_ROWS, D_CONST);
-        pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane_id, static_cast<uint32_t>(num_edges), my_dbuf, edge_rows, consume);
+        pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane_id, num_edges, my_dbuf, edge_rows, consume);
     } else {
         // Direct path. The edge list is grouped by dst when an operand reads Dst_V
         // and by src otherwise (see _graph_edge_list), so a warp's chunk usually
@@ -464,19 +488,19 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         // shared_tiles is captured BY REFERENCE: it is filled below, after this
         // closure is created, so a by-value capture would compute on the copy
         // taken while the array was still uninitialized.
-        auto edge_body = [L, R, O, canonical_of, &shared_tiles, my_pair, lane_id](auto cache_c, size_t k) {
+        auto edge_body = [L, R, O, canonical_of, &shared_tiles, my_pair, lane_id](auto cache_c, uint32_t k) {
             constexpr bool USE_CACHE = decltype(cache_c)::value;
-            const uint64_t e         = canonical_of(k);
+            const eidx_t e           = canonical_of(k);
             cuda_t const *l_row      = nullptr;
             cuda_t const *r_row      = nullptr;
             if constexpr (!(USE_CACHE && L_SHARED)) {
-                l_row = gsddmm_edge_member_row<ll, D_CONST, cuda_t>(L, my_pair, k, e);
+                l_row = gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e);
             }
             if constexpr (Plan::USE_R && !(USE_CACHE && R_SHARED)) {
-                r_row = gsddmm_edge_member_row<rr, D_CONST, cuda_t>(R, my_pair, k, e);
+                r_row = gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e);
             }
 
-            cuda_t *const O_row = O + e * D_CONST;  // elementwise ops write the edge's own row
+            cuda_t *const O_row = O + static_cast<size_t>(e) * D_CONST;  // elementwise ops write the edge's own row
             accum_t partial{};
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
@@ -515,11 +539,11 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         };
 
         // One ballot decides the chunk: lanes beyond the chunk vote "same".
-        const uint64_t my_key   = GROUPED_BY_DST ? my_pair.y : my_pair.x;
-        const uint64_t key0     = __shfl_sync(FULL_WARP_MASK, my_key, 0);
+        const eidx_t my_key     = GROUPED_BY_DST ? my_pair.y : my_pair.x;
+        const eidx_t key0       = __shfl_sync(FULL_WARP_MASK, my_key, 0);
         const bool chunk_shared = __all_sync(FULL_WARP_MASK, (lane_id >= num_edges) || (my_key == key0)) != 0;
         if (chunk_shared) {
-            cuda_t const *const row = (L_SHARED ? L : R) + D_CONST * key0;
+            cuda_t const *const row = (L_SHARED ? L : R) + D_CONST * static_cast<size_t>(key0);
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
                 const size_t tile_idx = lane_id + kWarpSize * t;
@@ -527,11 +551,11 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     shared_tiles[t] = Tile::read<Tile::MemoryHint::NoHint>(row, tile_idx);
                 }
             }
-            for (size_t k = 0; k < num_edges; ++k) {
+            for (uint32_t k = 0; k < num_edges; ++k) {
                 edge_body(std::true_type{}, k);
             }
         } else {
-            for (size_t k = 0; k < num_edges; ++k) {
+            for (uint32_t k = 0; k < num_edges; ++k) {
                 edge_body(std::false_type{}, k);
             }
         }
@@ -606,21 +630,43 @@ __device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_accum_to_vec(accum_t cons
     return out;
 }
 
-// d_out tile for edge e: the edge's own row for elementwise ops, or its broadcast
-// scalar for dot, whose output -- and so whose gradient -- is [E] rather than
-// [E, D]. Every op's partial is linear in d_out, so broadcasting the scalar here
-// lets one tile-shaped code path serve both.
-template <bool IS_DOT, size_t D_CONST, size_t TW, FloatingNum cuda_t>
-__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_tile(cuda_t const *__restrict__ dO, size_t edge_id, size_t tile_idx) {
-    using Tile = TileOps<TW, cuda_t, float>;
+// The tile-INDEPENDENT part of d_out for edge e: dot's output -- and so its
+// gradient -- is [E] rather than [E, D], and every op's partial is linear in
+// d_out, so broadcasting that one scalar lets a single tile-shaped code path
+// serve both shapes.
+//
+// Split out of the per-tile read on purpose: the splat is the same for every
+// tile of the edge, so building it inside the tile loop re-loaded dO[edge_id]
+// and rebuilt the vector TILES_PER_THREAD times per edge. Callers hoist this
+// above the loop and read gsddmm_grad_out_row_tile per tile instead. Returns a
+// defined (zero) vector for the elementwise ops, which never read it -- the
+// store is dead once the op is known and is eliminated.
+//
+// The broadcast is Vec's scalar constructor (reached through C++20 parenthesized
+// aggregate initialization, as gsddmm_inv_sq_chunk and the GATv2 helpers already
+// do). Measured identical, instruction for instruction and register for
+// register, to a hand-written packed splat -- and 32 instructions cheaper across
+// six Dot kernels than store_zero_() followed by scalar_add_(), which pays an
+// add per element to reach a value already known.
+template <bool IS_DOT, size_t TW, FloatingNum cuda_t>
+__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_splat(cuda_t const *__restrict__ dO, size_t edge_id) {
     if constexpr (IS_DOT) {
-        typename Tile::vec_t v;
-        v.store_zero_();
-        v.scalar_add_(dO[edge_id]);
-        return v;
+        return VecFloat<TW, cuda_t>(dO[edge_id]);
     } else {
-        return Tile::template read<Tile::MemoryHint::Streaming>(dO + edge_id * D_CONST, tile_idx);
+        VecFloat<TW, cuda_t> v;
+        return v;
     }
+}
+
+// One tile of an elementwise op's d_out row. `hint` is Streaming when the row is
+// read straight from global (each edge's dO row is read exactly once, so it must
+// not evict the node rows that ARE reused) and NoHint when a cp.async pipeline
+// has already staged it into shared memory, where a global cache policy would be
+// meaningless.
+template <size_t TW, FloatingNum cuda_t, TileOps<TW, cuda_t, float>::MemoryHint hint>
+__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_row_tile(cuda_t const *__restrict__ dO_row, size_t tile_idx) {
+    using Tile = TileOps<TW, cuda_t, float>;
+    return Tile::template read<hint>(dO_row, tile_idx);
 }
 
 // 1/v^2 for one chunk, evaluated in accum_t. The reciprocal is taken once and
@@ -733,7 +779,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
     cuda_t *__restrict__ d_self, cuda_t *__restrict__ d_edge,
     index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
     index_t const *__restrict__ node_indices,
-    unsigned long long const *__restrict__ canonical_edge_idx
+    index_t const *__restrict__ canonical_edge_idx
 ) {
     using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
     static_assert(Plan::HAS_SELF, "this pass has no operand to reduce; the host must not launch it");
@@ -768,7 +814,8 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
     // The node's own row is constant over its edges, so each lane keeps its tiles
     // of it in registers: Div's -1/self^2 factor and the edge operand's gradient
     // both need it, and neither should re-read it per edge.
-    constexpr bool KEEP_SELF_TILES = Plan::NEEDS_SELF_ROW || (Plan::WRITE_EDGE_GRAD && EdgeGradOp::READS_OTHER);
+    constexpr bool KEEP_SELF_TILES = Plan::KEEP_SELF_ROW;
+    static_assert(KEEP_SELF_TILES == (Plan::NEEDS_SELF_ROW || (Plan::WRITE_EDGE_GRAD && EdgeGradOp::READS_OTHER)), "Plan::KEEP_SELF_ROW must match what this kernel actually needs");
     vec_t self_tiles[TILES_PER_THREAD];
     if constexpr (KEEP_SELF_TILES) {
 #pragma unroll
@@ -791,21 +838,41 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
     }
 
     // Warp-strided walk of the node's edges, mirroring the forward's loop so the
-    // trip count is exact and the body can be unrolled.
+    // trip count is exact and the body can be unrolled -- and size_t for the same
+    // measured reason the forward's is (see there).
     const size_t loop_iters = (num_edges > warp_id) ? ceil_div(num_edges - warp_id, N_PER_BLOCK) : 0;
 #pragma unroll 2
     for (size_t it = 0; it < loop_iters; ++it) {
         const index_t slot = edge_start + static_cast<index_t>(warp_id + it * N_PER_BLOCK);
         // Walking the backward CSR visits edges in CSC order, while dO and the
         // Edge operand are numbered by forward-CSR position.
-        const size_t edge_id   = (canonical_edge_idx != nullptr) ? static_cast<size_t>(canonical_edge_idx[slot]) : static_cast<size_t>(slot);
-        const size_t other_row = Plan::OTHER_IS_EDGE ? edge_id : static_cast<size_t>(col_idx[slot]);
+        // Widen through index_t's UNSIGNED form: ids are non-negative, and a
+        // zero-extend from a 32-bit unsigned is free, where the sign-extend of a
+        // signed index_t costs an instruction plus a second live value per use.
+        // Measured at D=256: the signed form spills 4-16 bytes at the same
+        // register count, and this spelling also clears a spill the uint64
+        // canonical index had before it was narrowed. Same reason the edge
+        // kernels carry every id in eidx_t.
+        using eidx_t           = std::make_unsigned_t<index_t>;
+        const size_t edge_id   = (canonical_edge_idx != nullptr) ? static_cast<size_t>(static_cast<eidx_t>(canonical_edge_idx[slot]))
+                                                                 : static_cast<size_t>(static_cast<eidx_t>(slot));
+        const size_t other_row = Plan::OTHER_IS_EDGE ? edge_id : static_cast<size_t>(static_cast<eidx_t>(col_idx[slot]));
+
+        // Dot's d_out is one broadcast scalar for the whole edge: build it once
+        // here rather than per tile. The elementwise ops read a row per tile.
+        const vec_t d_out_splat   = gsddmm_grad_out_splat<Plan::IS_DOT, TW, cuda_t>(dO, edge_id);
+        cuda_t const *const dO_row = Plan::IS_DOT ? nullptr : dO + edge_id * D_CONST;
 
 #pragma unroll
         for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
             const size_t v = lane_id + kWarpSize * t;
             if (v < TILES) [[likely]] {
-                const vec_t d_out = gsddmm_grad_out_tile<Plan::IS_DOT, D_CONST, TW, cuda_t>(dO, edge_id, v);
+                vec_t d_out;
+                if constexpr (Plan::IS_DOT) {
+                    d_out = d_out_splat;
+                } else {
+                    d_out = gsddmm_grad_out_row_tile<TW, cuda_t, Tile::MemoryHint::Streaming>(dO_row, v);
+                }
                 // Add/Sub/Copy have constant partials and never read this; it is
                 // still zeroed rather than left undefined, both to keep the
                 // value passed to apply() defined and to keep the build quiet.
@@ -917,35 +984,70 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
 // the same address and lose the sum's precision, and the repo already takes the
 // "fp32 buffer, cast on the host" route for the GT backward's dK.
 //
-// The list is grouped by the node being reduced, so a warp's chunk usually shares
-// its target row. One ballot (the forward's shared-row trick, applied to the
-// accumulation side instead of the load side) detects that, and the warp then
-// sums its whole chunk in registers and issues ONE atomicAdd per feature tile
-// instead of one per edge -- for a 32-edge chunk that is a 32x cut in atomic
-// traffic on exactly the high-degree nodes where contention would otherwise bite.
-// Mixed chunks fall back to a per-edge atomic.
+// RUNS. The list is grouped by the node being reduced, so a chunk is a short
+// sequence of runs of edges sharing a target node -- usually exactly one. The
+// warp walks the chunk in runs: sum a run in registers, flush it, start the next.
+// This subsumes the old shared-chunk ballot (a shared chunk is one run) without
+// its fallback, so the per-edge body exists once instead of twice, and it earns
+// two things per run rather than per chunk:
+//   * ONE set of atomics per run instead of one per edge;
+//   * ONE read of the reduced node's own row -- which Div's -1/self^2 factor and
+//     the edge operand's gradient both want -- held in registers for the run,
+//     where it used to be re-read once or twice per EDGE.
+//
+// ATOMIC SHAPE. acc is blocked by lane: lane l owns features [(l + 32t)*TW, +TW).
+// That is what makes every operand load one 16-byte vector, and it is
+// simultaneously the worst possible shape for a scalar atomic -- at a fixed j the
+// warp's 32 lanes are TW * sizeof(accum_t) bytes apart, so one atomic touches 32
+// distinct sectors and uses 4 bytes of each (measured on A100: exactly 32.00
+// sectors per request, against the 4 a 128-byte request needs; the kernel sat at
+// 60% lg_throttle / 50% mio_throttle and 4% SM throughput because of it). The
+// flush therefore stages the row through per-warp shared memory and re-reads it
+// at s * 32 + lane, so each atomic is one contiguous 128-byte, 4-sector request.
+// Instruction count is unchanged -- D_CONST/32 atomics either way -- for
+// D_CONST/32 shared stores and loads and two __syncwarp().
+//
+// PIPELINE_STAGES prefetches the per-edge rows (the dO row, and the other
+// operand's when the partial reads it) that many edges ahead with cp.async, as
+// the forward edge kernel does. The reduced node's row is deliberately not in the
+// ring: it is a per-RUN constant, so it belongs in registers.
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block( // no-format
-    uint64_t E,
+    index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
     accum_t *__restrict__ d_self_f32, cuda_t *__restrict__ d_edge,
-    ulonglong2 const *__restrict__ edge_nodes_idx,
-    unsigned long long const *__restrict__ canonical_edge_idx,
+    index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
+    index_t const *__restrict__ canonical_edge_idx,
     uint32_t edges_per_warp
 ) {
-    using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
+    // See GSDDMM_forward_edge_block: ids ride in index_t's unsigned form.
+    using eidx_t = std::make_unsigned_t<index_t>;
+    using Plan   = GsddmmBackwardPlan<op, ll, rr, reduce>;
     static_assert(Plan::HAS_SELF, "this pass has no operand to reduce; the host must not launch it");
+    static_assert(Plan::NUM_EDGE_ROWS >= 1, "a pass with a SELF operand always gathers at least its dO or its other row per edge");
     using Shape = GsddmmRowShape<D_CONST, cuda_t, accum_t>;
 
     constexpr size_t TW               = Shape::TW;
     constexpr size_t TILES            = Shape::TILES;
     constexpr size_t TILES_PER_THREAD = Shape::TILES_PER_THREAD;
+    static_assert(TILES * TW == D_CONST, "the flush transpose below relies on the lanes' tiles covering the row exactly");
+    static_assert(D_CONST % kWarpSize == 0, "the flush issues one atomic per 32 consecutive features");
+    constexpr size_t FLUSH_STEPS = D_CONST / kWarpSize;
 
     using Tile       = Shape::Tile;
     using vec_t      = Shape::vec_t;
     using GradOp     = GsddmmGradOp<op, Plan::SELF_IS_LHS, TW, cuda_t>;
     using EdgeGradOp = GsddmmGradOp<op, !Plan::SELF_IS_LHS, TW, cuda_t>;
+
+    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
+    constexpr size_t NUM_STAGES = USE_PIPELINE ? static_cast<size_t>(PIPELINE_STAGES) : 1;  // only read when USE_PIPELINE
+    constexpr size_t NUM_ROWS   = Plan::NUM_EDGE_ROWS;
+    constexpr int DO_SLOT       = Plan::DO_SLOT;
+    constexpr int OTHER_SLOT    = Plan::OTHER_SLOT;
+    // Prefetched rows live in shared memory; directly gathered ones in global,
+    // where each dO row is read exactly once and so should evict first.
+    constexpr auto DO_HINT = USE_PIPELINE ? Tile::MemoryHint::NoHint : Tile::MemoryHint::Streaming;
 
     __builtin_assume(threadIdx.x < static_cast<unsigned>(kWarpSize));
     __builtin_assume(threadIdx.y < static_cast<unsigned>(kGsddmmEdgeMaxWarpsPerBlock));
@@ -953,56 +1055,130 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     const size_t lane_id = threadIdx.x;
     const size_t warp_id = threadIdx.y;
 
-    const uint64_t block_linear = (static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
-    const uint64_t global_warp  = block_linear * blockDim.y + warp_id;
-    const uint64_t edge_base    = global_warp * edges_per_warp;
-    if (edge_base >= E) [[unlikely]] {
+    // Chunk arithmetic in index_t: the grid covers ceil(E / edges_per_warp) warps,
+    // so a warp index fits index_t whenever E does.
+    const eidx_t block_linear = static_cast<eidx_t>((static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x);
+    const eidx_t global_warp  = block_linear * static_cast<eidx_t>(blockDim.y) + static_cast<eidx_t>(warp_id);
+    const eidx_t edge_base    = global_warp * static_cast<eidx_t>(edges_per_warp);
+    const eidx_t num_total = static_cast<eidx_t>(E);
+    if (edge_base >= num_total) [[unlikely]] {
         return;
     }
-    const size_t num_edges = static_cast<size_t>((E - edge_base < edges_per_warp) ? (E - edge_base) : edges_per_warp);
+    // <= kGsddmmEdgeMaxEdgesPerWarp (32): chunk-local counters stay 32-bit.
+    const uint32_t num_edges = static_cast<uint32_t>((num_total - edge_base < edges_per_warp) ? (num_total - edge_base) : edges_per_warp);
 
     // Lane k caches edge k's endpoints and canonical id (see the forward kernel).
-    ulonglong2 my_pair{};
+    index_pair_t<index_t> my_pair{};
     if (lane_id < num_edges) {
         my_pair = __ldcs(&edge_nodes_idx[edge_base + lane_id]);
     }
-    const bool remap_edge_ids       = canonical_edge_idx != nullptr;
-    unsigned long long my_canonical = 0;
+    const bool remap_edge_ids = canonical_edge_idx != nullptr;
+    eidx_t my_canonical       = 0;
     if (remap_edge_ids && lane_id < num_edges) {
-        my_canonical = __ldcs(&canonical_edge_idx[edge_base + lane_id]);
+        my_canonical = static_cast<eidx_t>(__ldcs(&canonical_edge_idx[edge_base + lane_id]));
     }
-    auto canonical_of = [remap_edge_ids, my_canonical, edge_base](size_t k) -> uint64_t {
-        return remap_edge_ids ? __shfl_sync(FULL_WARP_MASK, my_canonical, static_cast<int>(k)) : edge_base + k;
+    auto canonical_of = [remap_edge_ids, my_canonical, edge_base](uint32_t k) -> eidx_t {
+        return remap_edge_ids ? __shfl_sync(FULL_WARP_MASK, my_canonical, static_cast<int>(k)) : edge_base + static_cast<eidx_t>(k);
     };
     // Node this pass reduces into, and the node the other operand is read from.
-    auto self_node_of = [my_pair](size_t k) -> uint64_t {
+    // Warp-uniform: every lane must reach these together.
+    auto self_node_of = [my_pair](uint32_t k) -> eidx_t {
         return __shfl_sync(FULL_WARP_MASK, reduce == GSDDMM_REDUCE::Dst ? my_pair.y : my_pair.x, static_cast<int>(k));
     };
-    auto other_node_of = [my_pair](size_t k) -> uint64_t {
+    auto other_node_of = [my_pair](uint32_t k) -> eidx_t {
         return __shfl_sync(FULL_WARP_MASK, reduce == GSDDMM_REDUCE::Dst ? my_pair.x : my_pair.y, static_cast<int>(k));
     };
 
-    // One ballot for the chunk: lanes past the end vote "same". The list is
-    // grouped by the reduced node, so this is the common case.
-    const uint64_t my_key   = (reduce == GSDDMM_REDUCE::Dst) ? my_pair.y : my_pair.x;
-    const uint64_t key0     = __shfl_sync(FULL_WARP_MASK, my_key, 0);
-    const bool chunk_shared = __all_sync(FULL_WARP_MASK, (lane_id >= num_edges) || (my_key == key0)) != 0;
+    // Per-warp shared slice: the flush staging row first (a multiple of 16 bytes,
+    // so the ring behind it stays 16-byte aligned for cp.async), then the ring.
+    // Addressed from warp_id alone, so no warp needs to know blockDim.y.
+    constexpr size_t FLUSH_BYTES    = D_CONST * sizeof(accum_t);
+    constexpr size_t RING_ELEMS     = USE_PIPELINE ? pipelined_ring_elems(NUM_STAGES, NUM_ROWS, D_CONST) : size_t{0};
+    constexpr size_t PER_WARP_BYTES = FLUSH_BYTES + RING_ELEMS * sizeof(cuda_t);
+    static_assert(FLUSH_BYTES % 16 == 0, "flush row must be a multiple of 16 bytes to keep the ring aligned");
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    uint8_t *const my_sh      = sh_raw + warp_id * PER_WARP_BYTES;
+    accum_t *const flush_sh   = reinterpret_cast<accum_t *>(my_sh);
+    cuda_t *const my_ring     = reinterpret_cast<cuda_t *>(my_sh + FLUSH_BYTES);
 
-    // edge_body(k, acc): the per-edge partial for edge k of the chunk, added into
-    // acc (fp32). Also stores the edge operand's gradient, which needs no sum.
-    auto edge_body = [&](size_t k, accum_t acc[TILES_PER_THREAD][TW]) {
-        const uint64_t edge_id   = canonical_of(k);
-        const uint64_t self_node = self_node_of(k);
-        const uint64_t other_row = Plan::OTHER_IS_EDGE ? edge_id : other_node_of(k);
+    // Per-lane fp32 running sums for the current run, one per feature tile.
+    accum_t acc[TILES_PER_THREAD][TW];
+    auto clear_acc = [&acc]() {
+#pragma unroll
+        for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
+#pragma unroll
+            for (size_t j = 0; j < TW; ++j) {
+                acc[t][j] = accum_t{0};
+            }
+        }
+    };
+
+    // The run's reduced node row, constant for the whole run (see KEEP_SELF_ROW).
+    vec_t self_tiles[TILES_PER_THREAD];
+    auto load_self_tiles = [&self_tiles, lane_id, L, R](eidx_t node) {
+        if constexpr (Plan::KEEP_SELF_ROW) {
+            cuda_t const *const row = (Plan::SELF_IS_LHS ? L : R) + static_cast<size_t>(node) * D_CONST;
+#pragma unroll
+            for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
+                const size_t v = lane_id + kWarpSize * t;
+                if (v < TILES) [[likely]] {
+                    self_tiles[t] = Tile::read(row, v);
+                }
+            }
+        }
+    };
+
+    // flush(node): add the finished run's tiles into node's row, transposed
+    // through shared so each atomic is one 128-byte request (see the header).
+    auto flush_acc = [&](eidx_t node) {
+#pragma unroll
+        for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
+            const size_t v = lane_id + kWarpSize * t;
+            if (v < TILES) [[likely]] {
+#pragma unroll
+                for (size_t j = 0; j < TW; ++j) {
+                    flush_sh[v * TW + j] = acc[t][j];
+                }
+            }
+        }
+        // Order this run's stores before the reads below, and -- on the way out --
+        // the reads before the next run's stores into the same buffer.
+        __syncwarp();
+        accum_t *const dst = d_self_f32 + static_cast<size_t>(node) * D_CONST;
+#pragma unroll
+        for (size_t s = 0; s < FLUSH_STEPS; ++s) {
+            const size_t f = s * kWarpSize + lane_id;
+            atomicAdd(&dst[f], flush_sh[f]);
+        }
+        __syncwarp();
+    };
+
+    // body(k, rows): edge k's partial into acc, plus the edge operand's gradient
+    // (a plain per-edge store, needing no sum). rows[] holds the prefetched
+    // shared-memory rows when pipelined and the gathered global rows otherwise;
+    // the reduced node's row always comes from self_tiles.
+    auto body = [&](uint32_t k, cuda_t const *const (&rows)[NUM_ROWS]) {
+        const eidx_t edge_id = canonical_of(k);
+
+        // Dot's d_out is one broadcast scalar per edge: built once, not per tile.
+        const vec_t d_out_splat = gsddmm_grad_out_splat<Plan::IS_DOT, TW, cuda_t>(dO, static_cast<size_t>(edge_id));
 
 #pragma unroll
         for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
             const size_t v = lane_id + kWarpSize * t;
             if (v < TILES) [[likely]] {
-                const vec_t d_out = gsddmm_grad_out_tile<Plan::IS_DOT, D_CONST, TW, cuda_t>(dO, edge_id, v);
+                vec_t d_out;
+                if constexpr (Plan::IS_DOT) {
+                    d_out = d_out_splat;
+                } else {
+                    d_out = gsddmm_grad_out_row_tile<TW, cuda_t, DO_HINT>(rows[DO_SLOT], v);
+                }
+                // Add/Sub/Copy have constant partials and never read this; it is
+                // still zeroed rather than left undefined, both to keep the value
+                // passed to apply() defined and to keep the build quiet.
                 vec_t other;
                 if constexpr (Plan::READS_OTHER) {
-                    other = Tile::read((Plan::SELF_IS_LHS ? R : L) + other_row * D_CONST, v);
+                    other = Tile::read(rows[OTHER_SLOT], v);
                 } else {
                     other.store_zero_();
                 }
@@ -1011,11 +1187,10 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     // Div's denominator: -(dO * other) / self^2. Unlike the
                     // node-parallel variant this warp does not own the whole
                     // node, so the factor cannot be deferred past the atomic and
-                    // is applied per edge from the (broadcast) self row -- the
-                    // whole term in accum_t, product included. Div/rhs negates.
+                    // is applied per edge -- from the run's cached self row, in
+                    // accum_t, product included. Div/rhs negates.
                     static_assert(op == GSDDMM_OP::Div && Plan::NEGATE_SELF, "NEEDS_SELF_ROW is the negating Div/rhs case");
-                    const vec_t self_row = Tile::read((Plan::SELF_IS_LHS ? L : R) + self_node * D_CONST, v);
-                    gsddmm_accum_sub_prod_div_sq<TW, cuda_t, accum_t>(acc[t], d_out, other, self_row);
+                    gsddmm_accum_sub_prod_div_sq<TW, cuda_t, accum_t>(acc[t], d_out, other, self_tiles[t]);
                 } else {
                     vec_t contrib = GradOp::apply(d_out, other);
                     if constexpr (Plan::NEGATE_SELF) {
@@ -1029,7 +1204,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     // operand the backward never touches may be a 1-row stand-in.
                     vec_t node_row;
                     if constexpr (EdgeGradOp::READS_OTHER) {
-                        node_row = Tile::read((Plan::SELF_IS_LHS ? L : R) + self_node * D_CONST, v);
+                        node_row = self_tiles[t];
                     } else {
                         node_row.store_zero_();
                     }
@@ -1040,50 +1215,58 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     } else if constexpr (op == GSDDMM_OP::Sub && Plan::OTHER == rr) {
                         g_edge.neg_();
                     }
-                    Tile::template write<Tile::MemoryHint::Streaming>(d_edge + edge_id * D_CONST, v, g_edge);
+                    Tile::template write<Tile::MemoryHint::Streaming>(d_edge + static_cast<size_t>(edge_id) * D_CONST, v, g_edge);
                 }
             }
         }
     };
 
-    accum_t acc[TILES_PER_THREAD][TW];
-    auto clear_acc = [&acc]() {
-#pragma unroll
-        for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
-#pragma unroll
-            for (size_t j = 0; j < TW; ++j) {
-                acc[t][j] = accum_t{0};
-            }
-        }
-    };
-    // flush(node): atomically add this warp's accumulated tiles into node's row.
-    auto flush_acc = [&](uint64_t node) {
-#pragma unroll
-        for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
-            const size_t v = lane_id + kWarpSize * t;
-            if (v < TILES) [[likely]] {
-#pragma unroll
-                for (size_t j = 0; j < TW; ++j) {
-                    atomicAdd(&d_self_f32[node * D_CONST + v * TW + j], acc[t][j]);
-                }
-            }
-        }
-    };
-
-    if (chunk_shared) {
-        // The whole chunk targets key0: sum it in registers, one atomic per tile.
-        clear_acc();
-        for (size_t k = 0; k < num_edges; ++k) {
-            edge_body(k, acc);
-        }
-        flush_acc(key0);
-    } else {
-        for (size_t k = 0; k < num_edges; ++k) {
+    // Run bookkeeping, shared by the pipelined and direct paths: both visit the
+    // chunk's edges in order, so a run ends exactly when the target node changes.
+    // num_edges >= 1 here (the chunk would have exited otherwise), so the first
+    // run can be opened before the loop and closed after it.
+    eidx_t run_node = self_node_of(0);
+    clear_acc();
+    load_self_tiles(run_node);
+    auto consume = [&](uint32_t k, cuda_t const *const (&rows)[NUM_ROWS]) {
+        const eidx_t node = self_node_of(k);
+        if (node != run_node) {
+            flush_acc(run_node);
+            run_node = node;
             clear_acc();
-            edge_body(k, acc);
-            flush_acc(self_node_of(k));
+            load_self_tiles(node);
+        }
+        body(k, rows);
+    };
+
+    if constexpr (USE_PIPELINE) {
+        // Global row addresses of edge k's prefetched rows (warp-uniform).
+        auto addr = [&](uint32_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
+            const eidx_t e = canonical_of(k);
+            if constexpr (!Plan::IS_DOT) {
+                srcs[DO_SLOT] = dO + static_cast<size_t>(e) * D_CONST;
+            }
+            if constexpr (Plan::READS_OTHER) {
+                const eidx_t other_row = Plan::OTHER_IS_EDGE ? e : other_node_of(k);
+                srcs[OTHER_SLOT]       = (Plan::SELF_IS_LHS ? R : L) + static_cast<size_t>(other_row) * D_CONST;
+            }
+        };
+        pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane_id, num_edges, my_ring, addr, consume);
+    } else {
+        for (uint32_t k = 0; k < num_edges; ++k) {
+            const eidx_t e = canonical_of(k);
+            cuda_t const *rows[NUM_ROWS];
+            if constexpr (!Plan::IS_DOT) {
+                rows[DO_SLOT] = dO + static_cast<size_t>(e) * D_CONST;
+            }
+            if constexpr (Plan::READS_OTHER) {
+                const eidx_t other_row = Plan::OTHER_IS_EDGE ? e : other_node_of(k);
+                rows[OTHER_SLOT]       = (Plan::SELF_IS_LHS ? R : L) + static_cast<size_t>(other_row) * D_CONST;
+            }
+            consume(k, rows);
         }
     }
+    flush_acc(run_node);
 }
 
 }  // namespace gsddmm

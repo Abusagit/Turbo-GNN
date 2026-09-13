@@ -72,11 +72,17 @@ struct GsddmmLaunchArgsEdge {
     const torch::Tensor& L;
     const torch::Tensor& R;
     torch::Tensor& O;
-    ulonglong2 const *__restrict__ edge_nodes_idx;
+    // Untyped here, reinterpreted as index_pair_t<index_t> / index_t const* once
+    // edge_index_dtype has been dispatched to a compile-time index_t: the edge
+    // list carries the graph's own index width, not an unconditional 64-bit one.
+    void const *__restrict__ edge_nodes_idx;
     // Nullable [E] canonical edge id of every traversal slot; indexes the Edge
     // operand rows and the output row, so a source-grouped list can still emit
     // forward-CSR-numbered output. nullptr: traversal order is canonical.
-    unsigned long long const *__restrict__ canonical_edge_idx;
+    void const *__restrict__ canonical_edge_idx;
+    // Scalar type of edge_nodes_idx and canonical_edge_idx (they must agree);
+    // the binding pins it to the CSR's index dtype.
+    at::ScalarType edge_index_dtype;
     const at::cuda::CUDAStream& stream;
     uint64_t E;
     uint64_t D;
@@ -121,7 +127,8 @@ struct GsddmmBackwardLaunchArgs {
     const torch::Tensor& col_idx_T;
     const torch::Tensor& light_nodes_T;
     const torch::Tensor& heavy_nodes_T;
-    unsigned long long const *__restrict__ canonical_edge_idx;
+    // Reinterpreted as index_t const* (the CSR's index dtype) by the dispatch.
+    void const *__restrict__ canonical_edge_idx;
     const at::cuda::CUDAStream& stream;
     uint64_t N;
     uint64_t D;
@@ -151,13 +158,16 @@ struct GsddmmBackwardLaunchArgsEdge {
     torch::Tensor& dR;
     torch::Tensor& dL_f32;
     torch::Tensor& dR_f32;
-    ulonglong2 const *__restrict__ edge_nodes_idx_dst;
-    ulonglong2 const *__restrict__ edge_nodes_idx_src;
-    unsigned long long const *__restrict__ canonical_edge_idx;
+    // Untyped until edge_index_dtype is dispatched; see GsddmmLaunchArgsEdge.
+    void const *__restrict__ edge_nodes_idx_dst;
+    void const *__restrict__ edge_nodes_idx_src;
+    void const *__restrict__ canonical_edge_idx;
+    at::ScalarType edge_index_dtype;
     const at::cuda::CUDAStream& stream;
     uint64_t E;
     uint64_t D;
     LRO key;
+    uint8_t pipeline_stages;  // cp.async prefetch depth of the per-edge rows, 0 = direct loads
     uint8_t edges_per_warp;
     uint8_t warps_per_block;
 };
