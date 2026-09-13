@@ -4,60 +4,120 @@
 
 // Per-thread pipelined scan over edges [start, end): each edge contributes the
 // TW-wide slice X[edge_idx[eid]*d + base_f : +TW]. Per-thread (not per-warp)
-// parallelism, so each thread prefetches its own <=16B slice.
+// parallelism, so each thread prefetches its own <=16B slice; the stage
+// convention is that of pipelined_row_loop (common/pipeline.cuh): NUM_STAGES
+// slices in flight while one is visited, so the ring has NUM_STAGES + 1 slots
+// and the prefetch of edge it + NUM_STAGES is issued BEFORE visit(it).
+//
+// Ring layout is SLOT-MAJOR across the block: slot s of this thread is at
+// dbuf + s * slot_stride, where dbuf is the thread's 16B slice inside slot 0
+// and slot_stride (elements) is the block's thread count times TW. Keeping
+// neighbouring threads' slices adjacent (16B apart) is what makes the shared
+// reads and the cp.async writes bank-conflict-free; a thread-major ring
+// (this thread's slots contiguous) doubles the inter-thread stride to 32B and
+// was measured at 2x the shared wavefronts, 3-150x the bank conflicts and up
+// to +42% kernel time. Slots are walked with pointer cursors (no per-edge
+// multiply, no pointer array to be demoted to local memory).
+//
+// The source id of each in-flight edge is kept in a NUM_SLOTS-entry register
+// ring indexed only through unrolled compare-selects, so it stays in
+// registers: re-reading it from edge_idx at visit time is an L1 hit, but sits
+// on the critical path of a per-edge body that is only a handful of compares.
 //
 // NOTE: benchmarks show PIPELINE_STAGES>0 regresses min/max_aggr -- visit() is
 // a few compares, too little compute to hide the cp.async latency, while the
 // pipeline serializes edges the compiler could otherwise overlap. Keep at 0.
 //
 // visit(src, val): val is the prefetched slice, valid only inside the call.
-// dbuf: this thread's scratch, NUM_STAGES * TW elements.
+// dbuf:        this thread's TW-element slice of slot 0.
+// slot_stride: elements between consecutive slots (block threads * TW); the
+//              block's ring is pipelined_ring_slots(NUM_STAGES) * slot_stride.
 template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, IntegralNum index_t, typename VisitFn>
 __device__ __forceinline__ void pipelined_thread_edge_scan(
     index_t start, index_t end, index_t const *__restrict__ edge_idx, cuda_t const *__restrict__ X, size_t d, size_t base_f, cuda_t *dbuf,
-    VisitFn&& visit
+    size_t slot_stride, VisitFn&& visit
 ) {
+    static_assert(NUM_STAGES >= 1, "The pipeline needs at least one stage in flight; PIPELINE_STAGES == 0 takes the direct-load loop");
     if (end <= start) {
         return;
     }
     const index_t num_edges = end - start;
 
-    cuda_t *slots[NUM_STAGES];
+    // Slot index (feeds the register ring's selects; at most 9 slots, so
+    // 32-bit) and slot pointer cursor (feeds the copies and visits), advanced
+    // together.
+    constexpr uint32_t NUM_SLOTS = static_cast<uint32_t>(pipelined_ring_slots(NUM_STAGES));
+    auto advance                 = [](uint32_t slot) { return (slot + 1 == NUM_SLOTS) ? uint32_t{0} : slot + 1; };
+    cuda_t *const ring_end       = dbuf + NUM_SLOTS * slot_stride;
+    auto advance_ptr             = [dbuf, ring_end, slot_stride](cuda_t *slot) {
+        cuda_t *const next = slot + slot_stride;
+        return next == ring_end ? dbuf : next;
+    };
+
+    // Source id of the edge whose slice occupies each slot; see the note above
+    // on why it is accessed only through unrolled selects.
+    index_t src_ring[NUM_SLOTS];
+    auto ring_set = [&src_ring](uint32_t slot, index_t v) {
 #pragma unroll
-    for (size_t s = 0; s < NUM_STAGES; ++s) {
-        slots[s] = dbuf + s * TW;
-    }
-    index_t src_buf[NUM_STAGES];
+        for (uint32_t s = 0; s < NUM_SLOTS; ++s) {
+            if (s == slot) {
+                src_ring[s] = v;
+            }
+        }
+    };
+    auto ring_get = [&src_ring](uint32_t slot) {
+        index_t v = src_ring[0];
+#pragma unroll
+        for (uint32_t s = 1; s < NUM_SLOTS; ++s) {
+            if (s == slot) {
+                v = src_ring[s];
+            }
+        }
+        return v;
+    };
 
     cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-    auto prefetch = [&pipe, num_edges, start, edge_idx, &src_buf, X, d, base_f, &slots](index_t it) {
+    auto prefetch = [&pipe, num_edges, start, edge_idx, X, d, base_f, &ring_set](index_t it, uint32_t slot, cuda_t *slot_ptr) {
         pipe.producer_acquire();
         if (it < num_edges) {
-            const index_t eid        = start + it;
-            const index_t src        = edge_idx[eid];
-            src_buf[it % NUM_STAGES] = src;
-            const cuda_t *src_ptr    = X + static_cast<size_t>(src) * d + base_f;
-            async_copy_slice_thread<TW, cuda_t>(slots[it % NUM_STAGES], src_ptr, pipe);
+            const index_t src = edge_idx[start + it];
+            ring_set(slot, src);
+            const cuda_t *src_ptr = X + static_cast<size_t>(src) * d + base_f;
+            async_copy_slice_thread<TW, cuda_t>(slot_ptr, src_ptr, pipe);
         }
         pipe.producer_commit();
     };
 
+    {
+        cuda_t *slot_ptr = dbuf;
 #pragma unroll
-    for (size_t s = 0; s < NUM_STAGES; ++s) {
-        prefetch(s);
+        for (uint32_t s = 0; s < NUM_STAGES; ++s) {
+            prefetch(static_cast<index_t>(s), s, slot_ptr);
+            slot_ptr = advance_ptr(slot_ptr);
+        }
     }
 
+    uint32_t visit_slot    = 0;
+    uint32_t prefetch_slot = NUM_STAGES;  // the one free slot
+    cuda_t *visit_ptr      = dbuf;
+    cuda_t *prefetch_ptr   = dbuf + NUM_STAGES * slot_stride;
     for (index_t it = 0; it < num_edges; ++it) {
         cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
-        visit(src_buf[it % NUM_STAGES], slots[it % NUM_STAGES]);
+        // Next slice in flight before this one is visited (never into the slot
+        // about to be read; the slot was freed by the previous visit).
+        prefetch(it + static_cast<index_t>(NUM_STAGES), prefetch_slot, prefetch_ptr);
+        visit(ring_get(visit_slot), visit_ptr);
         pipe.consumer_release();
-        prefetch(it + NUM_STAGES);
+        visit_slot    = advance(visit_slot);
+        prefetch_slot = advance(prefetch_slot);
+        visit_ptr     = advance_ptr(visit_ptr);
+        prefetch_ptr  = advance_ptr(prefetch_ptr);
     }
 }
 
 // PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
     index_t const *const __restrict__ light_nodes_indices,
     index_t const *const __restrict__ edge_ptr,
@@ -103,7 +163,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     // so the pipeline slots must be private per thread -- index by the linear
     // in-block thread id. The launcher allocates THREADS_PER_BLOCK slots' worth
     // of shared memory, which covers blockDim.x * blockDim.y <= THREADS_PER_BLOCK.
-    cuda_t *my_dbuf = val_dbuf + (threadIdx.y * tile_dim + tid) * NUM_STAGES * TW;
+    // Slot-major ring (see pipelined_thread_edge_scan): this thread's slice of
+    // slot 0, slots blockDim.x * blockDim.y slices apart.
+    cuda_t *my_dbuf              = val_dbuf + (threadIdx.y * tile_dim + tid) * TW;
+    const size_t ring_slot_stride = static_cast<size_t>(blockDim.x) * blockDim.y * TW;
 
     for (size_t fv = tid; fv < d_vec; fv += tile_dim) {
         const size_t base_f = fv * TW;
@@ -128,7 +191,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
         };
 
         if constexpr (USE_PIPELINE) {
-            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(row_start, row_end, edge_idx, X, d, base_f, my_dbuf, visit);
+            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(
+                row_start, row_end, edge_idx, X, d, base_f, my_dbuf, ring_slot_stride, visit
+            );
         } else {
             for (index_t eid = row_start; eid < row_end; ++eid) {
                 const index_t src              = edge_idx[eid];
@@ -208,7 +273,7 @@ __device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int&
 // PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
 template <
     size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, IntegralNum index_t, FloatingNum accum_t = float,
-    int PIPELINE_STAGES = 0
+    uint8_t PIPELINE_STAGES = 0
 >
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
     index_t const *const __restrict__ heavy_nodes_indices,
@@ -253,7 +318,10 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
 
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
-    cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
+    // Slot-major ring (see pipelined_thread_edge_scan): this thread's slice of
+    // slot 0, slots BLOCK_DIM slices apart.
+    cuda_t *my_dbuf                    = val_dbuf + tid * TW;
+    constexpr size_t RING_SLOT_STRIDE = BLOCK_DIM * TW;
 
     for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
         const size_t base_f = fv * TW;
@@ -278,7 +346,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
         };
 
         if constexpr (USE_PIPELINE) {
-            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(chunk_start, chunk_end, edge_idx, X, d, base_f, my_dbuf, visit);
+            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(
+                chunk_start, chunk_end, edge_idx, X, d, base_f, my_dbuf, RING_SLOT_STRIDE, visit
+            );
         } else {
             for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
                 index_t src                    = edge_idx[eid];
@@ -603,7 +673,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 const dim3 threads_l(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y));
                 const unsigned blocks_l = static_cast<unsigned>(ceil_div<size_t>(num_light, node_y));
                 // val_dbuf (STAGES == 0 makes this term vanish)
-                size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
+                size_t shmem = THREADS_PER_BLOCK * pipelined_ring_elems(STAGES, 1, TW) * sizeof(cuda_t);
 
                 ensure_dynamic_shmem(
                     reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>, shmem, "reduction_aggr light"
@@ -679,7 +749,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                 dim3 grid(num_heavy, ceil_div(max_degree, EDGES_PER_BLOCK));
 
                                 // val_dbuf (STAGES == 0 makes this term vanish)
-                                size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
+                                size_t shmem = THREADS_PER_BLOCK * pipelined_ring_elems(STAGES, 1, TW) * sizeof(cuda_t);
 
                                 ensure_dynamic_shmem(
                                     reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>,

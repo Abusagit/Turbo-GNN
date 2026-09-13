@@ -7,7 +7,7 @@
 // =============================================================================
 // Unified GATv2 Backward AL kernel (computes grad_a, grad_l, G)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     // Shared memory layout:
     //   li_sh:      D_CONST * sizeof(cuda_t)                       -- read-only
     //   ghi_sh:     D_CONST * sizeof(cuda_t)                       -- read-only
-    //   r_dbuf:     WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) -- per-warp ping-pong for r[j], only when USE_PIPELINE
+    //   r_dbuf:     WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, 1, D_CONST) * sizeof(cuda_t) -- per-warp cp.async ring for r[j], only when USE_PIPELINE
     //   warp_grada: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
     //   warp_gradl: WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)    -- per-warp
     //   warp_G:     WARPS_PER_BLOCK * sizeof(accum_t)              -- per-warp G partial
@@ -60,7 +60,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     cuda_t *ghi_sh = li_sh + D_CONST;
     cuda_t *r_dbuf = ghi_sh + D_CONST;  // only meaningful when USE_PIPELINE
 
-    constexpr size_t r_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    constexpr size_t r_dbuf_bytes = WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, 1, D_CONST) * sizeof(cuda_t);
     accum_t *warp_grada           = reinterpret_cast<accum_t *>(ghi_sh + D_CONST + r_dbuf_bytes / sizeof(cuda_t));
     accum_t *warp_gradl           = warp_grada + WARPS_PER_BLOCK * D_CONST;
     accum_t *warp_G               = warp_gradl + WARPS_PER_BLOCK * D_CONST;
@@ -149,7 +149,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
         cuda_t const *const r_bases[1] = {d_r};
         int64_t const r_stride_n[1]    = {stride_r_n};
         int64_t const r_stride_h[1]    = {stride_r_h};
-        cuda_t *warp_r_dbuf            = r_dbuf + warp_id * NUM_STAGES * D_CONST;
+        cuda_t *warp_r_dbuf            = r_dbuf + warp_id * pipelined_ring_elems(NUM_STAGES, 1, D_CONST);
         pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, 1, cuda_t, index_t>(
             warp_id, lane, num_neighbors, edge_start, d_col_idx, r_bases, r_stride_n, r_stride_h, head_h, warp_r_dbuf, pass1_consume
         );
@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
         cuda_t const *const r_bases[1] = {d_r};
         int64_t const r_stride_n[1]    = {stride_r_n};
         int64_t const r_stride_h[1]    = {stride_r_h};
-        cuda_t *warp_r_dbuf            = r_dbuf + warp_id * NUM_STAGES * D_CONST;
+        cuda_t *warp_r_dbuf            = r_dbuf + warp_id * pipelined_ring_elems(NUM_STAGES, 1, D_CONST);
         pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, 1, cuda_t, index_t>(
             warp_id, lane, num_neighbors, edge_start, d_col_idx, r_bases, r_stride_n, r_stride_h, head_h, warp_r_dbuf, pass2_consume
         );
@@ -274,7 +274,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 // =============================================================================
 // Unified GATv2 Backward R kernel (computes grad_r)
 // =============================================================================
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -316,13 +316,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
 
     // Shared memory layout:
     //   rj_sh:       D_CONST * sizeof(cuda_t)                      -- read-only
-    //   li_ghi_dbuf: WARPS_PER_BLOCK * 2 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- per-warp ping-pong for li[i]/ghi[i], only when USE_PIPELINE
+    //   li_ghi_dbuf: WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, 2, D_CONST) * sizeof(cuda_t) -- per-warp cp.async ring for li[i]/ghi[i], only when USE_PIPELINE
     //   warp_gradr:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)   -- per-warp
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *rj_sh       = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *li_ghi_dbuf = rj_sh + D_CONST;  // only meaningful when USE_PIPELINE
 
-    constexpr size_t li_ghi_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    constexpr size_t li_ghi_dbuf_bytes = WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, NUM_PREFETCH_ROWS, D_CONST) * sizeof(cuda_t);
     accum_t *warp_gradr                = reinterpret_cast<accum_t *>(rj_sh + D_CONST + li_ghi_dbuf_bytes / sizeof(cuda_t));
 
     accum_t *my_gradr = warp_gradr + warp_id * D_CONST;
@@ -406,7 +406,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
         cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {d_l, grad_h};
         int64_t const row_stride_n[NUM_PREFETCH_ROWS]    = {stride_l_n, stride_gh_n};
         int64_t const row_stride_h[NUM_PREFETCH_ROWS]    = {stride_l_h, stride_gh_h};
-        cuda_t *warp_dbuf                                = li_ghi_dbuf + warp_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
+        cuda_t *warp_dbuf                                = li_ghi_dbuf + warp_id * pipelined_ring_elems(NUM_STAGES, NUM_PREFETCH_ROWS, D_CONST);
         pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
             warp_id, lane, num_incoming, edge_start, d_col_idx_T, row_bases, row_stride_n, row_stride_h, head_h, warp_dbuf, r_consume
         );
@@ -512,7 +512,7 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
 // =============================================================================
 // Undirected GATv2 backward: G computation kernel (extracts pass 1 of AL)
 // =============================================================================
-template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -632,7 +632,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 // direction) in a single pass over forward CSR neighbors.
 // Requires G[j] to be pre-computed globally.
 // =============================================================================
-template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
@@ -676,7 +676,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     //   li_sh:      D_CONST * sizeof(cuda_t)   -- l[i]
     //   ri_sh:      D_CONST * sizeof(cuda_t)   -- r[i]
     //   ghi_sh:     D_CONST * sizeof(cuda_t)   -- grad_h[i]
-    //   rlghj_dbuf: 3 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- ping-pong for r[j]/l[j]/grad_h[j], only when USE_PIPELINE
+    //   rlghj_dbuf: pipelined_ring_elems(NUM_STAGES, 3, D_CONST) * sizeof(cuda_t) -- cp.async ring for r[j]/l[j]/grad_h[j], only when USE_PIPELINE
     //   grada_sh:   D_CONST * sizeof(accum_t)  -- accumulator for grad_a[i]
     //   gradli_sh:  D_CONST * sizeof(accum_t)  -- accumulator for grad_l[i]
     //   gradri_sh:  D_CONST * sizeof(accum_t)  -- accumulator for grad_r[i]
@@ -686,7 +686,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     cuda_t *ghi_sh     = ri_sh + D_CONST;
     cuda_t *rlghj_dbuf = ghi_sh + D_CONST;  // only meaningful when USE_PIPELINE
 
-    constexpr size_t rlghj_dbuf_bytes = USE_PIPELINE ? NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    constexpr size_t rlghj_dbuf_bytes = pipelined_ring_elems(NUM_STAGES, NUM_PREFETCH_ROWS, D_CONST) * sizeof(cuda_t);
     accum_t *grada_sh                 = reinterpret_cast<accum_t *>(ghi_sh + D_CONST + rlghj_dbuf_bytes / sizeof(cuda_t));
     accum_t *gradli_sh                = grada_sh + D_CONST;
     accum_t *gradri_sh                = gradli_sh + D_CONST;

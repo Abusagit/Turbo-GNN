@@ -3,6 +3,7 @@
 #include <type_traits>
 
 #include "common/misc.cuh"
+#include "common/pipeline.cuh"
 #include "common/tile.cuh"
 #include "common/traits.cuh"
 #include "gsddmm/gsddmm.cuh"
@@ -55,147 +56,13 @@ struct GsddmmRowShape {
     using vec_t = typename Tile::vec_t;
 };
 
-// Lane-parallel cp.async of NUM_ROWS operand rows into one ring-buffer slot.
-// The NUM_ROWS * (row bytes / 16) 16-byte chunks are spread over the warp as
-// ONE flat chunk index, so e.g. an L+R pair of 256-byte rows costs a single
-// cp.async per lane instead of two half-warp-predicated ones. Operand r of the
-// slot lives at slot_rows + r * ROW_STRIDE (see gsddmm_pipelined_row_loop).
-// The per-lane source is picked with an unrolled select chain: indexing srcs[]
-// by a lane-dependent value would demote the array to local memory.
-template <size_t D_CONST, size_t NUM_ROWS, size_t ROW_STRIDE, FloatingNum cuda_t>
-__device__ __forceinline__ void gsddmm_async_copy_rows_warp(
-    cuda_t *slot_rows, cuda_t const *const (&srcs)[NUM_ROWS], cuda::pipeline<cuda::thread_scope_thread>& pipe, size_t lane
-) {
-    constexpr size_t ROW_BYTES = D_CONST * sizeof(cuda_t);
-    static_assert(ROW_BYTES % 16 == 0, "Row width must be a multiple of 16 bytes for aligned async copies");
-    constexpr size_t CHUNK_ELEMS    = 16 / sizeof(cuda_t);
-    constexpr size_t CHUNKS_PER_ROW = ROW_BYTES / 16;
-    static_assert(std::popcount(CHUNKS_PER_ROW) == 1, "Chunks per row must be a power of two so the row of a chunk is a shift");
-    constexpr size_t TOTAL_CHUNKS = NUM_ROWS * CHUNKS_PER_ROW;
-    using chunk_t                 = Vec<CHUNK_ELEMS, cuda_t>;
-
-#pragma unroll
-    for (size_t base = 0; base < TOTAL_CHUNKS; base += kWarpSize) {
-        const size_t c = base + lane;
-        if (c < TOTAL_CHUNKS) {
-            const size_t r    = c / CHUNKS_PER_ROW;
-            const size_t i    = c % CHUNKS_PER_ROW;
-            cuda_t const *src = srcs[0];
-            cuda_t *dst       = slot_rows;
-#pragma unroll
-            for (size_t rr = 1; rr < NUM_ROWS; ++rr) {
-                if (r == rr) {
-                    src = srcs[rr];
-                    dst = slot_rows + rr * ROW_STRIDE;
-                }
-            }
-            cuda::memcpy_async(
-                reinterpret_cast<chunk_t *>(dst) + i, reinterpret_cast<chunk_t const *>(src) + i, cuda::aligned_size_t<16>(sizeof(chunk_t)),
-                pipe
-            );
-        }
-    }
-}
-
-// =============================================================================
-// cp.async pipeline over a warp's sequence of loop_iters row gathers:
-// NUM_STAGES-deep prefetch of NUM_ROWS rows per iteration into a per-warp
-// shared ring buffer. Modeled on pipelined_neighbor_row_loop (pipeline.cuh);
-// the addressing is delegated to addr() because GSDDMM rows are indexed by
-// neighbor id, by edge position or through an explicit edge list, none of
-// which col_idx alone expresses -- which is why this variant exists.
-//
-// Unlike pipelined_neighbor_row_loop, the prefetch of stage iter+NUM_STAGES is
-// issued BEFORE consume(iter), so the global->shared copy overlaps with the
-// compute. The ring buffer therefore has NUM_STAGES + 1 slots: one slot is
-// being consumed while up to NUM_STAGES more are in flight.
-//
-// Ring layout: operand r of slot s is at dbuf + s * D_CONST + r * ROW_STRIDE,
-// ROW_STRIDE = NUM_SLOTS * D_CONST. Slot addresses are COMPUTED from the
-// running slot counters, never read from a pointer array: a register array
-// indexed by a runtime slot is demoted to local memory (measured: 19M local
-// loads and a 4x instruction count for NUM_SLOTS = 3), and for the same reason
-// consume() receives the iteration index and recomputes its edge id itself.
-//
-// addr(it, srcs): fills srcs[r] with the global address of operand r's row for
-// iteration it (must be warp-uniform).
-// consume(it, rows): rows[r] is operand r's prefetched row in shared memory;
-// valid only inside the call (the slot is recycled on return).
-//
-// dbuf: this warp's private shared scratch, NUM_ROWS * (NUM_STAGES + 1) * D_CONST elements.
-// =============================================================================
-template <size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, typename AddrFn, typename ConsumeFn>
-__device__ __forceinline__ void gsddmm_pipelined_row_loop(
-    size_t lane, size_t loop_iters, cuda_t *__restrict__ dbuf, AddrFn&& addr, ConsumeFn&& consume
-) {
-    static_assert(NUM_STAGES >= 1, "The pipeline needs at least one stage in flight; PIPELINE_STAGES == 0 takes the direct-load loop");
-    if (loop_iters == 0) [[unlikely]] {
-        return;
-    }
-
-    // NUM_STAGES prefetch slots + the slot currently being consumed.
-    constexpr size_t NUM_SLOTS  = NUM_STAGES + 1;
-    constexpr size_t ROW_STRIDE = NUM_SLOTS * D_CONST;
-
-    auto advance = [](size_t slot) { return (slot + 1 == NUM_SLOTS) ? size_t{0} : slot + 1; };
-
-    cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
-
-    auto prefetch = [&pipe, dbuf, loop_iters, lane, addr_ = std::move(addr)](size_t it, size_t slot) {
-        pipe.producer_acquire();
-        if (it < loop_iters) {
-            cuda_t const *srcs[NUM_ROWS];
-            addr_(it, srcs);
-            // All NUM_ROWS rows of the stage go into one commit group, so the
-            // operands (L and R) are in flight concurrently.
-            gsddmm_async_copy_rows_warp<D_CONST, NUM_ROWS, ROW_STRIDE, cuda_t>(dbuf + slot * D_CONST, srcs, pipe, lane);
-        }
-        pipe.producer_commit();
-    };
-
-    // Fill the pipeline: NUM_STAGES stages in flight, one slot still free.
-#pragma unroll
-    for (size_t s = 0; s < NUM_STAGES; ++s) {
-        prefetch(s, s);
-    }
-
-    size_t consume_slot  = 0;
-    size_t prefetch_slot = NUM_STAGES;  // the one free slot
-    for (size_t iter = 0; iter < loop_iters; ++iter) {
-        cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
-
-        // Issue the next stage's copies before consuming the current one: the
-        // global->shared transfer overlaps with the compute below. The target
-        // slot is the one the previous iteration's consume freed -- never the
-        // slot about to be read.
-        prefetch(iter + NUM_STAGES, prefetch_slot);
-
-        // The thread-scope wait covers only this lane's own cp.async groups; a
-        // lane may read chunks copied by other lanes (tile < 16B, or a row <
-        // 512B leaves lanes idle), so completion must be observed warp-wide.
-        __syncwarp();
-
-        cuda_t const *cur_rows[NUM_ROWS];
-#pragma unroll
-        for (size_t r = 0; r < NUM_ROWS; ++r) {
-            cur_rows[r] = dbuf + consume_slot * D_CONST + r * ROW_STRIDE;
-        }
-
-        consume(iter, cur_rows);
-
-        // All lanes must finish reading the slot before prefetch() reuses it.
-        __syncwarp();
-        pipe.consumer_release();
-
-        consume_slot  = advance(consume_slot);
-        prefetch_slot = advance(prefetch_slot);
-    }
-}
-
-// CSR-row flavour of the loop above for GSDDMM_forward_normal: warp-strided
-// walk over the edge list of one CSR row, Src_V rows indexed by the neighbor
-// id j = col_idx[e], Edge rows indexed by the edge position e. consume(e, rows)
-// receives the edge position.
+// CSR-row adapter over pipelined_row_loop (common/pipeline.cuh) for
+// GSDDMM_forward_normal: warp-strided walk over the edge list of one CSR row,
+// Src_V rows indexed by the neighbor id j = col_idx[e], Edge rows indexed by
+// the edge position e. That per-operand choice is what the generic loop's
+// addr() callback exists for -- the common CSR adapter
+// (pipelined_neighbor_row_loop) can only index rows by neighbor id.
+// consume(e, rows) receives the edge position.
 template <size_t N_PER_BLOCK, size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, IntegralNum index_t, typename ConsumeFn>
 __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
     size_t warp_id,
@@ -208,11 +75,16 @@ __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
     cuda_t *__restrict__ dbuf,
     ConsumeFn&& consume
 ) {
-    const size_t loop_iters = (num_edges > warp_id) ? ceil_div(num_edges - warp_id, N_PER_BLOCK) : 0;
+    const uint32_t loop_iters = static_cast<uint32_t>((num_edges > warp_id) ? ceil_div(num_edges - warp_id, N_PER_BLOCK) : size_t{0});
 
-    auto edge_of = [edge_start, warp_id](size_t it) { return edge_start + static_cast<index_t>(warp_id + it * N_PER_BLOCK); };
+    auto edge_of = [edge_start, warp_id](uint32_t it) {
+        // 32-bit slot arithmetic (see pipelined_row_loop); only the final add is
+        // done in index_t.
+        const uint32_t k = static_cast<uint32_t>(warp_id) + it * static_cast<uint32_t>(N_PER_BLOCK);
+        return edge_start + static_cast<index_t>(k);
+    };
 
-    auto addr = [edge_of, row_bases, col_idx, row_edge_indexed](size_t it, cuda_t const *(&srcs)[NUM_ROWS]) {
+    auto addr = [edge_of, row_bases, col_idx, row_edge_indexed](uint32_t it, cuda_t const *(&srcs)[NUM_ROWS]) {
         const index_t e = edge_of(it);
         const index_t j = col_idx[e];
 #pragma unroll
@@ -221,17 +93,17 @@ __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
             srcs[r]             = row_bases[r] + row_id * D_CONST;
         }
     };
-    auto consume_it = [edge_of, consume_ = std::move(consume)](size_t it, cuda_t const *const(&rows)[NUM_ROWS]) {
-        consume_(static_cast<size_t>(edge_of(it)), rows);
+    auto consume_it = [edge_of, &consume](uint32_t it, cuda_t const *const (&rows)[NUM_ROWS]) {
+        consume(static_cast<size_t>(edge_of(it)), rows);
     };
 
-    gsddmm_pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane, loop_iters, dbuf, addr, consume_it);
+    pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane, loop_iters, dbuf, addr, consume_it);
 }
 
 // =============================================================================
 // GSDDMM forward kernel. See gsddmm.cuh for semantics and conventions.
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, int PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
 __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
@@ -290,8 +162,8 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
     // Shared memory layout (everything written through 16-byte vectors comes first):
     //   dst_sh[NUM_DST_ROWS * D_CONST] as cuda_t
     //       -- Dst_V operand rows, identical for every edge of this CSR row
-    //   edge_dbuf[N_PER_BLOCK * NUM_EDGE_ROWS * (NUM_STAGES + 1) * D_CONST] as cuda_t
-    //       -- per-warp ping-pong for gathered Src_V/Edge rows, only when USE_PIPELINE
+    //   edge_dbuf[N_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, NUM_EDGE_ROWS, D_CONST)] as cuda_t
+    //       -- per-warp cp.async ring for gathered Src_V/Edge rows, only when USE_PIPELINE
     extern __shared__ __align__(16) uint8_t sh_raw[];
     cuda_t *const dst_sh    = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *const edge_dbuf = dst_sh + Plan::NUM_DST_ROWS * D_CONST;
@@ -323,7 +195,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
     cuda_t const *const sh_l = dst_sh;
     cuda_t const *const sh_r = dst_sh + (Plan::L_DST ? D_CONST : 0);
 
-    cuda_t *const my_dbuf = edge_dbuf + warp_id * Plan::NUM_EDGE_ROWS * (NUM_STAGES + 1) * D_CONST;
+    cuda_t *const my_dbuf = edge_dbuf + warp_id * pipelined_ring_elems(NUM_STAGES, Plan::NUM_EDGE_ROWS, D_CONST);
 
     // consume(e, rows): apply the op for edge e. rows[] holds the per-edge
     // operand rows (shared-memory slots when pipelined, global rows otherwise);
@@ -369,7 +241,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
             row_bases[Plan::L_SLOT]        = L;
             row_edge_indexed[Plan::L_SLOT] = Plan::L_EDGE_INDEXED;
         }
-        if constexpr (!Plan::R_DST) {
+        if constexpr (Plan::R_EDGE_ROW) {
             row_bases[Plan::R_SLOT]        = R;
             row_edge_indexed[Plan::R_SLOT] = Plan::R_EDGE_INDEXED;
         }
@@ -391,7 +263,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
             if constexpr (!Plan::L_DST) {
                 rows[Plan::L_SLOT] = L + (Plan::L_EDGE_INDEXED ? static_cast<size_t>(e) : static_cast<size_t>(j)) * D_CONST;
             }
-            if constexpr (!Plan::R_DST) {
+            if constexpr (Plan::R_EDGE_ROW) {
                 rows[Plan::R_SLOT] = R + (Plan::R_EDGE_INDEXED ? static_cast<size_t>(e) : static_cast<size_t>(j)) * D_CONST;
             }
             consume(static_cast<size_t>(e), rows);
@@ -448,7 +320,7 @@ __device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(
 // shuffle. nullptr means the traversal order already IS the canonical order, and
 // the id degenerates to the slot index (no load, no shuffle).
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t, size_t PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block( // no-format
     uint64_t E, // total edge count
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
@@ -563,11 +435,11 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     };
 
     if constexpr (USE_PIPELINE) {
-        // Per-warp ring buffer of NUM_ROWS * (NUM_STAGES + 1) rows (see
+        // Per-warp cp.async ring of NUM_ROWS rows per slot (see
         // gsddmm_forward_edge_shmem_bytes_per_warp); warps are laid out back to back.
         extern __shared__ __align__(16) uint8_t sh_raw[];
-        cuda_t *const my_dbuf = reinterpret_cast<cuda_t *>(sh_raw) + warp_id * NUM_ROWS * (NUM_STAGES + 1) * D_CONST;
-        gsddmm_pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane_id, num_edges, my_dbuf, edge_rows, consume);
+        cuda_t *const my_dbuf = reinterpret_cast<cuda_t *>(sh_raw) + warp_id * pipelined_ring_elems(NUM_STAGES, NUM_ROWS, D_CONST);
+        pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane_id, static_cast<uint32_t>(num_edges), my_dbuf, edge_rows, consume);
     } else {
         // Direct path. The edge list is grouped by dst when an operand reads Dst_V
         // and by src otherwise (see _graph_edge_list), so a warp's chunk usually

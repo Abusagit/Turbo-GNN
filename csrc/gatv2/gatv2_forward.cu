@@ -10,8 +10,13 @@
 // =============================================================================
 
 // PIPELINE_STAGES == 0 disables the async-copy pipeline (plain warp-strided loop);
-// PIPELINE_STAGES >= 1 enables it with that many ping-pong stages for r[j].
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+// PIPELINE_STAGES >= 1 enables it with that many cp.async stages in flight for r[j].
+// The forward stages r[j] into registers before scoring it, so it releases its
+// pipeline slot early and needs only PIPELINE_STAGES ring slots per warp (see
+// pipelined_row_loop). Read by the launcher's shared-memory formula as well.
+inline constexpr bool kGatv2ForwardEarlyRelease = true;
+
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
     size_t N,
     size_t H,
@@ -79,7 +84,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
 
     // Shared memory layout:
     //   l_sh:      D_CONST * sizeof(cuda_t)                              -- read-only
-    //   r_dbuf:    WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) -- per-warp ping-pong for async r[j], only when USE_PIPELINE
+    //   r_dbuf:    WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, 1, D_CONST, early) * sizeof(cuda_t) -- per-warp cp.async ring for r[j], only when USE_PIPELINE
     //   warp_out:  WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)           -- per-warp output accum
     //   warp_max:  WARPS_PER_BLOCK * sizeof(accum_t)                     -- per-warp softmax max
     //   warp_sum:  WARPS_PER_BLOCK * sizeof(accum_t)                     -- per-warp softmax sum_exp
@@ -87,7 +92,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     cuda_t *l_sh   = reinterpret_cast<cuda_t *>(sh_raw);
     cuda_t *r_dbuf = l_sh + D_CONST;  // only meaningful when USE_PIPELINE
 
-    constexpr size_t r_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    constexpr size_t r_dbuf_bytes = WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, 1, D_CONST, kGatv2ForwardEarlyRelease) * sizeof(cuda_t);
     accum_t *warp_out             = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t) + r_dbuf_bytes);
     accum_t *warp_max             = warp_out + WARPS_PER_BLOCK * D_CONST;
     accum_t *warp_sum             = warp_max + WARPS_PER_BLOCK;
@@ -115,116 +120,77 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
 
     OnlineSoftmaxState softmax_state;
 
-    if constexpr (USE_PIPELINE) {
-        const int loop_iters = (num_neighbors > warp_id) ? ceil_div(num_neighbors - warp_id, WARPS_PER_BLOCK) : 0;
-
-        if (loop_iters > 0) {
-            cuda_t *rows[NUM_STAGES];
+    // stage_r(r_row, r_regs): this lane's tiles of one r[j] row into registers.
+    auto stage_r = [lane](cuda_t const *r_row, vec_t (&r_regs)[TILES_PER_THREAD]) {
 #pragma unroll
-            for (int s = 0; s < NUM_STAGES; ++s) {
-                rows[s] = r_dbuf + (warp_id * NUM_STAGES + s) * D_CONST;
-            }
-
-            cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
-
-            auto prefetch = [&pipe, loop_iters, warp_id, d_col_idx, edge_start, d_r, stride_r_n, head_h, stride_r_h, rows, lane](int it) {
-                pipe.producer_acquire();
-                if (it < loop_iters) {
-                    const int k         = warp_id + it * WARPS_PER_BLOCK;
-                    const index_t j     = d_col_idx[edge_start + static_cast<index_t>(k)];
-                    const cuda_t *r_src = d_r + j * stride_r_n + head_h * stride_r_h;
-                    async_copy_row_warp<D_CONST, cuda_t>(rows[it % NUM_STAGES], r_src, pipe, lane);
-                }
-                pipe.producer_commit();
-            };
-
-#pragma unroll
-            for (int s = 0; s < NUM_STAGES; ++s) {
-                prefetch(s);
-            }
-
-            vec_t r_regs[TILES_PER_THREAD];
-
-            for (int iter = 0; iter < loop_iters; ++iter) {
-                cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
-                __syncwarp();
-                cuda_t *r_cur = rows[iter % NUM_STAGES];
-
-#pragma unroll
-                for (int t = 0; t < TILES_PER_THREAD; ++t) {
-                    int v = lane + kWarpSize * t;
-                    if (v < TILES) {
-                        r_regs[t] = Tile::read(r_cur, v);
-                    }
-                }
-
-                __syncwarp();
-                pipe.consumer_release();
-                prefetch(iter + NUM_STAGES);
-
-                accum_t dot_lane{};
-#pragma unroll
-                for (int t = 0; t < TILES_PER_THREAD; ++t) {
-                    int v = lane + kWarpSize * t;
-                    if (v < TILES) {
-                        const vec_t lv = Tile::read(l_sh, v);
-                        const vec_t av = Tile::read(a_base, v);
-                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, r_regs[t], av, negative_slope);
-                    }
-                }
-                const accum_t dot = warp_reduce_sum(dot_lane);
-
-                const accum_t rescale = softmax_state.update(dot);
-#pragma unroll
-                for (int i = 0; i < ACCS_PER_THREAD; ++i) {
-                    h_acc[i] *= rescale;
-                }
-
-                const accum_t contrib = AccumOps::exp(dot - softmax_state.max_val);
-#pragma unroll
-                for (int t = 0; t < TILES_PER_THREAD; ++t) {
-                    int v = lane + kWarpSize * t;
-                    if (v < TILES) {
-                        r_regs[t].template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
-                    }
-                }
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                r_regs[t] = Tile::read(r_row, v);
             }
         }
+    };
+
+    // neighbor_body(r_regs): one neighbor -- score, online-softmax update, V
+    // accumulation -- from the staged r[j] tiles, so the pipelined path
+    // (shared-memory slot, released before this runs) and the direct path
+    // (global row) share the arithmetic.
+    auto neighbor_body = [&](vec_t const (&r_regs)[TILES_PER_THREAD]) {
+        accum_t dot_lane{};
+#pragma unroll
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                const vec_t lv = Tile::read(l_sh, v);
+                const vec_t av = Tile::read(a_base, v);
+                dot_lane += Tile::gatv2_dot_leaky_relu(lv, r_regs[t], av, negative_slope);
+            }
+        }
+        const accum_t dot = warp_reduce_sum(dot_lane);
+
+        const accum_t rescale = softmax_state.update(dot);
+#pragma unroll
+        for (int i = 0; i < ACCS_PER_THREAD; ++i) {
+            h_acc[i] *= rescale;
+        }
+
+        const accum_t contrib = AccumOps::exp(dot - softmax_state.max_val);
+#pragma unroll
+        for (int t = 0; t < TILES_PER_THREAD; ++t) {
+            int v = lane + kWarpSize * t;
+            if (v < TILES) {
+                r_regs[t].template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
+            }
+        }
+    };
+
+    if constexpr (USE_PIPELINE) {
+        // r[j] is prefetched with cp.async NUM_STAGES neighbors ahead into this
+        // warp's ring (common/pipeline.cuh). The row is staged into registers
+        // and its slot released -- which refills it with neighbor k + NUM_STAGES
+        // -- before neighbor k is scored, so the copy overlaps the compute with
+        // NUM_STAGES slots instead of NUM_STAGES + 1.
+        auto consume = [&](index_t /*neighbor_j*/, cuda_t const *const(&rows)[1], auto&& release) {
+            vec_t r_regs[TILES_PER_THREAD];
+            stage_r(rows[0], r_regs);
+            release();
+            neighbor_body(r_regs);
+        };
+        cuda_t const *const r_bases[1] = {d_r};
+        int64_t const r_stride_n[1]    = {stride_r_n};
+        int64_t const r_stride_h[1]    = {stride_r_h};
+        cuda_t *warp_r_dbuf            = r_dbuf + warp_id * pipelined_ring_elems(NUM_STAGES, 1, D_CONST, kGatv2ForwardEarlyRelease);
+        pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, 1, cuda_t, index_t, kGatv2ForwardEarlyRelease>(
+            warp_id, lane, num_neighbors, edge_start, d_col_idx, r_bases, r_stride_n, r_stride_h, head_h, warp_r_dbuf, consume
+        );
     } else {
-        // Warp-strided neighbor loop
+        // Warp-strided neighbor loop, r[j] read straight from global memory.
         for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
             index_t neighbor_j   = d_col_idx[edge_start + static_cast<index_t>(k)];
             const cuda_t *r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
-
             vec_t r_regs[TILES_PER_THREAD];
-
-            accum_t dot_lane{};
-#pragma unroll
-            for (int t = 0; t < TILES_PER_THREAD; ++t) {
-                int v = lane + kWarpSize * t;
-                if (v < TILES) {
-                    const vec_t lv = Tile::read(l_sh, v);
-                    r_regs[t]      = Tile::read(r_base, v);
-                    const vec_t av = Tile::read(a_base, v);
-                    dot_lane += Tile::gatv2_dot_leaky_relu(lv, r_regs[t], av, negative_slope);
-                }
-            }
-            const accum_t dot = warp_reduce_sum(dot_lane);
-
-            const accum_t rescale = softmax_state.update(dot);
-#pragma unroll
-            for (int i = 0; i < ACCS_PER_THREAD; ++i) {
-                h_acc[i] *= rescale;
-            }
-
-            const accum_t contrib = AccumOps::exp(dot - softmax_state.max_val);
-#pragma unroll
-            for (int t = 0; t < TILES_PER_THREAD; ++t) {
-                int v = lane + kWarpSize * t;
-                if (v < TILES) {
-                    r_regs[t].template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
-                }
-            }
+            stage_r(r_base, r_regs);
+            neighbor_body(r_regs);
         }
     }
 

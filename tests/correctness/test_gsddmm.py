@@ -168,17 +168,34 @@ def test_gsddmm_index_dtypes(index_dtype):
 # =============================================================================
 
 
+# Every member pair with a gathered per-edge row, so each GsddmmPlan row layout
+# (one or two Src_V/Edge rows, Dst_V staged or absent) runs through the cp.async
+# ring. copy/src is the regression case: its right operand is a 1-row stand-in
+# that must never be counted as a per-edge row, or the pipeline prefetches
+# out of bounds from it (the direct-load path never dereferenced it).
 @pytest.mark.parametrize("pipeline_stages", [0, 1, 2, 3])
-def test_gsddmm_pipeline_stages_match(pipeline_stages):
+@pytest.mark.parametrize(
+    "op,lhs_target,rhs_target",
+    [("mul", "src", "edge"), ("mul", "src", "dst"), ("dot", "edge", "dst"), ("copy", "src", "edge")],
+)
+def test_gsddmm_pipeline_stages_match(op, lhs_target, rhs_target, pipeline_stages):
     graph = _make_graph()
     num_nodes = graph.forward_indptr.numel() - 1
     num_edges = graph.forward_indices.numel()
-    lhs = torch.randn(num_nodes, 128, device=DEVICE)
-    rhs = torch.randn(num_edges, 128, device=DEVICE)
+    lhs, rhs = _make_operands(lhs_target, rhs_target, op, num_nodes, num_edges, dim=128, dtype=torch.float32)
 
-    out = gsddmm(graph, lhs, rhs, op="mul", lhs_target="src", rhs_target="edge", pipeline_stages=pipeline_stages)
-    ref = _reference(graph, lhs, rhs, "mul", "src", "edge")
-    assert torch.allclose(out, ref, **_tol(torch.float32))
+    out = gsddmm(
+        graph,
+        lhs,
+        rhs,
+        op=op,
+        lhs_target=lhs_target,
+        rhs_target=rhs_target,
+        variant="node",
+        pipeline_stages=pipeline_stages,
+    )
+    ref = _reference(graph, lhs, rhs, op, lhs_target, rhs_target)
+    assert torch.allclose(out.double(), ref.double(), **_tol(torch.float32, op))
 
 
 @pytest.mark.parametrize("light_warps", [4])

@@ -59,7 +59,7 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 // Q, K, V may be non-contiguous in N,H dims (e.g. from split/view).
 // logsumexp and Delta are [N, H].
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
-template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr_T,     // [N+1], CSR^T row pointers
@@ -123,7 +123,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     // Shared memory layout:
     // qj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
     // vj_shared: D_CONST * sizeof(cuda_t)                        -- read-only, 1 copy
-    // ki_dOi_dbuf: WARPS_PER_BLOCK * 2 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- ping-pong for K[i]/dO[i], only when USE_PIPELINE
+    // ki_dOi_dbuf: WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, 2, D_CONST) * sizeof(cuda_t) -- cp.async ring for K[i]/dO[i], only when USE_PIPELINE
     // warp_gq:   WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)       -- per-warp dQ accumulators
     // warp_gv:   WARPS_PER_BLOCK * D_CONST * sizeof(accum_t)       -- per-warp dV accumulators
     extern __shared__ __align__(16) uint8_t sh_raw[];
@@ -131,7 +131,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     cuda_t *vj_shared   = qj_shared + D_CONST;
     cuda_t *ki_dOi_dbuf = vj_shared + D_CONST;  // only meaningful when USE_PIPELINE
 
-    constexpr size_t ki_dOi_dbuf_bytes = USE_PIPELINE ? WARPS_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    constexpr size_t ki_dOi_dbuf_bytes = WARPS_PER_BLOCK * pipelined_ring_elems(NUM_STAGES, NUM_PREFETCH_ROWS, D_CONST) * sizeof(cuda_t);
     accum_t *warp_gq                   = reinterpret_cast<accum_t *>(sh_raw + 2 * D_CONST * sizeof(cuda_t) + ki_dOi_dbuf_bytes);
     accum_t *warp_gv                   = warp_gq + WARPS_PER_BLOCK * D_CONST;
 
@@ -228,7 +228,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
         cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {K, dO};
         int64_t const row_stride_n[NUM_PREFETCH_ROWS]    = {stride_k_n, static_cast<int64_t>(H) * D_CONST};
         int64_t const row_stride_h[NUM_PREFETCH_ROWS]    = {stride_k_h, D_CONST};
-        cuda_t *warp_dbuf                                = ki_dOi_dbuf + warp_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
+        cuda_t *warp_dbuf                                = ki_dOi_dbuf + warp_id * pipelined_ring_elems(NUM_STAGES, NUM_PREFETCH_ROWS, D_CONST);
         pipelined_neighbor_row_loop<WARPS_PER_BLOCK, D_CONST, NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
             warp_id, lane, num_incoming, edge_start, col_idx_T, row_bases, row_stride_n, row_stride_h, head_h, warp_dbuf, edge_consume
         );
@@ -281,7 +281,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 //   Forward direction: dK[d] (local)
 //   Reverse direction: dQ[d], dV[d] (local, exploiting symmetric adjacency)
 // =============================================================================
-template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <int D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirected_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr,  // [N+1], forward CSR row pointers
@@ -341,7 +341,7 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     //   kd_shared:   D_CONST * sizeof(cuda_t)   -- K[d]
     //   qd_shared:   D_CONST * sizeof(cuda_t)   -- Q[d]
     //   vd_shared:   D_CONST * sizeof(cuda_t)   -- V[d]
-    //   qkvOs_dbuf:  4 * NUM_STAGES * D_CONST * sizeof(cuda_t) -- ping-pong for Q[s]/K[s]/V[s]/dO[s], only when USE_PIPELINE
+    //   qkvOs_dbuf:  pipelined_ring_elems(NUM_STAGES, 4, D_CONST) * sizeof(cuda_t) -- cp.async ring for Q[s]/K[s]/V[s]/dO[s], only when USE_PIPELINE
     //   gk_shared:   D_CONST * sizeof(accum_t)  -- float32 accumulator for dK[d]
     //   gq_shared:   D_CONST * sizeof(accum_t)  -- float32 accumulator for dQ[d]
     //   gv_shared:   D_CONST * sizeof(accum_t)  -- float32 accumulator for dV[d]
@@ -351,7 +351,7 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     cuda_t *const vd_shared  = qd_shared + D_CONST;
     cuda_t *const qkvOs_dbuf = vd_shared + D_CONST;  // only meaningful when USE_PIPELINE
 
-    constexpr size_t qkvOs_dbuf_bytes = USE_PIPELINE ? NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
+    constexpr size_t qkvOs_dbuf_bytes = pipelined_ring_elems(NUM_STAGES, NUM_PREFETCH_ROWS, D_CONST) * sizeof(cuda_t);
     accum_t *const gk_shared          = reinterpret_cast<accum_t *>(sh_raw + 3 * D_CONST * sizeof(cuda_t) + qkvOs_dbuf_bytes);
     accum_t *const gq_shared          = gk_shared + D_CONST;
     accum_t *const gv_shared          = gq_shared + D_CONST;

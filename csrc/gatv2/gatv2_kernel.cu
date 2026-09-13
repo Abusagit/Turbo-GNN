@@ -23,10 +23,9 @@ void GATv2Backward_CSR_Undirected_Impl(
     std::visit(
         [&](auto stages_c) {
             constexpr int STAGES        = decltype(stages_c)::value;
-            constexpr bool USE_PIPELINE = STAGES > 0;
 
             // G kernel shared: li (cuda_t) + ghi (cuda_t) + r_dbuf (STAGES == 0 makes this term vanish)
-            size_t sh_g = 2 * D_CONST * sizeof(cuda_t) + (USE_PIPELINE ? STAGES * D_CONST * sizeof(cuda_t) : 0);
+            size_t sh_g = 2 * D_CONST * sizeof(cuda_t) + pipelined_ring_elems(STAGES, 1, D_CONST) * sizeof(cuda_t);
 
             GATv2Backward_G_Kernel<D_CONST, cuda_t, index_t, float, STAGES><<<nBlocks, nThreads, sh_g, stream>>>(
                 N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx,
@@ -35,8 +34,7 @@ void GATv2Backward_CSR_Undirected_Impl(
 
             // 2) Fused ALR kernel: grad_a, grad_l, grad_r using forward CSR only
             // Shared: li + ri + ghi (cuda_t) + rlghj_dbuf (STAGES == 0 makes this term vanish) + grada + gradli + gradri (float)
-            size_t sh_alr =
-                3 * D_CONST * sizeof(cuda_t) + (USE_PIPELINE ? 3 * STAGES * D_CONST * sizeof(cuda_t) : 0) + 3 * D_CONST * sizeof(float);
+            size_t sh_alr = 3 * D_CONST * sizeof(cuda_t) + pipelined_ring_elems(STAGES, 3, D_CONST) * sizeof(cuda_t) + 3 * D_CONST * sizeof(float);
 
             GATv2Backward_ALR_Undirected<D_CONST, cuda_t, index_t, float, STAGES><<<nBlocks, nThreads, sh_alr, stream>>>(
                 N, H, D, grad_h, stride_gh_n, stride_gh_h, d_l, stride_l_n, stride_l_h, d_r, stride_r_n, stride_r_h, d_row_ptr, d_col_idx,
@@ -219,7 +217,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 auto *h_out_ptr = reinterpret_cast<cuda_t *>(h_out.data_ptr<torch_t>());
 
                 // l_sh + r_dbuf (STAGES == 0 makes this term vanish) + W * D float + 2 * W float
-                size_t shmem = DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
+                size_t shmem = DC * sizeof(cuda_t) + W * pipelined_ring_elems(STAGES, 1, DC, kGatv2ForwardEarlyRelease) * sizeof(cuda_t) +
+                               W * DC * sizeof(float) + 2 * W * sizeof(float);
 
                 ensure_dynamic_shmem(GATv2Forward_Kernel<W, DC, cuda_t, index_t, float, STAGES>, shmem, "GATv2 forward");
 
@@ -373,8 +372,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     auto *grad_l_ptr = reinterpret_cast<cuda_t *>(grad_l.data_ptr<torch_t>());
 
                     // li_sh + ghi_sh + r_dbuf (STAGES == 0 makes this term vanish) + warp_grada + warp_gradl + warp_G + G_broadcast
-                    size_t sh_al =
-                        2 * DC * sizeof(cuda_t) + W * STAGES * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
+                    size_t sh_al = 2 * DC * sizeof(cuda_t) + W * pipelined_ring_elems(STAGES, 1, DC) * sizeof(cuda_t) +
+                                   W * 2 * DC * sizeof(float) + (W + 1) * sizeof(float);
 
                     ensure_dynamic_shmem(GATv2Backward_AL<W, DC, cuda_t, index_t, float, STAGES>, sh_al, "GATv2 backward AL");
 
@@ -412,7 +411,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     auto *grad_r_ptr = reinterpret_cast<cuda_t *>(grad_r.data_ptr<torch_t>());
 
                     // rj_sh + li_ghi_dbuf (2 rows, STAGES == 0 makes this term vanish) + warp_gradr
-                    size_t sh_r = DC * sizeof(cuda_t) + W * 2 * STAGES * DC * sizeof(cuda_t) + W * DC * sizeof(float);
+                    size_t sh_r = DC * sizeof(cuda_t) + W * pipelined_ring_elems(STAGES, 2, DC) * sizeof(cuda_t) + W * DC * sizeof(float);
 
                     ensure_dynamic_shmem(GATv2Backward_R<W, DC, cuda_t, index_t, float, STAGES>, sh_r, "GATv2 backward R");
 

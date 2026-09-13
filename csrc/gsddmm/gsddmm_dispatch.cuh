@@ -64,7 +64,7 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
                     index_ptr<index_t>(node_indices), block_parts ? index_ptr<index_t>(*block_parts) : nullptr, edges_per_block
                 );
             },
-            lro_variant, MakeIndexVariant<int32_t, int64_t>(args.row_ptr.scalar_type()),
+            lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
             MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
             warp_variant, MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
         );
@@ -223,7 +223,7 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
                     );
                 }
             },
-            lro_variant, MakeIndexVariant<int32_t, int64_t>(args.row_ptr.scalar_type()),
+            lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
             MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
             warp_variant
         );
@@ -231,10 +231,10 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
 
     // Dst pass over the forward CSR, then Src pass over the backward CSR. Each
     // writes a different operand's gradient, so they are independent.
-    launch_bucket(args.heavy_nodes, ReduceTag<GSDDMM_REDUCE::Dst>{}, MakeIntVariant<32>(args.heavy_warps_per_block));
-    launch_bucket(args.light_nodes, ReduceTag<GSDDMM_REDUCE::Dst>{}, MakeIntVariant<4>(args.light_warps_per_block));
-    launch_bucket(args.heavy_nodes_T, ReduceTag<GSDDMM_REDUCE::Src>{}, MakeIntVariant<32>(args.heavy_warps_per_block));
-    launch_bucket(args.light_nodes_T, ReduceTag<GSDDMM_REDUCE::Src>{}, MakeIntVariant<4>(args.light_warps_per_block));
+    launch_bucket(args.heavy_nodes, ReduceTag<GSDDMM_REDUCE::Dst>{}, MakeIntVariant<8, 16, 32>(args.heavy_warps_per_block));
+    launch_bucket(args.light_nodes, ReduceTag<GSDDMM_REDUCE::Dst>{}, MakeIntVariant<1, 2, 4>(args.light_warps_per_block));
+    launch_bucket(args.heavy_nodes_T, ReduceTag<GSDDMM_REDUCE::Src>{}, MakeIntVariant<8, 16, 32>(args.heavy_warps_per_block));
+    launch_bucket(args.light_nodes_T, ReduceTag<GSDDMM_REDUCE::Src>{}, MakeIntVariant<1, 2, 4>(args.light_warps_per_block));
 }
 
 // Edge-parallel backward: instantiates GSDDMM_backward_edge_block over Lros x the

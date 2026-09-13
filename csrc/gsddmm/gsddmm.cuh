@@ -65,14 +65,22 @@ struct GsddmmPlan {
     static constexpr bool L_DST = (ll == GSDDMM_MEMBER::Dst_V);
     static constexpr bool R_DST = USE_R && (rr == GSDDMM_MEMBER::Dst_V);
 
+    // The right operand has a per-edge row only when it is read at all and is
+    // not the staged Dst_V row. Copy's R must not be counted here: the kernel
+    // is handed a 1-row stand-in for it, and a prefetch of R + j * D from that
+    // stand-in is an out-of-bounds read (the direct-load path only ever formed
+    // the pointer, which is why the bug was confined to the pipelined path).
+    static constexpr bool R_EDGE_ROW = USE_R && !R_DST;
+
     // Dst_V rows are staged once per block in shared memory (they are the same
     // for every edge of the CSR row); Src_V / Edge rows are gathered per edge.
     static constexpr size_t NUM_DST_ROWS  = (L_DST ? 1 : 0) + (R_DST ? 1 : 0);
-    static constexpr size_t NUM_EDGE_ROWS = (L_DST ? 0 : 1) + (R_DST ? 0 : 1);
+    static constexpr size_t NUM_EDGE_ROWS = (L_DST ? 0 : 1) + (R_EDGE_ROW ? 1 : 0);
 
-    // Slot of each operand inside the per-edge rows[] array (-1: staged in shared).
+    // Slot of each operand inside the per-edge rows[] array (-1: staged in
+    // shared, or -- for Copy's R -- absent).
     static constexpr int L_SLOT = L_DST ? -1 : 0;
-    static constexpr int R_SLOT = R_DST ? -1 : (L_DST ? 0 : 1);
+    static constexpr int R_SLOT = R_EDGE_ROW ? (L_DST ? 0 : 1) : -1;
 
     // true: the per-edge row is indexed by edge position e; false: by neighbor node j.
     static constexpr bool L_EDGE_INDEXED = (ll == GSDDMM_MEMBER::Edge);
@@ -88,7 +96,7 @@ template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, 
 inline consteval size_t gsddmm_forward_shmem_bytes() {
     using Plan = GsddmmPlan<op, ll, rr>;
     return Plan::NUM_DST_ROWS * D_CONST * sizeof(cuda_t) +
-           (PIPELINE_STAGES > 0 ? N_PER_BLOCK * Plan::NUM_EDGE_ROWS * (PIPELINE_STAGES + 1) * D_CONST * sizeof(cuda_t) : 0);
+           N_PER_BLOCK * pipelined_ring_elems(PIPELINE_STAGES, Plan::NUM_EDGE_ROWS, D_CONST) * sizeof(cuda_t);
 }
 
 // Edge-block kernel launch limits (validated by the binding, baked into __launch_bounds__).
@@ -102,7 +110,7 @@ inline constexpr size_t kGsddmmEdgeMaxEdgesPerWarp  = kWarpSize;  // lane k cach
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, uint8_t PIPELINE_STAGES>
 inline consteval size_t gsddmm_forward_edge_shmem_bytes_per_warp() {
     constexpr size_t rows = GsddmmPlan<op, ll, rr>::USE_R ? 2 : 1;
-    return PIPELINE_STAGES > 0 ? rows * (PIPELINE_STAGES + 1) * D_CONST * sizeof(cuda_t) : 0;
+    return pipelined_ring_elems(PIPELINE_STAGES, rows, D_CONST) * sizeof(cuda_t);
 }
 
 // forward kernel: one thread block per (bucketed) CSR row node -- or, when
@@ -111,7 +119,7 @@ inline consteval size_t gsddmm_forward_edge_shmem_bytes_per_warp() {
 // this bounds a block's work by the chunk size instead of the node's degree).
 // Each warp of the block owns one edge at a time, lanes split the D_CONST
 // features into vector tiles.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal ( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
@@ -135,7 +143,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
 // applied to the Edge operand rows AND the output row, so the list may be grouped
 // by source for locality while the output stays numbered by forward-CSR position.
 // nullptr: the traversal order is already the canonical one (slot index == id).
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float, size_t PIPELINE_STAGES = 0>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block ( // no-format
     uint64_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
