@@ -57,14 +57,27 @@ def _rows(graph, target: str) -> int:
     return graph.forward_indices.numel() if target == "edge" else graph.forward_indptr.numel() - 1
 
 
+#: Smallest magnitude sampled for a div denominator. Div's gradient w.r.t. the
+#: denominator carries 1/rhs^2, which leaves fp16's range entirely for
+#: |rhs| < 2^-8: drawn from randn, a denominator near 1e-3 makes the true
+#: gradient ~1e5 against fp16's 65504, so the assert would be measuring dtype
+#: saturation rather than the kernel's math. A floor of 0.1 keeps 1/rhs^2 under
+#: 1e2 and every dtype in range; the sampled sign is kept.
+_DIV_DENOM_FLOOR = 0.1
+
+
 def _operands(graph, spec, feat_dim, dtype, seed=0):
     """Operands in the order _CudaGsddmmOp.forward takes them, plus a d_out."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     num_edges = graph.forward_indices.numel()
     operands = []
-    for kind in spec.operand_kinds:
+    for i, kind in enumerate(spec.operand_kinds):
         n = num_edges if kind == "e" else graph.forward_indptr.numel() - 1
-        operands.append(torch.randn(n, feat_dim, device=DEVICE, dtype=dtype, generator=gen))
+        operand = torch.randn(n, feat_dim, device=DEVICE, dtype=dtype, generator=gen)
+        if spec.op == "div" and i == 1:
+            sign = torch.where(operand < 0, -1.0, 1.0).to(dtype)
+            operand = sign * operand.abs().clamp_min(_DIV_DENOM_FLOOR)
+        operands.append(operand)
     d_out_shape = (num_edges,) if spec.op == "dot" else (num_edges, feat_dim)
     d_out = torch.randn(d_out_shape, device=DEVICE, dtype=dtype, generator=gen)
     return *operands, d_out
@@ -237,7 +250,7 @@ def test_copy_conv_takes_a_single_operand():
     the rhs must stay None rather than becoming a misread lhs."""
     graph = _make_graph()
     spec = gsddmm_op_spec("copy_v")
-    (lhs,), d_out = _operands(graph, spec, 64, torch.float32)
+    lhs, d_out = _operands(graph, spec, 64, torch.float32)
     lhs = lhs.requires_grad_(True)
     out = _CudaGsddmmOp("copy_v")(lhs, graph)
     out.backward(d_out)

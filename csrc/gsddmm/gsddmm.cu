@@ -751,14 +751,94 @@ __device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_tile(cuda_t cons
     }
 }
 
-// (1/v)^2, elementwise: one division per element instead of two (x/v/v), and
-// unlike x/(v*v) it cannot overflow the intermediate square in half precision.
-template <size_t TW, FloatingNum cuda_t>
-__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_recip_sq(VecFloat<TW, cuda_t> v) {
-    VecFloat<TW, cuda_t> r(cuda_t(1));
-    r.div_(v);
+// 1/v^2 for one chunk, evaluated in accum_t. The reciprocal is taken once and
+// squared rather than dividing twice: the approximate reciprocal is a
+// quarter-rate unit on sm_80 (16 results/clk/SM against 64 for an fp32
+// multiply), so halving the special-function work is the win, and the two fp32
+// multiplies replacing the second division run at full rate. accum_t is what
+// keeps the multiplier finite -- 1/v^2 leaves fp16's range already for
+// |v| < 2^-8 -- and it costs nothing to stay wide here, since fp16 has no
+// divide unit: __h2div widens to fp32 and narrows back anyway.
+template <size_t N, FloatingNum cuda_t, FloatingNum accum_t>
+__device__ __forceinline__ VecFloat<N, accum_t> gsddmm_inv_sq_chunk(VecFloat<N, cuda_t> v) {
+    VecFloat<N, accum_t> r(accum_t(1));
+    r.div_(v.template convert_vec<accum_t>());
     r.mul_(r);
     return r;
+}
+
+// x / v^2 for the edge gradient, whose destination is a cuda_t tensor: one
+// narrowing is unavoidable, so it is done last, on the result, never on the
+// 1/v^2 multiplier. Chunked like the accumulate helpers below so that no wide
+// accum_t vector is materialized into local memory.
+template <size_t TW, FloatingNum cuda_t, FloatingNum accum_t>
+__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_div_sq(VecFloat<TW, cuda_t> x, VecFloat<TW, cuda_t> v) {
+    constexpr size_t compact_N  = std::min(TW, sizeof(accum_t));
+    constexpr size_t repeat_cnt = TW / compact_N;
+    VecFloat<TW, cuda_t> out;
+#pragma unroll
+    for (size_t i = 0; i < repeat_cnt; ++i) {
+        VecFloat<compact_N, accum_t> q =
+            gsddmm_inv_sq_chunk<compact_N, cuda_t, accum_t>(reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&v)[i]);
+        q.mul_(reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&x)[i].template convert_vec<accum_t>());
+        reinterpret_cast<VecFloat<compact_N, cuda_t> *>(&out)[i] = q.template convert_vec<cuda_t>();
+    }
+    return out;
+}
+
+// acc = -acc / v^2, in place. The node-parallel backward owns the whole node, so
+// the factor is applied once to the finished fp32 sum -- and the free place for
+// it is before gsddmm_accum_to_vec: that narrowing already exists, and keeping
+// the scaling on its accum_t side means the multiplier never has to fit cuda_t.
+template <size_t TW, FloatingNum cuda_t, FloatingNum accum_t>
+__device__ __forceinline__ void gsddmm_accum_neg_div_sq(accum_t *const __restrict__ acc, VecFloat<TW, cuda_t> v) {
+    constexpr size_t compact_N  = std::min(TW, sizeof(accum_t));
+    constexpr size_t repeat_cnt = TW / compact_N;
+#pragma unroll
+    for (size_t i = 0; i < repeat_cnt; ++i) {
+        VecFloat<compact_N, accum_t> q =
+            gsddmm_inv_sq_chunk<compact_N, cuda_t, accum_t>(reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&v)[i]);
+        q.neg_();
+        reinterpret_cast<VecFloat<compact_N, accum_t> *>(acc)[i].mul_(q);
+    }
+}
+
+// acc += a * b with both operands widened first, so the product never rounds to
+// the storage type. Only Div's reduced partial needs this: the -1/self^2 applied
+// afterwards amplifies whatever the product lost, and once the sum cancels --
+// which it does on a random graph -- that loss stops being a relative epsilon
+// and becomes the answer. The other ops multiply in the storage type, where the
+// packed path is faster and nothing downstream amplifies the rounding.
+template <size_t TW, FloatingNum cuda_t, FloatingNum accum_t>
+__device__ __forceinline__ void gsddmm_accum_fma(accum_t *const __restrict__ acc, VecFloat<TW, cuda_t> a, VecFloat<TW, cuda_t> b) {
+    constexpr size_t compact_N  = std::min(TW, sizeof(accum_t));
+    constexpr size_t repeat_cnt = TW / compact_N;
+#pragma unroll
+    for (size_t i = 0; i < repeat_cnt; ++i) {
+        reinterpret_cast<VecFloat<compact_N, accum_t> *>(acc)[i].fmaa_(
+            reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&a)[i].template convert_vec<accum_t>(),
+            reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&b)[i].template convert_vec<accum_t>()
+        );
+    }
+}
+
+// acc -= a * b / v^2: the whole per-edge Div term in accum_t. The edge-parallel
+// backward cannot defer the 1/self^2 past its atomic, so both reasons to stay
+// wide apply at once -- the product for the accuracy above, and the scaled
+// result because it does not fit the storage type where 1/v^2 is largest.
+template <size_t TW, FloatingNum cuda_t, FloatingNum accum_t>
+__device__ __forceinline__ void gsddmm_accum_sub_prod_div_sq(
+    accum_t *const __restrict__ acc, VecFloat<TW, cuda_t> a, VecFloat<TW, cuda_t> b, VecFloat<TW, cuda_t> v
+) {
+    constexpr size_t compact_N  = std::min(TW, sizeof(accum_t));
+    constexpr size_t repeat_cnt = TW / compact_N;
+#pragma unroll
+    for (size_t i = 0; i < repeat_cnt; ++i) {
+        VecFloat<compact_N, accum_t> p = reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&a)[i].template convert_vec<accum_t>();
+        p.mul_(reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&b)[i].template convert_vec<accum_t>());
+        p.mul_(gsddmm_inv_sq_chunk<compact_N, cuda_t, accum_t>(reinterpret_cast<VecFloat<compact_N, cuda_t> const *>(&v)[i]));
+        reinterpret_cast<VecFloat<compact_N, accum_t> *>(acc)[i] -= p;
+    }
 }
 
 // =============================================================================
@@ -863,7 +943,16 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
                 } else {
                     other.store_zero_();
                 }
-                gsddmm_accum_add<TW, cuda_t, accum_t>(acc[t], GradOp::apply(d_out, other));
+                if constexpr (Plan::NEEDS_SELF_ROW) {
+                    // Div's denominator partial is dO * other (GsddmmGradOp's
+                    // Div/rhs branch), formed in accum_t because the -1/self^2
+                    // applied once after the sum amplifies any rounding taken
+                    // here. Every other op accumulates its cuda_t partial.
+                    static_assert(op == GSDDMM_OP::Div, "NEEDS_SELF_ROW is the Div/rhs case");
+                    gsddmm_accum_fma<TW, cuda_t, accum_t>(acc[t], d_out, other);
+                } else {
+                    gsddmm_accum_add<TW, cuda_t, accum_t>(acc[t], GradOp::apply(d_out, other));
+                }
 
                 // The edge operand owns one row per edge, so its gradient is a
                 // plain store: the node row (in registers) is its "other" operand.
@@ -879,7 +968,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
                     vec_t g_edge = EdgeGradOp::apply(d_out, node_row);
                     if constexpr (op == GSDDMM_OP::Div && Plan::OTHER == rr) {
                         // The edge operand is the denominator: -dO * self / edge^2.
-                        g_edge.mul_(gsddmm_recip_sq(other));
+                        g_edge = gsddmm_div_sq<TW, cuda_t, accum_t>(g_edge, other);
                         g_edge.neg_();
                     } else if constexpr (op == GSDDMM_OP::Sub && Plan::OTHER == rr) {
                         g_edge.neg_();
@@ -928,12 +1017,16 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
     for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
         const size_t v = lane_id + kWarpSize * t;
         if (v < TILES) [[likely]] {
-            vec_t out = gsddmm_accum_to_vec<TW, cuda_t, accum_t>(acc[t]);
             if constexpr (Plan::NEEDS_SELF_ROW) {
-                // -1/self^2: constant over the sum, so applied once, here.
-                out.mul_(gsddmm_recip_sq(self_tiles[t]));
+                // -1/self^2: constant over the sum, so applied once, here -- on
+                // the fp32 accumulator, before the narrowing below. Dividing by
+                // the self row is exactly the negating case, so the sign rides
+                // along with the scaling instead of costing a second pass.
+                static_assert(Plan::NEGATE_SELF, "Div by the self row must negate the self gradient");
+                gsddmm_accum_neg_div_sq<TW, cuda_t, accum_t>(acc[t], self_tiles[t]);
             }
-            if constexpr (Plan::NEGATE_SELF) {
+            vec_t out = gsddmm_accum_to_vec<TW, cuda_t, accum_t>(acc[t]);
+            if constexpr (Plan::NEGATE_SELF && !Plan::NEEDS_SELF_ROW) {
                 out.neg_();
             }
             Tile::template write<Tile::MemoryHint::Streaming>(d_self + node_i * D_CONST, v, out);
@@ -1042,19 +1135,22 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     other.store_zero_();
                 }
 
-                vec_t contrib = GradOp::apply(d_out, other);
                 if constexpr (Plan::NEEDS_SELF_ROW) {
-                    // Div's denominator: -1/self^2. Unlike the node-parallel
-                    // variant this warp does not own the whole node, so the
-                    // factor cannot be deferred past the atomic and is applied
-                    // per edge from the (broadcast) self row.
+                    // Div's denominator: -(dO * other) / self^2. Unlike the
+                    // node-parallel variant this warp does not own the whole
+                    // node, so the factor cannot be deferred past the atomic and
+                    // is applied per edge from the (broadcast) self row -- the
+                    // whole term in accum_t, product included. Div/rhs negates.
+                    static_assert(op == GSDDMM_OP::Div && Plan::NEGATE_SELF, "NEEDS_SELF_ROW is the negating Div/rhs case");
                     const vec_t self_row = Tile::read((Plan::SELF_IS_LHS ? L : R) + self_node * D_CONST, v);
-                    contrib.mul_(gsddmm_recip_sq(self_row));
+                    gsddmm_accum_sub_prod_div_sq<TW, cuda_t, accum_t>(acc[t], d_out, other, self_row);
+                } else {
+                    vec_t contrib = GradOp::apply(d_out, other);
+                    if constexpr (Plan::NEGATE_SELF) {
+                        contrib.neg_();
+                    }
+                    gsddmm_accum_add<TW, cuda_t, accum_t>(acc[t], contrib);
                 }
-                if constexpr (Plan::NEGATE_SELF) {
-                    contrib.neg_();
-                }
-                gsddmm_accum_add<TW, cuda_t, accum_t>(acc[t], contrib);
 
                 if constexpr (Plan::WRITE_EDGE_GRAD) {
                     // Only read the node row when the op's partial uses it: an
@@ -1067,7 +1163,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     }
                     vec_t g_edge = EdgeGradOp::apply(d_out, node_row);
                     if constexpr (op == GSDDMM_OP::Div && Plan::OTHER == rr) {
-                        g_edge.mul_(gsddmm_recip_sq(other));
+                        g_edge = gsddmm_div_sq<TW, cuda_t, accum_t>(g_edge, other);
                         g_edge.neg_();
                     } else if constexpr (op == GSDDMM_OP::Sub && Plan::OTHER == rr) {
                         g_edge.neg_();
