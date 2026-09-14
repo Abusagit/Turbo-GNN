@@ -41,6 +41,19 @@
 // a few compares, too little compute to hide the cp.async latency, while the
 // pipeline serializes edges the compiler could otherwise overlap. Keep at 0.
 //
+// The ring here is THREAD-MAJOR (this thread's NUM_STAGES slots contiguous) and
+// holds exactly NUM_STAGES slots, which is what the launchers size their
+// scratch for. The GSDDMM kernels' equivalent loop was since rewritten to a
+// SLOT-MAJOR ring (slot s of this thread at dbuf + s * block_threads * TW,
+// NUM_STAGES + 1 slots, pointer cursors, and the source ids held in a register
+// ring walked by unrolled selects); thread-major doubles the inter-thread
+// stride to 32B and was measured there at 2x the shared wavefronts, 3-150x the
+// bank conflicts and up to +42% kernel time. Porting that here means changing
+// this function, its three call sites' my_dbuf arithmetic, and the
+// pipelined_ring_elems / aggr_pipeline_bytes sizing in both launchers
+// together -- and it only pays off once a pipelined path is worth using at all
+// (see the NOTE above).
+//
 // visit(src, eid, val): val is the prefetched slice, valid only inside the call.
 // dbuf: this thread's scratch, NUM_STAGES * TW elements.
 template <size_t TW, size_t NUM_STAGES, FloatingNum cuda_t, typename index_t, typename VisitFn>

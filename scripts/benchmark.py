@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import csv
 import json
 import sys
@@ -112,7 +113,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--avg-degree", type=int, default=10)
     p.add_argument("--feature_dim", type=int, default=128)
     p.add_argument("--heads", type=int, default=1)
-    p.add_argument("--mode", type=str, default="forward", choices=["forward", "backward"])
+    p.add_argument(
+        "--mode",
+        type=str,
+        default="forward",
+        choices=["forward", "forward_nograd", "backward"],
+        help="forward times the differentiable call (an autograd graph is recorded, as it would be "
+        "in training); forward_nograd times the same call under torch.no_grad(), i.e. the kernel "
+        "alone. Both apply to every backend, so DGL skips its own graph building in forward_nograd "
+        "too and the comparison stays like-for-like. backward times out.backward(grad).",
+    )
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--amp", type=str, default="none", choices=["none", "bf16", "fp16"])
@@ -375,14 +385,23 @@ def main() -> int:
             nonlocal grad_output, Y
             Y.backward(grad_output, retain_graph=True)  # type: ignore[union-attr]
 
-        fn = _fn_forward if args.mode == "forward" else _fn_backward
-        res: MicrobenchResult = time_callable(
-            fn,
-            warmup=args.warmup,
-            iters=args.iters,
-            do_memory_profile=False,
-            exact_iters=args.exact_iters,
-        )
+        fn = _fn_backward if args.mode == "backward" else _fn_forward
+        # forward_nograd: grad mode is switched off ONCE around the whole timed
+        # region, not per call. torch.no_grad() as a decorator on fn would clone
+        # the context manager and run __enter__/__exit__ every iteration --
+        # measured at 8-10 us per call on a cora-sized op whose entire host cost
+        # is ~15 us, i.e. the mode would have been measuring its own guard. No
+        # inference_mode: it times the same and its inference tensors make the
+        # `Y = _fn_forward().requires_grad_(True)` above raise.
+        grad_ctx = torch.no_grad() if args.mode == "forward_nograd" else contextlib.nullcontext()
+        with grad_ctx:
+            res: MicrobenchResult = time_callable(
+                fn,
+                warmup=args.warmup,
+                iters=args.iters,
+                do_memory_profile=False,
+                exact_iters=args.exact_iters,
+            )
 
         base_dict = {
             "backend": args.backend,

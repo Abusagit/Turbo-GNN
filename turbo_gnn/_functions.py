@@ -515,6 +515,18 @@ class GsddmmFunction(torch.autograd.Function):
         # through save_for_backward.
         ctx.graph = graph
         ctx.save_for_backward(lhs if "lhs" in needed else None, rhs if "rhs" in needed else None)
+        return out
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, grad_out):
+        lhs, rhs = ctx.saved_tensors
+        d_lhs, d_rhs = ctx.plan.backward(ctx.graph, lhs, rhs, grad_out)
+        # forward(plan, graph, lhs, rhs): the first two take no gradient.
+        needs_lhs, needs_rhs = ctx.needs_input_grad[2], ctx.needs_input_grad[3]
+        return None, None, (d_lhs if needs_lhs else None), (d_rhs if needs_rhs else None)
+
+
 class GSpMMFunction(torch.autograd.Function):
     """Generalized SpMM: ``out[v] = reduce_{(u,e) in in(v)} op(lhs[u], rhs[e])``.
 

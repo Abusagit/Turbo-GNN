@@ -69,6 +69,9 @@ _PROBE_REPEATS = 3
 _EDGE_LIST_DST_KEY = "_gsddmm_edge_list_dst"
 _EDGE_LIST_SRC_KEY = "_gsddmm_edge_list_src"
 _CANONICAL_IDX_KEY = "_gsddmm_canonical_edge_idx"
+_COPY_RHS_KEY = "_gsddmm_copy_rhs_stub"
+_CSR_ALIASED_KEY = "_gsddmm_csr_aliased"
+_NUM_NODES_KEY = "_gsddmm_num_nodes"
 _HEAVY_BLOCKS_KEY = "_gsddmm_heavy_blocks"
 _VARIANT_MEMO_KEY = "_gsddmm_variant"
 
@@ -427,6 +430,16 @@ def _as_graph_index_dtype(t: torch.Tensor, graph) -> torch.Tensor:
     return out if signed is target else out.view(target)
 
 
+def _graph_num_nodes(graph) -> int:
+    """``graph``'s node count, memoized -- a dispatched ``numel()`` per launch
+    otherwise (see :func:`_edge_list_is_canonical` for why that is not free)."""
+    cached = graph.__dict__.get(_NUM_NODES_KEY)
+    if cached is None:
+        cached = graph.forward_indptr.numel() - 1
+        graph.__dict__[_NUM_NODES_KEY] = cached
+    return cached
+
+
 def _edge_list_is_canonical(graph, by_src: bool) -> bool:
     """True when the ``by_src`` *edge list* is in forward-CSR edge order.
 
@@ -443,7 +456,19 @@ def _edge_list_is_canonical(graph, by_src: bool) -> bool:
     row and then reads per-edge data -- the backward's source-side pass -- needs
     :func:`_graph_canonical_edge_idx` regardless of what this returns.
     """
-    return (not by_src) or graph.backward_indptr.data_ptr() == graph.forward_indptr.data_ptr()
+    if not by_src:
+        return True
+    # Memoized per graph object: whether the two CSRs are aliased is a property
+    # of the sparsity pattern, and both .to() (which reassigns both buffers) and
+    # repartition() (which returns a NEW graph object) preserve it. Worth
+    # memoizing because the two data_ptr() reads are dispatched through the
+    # torch-function mode that torch.set_default_device installs -- ~1.5 us each
+    # instead of ~0.2 -- and this sits on the edge kernel's launch path.
+    cached = graph.__dict__.get(_CSR_ALIASED_KEY)
+    if cached is None:
+        cached = graph.backward_indptr.data_ptr() == graph.forward_indptr.data_ptr()
+        graph.__dict__[_CSR_ALIASED_KEY] = cached
+    return cached
 
 
 def _graph_edge_list(graph, by_src: bool = False) -> torch.Tensor:
@@ -566,8 +591,29 @@ def _resolve_rhs(spec: GsddmmSpec, graph, lhs: torch.Tensor, rhs: torch.Tensor |
         if rhs is None:
             raise ValueError(f"gsddmm: rhs is required for op={spec.op!r}")
         return rhs
-    feat_dim = lhs.shape[-1]
-    return lhs.new_empty((1, feat_dim)).expand(graph.forward_indices.numel(), feat_dim)
+    # Cached on the graph: the stand-in is never read, so one stub per
+    # (dtype, D) serves every launch of this op on this graph, and the expand()
+    # is to this graph's edge count.
+    #
+    # The key is deliberately two tensor reads and no more. Under
+    # torch.set_default_device -- which benchmark.py sets, putting a
+    # torch-function mode on the stack -- every tensor attribute access is
+    # dispatched through it and costs ~1.5-1.9 us instead of ~0.2 (measured on
+    # an A100 host: lhs.dtype 0.15 -> 1.73, lhs.shape[-1] 0.29 -> 1.92). The
+    # host is what bounds these kernels on a small graph, so metadata reads are
+    # not free bookkeeping here. Device is left out of the key: a graph's CSR
+    # pins the device, so a same-dtype same-D operand on another device would
+    # have failed in the binding long before this.
+    #
+    # The real fix is for the binding to take no rhs for copy at all, rather
+    # than validating a tensor it never reads; that is a C++ change.
+    key = (lhs.dtype, lhs.shape[-1])
+    cached = graph.__dict__.get(_COPY_RHS_KEY)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    stub = lhs.new_empty((1, key[1])).expand(graph.forward_indices.numel(), key[1])
+    graph.__dict__[_COPY_RHS_KEY] = (key, stub)
+    return stub
 
 
 def _launch_node(
@@ -623,7 +669,7 @@ def _launch_edge(
         spec.op,
         spec.lhs_target,
         spec.rhs_target,
-        graph.forward_indptr.numel() - 1,
+        _graph_num_nodes(graph),
         params.pipeline_stages,
         params.edges_per_warp,
         params.warps_per_block,

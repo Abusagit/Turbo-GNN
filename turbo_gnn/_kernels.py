@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
+
+import torch
 
 from turbo_gnn._autotune import TunableKernel, TunableParam
 from turbo_gnn._functions import (
     GsddmmFunction,
-    ReductionAggrFunction,
-    _FusedGraphAttention,
-    gatv2_function,
     GSpMMFunction,
     ReductionAggrFunction,
     _FusedGraphAttention,
+    gatv2_function,
 )
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
@@ -28,9 +28,6 @@ from turbo_gnn._gsddmm import (
     select_variant,
 )
 
-if TYPE_CHECKING:
-    import torch
-
 # Re-exported for callers that import the per-graph caches from here (the
 # research backends and the correctness tests); they live in _gsddmm now,
 # next to the kernels that consume them.
@@ -40,9 +37,7 @@ __all__ = [
     "GraphTransformerAggrKernel",
     "GSDDMMKernel",
     "GSDDMMEdgeKernel",
-    "GSpMMFunction"
-    "ReductionAggrFunction",
-    "_FusedGraphAttention"
+    "GSpMMKernel",
     "_graph_edge_list",
     "_graph_heavy_blocks",
     "_graph_canonical_edge_idx",
@@ -343,6 +338,8 @@ class GSDDMMKernel(TunableKernel):
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
         # The resolved kernel; a searched axis only when variant == "auto".
         self.forward_variant = "node" if variant == "auto" else variant
+        #: (feat_dim, plan) memo for the pinned-variant path; see __setattr__.
+        self._plan_cache: tuple[int, object] | None = None
 
     # ---- spec passthrough, for callers that read the op off the kernel ----
 
@@ -376,6 +373,35 @@ class GSDDMMKernel(TunableKernel):
             warps_per_block=self.forward_warps_per_block,
         )
 
+    #: Attributes a pinned-variant plan is built from. Assigning any of them
+    #: drops the memo (see __setattr__); autotuning is the only writer.
+    _PLAN_INPUTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "variant",
+            "backward_variant",
+            "forward_light_warps",
+            "forward_heavy_warps",
+            "forward_pipeline_stages",
+            "forward_heavy_edges_per_block",
+            "forward_overlap_buckets",
+            "forward_edges_per_warp",
+            "forward_warps_per_block",
+        }
+    )
+
+    def __setattr__(self, name: str, value) -> None:
+        """Invalidate the plan memo when a plan input is written.
+
+        Checking the inputs on every *read* instead was measured at 4 us per
+        launch in the real call path (a 10-element tuple of attribute reads),
+        against the 5.8 us plan rebuild it was there to avoid -- barely a win on
+        an op whose whole host cost is ~15 us. Writes happen only at
+        construction and while autotuning, so paying there is free.
+        """
+        if name in self._PLAN_INPUTS:
+            self.__dict__["_plan_cache"] = None
+        object.__setattr__(self, name, value)
+
     def _plan(self, graph, lhs, rhs=None):
         """Resolve to one kernel carrying only that kernel's parameters.
 
@@ -401,8 +427,27 @@ class GSDDMMKernel(TunableKernel):
                 )
                 # Record the decision so parameter dumps see which kernel ran.
                 self.forward_variant = plan.variant
-                return plan
-        return resolve_plan(
+                # Stamped here too: the pinned path below does it when it builds
+                # the plan, and select_variant does not know this kernel's
+                # backward choice.
+                return replace(plan, backward_variant=self.backward_variant)
+        # Pinned variant: resolve_plan measures nothing, so the plan depends only
+        # on the plan inputs (invalidated by __setattr__) plus, for the edge
+        # kernel, the feature dim -- which is what picks its traversal order.
+        #
+        # The node kernel's plan does not depend on the feature dim, so it is not
+        # read at all there. That read is not free: benchmark.py (and any caller
+        # that wants a default device) runs under torch.set_default_device, which
+        # puts a torch-function mode on the stack, and EVERY tensor attribute
+        # access is then dispatched through it -- measured on an A100 host,
+        # lhs.shape[-1] 0.29 -> 1.92 us and lhs.ndim 0.15 -> 1.73 us. Two reads
+        # per launch is 3.5 us on an op whose whole host cost is ~12 us, and the
+        # host is what bounds these kernels on a small graph.
+        feat_dim = -1 if variant == "node" else (lhs.shape[-1] if lhs.ndim > 1 else 1)
+        cached = self._plan_cache
+        if cached is not None and cached[0] == feat_dim:
+            return cached[1]
+        plan = resolve_plan(
             self.spec,
             graph,
             lhs,
@@ -412,6 +457,14 @@ class GSDDMMKernel(TunableKernel):
             self._edge_params(),
             canonical_output=self._CANONICAL_OUTPUT,
         )
+        # backward_variant is stamped here rather than by a dataclasses.replace()
+        # in forward(): replace() re-runs __init__ reflectively on every call, and
+        # launch() ignores the field, so one plan serves both entry points.
+        plan = replace(plan, backward_variant=self.backward_variant)
+        # Direct dict write: self._plan_cache = ... would route through
+        # __setattr__, which is harmless but pointless here.
+        self.__dict__["_plan_cache"] = (feat_dim, plan)
+        return plan
 
     def _execute(self, graph, x, *, rhs=None, **kwargs):
         return self._plan(graph, x, rhs).launch(graph, x, rhs)
@@ -432,7 +485,12 @@ class GSDDMMKernel(TunableKernel):
         position. That is also why :class:`GSDDMMEdgeKernel` refuses this
         method: its traversal-order numbering cannot serve as ``d_out``.
         """
-        plan = replace(self._plan(graph, lhs, rhs), backward_variant=self.backward_variant)
+        plan = self._plan(graph, lhs, rhs)
+        # Nothing to record: torch.autograd.Function.apply costs ~10 us of host
+        # time (measured on this call, against ~12 us for the whole launch), and
+        # an output with no grad_fn is what the caller would get from it anyway.
+        if not (torch.is_grad_enabled() and (lhs.requires_grad or (rhs is not None and rhs.requires_grad))):
+            return plan.launch(graph, lhs, rhs)
         return GsddmmFunction.apply(plan, graph, lhs, rhs)
 
     # ---- tunable parameter declarations ----
@@ -442,8 +500,8 @@ class GSDDMMKernel(TunableKernel):
         """The axes the given kernel actually reads."""
         if variant == "node":
             return [
-                TunableParam("forward_light_warps", [1, 2, 4], default=4),
-                TunableParam("forward_heavy_warps", [8, 16, 32], default=32),
+                TunableParam("forward_light_warps", [4], default=4),
+                TunableParam("forward_heavy_warps", [32], default=32),
                 TunableParam("forward_pipeline_stages", [0, 1, 2, 3], default=0),
                 TunableParam("forward_heavy_edges_per_block", [0, 512, 1024, 2048, 4096], default=0),
                 TunableParam("forward_overlap_buckets", [False, True], default=False),

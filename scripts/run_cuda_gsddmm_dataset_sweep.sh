@@ -8,9 +8,28 @@
 # out/cuda_gsddmm/<dataset>_cuda_gsddmm.csv (64 ops x 2 modes x 3 dtypes = 384
 # rows), plus a combined all_datasets_cuda_gsddmm.csv at the end.
 #
-# MODES: a forward row times the forward kernel alone; a backward row times
+# EXCLUSIVE GPU REQUIRED. These kernels are microseconds long on the small
+# graphs, and a neighbour process on the same device adds a roughly constant
+# per-launch scheduling delay -- which is invisible on a 2 ms kernel and
+# swamps a 10 us one. Measured on cora (D=32, fp16, forward, 64 ops, identical
+# code and binary): median 14.2 us/op on an idle A100 against 83.6 us with one
+# other process running bmm on the same device, i.e. a 5.9x inflation
+# concentrated entirely in the cheapest rows. That is enough to invent or hide
+# a whole optimization, and it is asymmetric: dividing a contended turbo run by
+# an uncontended DGL run (or the reverse) moves the reported speedup by more
+# than most real changes do. So before a sweep, check the device is idle
+#     nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv
+# and re-measure BOTH sides of any comparison in the same session.
+#
+# MODES: a forward row times the differentiable forward call, with an autograd
+# graph recorded as it would be in training; a forward_nograd row times the
+# same call under torch.no_grad(), i.e. the kernel alone; a backward row times
 # out.backward(grad) (the forward still runs, once and untimed, to build the
-# graph). The op name pins a kernel family for BOTH modes: a bare name runs the
+# graph). forward vs forward_nograd differ only in HOST cost, which --exact-
+# iters cannot see (its CUDA-event window brackets the call on the stream, so
+# host gaps fall between windows); the pair is what do_bench rows and real
+# training loops separate. Every mode applies to every backend, so DGL skips
+# its own graph building in forward_nograd too. The op name pins a kernel family for BOTH modes: a bare name runs the
 # CSR node-block forward + node-parallel backward (deterministic, no atomics),
 # `_edge` the edge-parallel forward + backward (load balanced, fp32 atomics).
 # Join against the DGL sweep (run_dgl_ops_dataset_sweep.sh) on (dataset,
@@ -44,7 +63,7 @@
 # dataset's CSV self-consistent across precisions.
 #
 # SUBSETTING -- env-overridable: DTYPES (default "fp32 fp16 bf16"), MODES
-# (default "forward backward"), FEATURE_DIMS (default "256 128 64 32"), OUT_DIR
+# (default "forward forward_nograd backward"), FEATURE_DIMS (default "256 128 64 32"), OUT_DIR
 # (default out/cuda_gsddmm; redirects CSVs, logs and overrides), DATASETS
 # (default "" = all, e.g. "cora ogbn_arxiv"; names as they appear in the CSV
 # filenames, space- or comma-separated; an unrecognised name is a hard error
@@ -103,7 +122,7 @@ ITERS=20
 DTYPES="${DTYPES:-fp32 fp16 bf16}"
 # Benchmark modes: forward times the forward kernel alone, backward times
 # out.backward(grad) (the forward runs once, untimed, to build the graph).
-MODES="$(echo "${MODES:-forward backward}" | tr ',' ' ')"
+MODES="$(echo "${MODES:-forward forward_nograd backward}" | tr ',' ' ')"
 # Feature dims to try, in order; the kernels reject anything outside
 # {32, 64, 128, 256}, so this is the whole usable fallback chain below 256.
 FEATURE_DIMS="${FEATURE_DIMS:-256 128 64 32}"

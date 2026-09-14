@@ -393,18 +393,31 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         my_pair = __ldcs(&edge_nodes_idx[edge_base + lane_id]);
     }
 
-    // Lane k also caches the canonical edge id of slot k, same access pattern. The
-    // pointer is grid-uniform, so the branch below never diverges and the shuffle
-    // inside canonical_of stays convergent.
     const bool remap_edge_ids = canonical_edge_idx != nullptr;
-    eidx_t my_canonical       = 0;
-    if (remap_edge_ids && lane_id < num_edges) {
-        my_canonical = static_cast<eidx_t>(__ldcs(&canonical_edge_idx[edge_base + lane_id]));
-    }
 
     // Canonical edge id of slot k of this chunk (warp-uniform result).
-    auto canonical_of = [remap_edge_ids, my_canonical, edge_base](uint32_t k) -> eidx_t {
-        return remap_edge_ids ? __shfl_sync(FULL_WARP_MASK, my_canonical, static_cast<int>(k)) : edge_base + static_cast<eidx_t>(k);
+    //
+    // The slot index is warp-uniform, so the remapped id is read with a plain
+    // (broadcast) load rather than cached per lane and shuffled. The shuffle it
+    // replaces was the expensive part: sitting inside the ternary it was a
+    // convergent operation under a data-dependent condition, which ptxas cannot
+    // prove the whole warp reaches, so it wrapped EVERY call site in divergent
+    // reconvergence. Measured on the D=32 fp16 edge forward (sm_80, 64-bit ids),
+    // against the pre-canonical kernel: +20 SHFL, BRA.DIV 4 -> 27 and
+    // CALL.REL.NOINC 10 -> 30, for 384 -> 624 instructions on add(dst, edge) and
+    // 600 -> 784 on add(src, dst). That is a per-edge constant, so it was
+    // invisible on dot (~32 tiles of work per edge) and cost 15-48% on the
+    // elementwise ops at D=32/64, where a warp does one row load and one row
+    // store per edge. The load form brings SHFL back to its pre-canonical count
+    // (13 and 25) for 448 and 504 instructions, and the line it reads was just
+    // touched by the neighbouring slots, so it is an L1 hit. Two alternatives
+    // measured worse: shuffling unconditionally and selecting afterwards drops
+    // the divergence but keeps the 20 extra SHFL (696 / 856), and resolving the
+    // flag into a compile-time branch around the whole loop compiles both bodies
+    // into one kernel (992 / 1368).
+    auto canonical_of = [remap_edge_ids, canonical_edge_idx, edge_base](uint32_t k) -> eidx_t {
+        const eidx_t slot = edge_base + static_cast<eidx_t>(k);
+        return remap_edge_ids ? static_cast<eidx_t>(canonical_edge_idx[slot]) : slot;
     };
 
     // Global row addresses of the operands for edge k of the chunk (warp-uniform).
@@ -500,8 +513,8 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                 r_row = gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e);
             }
 
-            cuda_t *const O_row = O + static_cast<size_t>(e) * D_CONST;  // elementwise ops write the edge's own row
-            accum_t partial{};
+            [[maybe_unused]] cuda_t *const O_row = O + static_cast<size_t>(e) * D_CONST;  // elementwise ops write the edge's own row
+            [[maybe_unused]] accum_t partial{};
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
                 const size_t tile_idx = lane_id + kWarpSize * t;
@@ -654,6 +667,7 @@ __device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_splat(cuda_t con
         return VecFloat<TW, cuda_t>(dO[edge_id]);
     } else {
         VecFloat<TW, cuda_t> v;
+        v.store_zero_();
         return v;
     }
 }
@@ -1067,18 +1081,17 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     // <= kGsddmmEdgeMaxEdgesPerWarp (32): chunk-local counters stay 32-bit.
     const uint32_t num_edges = static_cast<uint32_t>((num_total - edge_base < edges_per_warp) ? (num_total - edge_base) : edges_per_warp);
 
-    // Lane k caches edge k's endpoints and canonical id (see the forward kernel).
+    // Lane k caches edge k's endpoints (see the forward kernel).
     index_pair_t<index_t> my_pair{};
     if (lane_id < num_edges) {
         my_pair = __ldcs(&edge_nodes_idx[edge_base + lane_id]);
     }
     const bool remap_edge_ids = canonical_edge_idx != nullptr;
-    eidx_t my_canonical       = 0;
-    if (remap_edge_ids && lane_id < num_edges) {
-        my_canonical = static_cast<eidx_t>(__ldcs(&canonical_edge_idx[edge_base + lane_id]));
-    }
-    auto canonical_of = [remap_edge_ids, my_canonical, edge_base](uint32_t k) -> eidx_t {
-        return remap_edge_ids ? __shfl_sync(FULL_WARP_MASK, my_canonical, static_cast<int>(k)) : edge_base + static_cast<eidx_t>(k);
+    // Warp-uniform (broadcast) load, not a per-lane cache plus a shuffle -- see
+    // the forward kernel for why the shuffle under the ternary was costly.
+    auto canonical_of = [remap_edge_ids, canonical_edge_idx, edge_base](uint32_t k) -> eidx_t {
+        const eidx_t slot = edge_base + static_cast<eidx_t>(k);
+        return remap_edge_ids ? static_cast<eidx_t>(canonical_edge_idx[slot]) : slot;
     };
     // Node this pass reduces into, and the node the other operand is read from.
     // Warp-uniform: every lane must reach these together.

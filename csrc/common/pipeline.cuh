@@ -92,21 +92,12 @@ __device__ __forceinline__ void async_copy_rows_warp(
     };
 
     if constexpr (CHUNKS_PER_ROW >= kWarpSize || kWarpSize % CHUNKS_PER_ROW != 0) {
-        // Wide rows (or a width that does not tile the warp): plain per-row
-        // copy, chunk lane + 32k. The trip count is a compile-time constant on
-        // purpose: written as `for (i = lane; i < CHUNKS; i += 32)` the start
-        // depends on the lane and the compiler emits a real loop -- measured as
-        // a 12-instruction loop per prefetch site, +10-35% instructions on the
-        // 32-warp GSDDMM kernels -- instead of one straight-line cp.async per k.
-        constexpr size_t COPIES_PER_LANE = ceil_div(CHUNKS_PER_ROW, kWarpSize);
+        // Wide rows (or a width that does not tile the warp): plain per-row copy.
 #pragma unroll
         for (size_t r = 0; r < NUM_ROWS; ++r) {
 #pragma unroll
-            for (size_t k = 0; k < COPIES_PER_LANE; ++k) {
-                const size_t i = lane + k * kWarpSize;
-                if (CHUNKS_PER_ROW % kWarpSize == 0 || i < CHUNKS_PER_ROW) {
-                    copy_chunk(slot_rows + r * ROW_STRIDE, srcs[r], i);
-                }
+            for (size_t i = lane; i < CHUNKS_PER_ROW; i += kWarpSize) {
+                copy_chunk(slot_rows + r * ROW_STRIDE, srcs[r], i);
             }
         }
     } else {
