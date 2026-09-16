@@ -143,6 +143,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
 // applied to the Edge operand rows AND the output row, so the list may be grouped
 // by source for locality while the output stays numbered by forward-CSR position.
 // nullptr: the traversal order is already the canonical one (slot index == id).
+// REMAP_IDS is the compile-time shadow of that nullness, set by the dispatcher:
+// the no-remap instantiation compiles the remap away entirely, and the remap
+// one is a plain load with no flag branch left in the body.
 //
 // index_t is the graph's own (unsigned) index width -- the same type that bounds
 // the CSR -- and it types the edge list, the canonical ids, E, and every id the
@@ -150,7 +153,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
 // instead of 16, 4 bytes per canonical id instead of 8, and broadcasts each id
 // with ONE shuffle instead of two. Only byte offsets are widened to size_t:
 // node_id * D_CONST overflows 32 bits long before a node id does.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block ( // no-format
     index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
@@ -332,8 +335,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_backward_norma
 // PIPELINE_STAGES prefetches the per-edge rows (the dO row and the other
 // operand's) that many edges ahead with cp.async, exactly as the forward edge
 // kernel does; 0 takes the direct-load path. index_t types the edge list and
-// every id, as in the forward.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
+// every id, as in the forward. REMAP_IDS is the compile-time shadow of
+// canonical_edge_idx != nullptr, exactly as in the forward edge kernel.
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block ( // no-format
     index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,

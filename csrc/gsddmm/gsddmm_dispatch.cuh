@@ -117,7 +117,7 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
     auto lro_variant = MakeEnumVariant<LRO, Lros...>(args.key);
 
     std::visit(
-        [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto stages_c) {
+        [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto stages_c, auto remap_c) {
             constexpr GSDDMM_OP OP     = decltype(lro_c)::value.op;
             constexpr GSDDMM_MEMBER LL = decltype(lro_c)::value.l;
             constexpr GSDDMM_MEMBER RR = decltype(lro_c)::value.r;
@@ -127,12 +127,16 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             using cuda_t               = typename decltype(typeInfo)::CudaType;
             constexpr size_t DC        = decltype(d_c)::value;
             constexpr int STAGES       = decltype(stages_c)::value;
+            // The remap flag as a template parameter: the no-remap instantiation
+            // compiles the canonical-id select away entirely. See the kernel body
+            // for why a runtime flag here cost 20%+ of the whole kernel.
+            constexpr bool REMAP_IDS   = decltype(remap_c)::value != 0;
 
             cuda_t const *L_ptr = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
             cuda_t const *R_ptr = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
             cuda_t *O_ptr       = reinterpret_cast<cuda_t *>(args.O.data_ptr<torch_t>());
 
-            auto kernel = GSDDMM_forward_edge_block<OP, LL, RR, DC, cuda_t, index_t, float, STAGES>;
+            auto kernel = GSDDMM_forward_edge_block<OP, LL, RR, DC, cuda_t, index_t, float, STAGES, REMAP_IDS>;
 
             const size_t shmem = args.warps_per_block * gsddmm_forward_edge_shmem_bytes_per_warp<OP, LL, RR, DC, cuda_t, STAGES>();
             ensure_dynamic_shmem(kernel, shmem, "GSDDMM forward (edge blocks)");
@@ -162,7 +166,8 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
         },
         lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
         MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-        MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
+        MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
+        MakeIntVariant<0, 1>(args.canonical_edge_idx != nullptr ? 1 : 0)
     );
 }
 
@@ -255,13 +260,21 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
     auto lro_variant = MakeEnumVariant<LRO, Lros...>(args.key);
 
     auto launch_pass = [&](auto reduce_c) {
+        constexpr GSDDMM_REDUCE REDUCE = decltype(reduce_c)::value;
+        // Grouped by the reduced node: the Src pass walks the source-grouped
+        // list and remaps its slots to canonical ids; the Dst pass's list is
+        // already in canonical order. Known here (not inside the visit) so the
+        // remap axis below can be selected from it.
+        void const *edges     = REDUCE == GSDDMM_REDUCE::Src ? args.edge_nodes_idx_src : args.edge_nodes_idx_dst;
+        void const *canonical = REDUCE == GSDDMM_REDUCE::Src ? args.canonical_edge_idx : nullptr;
+
         std::visit(
-            [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto stages_c) {
+            [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto stages_c, auto remap_c) {
                 constexpr GSDDMM_OP OP         = decltype(lro_c)::value.op;
                 constexpr GSDDMM_MEMBER LL     = decltype(lro_c)::value.l;
                 constexpr GSDDMM_MEMBER RR     = decltype(lro_c)::value.r;
-                constexpr GSDDMM_REDUCE REDUCE = decltype(reduce_c)::value;
-                using Plan                     = GsddmmBackwardPlan<OP, LL, RR, REDUCE>;
+                constexpr GSDDMM_REDUCE REDUCE_ = decltype(reduce_c)::value;
+                using Plan                     = GsddmmBackwardPlan<OP, LL, RR, REDUCE_>;
 
                 if constexpr (Plan::HAS_SELF) {
                     using index_t         = typename decltype(idxInfo)::Type;
@@ -270,7 +283,8 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     using cuda_t          = typename decltype(typeInfo)::CudaType;
                     constexpr size_t DC   = decltype(d_c)::value;
                     constexpr int STAGES  = decltype(stages_c)::value;
-                    constexpr bool IS_SRC = REDUCE == GSDDMM_REDUCE::Src;
+                    // The remap flag as a template parameter; see the forward dispatch.
+                    constexpr bool REMAP_IDS = decltype(remap_c)::value != 0;
 
                     cuda_t const *L_ptr     = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
                     cuda_t const *R_ptr     = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
@@ -280,19 +294,14 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     float *self_ptr         = self_f32.data_ptr<float>();
                     cuda_t *edge_ptr        = Plan::WRITE_EDGE_GRAD ? reinterpret_cast<cuda_t *>(edge_out.data_ptr<torch_t>()) : nullptr;
 
-                    auto kernel = GSDDMM_backward_edge_block<OP, LL, RR, REDUCE, DC, cuda_t, index_t, float, STAGES>;
+                    auto kernel = GSDDMM_backward_edge_block<OP, LL, RR, REDUCE_, DC, cuda_t, index_t, float, STAGES, REMAP_IDS>;
 
                     // Per-warp shared memory: the atomic-flush staging row plus,
                     // when pipelined, the cp.async ring (gsddmm.cuh).
                     const size_t shmem =
                         args.warps_per_block *
-                        gsddmm_backward_edge_shmem_bytes_per_warp<OP, LL, RR, REDUCE, DC, cuda_t, float, static_cast<uint8_t>(STAGES)>();
+                        gsddmm_backward_edge_shmem_bytes_per_warp<OP, LL, RR, REDUCE_, DC, cuda_t, float, static_cast<uint8_t>(STAGES)>();
                     ensure_dynamic_shmem(kernel, shmem, "GSDDMM backward (edge blocks)");
-
-                    // Grouped by the reduced node: the Src pass walks the
-                    // source-grouped list and remaps its slots to canonical ids.
-                    void const *edges     = IS_SRC ? args.edge_nodes_idx_src : args.edge_nodes_idx_dst;
-                    void const *canonical = IS_SRC ? args.canonical_edge_idx : nullptr;
 
                     const uint64_t num_warps  = ceil_div<uint64_t>(args.E, args.edges_per_warp);
                     const uint64_t num_blocks = ceil_div<uint64_t>(num_warps, args.warps_per_block);
@@ -317,7 +326,8 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
             MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
+            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
+            MakeIntVariant<0, 1>(canonical != nullptr ? 1 : 0)
         );
     };
 

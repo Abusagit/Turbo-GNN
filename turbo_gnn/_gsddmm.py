@@ -803,19 +803,29 @@ def _geometry_prefers_node(num_nodes: int, num_edges: int, feat_dim: int) -> boo
     return avg_degree > 250 and feat_dim <= 64
 
 
-def _default_traversal(spec: GsddmmSpec, feat_dim: int) -> TraversalOrder:
+def _default_traversal(spec: GsddmmSpec, feat_dim: int, canonical_output: bool = True) -> TraversalOrder:
     """Traversal order to use when nothing is measured (pinned variant, or the
     measurement-free fallback).
 
-    Source grouping shares the ``Src_V`` row across a warp's chunk, but for an
-    op with no ``dst`` operand it also forces the canonical-id indirection, which
-    costs an extra per-lane load, a shuffle, and scattered row stores. Measured
-    on an A100 (mul(src, edge), fp16) that trade is worth it at D=128 (5-23 %
-    faster than traversing CSR) and a loss at D=32 (6-29 % slower), so narrow
-    features default to the CSR traversal, which needs no remap at all.
+    Source grouping shares the ``Src_V`` row across a warp's chunk, but for a
+    canonical-output plan of an op with no ``dst`` operand it also forces the
+    canonical-id indirection: an unconditional per-lane load (see the kernel's
+    ``REMAP_IDS`` template parameter) plus scattered row stores. Measured on an
+    A100 (mul(src, edge), fp16) that trade is worth it at D=128 (5-23 % faster
+    than traversing CSR) and a loss at D=32 (6-29 % slower), so narrow features
+    default to the CSR traversal, which needs no remap at all.
     ``variant="auto"`` does not use this -- it times both (see
     :func:`_measure_variant`).
+
+    A plan whose output rows follow the traversal itself (``canonical_output=
+    False``) pays no indirection under either grouping, so it always takes the
+    operand-reuse-maximizing order -- source grouping whenever no operand reads
+    the destination. Forcing CSR there would trade real ``Src_V`` row sharing
+    (the directed-graph case: the backward CSR is a different list, not an alias)
+    for nothing.
     """
+    if not canonical_output:
+        return spec.preferred_traversal
     return spec.preferred_traversal if feat_dim > 32 else TraversalOrder.CSR
 
 
@@ -985,7 +995,7 @@ def _measure_variant(
     measure = num_edges > 0 and getattr(config, "measure_variant", True)
     if not measure:
         variant: GsddmmVariant = "node" if _geometry_prefers_node(num_nodes, num_edges, feat_dim) else "edge"
-        traversal = _default_traversal(spec, feat_dim)
+        traversal = _default_traversal(spec, feat_dim, canonical_output=canonical_output)
         logger.debug(
             "gsddmm: %s -> %s/%s by geometry (N=%d, E=%d, D=%d)",
             spec.op,
@@ -1060,7 +1070,9 @@ def resolve_plan(
             spec,
             "edge",
             edge_params or EdgeBlockParams(),
-            traversal=_default_traversal(spec, lhs.shape[-1] if lhs.ndim > 1 else 1),
+            traversal=_default_traversal(
+                spec, lhs.shape[-1] if lhs.ndim > 1 else 1, canonical_output=canonical_output
+            ),
             canonical_output=canonical_output,
         )
     if variant != "auto":

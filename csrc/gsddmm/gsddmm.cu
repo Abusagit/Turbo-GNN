@@ -333,7 +333,7 @@ __device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(
 // shuffle. nullptr means the traversal order already IS the canonical order, and
 // the id degenerates to the slot index (no load, no shuffle).
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES, bool REMAP_IDS>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block( // no-format
     index_t E, // total edge count
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
@@ -393,31 +393,43 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         my_pair = __ldcs(&edge_nodes_idx[edge_base + lane_id]);
     }
 
-    const bool remap_edge_ids = canonical_edge_idx != nullptr;
-
     // Canonical edge id of slot k of this chunk (warp-uniform result).
     //
     // The slot index is warp-uniform, so the remapped id is read with a plain
-    // (broadcast) load rather than cached per lane and shuffled. The shuffle it
-    // replaces was the expensive part: sitting inside the ternary it was a
-    // convergent operation under a data-dependent condition, which ptxas cannot
-    // prove the whole warp reaches, so it wrapped EVERY call site in divergent
-    // reconvergence. Measured on the D=32 fp16 edge forward (sm_80, 64-bit ids),
-    // against the pre-canonical kernel: +20 SHFL, BRA.DIV 4 -> 27 and
-    // CALL.REL.NOINC 10 -> 30, for 384 -> 624 instructions on add(dst, edge) and
-    // 600 -> 784 on add(src, dst). That is a per-edge constant, so it was
-    // invisible on dot (~32 tiles of work per edge) and cost 15-48% on the
-    // elementwise ops at D=32/64, where a warp does one row load and one row
-    // store per edge. The load form brings SHFL back to its pre-canonical count
-    // (13 and 25) for 448 and 504 instructions, and the line it reads was just
-    // touched by the neighbouring slots, so it is an L1 hit. Two alternatives
-    // measured worse: shuffling unconditionally and selecting afterwards drops
-    // the divergence but keeps the 20 extra SHFL (696 / 856), and resolving the
-    // flag into a compile-time branch around the whole loop compiles both bodies
-    // into one kernel (992 / 1368).
-    auto canonical_of = [remap_edge_ids, canonical_edge_idx, edge_base](uint32_t k) -> eidx_t {
+    // (broadcast) load rather than cached per lane and shuffled, and the
+    // no-remap instantiation degenerates to the slot index with no trace of the
+    // array left in the body. Both are compile-time: REMAP_IDS is set by the
+    // dispatcher from canonical_edge_idx != nullptr, one instantiation per
+    // value. A runtime flag here was the expensive form, in two stages. The
+    // shuffle it originally fed was a convergent operation under a
+    // data-dependent condition, which ptxas cannot prove the whole warp reaches,
+    // so it wrapped EVERY call site in divergent reconvergence: +20 SHFL,
+    // BRA.DIV 4 -> 27 and CALL.REL.NOINC 10 -> 30 on the D=32 fp16 edge forward
+    // (sm_80, 64-bit ids), for 384 -> 624 instructions on add(dst, edge) and
+    // 600 -> 784 on add(src, dst) -- a per-edge constant, invisible on dot
+    // (~32 tiles of work per edge) but 15-48% on the elementwise ops at
+    // D=32/64, where a warp does one row load and one row store per edge.
+    // Replacing the shuffle with the broadcast load (an L1 hit -- the line was
+    // just touched by the neighbouring slots) brought SHFL back to its
+    // pre-canonical count (13 and 25) for 448 / 504 instructions, but kept the
+    // flag runtime: ptxas still wrapped the select and everything it fed in
+    // reconvergence machinery that executed per edge even at false (BRA.DIV
+    // 8 -> 16, +10 predicated LDG.E.64 slots, +10 SHF.L.U64.HI / IMAD.SHL.U32),
+    // for +15.9% executed instructions at identical DRAM traffic and occupancy
+    // and +22-28% wall time on a reddit-shaped microbench -- all of it dead
+    // weight at D=32, where the traversal is always destination-grouped and
+    // therefore canonical (the flag is false on every launch). Two alternatives
+    // measured worse than either: shuffling unconditionally and selecting
+    // afterwards keeps the 20 extra SHFL (696 / 856), and a runtime branch
+    // around the whole loop compiles both bodies into one kernel (992 / 1368).
+    // The template flag removes the machinery outright -- on that microbench,
+    // against the pre-canonical kernel: add(src, dst) 17.3 ms -> 17.5 (the
+    // runtime flag was at 21.2-22.2), add(dst, edge) 15.6 -> 15.7 (was 19.7),
+    // and the remap instantiation itself drops 27.0 -> 23.5 ms, so the
+    // source-grouped D>=64 launches that really use the array get faster too.
+    auto canonical_of = [canonical_edge_idx, edge_base](uint32_t k) -> eidx_t {
         const eidx_t slot = edge_base + static_cast<eidx_t>(k);
-        return remap_edge_ids ? static_cast<eidx_t>(canonical_edge_idx[slot]) : slot;
+        return REMAP_IDS ? static_cast<eidx_t>(canonical_edge_idx[slot]) : slot;
     };
 
     // Global row addresses of the operands for edge k of the chunk (warp-uniform).
@@ -496,24 +508,34 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
 
         vec_t shared_tiles[TILES_PER_THREAD];
 
-        // edge_body(cache_c, k): op for edge k of the chunk; with cache_c true the
-        // SHARED operand comes from shared_tiles instead of its own gathered row.
+        // edge_body(cache_c, k, edge_row, o_row): op for edge k of the chunk; with
+        // cache_c true the SHARED operand comes from shared_tiles instead of its own
+        // gathered row. edge_row / o_row are this slot's id-derived pointers -- the
+        // Edge-member operand row and the output pointer -- which the caller
+        // advances as induction variables when !REMAP_IDS (see the cursor setup
+        // below); under REMAP_IDS they are never read and arrive as nullptr.
         // shared_tiles is captured BY REFERENCE: it is filled below, after this
         // closure is created, so a by-value capture would compute on the copy
         // taken while the array was still uninitialized.
-        auto edge_body = [L, R, O, canonical_of, &shared_tiles, my_pair, lane_id](auto cache_c, uint32_t k) {
+        auto edge_body = [L, R, O, canonical_of, &shared_tiles, my_pair, lane_id](auto cache_c, uint32_t k,
+                              cuda_t const *const edge_row, cuda_t *const o_row) {
             constexpr bool USE_CACHE = decltype(cache_c)::value;
             const eidx_t e           = canonical_of(k);
             cuda_t const *l_row      = nullptr;
             cuda_t const *r_row      = nullptr;
             if constexpr (!(USE_CACHE && L_SHARED)) {
-                l_row = gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e);
+                l_row = (!REMAP_IDS && ll == GSDDMM_MEMBER::Edge)
+                            ? edge_row
+                            : gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e);
             }
             if constexpr (Plan::USE_R && !(USE_CACHE && R_SHARED)) {
-                r_row = gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e);
+                r_row = (!REMAP_IDS && rr == GSDDMM_MEMBER::Edge)
+                            ? edge_row
+                            : gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e);
             }
 
-            [[maybe_unused]] cuda_t *const O_row = O + static_cast<size_t>(e) * D_CONST;  // elementwise ops write the edge's own row
+            // elementwise ops write the edge's own row
+            [[maybe_unused]] cuda_t *const O_row = REMAP_IDS ? O + static_cast<size_t>(e) * D_CONST : o_row;
             [[maybe_unused]] accum_t partial{};
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
@@ -546,15 +568,55 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                 partial = warp_reduce_sum(partial);
                 if (lane_id == 0) {
                     // Dot output is [E] (one scalar per edge), not an [E, D] row.
-                    O[e] = static_cast<cuda_t>(partial);
+                    if constexpr (REMAP_IDS) {
+                        O[e] = static_cast<cuda_t>(partial);
+                    } else {
+                        *o_row = static_cast<cuda_t>(partial);
+                    }
                 }
             }
         };
+
+        // Id-derived row cursors. With no remap, slot k's edge id is edge_base + k,
+        // so the Edge-member operand row and the output pointer advance by a fixed
+        // stride per slot (one element for dot, whose output is a scalar per edge).
+        // Held as induction variables the per-slot address math is one add per row,
+        // and the unrolled k-loop folds the rest into immediate offsets. Recomputed
+        // as base + D*id per slot instead, the address is a 64-bit multiply chain
+        // per row (IADD3 + LEA x32 + IMAD.X + LEA.HI.X) that ptxas does not
+        // strength-reduce back across the unrolled loop: it cost +4-8% wall at
+        // D=32 fp16 on power-law graphs, where this loop is issue-bound rather
+        // than DRAM-bound (hub rows stay in L2, so ALU work is not hidden), and
+        // ~1% on uniform random graphs, which are DRAM-bound. REMAP_IDS ids are
+        // arbitrary, so there the per-slot form stays and the cursors stay null.
+        constexpr bool HAS_EDGE_OPERAND = (ll == GSDDMM_MEMBER::Edge) || (Plan::USE_R && rr == GSDDMM_MEMBER::Edge);
+        constexpr size_t O_STRIDE       = Plan::IS_DOT ? 1 : D_CONST;
+        cuda_t const *edge_row_cursor   = nullptr;
+        cuda_t *o_cursor                = nullptr;
+        if constexpr (!REMAP_IDS) {
+            if constexpr (HAS_EDGE_OPERAND) {
+                edge_row_cursor = (ll == GSDDMM_MEMBER::Edge ? L : R) + D_CONST * static_cast<size_t>(edge_base);
+            }
+            o_cursor = O + O_STRIDE * static_cast<size_t>(edge_base);
+        }
 
         // One ballot decides the chunk: lanes beyond the chunk vote "same".
         const eidx_t my_key     = GROUPED_BY_DST ? my_pair.y : my_pair.x;
         const eidx_t key0       = __shfl_sync(FULL_WARP_MASK, my_key, 0);
         const bool chunk_shared = __all_sync(FULL_WARP_MASK, (lane_id >= num_edges) || (my_key == key0)) != 0;
+
+        // run_chunk(cache_c): the k-loop, advancing the cursors per slot.
+        const auto run_chunk = [&](auto cache_c) {
+            for (uint32_t k = 0; k < num_edges; ++k) {
+                edge_body(cache_c, k, edge_row_cursor, o_cursor);
+                if constexpr (!REMAP_IDS) {
+                    if constexpr (HAS_EDGE_OPERAND) {
+                        edge_row_cursor += D_CONST;
+                    }
+                    o_cursor += O_STRIDE;
+                }
+            }
+        };
         if (chunk_shared) {
             cuda_t const *const row = (L_SHARED ? L : R) + D_CONST * static_cast<size_t>(key0);
 #pragma unroll
@@ -564,13 +626,9 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     shared_tiles[t] = Tile::read<Tile::MemoryHint::NoHint>(row, tile_idx);
                 }
             }
-            for (uint32_t k = 0; k < num_edges; ++k) {
-                edge_body(std::true_type{}, k);
-            }
+            run_chunk(std::true_type{});
         } else {
-            for (uint32_t k = 0; k < num_edges; ++k) {
-                edge_body(std::false_type{}, k);
-            }
+            run_chunk(std::false_type{});
         }
     }
 }
@@ -1026,7 +1084,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
 // the forward edge kernel does. The reduced node's row is deliberately not in the
 // ring: it is a per-RUN constant, so it belongs in registers.
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES, bool REMAP_IDS>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block( // no-format
     index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
@@ -1086,12 +1144,12 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     if (lane_id < num_edges) {
         my_pair = __ldcs(&edge_nodes_idx[edge_base + lane_id]);
     }
-    const bool remap_edge_ids = canonical_edge_idx != nullptr;
-    // Warp-uniform (broadcast) load, not a per-lane cache plus a shuffle -- see
-    // the forward kernel for why the shuffle under the ternary was costly.
-    auto canonical_of = [remap_edge_ids, canonical_edge_idx, edge_base](uint32_t k) -> eidx_t {
+    // Warp-uniform (broadcast) load, not a per-lane cache plus a shuffle; the
+    // flag itself is the REMAP_IDS template parameter, so the select is
+    // compile-time -- see the forward kernel for the full measurement history.
+    auto canonical_of = [canonical_edge_idx, edge_base](uint32_t k) -> eidx_t {
         const eidx_t slot = edge_base + static_cast<eidx_t>(k);
-        return remap_edge_ids ? static_cast<eidx_t>(canonical_edge_idx[slot]) : slot;
+        return REMAP_IDS ? static_cast<eidx_t>(canonical_edge_idx[slot]) : slot;
     };
     // Node this pass reduces into, and the node the other operand is read from.
     // Warp-uniform: every lane must reach these together.
