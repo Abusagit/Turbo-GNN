@@ -236,8 +236,8 @@ _SCHEDULE_PARAMS = (
         "schedule",
         str,
         "one_per_block",
-        "Node->block policy: one_per_block (grid.x == node count) | grid_stride | precomputed | dynamic.",
-        choices=("one_per_block", "grid_stride", "precomputed", "dynamic"),
+        "Node->block policy: one_per_block (grid.x == node count).",
+        choices=("one_per_block",),
     ),
     KernelParam(
         "blocks_per_sm",

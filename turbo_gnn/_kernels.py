@@ -234,15 +234,6 @@ class GATv2AggrKernel(TunableKernel):
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            # The node->block policy. Searched rather than swept externally: which policy wins
-            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
-            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
-            # the gain. One value covers both passes, so it appears in each list.
-            TunableParam(
-                "schedule",
-                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
-                default="one_per_block",
-            ),
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
             TunableParam("forward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
@@ -268,15 +259,6 @@ class GATv2AggrKernel(TunableKernel):
 
     def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
         return [
-            # The node->block policy. Searched rather than swept externally: which policy wins
-            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
-            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
-            # the gain. One value covers both passes, so it appears in each list.
-            TunableParam(
-                "schedule",
-                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
-                default="one_per_block",
-            ),
             TunableParam("backward_grad_A_reduce_row_chunk_size", [512, 1024], default=512),
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
@@ -836,15 +818,6 @@ class GraphTransformerAggrKernel(TunableKernel):
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            # The node->block policy. Searched rather than swept externally: which policy wins
-            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
-            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
-            # the gain. One value covers both passes, so it appears in each list.
-            TunableParam(
-                "schedule",
-                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
-                default="one_per_block",
-            ),
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
             TunableParam("forward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
@@ -870,15 +843,6 @@ class GraphTransformerAggrKernel(TunableKernel):
 
     def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
         return [
-            # The node->block policy. Searched rather than swept externally: which policy wins
-            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
-            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
-            # the gain. One value covers both passes, so it appears in each list.
-            TunableParam(
-                "schedule",
-                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
-                default="one_per_block",
-            ),
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
             TunableParam("backward_bucket_launch", ["sequential", "concurrent"], default="sequential"),

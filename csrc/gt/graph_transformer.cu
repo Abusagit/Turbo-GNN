@@ -1,3 +1,10 @@
+// Compiled once per dtype through gt/gt_shard_{f32,f16,bf16}.cu, which define
+// ATTN_SHARD_TYPE and ATTN_SHARD_FN. One translation unit instantiating every dtype took
+// most of the build; split three ways the shards compile in parallel.
+#ifndef ATTN_SHARD_TYPE
+#error "compile this file through its per-dtype shards"
+#endif
+
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -6,7 +13,7 @@
 #include "gt/gt_backward.cu"
 #include "gt/gt_forward.cu"
 
-std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
+std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_csr_mh_cuda)(
     torch::Tensor row_ptr,
     torch::Tensor col_idx,
     torch::Tensor Q,
@@ -131,8 +138,8 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
                     o_strides[1], lse.data_ptr<float>(), scale
                 );
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(D), warp_variant, MakeIntVariant<0, 1, 2, 3>(schedule),
+            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
+            MakeIntVariant<32, 64, 128, 256>(D), warp_variant, MakeIntVariant<0>(schedule),
             MakeIntVariant<0, 2, 6, 12>(bucket_stages)
         );
     };
@@ -201,7 +208,7 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
                     lse.data_ptr<float>(), num_heavy
                 );
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
+            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
             MakeIntVariant<32, 64, 128, 256>(D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block),
             MakeIntVariant<0, 2, 6, 12>(heavy_pipeline_stages)
         );
@@ -228,7 +235,7 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     return std::make_tuple(O, lse);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward_csr_mh_cuda(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_backward_csr_mh_cuda)(
     torch::Tensor row_ptr,    // [N+1], forward CSR,
     torch::Tensor col_idx,    // [E],   forward CSR,
     torch::Tensor row_ptr_T,  // [N+1], CSR^T (backward)
@@ -371,8 +378,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                     spD, dO_ptr, O_ptr, Delta.data_ptr<float>(), N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
                 );
             },
-            MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(D),
-            MakeIntVariant<0, 1, 2, 3>(schedule)
+            MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(D),
+            MakeIntVariant<0>(schedule)
         );
     }
 
@@ -443,8 +450,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
-                MakeIntVariant<0, 1, 2, 3>(schedule),
+                MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0>(schedule),
                 MakeIntVariant<0, 2, 6, 12>(bucket_stages)
             );
         };
@@ -512,7 +519,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                         );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
+                MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
                 MakeIntVariant<32, 64, 128, 256>((int)D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block),
                 MakeIntVariant<0, 2, 6, 12>(backward_heavy_pipeline_stages)
             );
@@ -580,8 +587,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                     dQ_ptr, dK_ptr, dV_ptr
                 );
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(Q.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(D), MakeIntVariant<0, 1, 2, 3>(schedule),
+            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
+            MakeIntVariant<32, 64, 128, 256>(D), MakeIntVariant<0>(schedule),
             MakeIntVariant<0, 2, 6, 12>(pipeline_stages)
         );
     }

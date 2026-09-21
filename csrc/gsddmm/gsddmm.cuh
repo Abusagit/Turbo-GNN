@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "common/gsddmm_pipeline.cuh"
 
 namespace gsddmm {
 

@@ -1,5 +1,11 @@
 #pragma once
 
+// The dtype axis is fixed by the including shard (gsddmm_launch_<op>_<dtype>.cu): one
+// translation unit per op and dtype keeps each nvcc job small enough to finish quickly.
+#ifndef GSDDMM_SHARD_TYPE
+#error "include gsddmm_dispatch.cuh through a per-op, per-dtype shard"
+#endif
+
 #include <ATen/cuda/CUDAEvent.h>
 
 #include <optional>
@@ -12,7 +18,7 @@
 // =============================================================================
 // The templated GSDDMM forward dispatch grid, instantiated once per op shard.
 //
-// Include this from a gsddmm_launch_<op>.cu only -- every inclusion compiles
+// Include this from a gsddmm_launch_<op>_<dtype>.cu only -- every inclusion compiles
 // (LRO count) x (4 index types) x (3 dtypes) x (4 feature dims) x (warp counts)
 // x (4 pipeline depths) kernels, for each of the four kernel families.
 // gsddmm_binding.cu deliberately does not include it.
@@ -65,7 +71,7 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
                 );
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
-            MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+            MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
             warp_variant, MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
         );
     };
@@ -165,7 +171,7 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             );
         },
         lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
-        MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+        MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
         MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
         MakeIntVariant<0, 1>(args.canonical_edge_idx != nullptr ? 1 : 0)
     );
@@ -235,7 +241,7 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
                 }
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
-            MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+            MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
             warp_variant
         );
     };
@@ -325,7 +331,7 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                 }
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
-            MakeTypeVariant<float, at::Half, at::BFloat16>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
+            MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
             MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
             MakeIntVariant<0, 1>(canonical != nullptr ? 1 : 0)
         );

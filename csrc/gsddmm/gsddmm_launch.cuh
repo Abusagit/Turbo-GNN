@@ -12,13 +12,13 @@
 // dtype, index type, pipeline stages), so every combination is a separate
 // instantiation and the size of the dispatch grid alone drives this kernel's
 // compile time. nvcc scales superlinearly in instantiations per translation
-// unit, so the grid is sharded by op: gsddmm_launch_<op>.cu instantiates only
+// unit, so the grid is sharded by op: gsddmm_launch_<op>_<dtype>.cu instantiates only
 // its own op's slice of the grid and the six files compile in parallel.
 //
 // gsddmm_binding.cu keeps the argument checking and output allocation (it
 // instantiates no kernels at all) and routes to one of the entry points below.
 // Adding an op means adding an enumerator, an entry point here, and one more
-// gsddmm_launch_<op>.cu; extending the dtype / index / D / warps / stages axes
+// gsddmm_launch_<op>_<dtype>.cu; extending the dtype / index / D / warps / stages axes
 // happens once in gsddmm_dispatch.cuh and costs every shard.
 // =============================================================================
 
@@ -60,7 +60,7 @@ struct GsddmmLaunchArgs {
     bool overlap_buckets;
 };
 
-// Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
+// Per-op entry points; one translation unit each (gsddmm_launch_<op>_<dtype>.cu). Each
 // covers the member pairs that op is instantiated for and raises from
 // MakeEnumVariant on any other pair. The declarations are X-macro'd over the
 // op list so they cannot drift from the routing switches or the shards.
@@ -92,7 +92,7 @@ struct GsddmmLaunchArgsEdge {
     uint8_t warps_per_block;  // independent warps packed per block, 1..kGsddmmEdgeMaxWarpsPerBlock
 };
 
-// Per-op entry points; one translation unit each (gsddmm_launch_<op>.cu). Each
+// Per-op entry points; one translation unit each (gsddmm_launch_<op>_<dtype>.cu). Each
 // covers the member pairs that op is instantiated for and raises from
 // MakeEnumVariant on any other pair. The declarations are X-macro'd over the
 // op list so they cannot drift from the routing switches or the shards.

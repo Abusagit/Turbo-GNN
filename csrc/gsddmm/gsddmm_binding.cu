@@ -15,7 +15,7 @@
 // validation and output allocation only.
 //
 // This translation unit instantiates no kernels -- it routes to one of the
-// per-op launchers in gsddmm_launch_<op>.cu, each of which compiles its own
+// per-op launchers in gsddmm_launch_<op>_<dtype>.cu, each of which compiles its own
 // slice of the (op x members x dtype x index x D x warps x stages) grid. See
 // gsddmm_launch.cuh for the reasoning; deliberately do not include
 // gsddmm_dispatch.cuh here.

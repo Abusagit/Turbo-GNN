@@ -50,7 +50,7 @@ GRAPHS = [
 ]
 
 CONVS = ["min_aggr", "gat_v2", "gt"]
-SCHEDULES = ["one_per_block", "grid_stride", "precomputed", "dynamic"]
+SCHEDULES = ["one_per_block"]
 ORDERS = "natural,degree,locality"
 BUCKET_LAUNCHES = ["sequential"]
 

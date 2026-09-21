@@ -159,13 +159,9 @@ def gatv2_aggr(
         negative_slope: LeakyReLU negative slope (typically 0.2).
         grad_A_reduce_row_chunk_size: Row chunk size for backward attention gradient
             reduction. Larger values use more shared memory but fewer kernel launches.
-        schedule: Node-to-block scheduling policy. ``"one_per_block"`` reproduces the
-            historical one-block-per-node launch; ``"grid_stride"``, ``"precomputed"`` and
-            ``"dynamic"`` launch persistently with ``blocks_per_sm * SM_count`` blocks and
-            loop. ``"dynamic"`` (the default) claims work from an atomic queue, which is
-            what balances heavy-tailed degree distributions.
-        blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
-            by ``"one_per_block"``.
+        schedule: Node-to-block scheduling policy. Only ``"one_per_block"`` (one block per
+            node) is available.
+        blocks_per_sm: Unused by ``"one_per_block"``; kept for signature stability.
         pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
             r[j] prefetch. 0 disables the pipeline (plain warp-strided loop).
         backward_pipeline_stages: Number of async-copy pipeline stages for the backward
@@ -270,13 +266,9 @@ def graph_transformer_aggr(
         K: Key tensor, shape ``[N, H, D]``.
         V: Value tensor, shape ``[N, H, D]``.
         scale: Scaling factor, typically ``1 / sqrt(D)``.
-        schedule: Node-to-block scheduling policy. ``"one_per_block"`` reproduces the
-            historical one-block-per-node launch; ``"grid_stride"``, ``"precomputed"`` and
-            ``"dynamic"`` launch persistently with ``blocks_per_sm * SM_count`` blocks and
-            loop. ``"dynamic"`` (the default) claims work from an atomic queue, which is
-            what balances heavy-tailed degree distributions.
-        blocks_per_sm: Target resident blocks per SM for the persistent policies. Ignored
-            by ``"one_per_block"``.
+        schedule: Node-to-block scheduling policy. Only ``"one_per_block"`` (one block per
+            node) is available.
+        blocks_per_sm: Unused by ``"one_per_block"``; kept for signature stability.
         forward_heavy_edge_slice: Edges per block in the forward heavy bucket. ``0`` keeps
             one block per heavy node; a positive value splits each heavy node's edge list
             into slices of that size, one block each, merged by a second kernel. Balances

@@ -17,36 +17,14 @@ import turbo_gnn._C as _C
 WARP_SIZE = 32
 FOUR_BYTES_CONSTANT = 4
 
-#: Node -> thread-block scheduling policies, mirroring ``csrc/common/scheduler.cuh``.
+#: Node -> thread-block scheduling policy, mirroring ``csrc/common/scheduler.cuh``.
 #:
-#: ``one_per_block`` is the historical behaviour (grid.x == node count). The other three are
-#: persistent: the grid is sized to ``blocks_per_sm * SM_count`` and each block loops over
-#: several nodes -- ``grid_stride`` strides by gridDim.x, ``precomputed`` walks a host-assigned
-#: contiguous slice balanced by edge count, ``dynamic`` claims from an atomic work queue.
-SCHEDULES = {"one_per_block": 0, "grid_stride": 1, "precomputed": 2, "dynamic": 3}
-
-#: The default is ``one_per_block``, i.e. the historical launch. This reverses the original
-#: design decision ("persistent dynamic by default") and it is worth saying why, because the
-#: reason is not that the persistent path is broken -- it is bit-exact and often faster.
-#:
-#: Measured over 108 (graph, conv, head dim, direction) cells -- every graph in
-#: ``configs/datasets/main/`` plus ogbn-proteins, head dims 128 and 256, forward and backward,
-#: on idle GPUs -- no persistent policy is a safe blanket default:
-#:
-#:     policy                geomean   worst    best   >=1.0
-#:     grid_stride/bps1024      0.98    0.58    1.35   41/108
-#:     precomputed/bps1024      0.90    0.37    1.10   16/108
-#:     dynamic/bps256/c4        0.83    0.46    1.16   19/108
-#:     dynamic/bps256/c1        0.77    0.22    1.08   23/108
-#:
-#: Picking the best policy per cell (an oracle no runtime can have) gives 1.02x. The reason
-#: the baseline is so hard to beat is that the hardware block scheduler is already a dynamic
-#: work queue *and* a locality-optimal one, at zero cost -- see ``SCHEDULER_PERF.md``.
-#:
-#: So the policies stay available and tunable, and the default costs nobody anything. Where
-#: they do pay, they pay well: min_aggr backward on small sparse graphs reaches 1.24-1.35x
-#: (tolokers-2, avazu-ctr, city-roads-M), min_aggr forward on cache-bound ogbn-proteins reaches
-#: 1.10x with ``precomputed``, and gat_v2 at head dim 256 reaches 1.08x with ``dynamic``.
+#: Only ``one_per_block`` (grid.x == node count) is compiled into the attention kernels. The
+#: hardware block scheduler already hands blocks out as a dynamic, locality-preserving queue, and
+#: the persistent policies that scheduler.cuh also implements were never a safe default; keeping
+#: them as a template axis quadrupled the attention kernels' build time. Load balance comes from
+#: degree bucketing, degree ordering, concurrent bucket launch and edge slicing instead.
+SCHEDULES = {"one_per_block": 0}
 DEFAULT_SCHEDULE = "one_per_block"
 
 #: Resident blocks per SM targeted by the persistent policies; ignored by ``one_per_block``.

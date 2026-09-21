@@ -1,3 +1,10 @@
+// Compiled once per dtype through gatv2/gatv2_shard_{f32,f16,bf16}.cu, which define
+// ATTN_SHARD_TYPE and ATTN_SHARD_FN. One translation unit instantiating every dtype took
+// most of the build; split three ways the shards compile in parallel.
+#ifndef ATTN_SHARD_TYPE
+#error "compile this file through its per-dtype shards"
+#endif
+
 #include "common.cuh"
 #include "gatv2/gatv2_backward.cu"
 #include "gatv2/gatv2_forward.cu"
@@ -50,7 +57,7 @@ void GATv2Backward_CSR_Undirected_Impl(
                     d_row_ptr, d_col_idx, d_attn_vec, d_logsumexp, negative_slope, d_G
                 );
             },
-            MakeIntVariant<0, 1, 2, 3>(schedule)
+            MakeIntVariant<0>(schedule)
         );
     };
 
@@ -77,7 +84,7 @@ void GATv2Backward_CSR_Undirected_Impl(
                     d_row_ptr, d_col_idx, d_attn_vec, d_logsumexp, d_G, negative_slope, grad_a, grad_l, grad_r
                 );
             },
-            MakeIntVariant<0, 1, 2, 3>(schedule)
+            MakeIntVariant<0>(schedule)
         );
     };
 
@@ -256,7 +263,7 @@ void GATv2Backward_CSR_Impl_UNUSED(
     CUDA_CHECK(cudaFree(d_G));
 }
 
-std::vector<torch::Tensor> gatv2_forward_cuda(
+std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_forward_cuda)(
     torch::Tensor l,         // [N, H, D] - left features,
     torch::Tensor r,         // [N, H, D] - right features,
     torch::Tensor row_ptr,   // [N+1] - CSR row pointers,
@@ -389,8 +396,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                     index_ptr<index_t>(col_idx), sp, attn_ptr, h_out_ptr, d_logsumexp, negative_slope
                 );
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1, 2, 3>(schedule),
+            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(l.scalar_type()),
+            MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0>(schedule),
             MakeIntVariant<0, 2, 6, 12>(bucket_stages)
         );
     };
@@ -448,7 +455,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                     part_o.data_ptr<float>(), part_ml.data_ptr<float>(), h_out_ptr, d_logsumexp, num_heavy
                 );
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
+            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(l.scalar_type()),
             MakeIntVariant<32, 64, 128, 256>((int)D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block),
             MakeIntVariant<0, 2, 6, 12>(heavy_pipeline_stages)
         );
@@ -474,7 +481,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     return {h_out, logsumexp};
 }
 
-std::vector<torch::Tensor> gatv2_backward_cuda(
+std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_backward_cuda)(
     torch::Tensor grad_h,     // [N, H, D] - gradient from output,
     torch::Tensor l,          // [N, H, D] - left features (saved)
     torch::Tensor r,          // [N, H, D] - right features (saved)
@@ -649,8 +656,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
-                MakeIntVariant<0, 1, 2, 3>(schedule),
+                MakeTypeVariant<ATTN_SHARD_TYPE>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0>(schedule),
                 MakeIntVariant<0, 2, 6, 12>(bucket_stages)
             );
         };
@@ -703,8 +710,8 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     );
                 },
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
-                MakeIntVariant<0, 1, 2, 3>(schedule),
+                MakeTypeVariant<ATTN_SHARD_TYPE>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
+                MakeIntVariant<0>(schedule),
                 MakeIntVariant<0, 2, 6, 12>(bucket_stages)
             );
         };
@@ -761,7 +768,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                         N, H, D, d_grad_a, grad_a_reduced_f32.data_ptr<float>()
                     );
                 },
-                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
+                MakeTypeVariant<ATTN_SHARD_TYPE>(l.scalar_type()),
                 MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(grad_A_reduce_row_chunk_size)
             );
         }
@@ -797,7 +804,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     static_cast<int>(chunk_node.numel()), backward_heavy_edge_slice, pipeline_stages
                 );
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
+            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(l.scalar_type()),
             MakeIntVariant<32, 64, 128, 256>((int)D)
         );
     }
