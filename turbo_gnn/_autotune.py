@@ -117,7 +117,7 @@ class _InlineAutotuneCache:
         num_edges = graph_repr.forward_indices.numel()
         return (num_nodes, num_edges, feat_dim, dtype)
 
-    def lookup(self, graph_repr, feat_dim: int, tune_backward: bool = False, dtype: torch.dtype | None = None) -> dict | None:
+    def lookup(self, graph_repr, feat_dim: int, dtype: torch.dtype | None = None, tune_backward: bool = False) -> dict | None:
         gid = id(graph_repr)
         tier1 = self._cache.get(gid)
         if tier1 is not None:
@@ -129,7 +129,7 @@ class _InlineAutotuneCache:
         return None
 
     def store(
-        self, graph_repr, feat_dim: int, result: dict, tune_backward: bool = False, dtype: torch.dtype | None = None
+        self, graph_repr, feat_dim: int, result: dict, dtype: torch.dtype | None = None, tune_backward: bool = False
     ) -> None:
         gid = id(graph_repr)
         if gid not in self._cache:
@@ -173,14 +173,14 @@ class TunableKernel(ABC):
             feat_dim = _infer_feat_dim(x, *extra_args, *kwargs.values())
             cfg = autotune_config or self._autotune_config
             tune_bwd = bool(getattr(cfg, "tune_backward", False))
-            cached = self._inline_cache.lookup(graph, feat_dim, tune_bwd, dtype=x.dtype)
+            cached = self._inline_cache.lookup(graph, feat_dim, x.dtype, tune_backward=tune_bwd)
             if cached is not None:
                 if cached["kernel_config"]:
                     self.configure(**cached["kernel_config"])
                 return self._execute(cached["graph_repr"], x, *extra_args, **kwargs)
 
             result = self._inline_autotune(x, graph, cfg, **kwargs)
-            self._inline_cache.store(graph, feat_dim, result, tune_bwd, dtype=x.dtype)
+            self._inline_cache.store(graph, feat_dim, result, x.dtype, tune_backward=tune_bwd)
             return self._execute(result["graph_repr"], x, *extra_args, **kwargs)
 
         return self._execute(*args, **kwargs)

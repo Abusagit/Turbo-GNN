@@ -26,6 +26,12 @@
 
 namespace gsddmm {
 
+// Internal linkage on purpose. These templates are parameterized only by the op's member
+// pairs, but each per-dtype shard compiles a different body (GSDDMM_SHARD_TYPE fixes the
+// dtype axis). With external linkage the three instantiations share one mangled name, the
+// linker keeps one of them, and the other two dtypes run a body that rejects their operands.
+namespace {
+
 // Instantiates GSDDMM_forward_normal over Lros x the dtype / index / D / warps /
 // stages grid and launches the light and heavy node buckets of args.
 template <LRO... Lros>
@@ -356,5 +362,7 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
 #define GSDDMM_COPY_LROS                                             \
     LRO{GSDDMM_MEMBER::Src_V, GSDDMM_MEMBER::Edge, GSDDMM_OP::Copy}, \
     LRO{GSDDMM_MEMBER::Dst_V, GSDDMM_MEMBER::Edge, GSDDMM_OP::Copy}
+
+}  // namespace
 
 }  // namespace gsddmm
