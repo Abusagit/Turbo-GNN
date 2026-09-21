@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", nargs=2, default=DEFAULT_LABELS, help="Tag to the left of each panel")
     parser.add_argument("--xlabel", default="Simulated cycles")
     parser.add_argument("--ylabel", default="SM index")
-    parser.add_argument("--colorbar-label", default="Utilization metric")
+    parser.add_argument("--colorbar-label", default="Utilization")
     parser.add_argument("--colorbar-side", choices=["right", "bottom"], default="right")
     parser.add_argument(
         "--cmap",

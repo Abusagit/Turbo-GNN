@@ -60,9 +60,11 @@ Panel letters are fixed throughout:
 
 PANEL_LEGEND_GOES_HERE
 
-Colour gives the fraction of an SM's block slots that are occupied at a given
-instant: the darkest shade means every slot is busy, the lightest means the SM
-is idle. The horizontal axis is the simulated cycle count; all five panels share
+Colour gives utilization: the fraction of an SM's block slots that are occupied
+at a given instant, so the darkest shade means every slot is busy and the
+lightest means the SM stands idle. It counts slots, not warps, and is therefore
+not the same quantity a profiler reports under that name.
+The horizontal axis is the simulated cycle count; all five panels share
 it, so a configuration that finishes earlier ends further to the left. The
 hatched region marks the interval after a configuration has finished, during
 which the remaining panels are still running; the solid rule marks the instant
@@ -147,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-line-color", default="black")
     parser.add_argument("--xlabel", default="Simulated cycles")
     parser.add_argument("--ylabel", default="SM index")
-    parser.add_argument("--colorbar-label", default="Utilization metric")
+    parser.add_argument("--colorbar-label", default="Utilization")
     parser.add_argument("--label-size", type=float, default=9.0)
     parser.add_argument("--width", type=float, default=7.0, help="Figure width in inches")
     parser.add_argument("--panel-height", type=float, default=0.62, help="Height of one heatmap in inches")
@@ -253,7 +255,9 @@ def caption(setup: dict, results, slices: list[int], args: argparse.Namespace) -
         f"mean degree ${degrees[0].mean():.1f}$, maximum degree ${int(degrees[0].max()):,}$, "
         f"skew ${degrees[0].max() / degrees[0].mean():.0f}\\times$), kernel "
         f"\\textsf{{{tex_escape(setup['conv'])}}} {setup['pass_name']} at head dimension "
-        f"{setup['head_dim']}, on {args.sms} SMs. The heavy bucket is the top "
+        f"{setup['head_dim']}, on {args.sms} SMs. Utilization is the fraction of an SM's block "
+        f"slots that are occupied at that instant: $1$ when every slot is busy, $0$ when the SM "
+        f"stands idle. The heavy bucket is the top "
         f"{(1 - setup['quantile']) * 100:.0f}\\% of vertices by degree "
         f"({len(degrees[2]):,} of them).{slicing} "
         f"Ratios $T/T^{{*}}$, with the bound that attains the maximum in brackets: {ratios}."
@@ -274,6 +278,12 @@ def main() -> int:
         + [r"\end{description}"]
     )
     blocks = [PREAMBLE.replace("PANEL_LEGEND_GOES_HERE", legend)]
+    tex_path.write_text("".join(blocks))
+    if args.standalone:
+        preview = tex_path.with_name("preview.tex")
+        preview.write_text(STANDALONE.replace("GENERATED_TEX_NAME", tex_path.name))
+        print(f"wrote {preview}  (cd {tex_path.parent} && pdflatex preview.tex)\n")
+
     for spec in args.setups:
         graph, conv, pass_name, head_dim, quantile = spec.split(":")
         args.dataset, args.conv, args.pass_name = graph, conv, pass_name
@@ -319,14 +329,12 @@ def main() -> int:
                 "label": stem,
             }
         )
+        # Rewritten after every setup, not once at the end: a full grid takes most of a day,
+        # and an interrupted run would otherwise leave the PDFs without the captions that
+        # carry their T/T*, which cannot be recovered without simulating again.
+        tex_path.write_text("".join(blocks))
 
-    tex_path.write_text("".join(blocks))
-    print(f"\nwrote {tex_path}")
-
-    if args.standalone:
-        preview = tex_path.with_name("preview.tex")
-        preview.write_text(STANDALONE.replace("GENERATED_TEX_NAME", tex_path.name))
-        print(f"wrote {preview}  (cd {tex_path.parent} && pdflatex preview.tex)")
+    print(f"\nwrote {tex_path}  ({len(blocks) - 1} figure(s))")
     return 0
 
 
