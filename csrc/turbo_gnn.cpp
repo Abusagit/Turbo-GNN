@@ -4,6 +4,16 @@
 
 namespace py = pybind11;
 
+
+// Default for the optional edge-slice table arguments. An undefined at::Tensor would register
+// as a `None` default, and pybind cannot convert None back to at::Tensor, which makes every
+// call that omits these arguments fail overload resolution. A real empty tensor is convertible
+// and reads identically on the C++ side, where only numel() is consulted.
+static at::Tensor kEmptyI32() {
+    static at::Tensor t = at::empty({0}, at::TensorOptions().dtype(at::kInt));
+    return t;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Reduction aggregation
     m.def(
@@ -22,7 +32,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gatv2_forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)", py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),
         py::arg("attn_vec"), py::arg("negative_slope") = 0.2f, py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("pipeline_stages") = 0
+        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 3,
+        py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
+        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
+        py::arg("pipeline_stages") = 0, py::arg("heavy_pipeline_stages") = 0
     );
 
     m.def(
@@ -30,21 +44,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("attn_vec"), py::arg("logsumexp"),
         py::arg("negative_slope") = 0.2f, py::arg("grad_A_reduce_row_chunk_size") = 512, py::arg("fwd_light_nodes"), py::arg("fwd_heavy_nodes"),
         py::arg("bwd_light_nodes"), py::arg("bwd_heavy_nodes"), py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8,
-        py::arg("is_directed") = true, py::arg("pipeline_stages") = 0
+        py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
+        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("backward_heavy_edge_slice") = 0,
+        py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0
     );
 
     // Graph Transformer aggregation
     m.def(
         "gt_forward_csr_mh", &graph_attention_forward_csr_mh_cuda, "Graph Transformer forward (CSR, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 8, py::arg("pipeline_stages") = 0
+        py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 3,
+        py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
+        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
+        py::arg("pipeline_stages") = 0, py::arg("heavy_pipeline_stages") = 0
     );
 
     m.def(
         "gt_backward_csr_mh", &graph_attention_backward_csr_mh_cuda, "Graph Transformer backward (CSR + CSR^T, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("dO"),
         py::arg("logsumexp"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("light_warps_per_block") = 1,
-        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("pipeline_stages") = 0
+        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
+        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
+        py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0
     );
 
     // SpMM

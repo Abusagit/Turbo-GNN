@@ -1,11 +1,36 @@
-"""All TunableKernel subclasses for turbo_gnn kernels."""
+"""All TunableKernel subclasses for turbo_gnn kernels.
+
+Note on ``schedule`` / ``blocks_per_sm``: both are accepted as constructor kwargs and
+forwarded to the kernels, but they are deliberately **not** ``TunableParam``s. The autotuner
+takes the full Cartesian product of the declared parameters, so adding a 3-value and a
+6-value axis multiplies the reduction grid from 1,344 to 24,192 combinations -- 120,960
+timed trials once graph repartitioning is included, which does not finish. Sweep them
+explicitly instead.
+
+``forward_bucket_launch`` / ``backward_bucket_launch`` *are* tunable. Two values each only
+doubles the relevant grid, and the right answer genuinely varies: concurrency is worth
+1.11-1.14x on the forward buckets and 0.92-0.99 on the backward ones, and which side of that
+a given graph lands on is not predictable from its shape. Forward and backward are separate
+parameters so a search can take concurrency on one pass and decline it on the other.
+"""
 
 from __future__ import annotations
+
+from typing import Any
 
 import torch
 
 from turbo_gnn._autotune import TunableKernel, TunableParam
-from turbo_gnn._functions import GSpMMFunction, ReductionAggrFunction, _FusedGraphAttention, gatv2_function
+from turbo_gnn._functions import (
+    DEFAULT_BLOCKS_PER_SM,
+    DEFAULT_BUCKET_LAUNCH,
+    DEFAULT_SCHED_CHUNK,
+    DEFAULT_SCHEDULE,
+    GSpMMFunction,
+    ReductionAggrFunction,
+    _FusedGraphAttention,
+    gatv2_function,
+)
 
 
 class ReductionAggrKernel(TunableKernel):
@@ -113,14 +138,33 @@ class GATv2AggrKernel(TunableKernel):
     def __init__(self, **kwargs):
         super().__init__()
         self.backward_grad_A_reduce_row_chunk_size = kwargs.get("grad_A_reduce_row_chunk_size", 512)
+        self.schedule = kwargs.get("schedule", DEFAULT_SCHEDULE)
+        self.blocks_per_sm = kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM)
+        self.sched_chunk = kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK)
+        self.forward_bucket_launch = kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH)
+        self.backward_bucket_launch = kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH)
         self.forward_light_warps = kwargs.get("forward_light_warps", 1)
         self.forward_heavy_warps = kwargs.get("forward_heavy_warps", 8)
         self.backward_light_warps = kwargs.get("backward_light_warps", 1)
         self.backward_heavy_warps = kwargs.get("backward_heavy_warps", 8)
+        self.forward_heavy_edge_slice = kwargs.get("forward_heavy_edge_slice", 0)
+        self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
+        self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
+        self.forward_heavy_pipeline_stages = kwargs.get("heavy_pipeline_stages", 0)
         self.backward_pipeline_stages = kwargs.get("backward_pipeline_stages", 0)
+        self.backward_heavy_pipeline_stages = kwargs.get("backward_heavy_pipeline_stages", 0)
 
     def _execute(self, graph, x, *, x_neighbors=None, attention_weights=None, negative_slope=None, **kwargs):
+        # An explicit edge count wins; otherwise size the slice from the heavy-degree
+        # threshold, so the parameter means the same thing on graphs of different density.
+        slice_size = self.forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+            "forward", self.forward_heavy_slice_blocks_per_sm
+        )
+        table = graph.heavy_edge_slices("forward", slice_size) if slice_size > 0 else None
+        bwd_slice = graph.heavy_slice_for_blocks_per_sm("forward", self.backward_heavy_slice_blocks_per_sm)
+        bwd_table = graph.heavy_edge_slices("forward", bwd_slice) if bwd_slice > 0 else None
+
         return gatv2_function.apply(
             graph.forward_indptr,
             graph.forward_indices,
@@ -140,15 +184,52 @@ class GATv2AggrKernel(TunableKernel):
             self.backward_light_warps,
             self.backward_heavy_warps,
             graph.is_directed,
+            self.schedule,
+            self.blocks_per_sm,
+            self.sched_chunk,
+            self.forward_bucket_launch,
+            self.backward_bucket_launch,
+            slice_size,
+            table.chunk_node if table is not None else None,
+            table.chunk_start if table is not None else None,
+            table.node_chunk_offset if table is not None else None,
+            bwd_slice,
+            bwd_table.chunk_node if bwd_table is not None else None,
+            bwd_table.chunk_start if bwd_table is not None else None,
+            bwd_table.node_chunk_offset if bwd_table is not None else None,
             self.forward_pipeline_stages,
+            self.forward_heavy_pipeline_stages,
             self.backward_pipeline_stages,
+            self.backward_heavy_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
+            # The node->block policy. Searched rather than swept externally: which policy wins
+            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
+            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
+            # the gain. One value covers both passes, so it appears in each list.
+            TunableParam(
+                "schedule",
+                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
+                default="one_per_block",
+            ),
+            # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
+            # (0.92-0.99), so the two are searched independently rather than tied together.
+            TunableParam("forward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
             TunableParam("forward_light_warps", [1, 2, 4], default=1),
             TunableParam("forward_heavy_warps", [8, 16, 32], default=8),
-            TunableParam("forward_pipeline_stages", [0, 1], default=0),
+            # Edge-slice size for the heavy bucket; 0 keeps one block per heavy node, so the
+            # old and new decompositions are compared inside a single search axis.
+            # Slice sized to fill the device with N blocks per SM, from the heavy bucket's
+            # edge count. Degree statistics do not predict the optimum (1125x spread for the
+            # bucketing threshold); block count does (7x). 0 disables slicing.
+            TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("forward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so
+            # its staging buffer hits the shared-memory ceiling at a depth the light bucket
+            # (1-4 warps) absorbs without losing occupancy.
+            TunableParam("forward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -158,10 +239,29 @@ class GATv2AggrKernel(TunableKernel):
 
     def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("backward_grad_A_reduce_row_chunk_size", [16, 32, 64, 128, 256, 512, 1024, 2048], default=512),
+            # The node->block policy. Searched rather than swept externally: which policy wins
+            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
+            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
+            # the gain. One value covers both passes, so it appears in each list.
+            TunableParam(
+                "schedule",
+                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
+                default="one_per_block",
+            ),
+            TunableParam("backward_grad_A_reduce_row_chunk_size", [512, 1024], default=512),
+            # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
+            # (0.92-0.99), so the two are searched independently rather than tied together.
+            TunableParam("backward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
             TunableParam("backward_light_warps", [1, 2, 4], default=1),
             TunableParam("backward_heavy_warps", [8, 16, 32], default=8),
-            TunableParam("backward_pipeline_stages", [0, 1], default=0),
+            # The undirected backward's heavy bucket is ~81% of that pass at ~7% occupancy;
+            # slicing it is the point of this axis. 0 keeps one block per heavy node.
+            TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("backward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so
+            # its staging buffer hits the shared-memory ceiling at a depth the light bucket
+            # (1-4 warps) absorbs without losing occupancy.
+            TunableParam("backward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:
@@ -208,13 +308,38 @@ class GraphTransformerAggrKernel(TunableKernel):
     def __init__(self, **kwargs):
         super().__init__()
         self.forward_light_warps = kwargs.get("forward_light_warps", 4)
+        self.schedule = kwargs.get("schedule", DEFAULT_SCHEDULE)
+        self.blocks_per_sm = kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM)
+        self.sched_chunk = kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK)
+        self.forward_bucket_launch = kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH)
+        self.backward_bucket_launch = kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH)
         self.forward_heavy_warps = kwargs.get("forward_heavy_warps", 8)
         self.backward_light_warps = kwargs.get("backward_light_warps", 1)
         self.backward_heavy_warps = kwargs.get("backward_heavy_warps", 8)
+        self.forward_heavy_edge_slice = kwargs.get("forward_heavy_edge_slice", 0)
+        self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
+        self.backward_heavy_edge_slice = kwargs.get("backward_heavy_edge_slice", 0)
+        self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
         self.backward_pipeline_stages = kwargs.get("backward_pipeline_stages", 0)
+        self.forward_heavy_pipeline_stages = kwargs.get("heavy_pipeline_stages", 0)
+        self.backward_heavy_pipeline_stages = kwargs.get("backward_heavy_pipeline_stages", 0)
 
     def _execute(self, graph, x, *, Q=None, K=None, V=None, scale=None, **kwargs):
+        # A positive slice size switches the heavy bucket from one block per node to one block
+        # per fixed-size run of edges. The table is cached on the graph, so it is built once per
+        # (direction, slice size) rather than per call.
+        # An explicit edge count wins; otherwise size the slice from the heavy-degree
+        # threshold, so the parameter means the same thing on graphs of different density.
+        slice_size = self.forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+            "forward", self.forward_heavy_slice_blocks_per_sm
+        )
+        table = graph.heavy_edge_slices("forward", slice_size) if slice_size > 0 else None
+        bwd_slice = self.backward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
+            "backward", self.backward_heavy_slice_blocks_per_sm
+        )
+        bwd_table = graph.heavy_edge_slices("backward", bwd_slice) if bwd_slice > 0 else None
+
         return _FusedGraphAttention.apply(
             graph.forward_indptr,
             graph.forward_indices,
@@ -233,15 +358,52 @@ class GraphTransformerAggrKernel(TunableKernel):
             self.backward_light_warps,
             self.backward_heavy_warps,
             graph.is_directed,
+            self.schedule,
+            self.blocks_per_sm,
+            self.sched_chunk,
+            self.forward_bucket_launch,
+            self.backward_bucket_launch,
+            slice_size,
+            table.chunk_node if table is not None else None,
+            table.chunk_start if table is not None else None,
+            table.node_chunk_offset if table is not None else None,
+            bwd_slice,
+            bwd_table.chunk_node if bwd_table is not None else None,
+            bwd_table.chunk_start if bwd_table is not None else None,
+            bwd_table.node_chunk_offset if bwd_table is not None else None,
             self.forward_pipeline_stages,
+            self.forward_heavy_pipeline_stages,
             self.backward_pipeline_stages,
+            self.backward_heavy_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
+            # The node->block policy. Searched rather than swept externally: which policy wins
+            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
+            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
+            # the gain. One value covers both passes, so it appears in each list.
+            TunableParam(
+                "schedule",
+                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
+                default="one_per_block",
+            ),
+            # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
+            # (0.92-0.99), so the two are searched independently rather than tied together.
+            TunableParam("forward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
             TunableParam("forward_light_warps", [1, 2, 4], default=4),
             TunableParam("forward_heavy_warps", [8, 16, 32], default=8),
-            TunableParam("forward_pipeline_stages", [0, 1], default=0),
+            # Edge-slice size for the heavy bucket. 0 keeps one block per heavy node, so the old
+            # and new decompositions are compared inside a single search axis rather than behind
+            # a separate flag. Larger slices mean fewer, longer blocks and less scratch memory.
+            # Slice sized to fill the device with N blocks per SM, from the heavy bucket's
+            # edge count. Degree statistics do not predict the optimum (1125x spread for the
+            # bucketing threshold); block count does (7x). 0 disables slicing.
+            TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("forward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so its
+            # staging buffer hits the shared-memory ceiling at a depth the light bucket absorbs.
+            TunableParam("forward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -251,9 +413,28 @@ class GraphTransformerAggrKernel(TunableKernel):
 
     def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
         return [
+            # The node->block policy. Searched rather than swept externally: which policy wins
+            # is graph-dependent -- grid_stride and precomputed each take cells the other loses
+            # -- and it interacts with the warp counts, so tuning it in isolation misattributes
+            # the gain. One value covers both passes, so it appears in each list.
+            TunableParam(
+                "schedule",
+                ["one_per_block", "grid_stride", "precomputed", "dynamic"],
+                default="one_per_block",
+            ),
+            # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
+            # (0.92-0.99), so the two are searched independently rather than tied together.
+            TunableParam("backward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
             TunableParam("backward_light_warps", [1, 2, 4], default=1),
             TunableParam("backward_heavy_warps", [8, 16, 32], default=8),
-            TunableParam("backward_pipeline_stages", [0, 1], default=0),
+            # Backward slices the transpose CSR, so it gets its own size. 0 keeps the
+            # node-per-block heavy path.
+            TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
+            TunableParam("backward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so
+            # its staging buffer hits the shared-memory ceiling at a depth the light bucket
+            # (1-4 warps) absorbs without losing occupancy.
+            TunableParam("backward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:

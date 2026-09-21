@@ -1,0 +1,49 @@
+192 cells from reports/scheduler-ablation
+Every other kernel parameter pinned to the autotuned argmax; only schedule, node order and
+bucket launch vary. A/B/C all measured in one sweep per cell.
+
+                          B/A scheduling   C/B streams   C/A both
+  all cells                       1.1120        1.0507     1.1683
+  forward                         1.1446        1.0937     1.2518
+  backward                        1.0803        1.0094     1.0904
+  head dim 128                    1.1139        1.0550     1.1752
+  head dim 256                    1.1100        1.0463     1.1615
+  min_aggr                        1.1232        1.0372     1.1650
+  gat_v2                          1.1155        1.0660     1.1891
+  gt                              1.0974        1.0490     1.1512
+
+  streams improved on the best sequential configuration in 90/192 cells
+  winning schedule      {'one_per_block': 128, 'grid_stride': 51, 'dynamic': 8, 'precomputed': 5}
+  winning bucket launch {'concurrent': 115, 'sequential': 77}
+  winning node order    {'degree': 76, 'locality': 59, 'natural': 57}
+
+  per graph
+    graph            avg deg     B/A     C/B     C/A   best cell
+    tolokers-2          89.3   1.377   1.072   1.476   2.60x gat_v2/256/bac
+    ogbn-products       51.5   1.257   1.012   1.272   1.77x gt/256/for
+    city-reviews        16.7   1.096   1.154   1.265   1.64x min_aggr/128/for
+    ogbn-arxiv           7.9   1.089   1.147   1.249   1.63x gat_v2/128/for
+    pubmed               5.5   1.188   1.050   1.248   1.70x min_aggr/128/bac
+    web-fraud            5.5   1.071   1.143   1.224   1.51x min_aggr/256/bac
+    avazu-ctr          289.0   1.111   1.086   1.207   1.59x gat_v2/128/for
+    twitch-views        81.9   1.151   1.028   1.184   1.56x gat_v2/128/for
+    hm-categories      461.9   1.098   1.067   1.172   1.51x gt/256/for
+    citeseer             3.7   1.146   1.008   1.155   1.46x gat_v2/128/bac
+    cora                 4.9   1.098   1.036   1.137   1.29x min_aggr/256/for
+    artnet-exp          12.1   1.101   1.011   1.113   1.29x gt/128/for
+    city-roads-L         3.0   1.037   1.002   1.039   1.07x gat_v2/128/for
+    city-roads-M         3.3   1.026   1.003   1.029   1.06x gat_v2/128/bac
+    pokec-regions       19.8   1.002   1.008   1.010   1.04x gat_v2/128/for
+    ogbn-proteins      598.0   1.003   1.005   1.008   1.03x min_aggr/128/bac
+
+  largest gains from streams alone (C/B)
+    web-fraud      gat_v2    256 forward    16.3234 ->   11.1749 ms  x1.461
+    web-fraud      gat_v2    128 forward    12.3726 ->    8.5714 ms  x1.443
+    web-fraud      gt        256 forward    23.3047 ->   16.1541 ms  x1.443
+    city-reviews   gat_v2    256 forward     1.7591 ->    1.2199 ms  x1.442
+    city-reviews   min_aggr  128 forward     0.7006 ->    0.4881 ms  x1.435
+    city-reviews   gt        128 forward     1.4882 ->    1.0541 ms  x1.412
+    ogbn-arxiv     gt        128 forward     1.2137 ->    0.8600 ms  x1.411
+    avazu-ctr      gat_v2    128 forward     4.9057 ->    3.4993 ms  x1.402
+
+wrote reports/scheduler-ablation/grid.json
