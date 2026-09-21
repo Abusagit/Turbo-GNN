@@ -1,4 +1,4 @@
-"""Correctness tests for the GSDDMM kernels (turbo_gnn.gsddmm and DGL-style aliases).
+"""Correctness tests for the GSDDMM kernels (skewgnn.gsddmm and DGL-style aliases).
 
 The kernel writes one output row per edge in CSR edge order (edges sorted by
 destination node). The pure-PyTorch reference below reconstructs that exact
@@ -8,9 +8,9 @@ order from the graph's own CSR, so the comparison is order-exact.
 import pytest
 import torch
 
-import turbo_gnn
-from turbo_gnn import gsddmm
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+import skewgnn
+from skewgnn import gsddmm
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
@@ -269,7 +269,7 @@ def test_gsddmm_overlap_buckets_stream_ordering():
 
 
 def test_gsddmm_heavy_blocks_descriptors():
-    from turbo_gnn._kernels import _graph_heavy_blocks
+    from skewgnn._kernels import _graph_heavy_blocks
 
     graph = _make_graph(quantile=0.5)
     indptr = graph.forward_indptr.long()
@@ -322,7 +322,7 @@ def test_dgl_style_alias_matches_generic(alias_name, op, lhs_target, rhs_target)
     num_edges = graph.forward_indices.numel()
     lhs, rhs = _make_operands(lhs_target, rhs_target, op, num_nodes, num_edges, dim=64, dtype=torch.float32)
 
-    alias = getattr(turbo_gnn, alias_name)
+    alias = getattr(skewgnn, alias_name)
     out_alias = alias(graph, lhs, rhs)
     out_generic = gsddmm(graph, lhs, rhs, op=op, lhs_target=lhs_target, rhs_target=rhs_target)
     assert torch.equal(out_alias, out_generic)
@@ -336,8 +336,8 @@ def test_copy_aliases():
     num_nodes = graph.forward_indptr.numel() - 1
     x = torch.randn(num_nodes, 64, device=DEVICE)
 
-    out_u = turbo_gnn.copy_u(graph, x)
-    out_v = turbo_gnn.copy_v(graph, x)
+    out_u = skewgnn.copy_u(graph, x)
+    out_v = skewgnn.copy_v(graph, x)
 
     assert torch.equal(out_u, gsddmm(graph, x, None, op="copy", lhs_target="src"))
     assert torch.equal(out_v, gsddmm(graph, x, None, op="copy", lhs_target="dst"))
@@ -347,9 +347,9 @@ def test_copy_aliases():
 
 def test_all_prefilled_ops_exported():
     # 6 ordered member pairs x 5 binary ops + 2 copy ops.
-    assert len(turbo_gnn.ops._GSDDMM_PREFILLED_OPS) == 6 * 5 + 2
+    assert len(skewgnn.ops._GSDDMM_PREFILLED_OPS) == 6 * 5 + 2
     for name in ("u_sub_v", "v_dot_u", "e_add_u", "u_mul_e", "copy_u", "copy_v"):
-        assert callable(getattr(turbo_gnn, name))
+        assert callable(getattr(skewgnn, name))
 
 
 # =============================================================================
@@ -363,7 +363,7 @@ def test_gsddmm_autotune_matches_reference():
     lhs = torch.randn(num_nodes, 64, device=DEVICE)
     rhs = torch.randn(num_nodes, 64, device=DEVICE)
 
-    cfg = turbo_gnn.AutotuneConfig(warmup=1, iters=2)
+    cfg = skewgnn.AutotuneConfig(warmup=1, iters=2)
     out = gsddmm(graph, lhs, rhs, op="mul", lhs_target="src", rhs_target="dst", autotune=True, autotune_config=cfg)
     ref = _reference(graph, lhs, rhs, "mul", "src", "dst")
     assert torch.allclose(out, ref, **_tol(torch.float32))

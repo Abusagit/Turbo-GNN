@@ -31,7 +31,7 @@
 // side stream. Any tensor allocated on the caller's stream but read or written on the side one
 // must be passed to `record()`, or the caching allocator may hand its memory to someone else
 // while the side stream is still using it.
-namespace turbo_gnn::streams {
+namespace skewgnn::streams {
 
 enum class BucketLaunch : int {
     Sequential = 0,  ///< light then heavy on one stream -- the historical behaviour
@@ -137,4 +137,4 @@ inline void run_buckets(BucketStreams &b, LightFn &&light, HeavyFn &&heavy) {
     b.join();
 }
 
-}  // namespace turbo_gnn::streams
+}  // namespace skewgnn::streams

@@ -37,7 +37,7 @@ from simulate_load_imbalance import (  # noqa: E402
     resolve_heavy_slice,
 )
 
-from turbo_gnn.simulation import bandwidth_cap_from_hardware  # noqa: E402
+from skewgnn.simulation import bandwidth_cap_from_hardware  # noqa: E402
 
 # The five configurations, in the order the paper builds the argument: start degree-agnostic,
 # add bucketing, add slicing, then overlap the buckets, then both.

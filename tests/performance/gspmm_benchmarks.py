@@ -1,10 +1,10 @@
-"""turbo_gnn.gspmm vs dgl.ops over the 6 x 3 operator table.
+"""skewgnn.gspmm vs dgl.ops over the 6 x 3 operator table.
 
     python -m tests.performance.gspmm_benchmarks
     python -m tests.performance.gspmm_benchmarks --ops mul --reducers sum --dtype float16
     python -m tests.performance.gspmm_benchmarks --graph ogbn-arxiv
 
-Correctness is checked before timing; the CSR permutation turbo_gnn needs for
+Correctness is checked before timing; the CSR permutation skewgnn needs for
 edge data is reported as its own column, since whether it belongs in the
 comparison depends on whether the edge weights are static or model-produced.
 """
@@ -22,8 +22,8 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("this benchmark needs dgl: pip install dgl (see Makefile install-bench)")
 
-from turbo_gnn import gspmm
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn import gspmm
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 OPS = ["copy_u", "copy_e", "add", "sub", "mul", "div"]
 REDUCERS = ["sum", "min", "max"]
@@ -93,7 +93,7 @@ def run_case(
     op: str,
     reduce: str,
     g_dgl,
-    turbo,
+    skewgnn,
     num_nodes: int,
     num_edges: int,
     d: int,
@@ -113,11 +113,11 @@ def run_case(
     if args.autotune:
         kernel_kw["autotune"] = True
 
-    e_csr = turbo.to_csr_edge_order(e) if e is not None else None
+    e_csr = skewgnn.to_csr_edge_order(e) if e is not None else None
 
     with torch.no_grad():
         want = ref_fn(g_dgl, *[a for a in (x, e) if a is not None])
-        got = gspmm(turbo, x, e_csr, **kernel_kw)
+        got = gspmm(skewgnn, x, e_csr, **kernel_kw)
         want = want.reshape(got.shape)
         tol = 1e-2 if dtype is not torch.float32 else 1e-4
         ok = torch.allclose(got, want, rtol=tol, atol=tol)
@@ -128,9 +128,9 @@ def run_case(
         return row
 
     row["dgl_fwd"] = time_ms(lambda: ref_fn(g_dgl, *[a for a in (x, e) if a is not None]), args.iters, args.repeats)
-    row["turbo_fwd"] = time_ms(lambda: gspmm(turbo, x, e_csr, **kernel_kw), args.iters, args.repeats)
+    row["skewgnn_fwd"] = time_ms(lambda: gspmm(skewgnn, x, e_csr, **kernel_kw), args.iters, args.repeats)
 
-    row["perm"] = time_ms(lambda: turbo.to_csr_edge_order(e), args.iters, args.repeats) if e is not None else 0.0
+    row["perm"] = time_ms(lambda: skewgnn.to_csr_edge_order(e), args.iters, args.repeats) if e is not None else 0.0
 
     if args.backward:
         x_g = x.detach().clone().requires_grad_(True) if x is not None else None
@@ -139,12 +139,12 @@ def run_case(
         e_r = e.detach().clone().requires_grad_(True) if e is not None else None
         seed_grad = torch.randn(num_nodes, d, device=device, dtype=dtype)
 
-        def turbo_step():
+        def skewgnn_step():
             for t in (x_g, e_g):
                 if t is not None:
                     t.grad = None
-            rhs = turbo.to_csr_edge_order(e_g) if e_g is not None else None
-            gspmm(turbo, x_g, rhs, **kernel_kw).reshape(num_nodes, d).backward(seed_grad)
+            rhs = skewgnn.to_csr_edge_order(e_g) if e_g is not None else None
+            gspmm(skewgnn, x_g, rhs, **kernel_kw).reshape(num_nodes, d).backward(seed_grad)
 
         def dgl_step():
             for t in (x_r, e_r):
@@ -153,7 +153,7 @@ def run_case(
             ref_fn(g_dgl, *[a for a in (x_r, e_r) if a is not None]).reshape(num_nodes, d).backward(seed_grad)
 
         row["dgl_fb"] = time_ms(dgl_step, args.iters, args.repeats)
-        row["turbo_fb"] = time_ms(turbo_step, args.iters, args.repeats)
+        row["skewgnn_fb"] = time_ms(skewgnn_step, args.iters, args.repeats)
 
     return row
 
@@ -197,21 +197,21 @@ def main() -> int:
     num_edges = edge_index.size(1)
 
     g_dgl = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
-    turbo = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
+    skewgnn = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
         edge_index, num_nodes=num_nodes, quantile=args.quantile, index_dtype=index_dtype
     ).to(device)
 
-    n_heavy = turbo.forward_heavy_nodes.numel()
+    n_heavy = skewgnn.forward_heavy_nodes.numel()
     print(f"device      {torch.cuda.get_device_name(0)}")
     print(f"graph       {args.graph}: N={num_nodes} E={num_edges} avg_deg={num_edges / num_nodes:.1f}")
-    print(f"buckets     light={turbo.forward_light_nodes.numel()} heavy={n_heavy} (quantile={args.quantile})")
+    print(f"buckets     light={skewgnn.forward_light_nodes.numel()} heavy={n_heavy} (quantile={args.quantile})")
     print(f"dtype       {args.dtype} / index {args.index_dtype}")
     print(f"launch      warps={args.warps} fpb={args.fpb} tiles_y={args.tiles_y} autotune={args.autotune}")
     print(f"timing      {args.iters} iters x {args.repeats} repeats, median\n")
 
-    hdr = f"{'op':8} {'red':5} {'d':>5} {'dgl fwd':>10} {'turbo fwd':>10} {'x':>7} {'perm':>8} {'x w/perm':>9}"
+    hdr = f"{'op':8} {'red':5} {'d':>5} {'dgl fwd':>10} {'skewgnn fwd':>10} {'x':>7} {'perm':>8} {'x w/perm':>9}"
     if args.backward:
-        hdr += f" {'dgl f+b':>10} {'turbo f+b':>10} {'x':>7}"
+        hdr += f" {'dgl f+b':>10} {'skewgnn f+b':>10} {'x':>7}"
     print(hdr)
     print("-" * len(hdr))
 
@@ -223,7 +223,7 @@ def main() -> int:
                     op=op,
                     reduce=reduce,
                     g_dgl=g_dgl,
-                    turbo=turbo,
+                    skewgnn=skewgnn,
                     num_nodes=num_nodes,
                     num_edges=num_edges,
                     d=d,
@@ -235,16 +235,16 @@ def main() -> int:
                     print(f"{op:8} {reduce:5} {d:5}   MISMATCH vs DGL (max abs err {row['max_abs_err']:.3g})")
                     continue
 
-                sp = row["dgl_fwd"] / row["turbo_fwd"]
-                sp_perm = row["dgl_fwd"] / (row["turbo_fwd"] + row["perm"])
+                sp = row["dgl_fwd"] / row["skewgnn_fwd"]
+                sp_perm = row["dgl_fwd"] / (row["skewgnn_fwd"] + row["perm"])
                 speedups.append(sp)
                 speedups_perm.append(sp_perm)
                 line = (
-                    f"{op:8} {reduce:5} {d:5} {row['dgl_fwd']:10.3f} {row['turbo_fwd']:10.3f} "
+                    f"{op:8} {reduce:5} {d:5} {row['dgl_fwd']:10.3f} {row['skewgnn_fwd']:10.3f} "
                     f"{sp:6.2f}x {row['perm']:8.3f} {sp_perm:8.2f}x"
                 )
                 if args.backward:
-                    line += f" {row['dgl_fb']:10.3f} {row['turbo_fb']:10.3f} {row['dgl_fb'] / row['turbo_fb']:6.2f}x"
+                    line += f" {row['dgl_fb']:10.3f} {row['skewgnn_fb']:10.3f} {row['dgl_fb'] / row['skewgnn_fb']:6.2f}x"
                 print(line)
 
     if speedups:

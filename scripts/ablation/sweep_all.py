@@ -42,8 +42,8 @@ from simulate_load_imbalance import (  # noqa: E402
     resolve_heavy_slice,
 )
 
-from turbo_gnn.calibration import anchor_tick_ns, load_cost_models  # noqa: E402
-from turbo_gnn.simulation import (  # noqa: E402
+from skewgnn.calibration import anchor_tick_ns, load_cost_models  # noqa: E402
+from skewgnn.simulation import (  # noqa: E402
     CostModel,
     SimulationConfig,
     bandwidth_cap_from_hardware,

@@ -39,7 +39,7 @@ inline constexpr int kGATv2FwdMinBlocksPerSM = [] {
 // =============================================================================
 
 template <
-    turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
+    skewgnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
     FloatingNum accum_t = float,
     // PIPELINE_STAGES == 0 disables the async-copy pipeline (plain warp-strided loop);
     // PIPELINE_STAGES >= 1 enables it with that many ping-pong stages for r[j].
@@ -56,7 +56,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize, kGATv2FwdMinBlocks
     int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr,
     const index_t *__restrict__ d_col_idx,
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
+    skewgnn::sched::SchedulerParams<index_t> sched_params,
     const cuda_t *__restrict__ d_attn_vec,
     cuda_t *__restrict__ d_h_out,
     float *__restrict__ d_logsumexp_out,
@@ -412,7 +412,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize, kGATv2FwdMinBlocks
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {

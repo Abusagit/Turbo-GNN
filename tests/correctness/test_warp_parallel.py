@@ -15,8 +15,8 @@ _project_root = str(Path(__file__).resolve().parent.parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from turbo_gnn._functions import _FusedGraphAttention, gatv2_function  # noqa: E402
-from turbo_gnn.graph import (  # noqa: E402
+from skewgnn._functions import _FusedGraphAttention, gatv2_function  # noqa: E402
+from skewgnn.graph import (  # noqa: E402
     AdjacencyForwardBackwardWithNodeBuckets,
     build_csr_as_is,
 )

@@ -29,9 +29,9 @@ bijection the permutation is built from.
 import pytest
 import torch
 
-from turbo_gnn import gsddmm
-from turbo_gnn._gsddmm import EdgeBlockParams, GsddmmLaunchPlan, GsddmmSpec, NodeBlockParams, _edge_endpoints
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn import gsddmm
+from skewgnn._gsddmm import EdgeBlockParams, GsddmmLaunchPlan, GsddmmSpec, NodeBlockParams, _edge_endpoints
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
@@ -368,13 +368,13 @@ def test_backward_is_independent_of_the_forward_kernel(forward_variant):
 
 def test_prefilled_aliases_are_differentiable():
     """The public op family goes through the same autograd path."""
-    import turbo_gnn
+    import skewgnn
 
     graph = _make_graph()
     lhs, rhs, d_out = _operands(graph, "add", "src", "dst", 64, torch.float32)
     lhs = lhs.detach().requires_grad_(True)
     rhs = rhs.detach().requires_grad_(True)
-    out = turbo_gnn.u_add_v(graph, lhs, rhs)
+    out = skewgnn.u_add_v(graph, lhs, rhs)
     assert out.requires_grad, "the prefilled ops must be differentiable"
     out.backward(d_out)
     d_lhs_ref, d_rhs_ref = _reference_grads(graph, lhs, rhs, d_out, "add", "src", "dst")

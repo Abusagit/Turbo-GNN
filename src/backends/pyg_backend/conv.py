@@ -205,7 +205,7 @@ class _PygGTAggr(BaseAggr):
         num_nodes = Q.size(0)
 
         # PyG's query is destination-indexed and its key source-indexed, while
-        # turbo_gnn puts Q on the source and K on the destination -- hence the swap.
+        # skewgnn puts Q on the source and K on the destination -- hence the swap.
         query_i = K.index_select(0, dst)
         key_j = Q.index_select(0, src)
         value_j = V.index_select(0, src)

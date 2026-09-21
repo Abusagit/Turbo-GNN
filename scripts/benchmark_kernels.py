@@ -15,8 +15,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.benchmarking.microbench import MicrobenchResult, get_gpu_info, time_callable
-from turbo_gnn import AdjacencyForwardBackwardWithNodeBuckets, AutotuneConfig
-from turbo_gnn._functions import DEFAULT_BLOCKS_PER_SM
+from skewgnn import AdjacencyForwardBackwardWithNodeBuckets, AutotuneConfig
+from skewgnn._functions import DEFAULT_BLOCKS_PER_SM
 
 doc = """
 Kernel microbenchmark launcher.
@@ -25,7 +25,7 @@ Times a backend's graph convolution alone -- the projection-free aggregation
 from src/backends -- on a CSR graph and randomly generated pre-projected
 inputs. No linear/QKV projections, no bias, no framework dispatch.
 
-`--backend cuda` reaches the turbo_gnn kernels; every other backend runs its
+`--backend cuda` reaches the skewgnn kernels; every other backend runs its
 own aggregation, so implementations compare at the same level.
 
 Autotuning is OFF by default so that a run measures exactly the configuration
@@ -226,7 +226,7 @@ CONV_TYPES: dict[str, ConvFamily] = {ct: family for family in CONV_FAMILIES for 
 
 ATTENTION_CONVS = frozenset(ct for ct in CONV_TYPES if CONV_TYPES[ct].name in {"gat_v2", "gt"})
 
-#: turbo_gnn kernel parameters, per conv type, settable with ``-K name=value``.
+#: skewgnn kernel parameters, per conv type, settable with ``-K name=value``.
 #: These describe the ``cuda`` backend's kernels, so they are validated only for
 #: that backend; every other backend takes -K as unvalidated pass-through.
 #: Node->block scheduling, shared by the convs whose kernels map nodes onto blocks.
@@ -420,7 +420,7 @@ CUDA_CONV_PARAMS: dict[str, tuple[KernelParam, ...]] = {
     "gt": _GT_PARAMS,
 }
 
-#: Convs whose turbo_gnn entry point accepts ``autotune=True``. The SpMM op has
+#: Convs whose skewgnn entry point accepts ``autotune=True``. The SpMM op has
 #: no autotuning path, so --autotune is rejected for the norm-based convs.
 AUTOTUNABLE_CONVS = frozenset({"min_aggr", "max_aggr", "gat_v2", "gt"})
 
@@ -503,7 +503,7 @@ def format_kernel_catalog() -> str:
         "  For gat_v2 the per-head width is --feature-dim (total heads*feature-dim);",
         "  for gt, --feature-dim is split across --heads. This follows create_aggr.",
         "",
-        "-K arguments for --backend cuda (turbo_gnn kernel parameters). Other backends",
+        "-K arguments for --backend cuda (skewgnn kernel parameters). Other backends",
         "take -K as unvalidated pass-through to create_aggr:",
         "",
     ]
@@ -811,7 +811,7 @@ def reorder_nodes(graph: BenchGraph, order: str) -> BenchGraph:
     if order == "natural":
         return graph
     if not isinstance(graph.repr, AdjacencyForwardBackwardWithNodeBuckets):
-        raise SystemExit(f"--node-order {order!r} needs the turbo_gnn CSR representation (--backend cuda).")
+        raise SystemExit(f"--node-order {order!r} needs the skewgnn CSR representation (--backend cuda).")
     if order == "degree":
         reordered = graph.repr.sorted_by_degree()
     elif order == "locality":
@@ -920,7 +920,7 @@ def _add_self_loops(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
 
 
 def _csr_stats(graph: AdjacencyForwardBackwardWithNodeBuckets) -> dict[str, Any]:
-    """Summarize a turbo_gnn dual-CSR graph.
+    """Summarize a skewgnn dual-CSR graph.
 
     Args:
         graph (AdjacencyForwardBackwardWithNodeBuckets): Graph under test.
@@ -945,7 +945,7 @@ def _csr_stats(graph: AdjacencyForwardBackwardWithNodeBuckets) -> dict[str, Any]
 def _collect_tensors(obj: Any) -> list[torch.Tensor]:
     """Best-effort collection of device tensors inside a graph representation.
 
-    Representations vary per backend: the turbo_gnn CSR object, plain tuples of
+    Representations vary per backend: the skewgnn CSR object, plain tuples of
     tensors, or opaque objects (DGL graphs) that expose none. Returns an empty
     list for the opaque case, which surfaces as a null ``graph_mb``.
 
@@ -984,7 +984,7 @@ def load_graph(args: argparse.Namespace, device: torch.device, conv_backend: str
         "huge_degree_threshold_quantile": args.quantile,
     }
 
-    # Fast path: the turbo_gnn CSR can be built directly, keeping the dataset
+    # Fast path: the skewgnn CSR can be built directly, keeping the dataset
     # loaders -- and their heavyweight deps (PyG / DGL / OGB) -- unimported.
     if args.dataset is None and conv_backend == "cuda":
         edge_index = make_random_graph(args.num_nodes, args.avg_degree, device=device)
@@ -1158,7 +1158,7 @@ def parse_args() -> argparse.Namespace:
 
         The catalog enumerates installed backends, which means importing
         src.backends. Doing that eagerly would slow every run and pull in
-        PyG/DGL even for a plain turbo_gnn kernel benchmark.
+        PyG/DGL even for a plain skewgnn kernel benchmark.
         """
 
         def format_help(self) -> str:
@@ -1166,7 +1166,7 @@ def parse_args() -> argparse.Namespace:
             return super().format_help()
 
     p = _Parser(
-        description="Microbenchmark projection-free graph convolutions (turbo_gnn kernels and other backends).",
+        description="Microbenchmark projection-free graph convolutions (skewgnn kernels and other backends).",
         formatter_class=_HelpFormatter,
     )
     p.add_argument(
@@ -1339,7 +1339,7 @@ def prepare_target(args: argparse.Namespace, device: torch.device) -> BenchTarge
     Uses ``BaseBackend.create_aggr``, which returns the backend's aggregation
     with the linear / QKV projections stripped, so the measurement covers the
     graph convolution alone. For the ``cuda`` backend the aggregation forwards
-    every kernel parameter, so ``-K`` and ``--autotune`` reach the turbo_gnn
+    every kernel parameter, so ``-K`` and ``--autotune`` reach the skewgnn
     kernel exactly as a direct call would.
 
     Args:
@@ -1369,7 +1369,7 @@ def prepare_target(args: argparse.Namespace, device: torch.device) -> BenchTarge
 
     is_cuda = args.backend == "cuda"
     if is_cuda:
-        # The turbo_gnn kernel parameters are known, so -K is validated here.
+        # The skewgnn kernel parameters are known, so -K is validated here.
         kernel_params, explicit_params = resolve_kernel_params(args.conv, CUDA_CONV_PARAMS[args.conv], args.kernel_arg)
     else:
         # Other backends declare no schema; pass -K through untouched.
@@ -1510,7 +1510,7 @@ def autotune_selection() -> dict[str, Any] | None:
         dict[str, Any] | None: Selected configuration, or None if unavailable.
     """
     try:
-        from turbo_gnn._autotune import TunableKernel
+        from skewgnn._autotune import TunableKernel
 
         for kernel in TunableKernel._shared_instances.values():
             for by_csr in kernel._inline_cache._cache.values():
@@ -1535,7 +1535,7 @@ def main() -> int:
     args = parse_args()
 
     if not torch.cuda.is_available():
-        raise SystemExit("turbo_gnn kernels are CUDA-only and no CUDA device is available.")
+        raise SystemExit("skewgnn kernels are CUDA-only and no CUDA device is available.")
 
     device = torch.device("cuda", args.device)
     torch.set_default_device(device)

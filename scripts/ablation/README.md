@@ -86,16 +86,14 @@ python scripts/ablation/plot_heatmap_pair.py --dataset tolokers-2 \
 `plot_heatmap_grid.py` prints the graph's shape and every panel's `T`, `T*` and `T/T*`, which
 is everything a caption needs. Pass `--tex` if you also want that written as LaTeX.
 
-The older figure scripts are still here: `plot_all.py` walks the whole grid into per-cell
-directories of PNGs, `plot_launch_modes.py` draws one such figure, and
-`plot_occupancy_profile.py` collapses the SM axis into a single occupancy curve.
+`plot_launch_modes.py` draws a single launch-mode comparison, and is what the heatmap scripts
+build on.
 
 ## Exploring a single configuration
 
 `simulate_load_imbalance.py` is the layer underneath all of the above, and runs one point of
 the space with every knob exposed -- assignment order, vertices per block, blocks per SM,
 occupancy, launch mode, slice size. Start here when changing the model rather than using it.
-`dump_timeline.py` prints the resulting schedule block by block.
 
 ## Checking that the simulation is sound
 
@@ -112,15 +110,3 @@ not that the hardware changed.
 
 **`T/T*` should never fall below 1.** It is a makespan over a lower bound on the same work;
 a value under 1 means a bound is computed wrong.
-
-Unit tests cover the fit and the launch barrier:
-
-```bash
-python -m pytest tests/unit/test_cost_model_calibration.py \
-                 tests/unit/test_load_imbalance_simulation.py
-```
-
-## Runbooks
-
-`dev/sinfillo/recalibrate.sh` runs steps 1--4 end to end on a new card.
-`dev/sinfillo/paper_figures.sh` runs step 4 for the setups chosen for the paper.

@@ -37,7 +37,7 @@ from simulate_load_imbalance import (  # noqa: E402
     resolve_heavy_slice,
 )
 
-from turbo_gnn.simulation import (  # noqa: E402
+from skewgnn.simulation import (  # noqa: E402
     SimulationConfig,
     SimulationResult,
     bandwidth_cap_from_hardware,

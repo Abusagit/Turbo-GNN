@@ -1,7 +1,7 @@
 """g-SpMM against a pure-torch reference, with no DGL dependency.
 
 test_gspmm_vs_dgl.py is the stricter check -- it pins the semantics to the
-operator family turbo_gnn is meant to replace -- but it skips wholesale where
+operator family skewgnn is meant to replace -- but it skips wholesale where
 DGL is not installed, and its graph tops out around degree 25.  Two kernel
 paths are invisible at that size:
 
@@ -21,8 +21,8 @@ two and a dense graph that reaches the third.
 import pytest
 import torch
 
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
-from turbo_gnn.ops import gspmm
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn.ops import gspmm
 
 OPS = ["copy_u", "copy_e", "add", "sub", "mul", "div"]
 REDUCERS = ["sum", "min", "max"]
@@ -109,7 +109,7 @@ def _forward_ref(indptr, indices, x, e, op, reduce, num_nodes, d, dtype):
     empty = torch.isinf(acc)
 
     # First edge (lowest CSR position) reaching the extremum, which is the
-    # tie-break turbo_gnn documents.
+    # tie-break skewgnn documents.
     eid = torch.arange(msg.size(0), dtype=torch.float32, device=msg.device).unsqueeze(1).expand(-1, d)
     hit = torch.where(sign * msg_cmp == acc[dst], eid, torch.full_like(eid, BIG))
     win = torch.full((num_nodes, d), BIG, dtype=torch.float32, device=msg.device)

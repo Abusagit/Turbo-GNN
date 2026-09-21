@@ -1,11 +1,11 @@
-"""Re-export shim: imports from turbo_gnn."""
+"""Re-export shim: imports from skewgnn."""
 
-import turbo_gnn._C as reduction_aggr_cuda
-from turbo_gnn._autotune import TunableKernel, TunableParam, with_autotune
-from turbo_gnn._functions import ReductionAggrFunction, csr_SPMM_normalized
-from turbo_gnn._kernels import ReductionAggrKernel
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
-from turbo_gnn.ops import reduction_aggr
+import skewgnn._C as reduction_aggr_cuda
+from skewgnn._autotune import TunableKernel, TunableParam, with_autotune
+from skewgnn._functions import ReductionAggrFunction, csr_SPMM_normalized
+from skewgnn._kernels import ReductionAggrKernel
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn.ops import reduction_aggr
 
 
 def reduction_aggr_forward_partitioned(

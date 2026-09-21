@@ -1,3 +1,4 @@
+import os
 import dgl
 import dgl.function as fn
 import numpy as np
@@ -6,6 +7,8 @@ import torch
 
 from src.backends.cuda_backend.reduction_aggr.utils import reduction_aggr, reduction_aggr_forward_partitioned
 from src.data.datasets import load_pyg_single_graph
+
+DATA_ROOT = os.environ.get("DATA_ROOT", "data")
 
 
 def create_random_graph(num_nodes, avg_degree=10, seed=42):
@@ -112,7 +115,7 @@ def load_real_graphs():
     graphs = {}
     import sys
 
-    sys.path.append("/home/fvelikon/projects/cuda_exp/data")
+    sys.path.append(DATA_ROOT)
     from src.data.graphland_datasets import GraphLandDataset
 
     for dataset_name in [
@@ -131,7 +134,7 @@ def load_real_graphs():
         "artnet-views",
         "web-traffic",
     ]:
-        dataset = GraphLandDataset(root="/home/fvelikon/projects/cuda_exp/data", name=dataset_name, split="RL")
+        dataset = GraphLandDataset(root=DATA_ROOT, name=dataset_name, split="RL")
         g = dgl.graph((dataset[0].edge_index[0], dataset[0].edge_index[1]))
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -145,7 +148,7 @@ def load_real_graphs():
     try:
         from dgl.data import CoraGraphDataset
 
-        dataset = CoraGraphDataset("/home/fvelikon/projects/cuda_exp/data")
+        dataset = CoraGraphDataset(DATA_ROOT)
         g = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -161,7 +164,7 @@ def load_real_graphs():
     try:
         from dgl.data import CiteseerGraphDataset
 
-        dataset = CiteseerGraphDataset("/home/fvelikon/projects/cuda_exp/data")
+        dataset = CiteseerGraphDataset(DATA_ROOT)
         g = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -177,7 +180,7 @@ def load_real_graphs():
     try:
         from dgl.data import PubmedGraphDataset
 
-        dataset = PubmedGraphDataset("/home/fvelikon/projects/cuda_exp/data")
+        dataset = PubmedGraphDataset(DATA_ROOT)
         g = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -193,7 +196,7 @@ def load_real_graphs():
     try:
         from ogb.nodeproppred import DglNodePropPredDataset
 
-        dataset = DglNodePropPredDataset(name="ogbn-arxiv", root="/home/fvelikon/projects/cuda_exp/data")
+        dataset = DglNodePropPredDataset(name="ogbn-arxiv", root=DATA_ROOT)
         g, _ = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)
@@ -211,7 +214,7 @@ def load_real_graphs():
     try:
         from ogb.nodeproppred import DglNodePropPredDataset
 
-        dataset = DglNodePropPredDataset(name="ogbn-products", root="/home/fvelikon/projects/cuda_exp/data")
+        dataset = DglNodePropPredDataset(name="ogbn-products", root=DATA_ROOT)
         g, _ = dataset[0]
         g = dgl.add_self_loop(g)
         g = dgl.to_bidirected(g)

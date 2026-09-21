@@ -15,7 +15,7 @@ _project_root = str(Path(__file__).resolve().parent.parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from turbo_gnn.graph import (  # noqa: E402
+from skewgnn.graph import (  # noqa: E402
     AdjacencyForwardBackwardWithNodeBuckets,
     build_csr_as_is,
 )
@@ -198,9 +198,9 @@ class TestGTUndirectedKernel:
         scale = D**-0.5
 
         try:
-            from turbo_gnn._functions import _FusedGraphAttention
+            from skewgnn._functions import _FusedGraphAttention
         except ImportError:
-            pytest.skip("turbo_gnn C extension not available")
+            pytest.skip("skewgnn C extension not available")
 
         all_nodes = torch.arange(num_nodes, device=device, dtype=torch.int32)
         empty_nodes = torch.tensor([], dtype=torch.int32, device=device)
@@ -295,9 +295,9 @@ class TestGATv2UndirectedKernel:
         negative_slope = 0.2
 
         try:
-            from turbo_gnn._functions import gatv2_function
+            from skewgnn._functions import gatv2_function
         except ImportError:
-            pytest.skip("turbo_gnn C extension not available")
+            pytest.skip("skewgnn C extension not available")
 
         all_nodes = torch.arange(num_nodes, device=device, dtype=torch.int32)
         empty_nodes = torch.tensor([], dtype=torch.int32, device=device)

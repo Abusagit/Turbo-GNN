@@ -1,4 +1,4 @@
-"""Re-export shim: imports from turbo_gnn."""
+"""Re-export shim: imports from skewgnn."""
 
-from turbo_gnn._functions import _CudaSpMMConvFn, csr_SPMM_normalized
-from turbo_gnn.ops import spmm_aggr
+from skewgnn._functions import _CudaSpMMConvFn, csr_SPMM_normalized
+from skewgnn.ops import spmm_aggr

@@ -22,7 +22,7 @@ void GATv2Backward_CSR_Undirected_Impl(
     const int *chunk_node, const int *chunk_start, const int *node_chunk_offset, int num_slices, int heavy_edge_slice,
     int pipeline_stages
 ) {
-    namespace sched_ns                   = turbo_gnn::sched;
+    namespace sched_ns                   = skewgnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
 
     // 1) Compute G[i,h], bucketed.
@@ -143,7 +143,7 @@ void GATv2Backward_CSR_Undirected_Impl(
         );
     };
 
-    namespace stream_ns = turbo_gnn::streams;
+    namespace stream_ns = skewgnn::streams;
     const auto launch_mode = stream_ns::bucket_launch_from_int(bucket_launch);
 
     // ALR reads d_G[neighbor_j] for arbitrary neighbours, not just the ones in its own bucket, so
@@ -344,7 +344,7 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_forward_cuda)(
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GATv2 forward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    namespace sched_ns                   = turbo_gnn::sched;
+    namespace sched_ns                   = skewgnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
     at::Tensor sched_counters            = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/2, l.device());
     int bucket_id                        = 0;
@@ -402,7 +402,7 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_forward_cuda)(
         );
     };
 
-    namespace stream_ns = turbo_gnn::streams;
+    namespace stream_ns = skewgnn::streams;
     stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), l.device());
     buckets.record_all(l, r, row_ptr, col_idx, attn_vec, h_out, logsumexp, light_nodes, sched_counters);
 
@@ -596,7 +596,7 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_backward_cuda)(
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GATv2 backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    namespace sched_ns                   = turbo_gnn::sched;
+    namespace sched_ns                   = skewgnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
     // Rows: AL light/heavy = 0/1, R light/heavy = 2/3 (directed); G/ALR = 0/1 (undirected).
     at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/4, l.device());
@@ -716,7 +716,7 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_backward_cuda)(
             );
         };
 
-        namespace stream_ns = turbo_gnn::streams;
+        namespace stream_ns = skewgnn::streams;
         const auto bl_mode = stream_ns::bucket_launch_from_int(bucket_launch);
 
         // 1: AL kernel (forward CSR direction) - light + heavy

@@ -3,8 +3,8 @@ import torch
 
 dgl = pytest.importorskip("dgl")
 
-from turbo_gnn import gspmm  # noqa: E402
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
+from skewgnn import gspmm  # noqa: E402
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
 
 OPS = ["copy_u", "copy_e", "add", "sub", "mul", "div"]
 REDUCERS = ["sum", "min", "max"]
@@ -45,11 +45,11 @@ def graphs(graph_data):
     g = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
 
     # quantile below 1 so that the heavy-node kernel is actually exercised
-    turbo = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
+    skewgnn = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
         edge_index, num_nodes=num_nodes, quantile=0.95, index_dtype=torch.int32
     ).to(device)
 
-    return g, turbo
+    return g, skewgnn
 
 
 def _make_inputs(op, num_nodes, num_edges, feat_dim, device, edge_broadcast=False):
@@ -71,7 +71,7 @@ def _make_inputs(op, num_nodes, num_edges, feat_dim, device, edge_broadcast=Fals
 @pytest.mark.parametrize("reduce", REDUCERS)
 @pytest.mark.parametrize("feat_dim", [1, 32, 65])
 def test_forward_matches_dgl(graphs, graph_data, op, reduce, feat_dim):
-    g, turbo = graphs
+    g, skewgnn = graphs
     _, num_nodes, device = graph_data
     num_edges = g.num_edges()
 
@@ -81,9 +81,9 @@ def test_forward_matches_dgl(graphs, graph_data, op, reduce, feat_dim):
     ref_args = [a for a in (x, e) if a is not None]
     expected = ref_fn(g, *ref_args)
 
-    # turbo_gnn wants edge data in CSR order, DGL in edge_index order
-    e_csr = turbo.to_csr_edge_order(e) if e is not None else None
-    got = gspmm(turbo, x, e_csr, op=op, reduce=reduce)
+    # skewgnn wants edge data in CSR order, DGL in edge_index order
+    e_csr = skewgnn.to_csr_edge_order(e) if e is not None else None
+    got = gspmm(skewgnn, x, e_csr, op=op, reduce=reduce)
 
     assert got.shape == expected.reshape(got.shape).shape
     torch.testing.assert_close(
@@ -94,7 +94,7 @@ def test_forward_matches_dgl(graphs, graph_data, op, reduce, feat_dim):
 @pytest.mark.parametrize("op", OPS)
 @pytest.mark.parametrize("reduce", REDUCERS)
 def test_backward_matches_dgl(graphs, graph_data, op, reduce):
-    g, turbo = graphs
+    g, skewgnn = graphs
     _, num_nodes, device = graph_data
     num_edges = g.num_edges()
     feat_dim = 32
@@ -111,10 +111,10 @@ def test_backward_matches_dgl(graphs, graph_data, op, reduce):
     out_ref = ref_fn(g, *ref_args)
     out_ref.reshape(num_nodes, feat_dim).backward(grad_seed)
 
-    e_csr = turbo.to_csr_edge_order(e) if e is not None else None
+    e_csr = skewgnn.to_csr_edge_order(e) if e is not None else None
     if e_csr is not None:
         e_csr.retain_grad()
-    out = gspmm(turbo, x, e_csr, op=op, reduce=reduce)
+    out = gspmm(skewgnn, x, e_csr, op=op, reduce=reduce)
     out.reshape(num_nodes, feat_dim).backward(grad_seed)
 
     if x is not None:
@@ -124,7 +124,7 @@ def test_backward_matches_dgl(graphs, graph_data, op, reduce):
 
     if e is not None:
         # our edge gradient is in CSR order; permute DGL's the same way
-        expected_e_grad = turbo.to_csr_edge_order(e_ref.grad)
+        expected_e_grad = skewgnn.to_csr_edge_order(e_ref.grad)
         torch.testing.assert_close(
             e_csr.grad,
             expected_e_grad,
@@ -138,7 +138,7 @@ def test_backward_matches_dgl(graphs, graph_data, op, reduce):
 @pytest.mark.parametrize("reduce", REDUCERS)
 def test_broadcast_edge_data_matches_dgl(graphs, graph_data, op, reduce):
     """Edge data of shape [E] must broadcast over the feature dimension."""
-    g, turbo = graphs
+    g, skewgnn = graphs
     _, num_nodes, device = graph_data
     num_edges = g.num_edges()
     feat_dim = 32
@@ -149,7 +149,7 @@ def test_broadcast_edge_data_matches_dgl(graphs, graph_data, op, reduce):
     # DGL wants an explicit trailing 1 to broadcast
     expected = ref_fn(g, x, e.unsqueeze(-1))
 
-    got = gspmm(turbo, x, turbo.to_csr_edge_order(e), op=op, reduce=reduce)
+    got = gspmm(skewgnn, x, skewgnn.to_csr_edge_order(e), op=op, reduce=reduce)
 
     torch.testing.assert_close(
         got, expected.reshape(got.shape), rtol=1e-4, atol=1e-4, msg=f"broadcast forward mismatch for {op}/{reduce}"
@@ -163,41 +163,41 @@ def test_isolated_node_semantics(graph_data, reduce):
 
     # node 0 has no incoming edge
     edge_index = torch.tensor([[1, 2, 3], [1, 2, 3]], device=device)
-    turbo = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
+    skewgnn = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
         edge_index, num_nodes=num_nodes, quantile=-1, index_dtype=torch.int32
     ).to(device)
 
     x = torch.randn(num_nodes, feat_dim, device=device)
-    out = gspmm(turbo, x, None, op="copy_u", reduce=reduce)
+    out = gspmm(skewgnn, x, None, op="copy_u", reduce=reduce)
 
     assert torch.isfinite(out).all(), "identity value leaked into the output"
     torch.testing.assert_close(out[0], torch.zeros(feat_dim, device=device))
 
 
 def test_edge_order_contract_is_load_bearing(graphs, graph_data):
-    g, turbo = graphs
+    g, skewgnn = graphs
     _, num_nodes, device = graph_data
     num_edges = g.num_edges()
     feat_dim = 16
 
     x, e = _make_inputs("mul", num_nodes, num_edges, feat_dim, device)
 
-    correct = gspmm(turbo, x, turbo.to_csr_edge_order(e), op="mul", reduce="sum")
-    unpermuted = gspmm(turbo, x, e, op="mul", reduce="sum")
+    correct = gspmm(skewgnn, x, skewgnn.to_csr_edge_order(e), op="mul", reduce="sum")
+    unpermuted = gspmm(skewgnn, x, e, op="mul", reduce="sum")
 
     assert not torch.allclose(correct, unpermuted, rtol=1e-3, atol=1e-3)
 
 
 def test_u_add_e_sum_decomposes(graphs, graph_data):
-    _, turbo = graphs
+    _, skewgnn = graphs
     _, num_nodes, device = graph_data
-    num_edges = turbo.forward_indices.numel()
+    num_edges = skewgnn.forward_indices.numel()
     feat_dim = 32
 
     x = torch.randn(num_nodes, feat_dim, device=device)
     e = torch.randn(num_edges, feat_dim, device=device)
 
-    fused = gspmm(turbo, x, e, op="add", reduce="sum")
-    split = gspmm(turbo, x, None, op="copy_u", reduce="sum") + gspmm(turbo, None, e, op="copy_e", reduce="sum")
+    fused = gspmm(skewgnn, x, e, op="add", reduce="sum")
+    split = gspmm(skewgnn, x, None, op="copy_u", reduce="sum") + gspmm(skewgnn, None, e, op="copy_e", reduce="sum")
 
     torch.testing.assert_close(fused, split, rtol=1e-4, atol=1e-4)

@@ -11,7 +11,7 @@ CuSparse backend: wraps CuSparse matmul-based convolutions behind the BaseBacken
 """
 
 
-class _СuSparseMatMulConvFn(torch.autograd.Function):
+class _CuSparseMatMulConvFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, graph, norm_type: str, cu_sparse_algorithm_id: int, block_dim: int):
         ctx.save_for_backward(*graph)
@@ -48,7 +48,7 @@ class _СuSparseMatMulConvFn(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
-class _СuSparseMatMulConvPrecomputedBWDMatrixFn(torch.autograd.Function):
+class _CuSparseMatMulConvPrecomputedBWDMatrixFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, graph, norm_type: str, cu_sparse_algorithm_id: int, block_dim: int):
         fwd_row_pointers, fwd_column_indices, fwd_edge_weight, bwd_row_pointers, bwd_column_indices, bwd_edge_weight = (
@@ -89,7 +89,7 @@ class _СuSparseMatMulConvPrecomputedBWDMatrixFn(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
-class _СuSparseMatMulConv(BaseConvolution):
+class _CuSparseMatMulConv(BaseConvolution):
     """CuSparse-backend MatMulConv wrapper."""
 
     def __init__(self, norm_type: str, cu_sparse_algorithm_id: int, block_dim: int):
@@ -121,10 +121,10 @@ class _СuSparseMatMulConv(BaseConvolution):
             torch.Tensor: Output features [N, Fout].
         """
 
-        return _СuSparseMatMulConvFn.apply(x, graph, self.norm_type, self.cu_sparse_algorithm_id, self.block_dim)
+        return _CuSparseMatMulConvFn.apply(x, graph, self.norm_type, self.cu_sparse_algorithm_id, self.block_dim)
 
 
-class _СuSparseMatMulPrecomputedBWDConv(_СuSparseMatMulConv):
+class _CuSparseMatMulPrecomputedBWDConv(_CuSparseMatMulConv):
     """CuSparse-backend MatMulConv wrapper."""
 
     def forward(
@@ -146,13 +146,13 @@ class _СuSparseMatMulPrecomputedBWDConv(_СuSparseMatMulConv):
             torch.Tensor: Output features [N, Fout].
         """
 
-        return _СuSparseMatMulConvPrecomputedBWDMatrixFn.apply(
+        return _CuSparseMatMulConvPrecomputedBWDMatrixFn.apply(
             x, graph, self.norm_type, self.cu_sparse_algorithm_id, self.block_dim
         )
 
 
 @BackendRegistry.register_backend("cusparse")
-class СuSparseBackend(BaseBackend):
+class CuSparseBackend(BaseBackend):
     """Backend that instantiates cusparse-based convolutions. Only matmul-based convolutions are supported."""
 
     def create_conv(
@@ -176,19 +176,19 @@ class СuSparseBackend(BaseBackend):
         conv_type = conv_type.lower()
 
         if conv_type == "sum_aggr":
-            return _СuSparseMatMulConv(
+            return _CuSparseMatMulConv(
                 norm_type="none", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         if conv_type == "mean_aggr":
-            return _СuSparseMatMulConv(
+            return _CuSparseMatMulConv(
                 norm_type="right", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         if conv_type == "random_walk":
-            return _СuSparseMatMulConv(
+            return _CuSparseMatMulConv(
                 norm_type="left", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         if conv_type == "gcn":
-            return _СuSparseMatMulConv(
+            return _CuSparseMatMulConv(
                 norm_type="both", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         raise KeyError(f"Unsupported conv_type for CuSparse backend: {conv_type}")
@@ -199,7 +199,7 @@ class СuSparseBackend(BaseBackend):
 
 
 @BackendRegistry.register_backend("cusparse_precomputed_bwd")
-class СuSparsePrecomputeBWDBackend(BaseBackend):
+class CuSparsePrecomputeBWDBackend(BaseBackend):
     """Backend that instantiates cusparse-based convolutions. Only matmul-based convolutions are supported."""
 
     def create_conv(
@@ -223,19 +223,19 @@ class СuSparsePrecomputeBWDBackend(BaseBackend):
         conv_type = conv_type.lower()
 
         if conv_type == "sum_aggr":
-            return _СuSparseMatMulPrecomputedBWDConv(
+            return _CuSparseMatMulPrecomputedBWDConv(
                 norm_type="none", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         if conv_type == "mean_aggr":
-            return _СuSparseMatMulPrecomputedBWDConv(
+            return _CuSparseMatMulPrecomputedBWDConv(
                 norm_type="right", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         if conv_type == "random_walk":
-            return _СuSparseMatMulPrecomputedBWDConv(
+            return _CuSparseMatMulPrecomputedBWDConv(
                 norm_type="left", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         if conv_type == "gcn":
-            return _СuSparseMatMulPrecomputedBWDConv(
+            return _CuSparseMatMulPrecomputedBWDConv(
                 norm_type="both", cu_sparse_algorithm_id=cu_sparse_algorithm_id, block_dim=block_dim
             )
         raise KeyError(f"Unsupported conv_type for CuSparse precomputed_bwd backend: {conv_type}")

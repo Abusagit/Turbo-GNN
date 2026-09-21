@@ -1,6 +1,6 @@
 .PHONY: venv install install-dev install-bench install-full clean test format check run-hooks update-hooks
 
-PYTHON_BIN   ?= $(HOME)/micromamba/envs/graph_ml/bin/python
+PYTHON_BIN   ?= python3
 CUDA_HOME    ?= /usr/local/cuda
 
 # Derive CUDA version tag (e.g. "cu129") from CUDA_HOME/bin/nvcc --version
@@ -28,23 +28,23 @@ test:
 	$(PYTHON) -m pytest tests/ -v
 
 format:
-	ruff format src/ scripts/ tests/ turbo_gnn/
+	ruff format src/ scripts/ tests/ skewgnn/
 	@echo "Code formatted with ruff"
 
 lint:
-	ruff check src/ scripts/ tests/ turbo_gnn/
+	ruff check src/ scripts/ tests/ skewgnn/
 	@echo "Linting complete"
 
 lint-fix:
-	ruff check --fix src/ scripts/ tests/ turbo_gnn/
+	ruff check --fix src/ scripts/ tests/ skewgnn/
 	@echo "Auto-fixed linting issues"
 
 # check both format and lint (without modifying files)
 check:
 	@echo "Checking code format..."
-	ruff format --check src/ scripts/ tests/ turbo_gnn/
+	ruff format --check src/ scripts/ tests/ skewgnn/
 	@echo "Checking code quality..."
-	ruff check src/ scripts/ tests/ turbo_gnn/
+	ruff check src/ scripts/ tests/ skewgnn/
 	@echo "All checks passed"
 
 setup-hooks:
@@ -84,7 +84,7 @@ venv:
 
 
 
-# Base: just turbo-gnn CUDA kernels with existing torch
+# Base: just skewgnn CUDA kernels with existing torch
 install: venv
 	$(PIP) install wheel numpy ninja packaging psutil "setuptools>=77.0"
 	CUDA_HOME=$(CUDA_HOME) $(PIP) install -e . $(NO_ISO)
@@ -150,7 +150,7 @@ install-full: venv _install-torch-bench _install-full _install-tcgnn setup-hooks
 
 help:
 	@echo "Available targets:"
-	@echo "  install           - Install turbo-gnn only (base: CUDA kernels + torch)"
+	@echo "  install           - Install skewgnn only (base: CUDA kernels + torch)"
 	@echo "  install-dev       - Dev environment: research + PyG + tests (no DGL, torch>=2.9)"
 	@echo "  install-bench     - Benchmarking: dev + DGL + viz + cugraph (torch==2.4.1)"
 	@echo "  install-full      - Everything: bench + notebooks + tracking"

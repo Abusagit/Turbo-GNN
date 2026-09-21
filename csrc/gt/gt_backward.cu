@@ -7,9 +7,9 @@
 // ===================================================
 
 // D[i,h] = sum_d dO[i,h,d] * O[i,h,d]
-template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float>
+template <skewgnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, FloatingNum accum_t = float>
 __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
-    turbo_gnn::sched::SchedulerParams<int32_t> sched_params,
+    skewgnn::sched::SchedulerParams<int32_t> sched_params,
     cuda_t const *const __restrict__ dO,    // [N, H, D]
     cuda_t const *const __restrict__ O_in,  // [N, H, D]
     accum_t *const __restrict__ D_out,      // [N, H]
@@ -58,7 +58,7 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, int32_t, /*SyncBlock=*/false>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, int32_t, /*SyncBlock=*/false>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
@@ -72,13 +72,13 @@ __global__ void __launch_bounds__(kWarpSize) compute_D_mh_kernel_D(
 // logsumexp and Delta are [N, H].
 // dQ, dK, dV are cuda_t output (contiguous); internal accumulation in float32
 template <
-    turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
+    skewgnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
     FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backward_csrT_kernel_D(
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr_T,     // [N+1], CSR^T row pointers
     index_t const *const __restrict__ col_idx_T,     // [E],   CSR^T col indices
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
+    skewgnn::sched::SchedulerParams<index_t> sched_params,
     cuda_t const *const __restrict__ Q,              // [N, H, D]
     cuda_t const *const __restrict__ K,              // [N, H, D]
     cuda_t const *const __restrict__ V,              // [N, H, D]
@@ -290,7 +290,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
@@ -305,9 +305,9 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) graph_attn_backwar
 //   Forward direction: dK[d] (local)
 //   Reverse direction: dQ[d], dV[d] (local, exploiting symmetric adjacency)
 // =============================================================================
-template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, typename cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <skewgnn::sched::ScheduleKind SK, int D_CONST, typename cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirected_kernel_D(
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
+    skewgnn::sched::SchedulerParams<index_t> sched_params,
     int64_t N, int64_t H,
     index_t const *const __restrict__ row_ptr,  // [N+1], forward CSR row pointers
     index_t const *const __restrict__ col_idx,  // [E],   forward CSR col indices
@@ -544,7 +544,7 @@ __global__ void __launch_bounds__(kWarpSize) graph_attn_backward_fwd_csr_undirec
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {

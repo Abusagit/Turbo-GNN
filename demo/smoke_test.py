@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Smoke test for turbo_gnn: verifies all kernels on random graphs in fp32 and fp16."""
+"""Smoke test for skewgnn: verifies all kernels on random graphs in fp32 and fp16."""
 
 import sys
 import traceback
 
 import torch
 
-from turbo_gnn import (
+from skewgnn import (
     AdjacencyForwardBackwardWithNodeBuckets,
     csr_SPMM_normalized,
     gatv2_aggr,
@@ -170,7 +170,7 @@ def test_csr_SPMM_normalized(graph, N, F, dtype, norm):
 
 def main():
     print("=" * 60)
-    print("turbo_gnn smoke test")
+    print("skewgnn smoke test")
     print("=" * 60)
 
     if not torch.cuda.is_available():

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from turbo_gnn import AdjacencyForwardBackwardWithNodeBuckets, reduction_aggr
+from skewgnn import AdjacencyForwardBackwardWithNodeBuckets, reduction_aggr
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="ordering tests need CUDA")
 

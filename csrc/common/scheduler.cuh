@@ -54,7 +54,7 @@
 // Reference: FlashAttention's hopper/tile_scheduler.hpp, whose Single / StaticPersistent /
 // DynamicPersistent split this mirrors, including the `atomicAdd(...) + gridDim.x` trick.
 
-namespace turbo_gnn::sched {
+namespace skewgnn::sched {
 
 template <typename T>
 __host__ __device__ inline constexpr T ceil_div(T a, T b) {
@@ -539,4 +539,4 @@ inline ScheduleKind schedule_from_int(int v) {
     return static_cast<ScheduleKind>(v);
 }
 
-}  // namespace turbo_gnn::sched
+}  // namespace skewgnn::sched

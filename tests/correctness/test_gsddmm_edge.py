@@ -1,4 +1,4 @@
-"""Correctness tests for the edge-parallel GSDDMM kernels (turbo_gnn.gsddmm_edge).
+"""Correctness tests for the edge-parallel GSDDMM kernels (skewgnn.gsddmm_edge).
 
 The edge kernel parallelizes one warp per edge over an explicit [E, 2] edge
 list of (src, dst) pairs, built once from the graph's CSR and cached. The
@@ -12,9 +12,9 @@ CSR/CSC and the comparison is order-exact.
 import pytest
 import torch
 
-import turbo_gnn
-from turbo_gnn import gsddmm, gsddmm_edge
-from turbo_gnn._kernels import _graph_edge_list
+import skewgnn
+from skewgnn import gsddmm, gsddmm_edge
+from skewgnn._kernels import _graph_edge_list
 
 
 def _signed(t: torch.Tensor) -> torch.Tensor:
@@ -27,7 +27,7 @@ def _signed(t: torch.Tensor) -> torch.Tensor:
     return t.view(signed)
 
 
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
@@ -317,7 +317,7 @@ def test_gsddmm_edge_ungrouped_edge_list(op: str, lhs_target: str, rhs_target: s
         right = select(rhs, rhs_target)
         ref = {"mul": left * right, "add": left + right, "dot": (left * right).sum(-1)}[op]
 
-    out = turbo_gnn._C.gsddmm_forward_edge(
+    out = skewgnn._C.gsddmm_forward_edge(
         lhs, rhs, edge_list, op, lhs_target, rhs_target, num_nodes, 0, edges_per_warp, 4
     )
     assert torch.allclose(out.double(), ref.double(), **_tol(torch.float32, op))
@@ -550,7 +550,7 @@ def test_dgl_style_edge_alias_matches_generic(alias_name: str, op: str, lhs_targ
     num_edges = graph.forward_indices.numel()
     lhs, rhs = _make_operands(lhs_target, rhs_target, op, num_nodes, num_edges, dim=64, dtype=torch.float32)
 
-    alias = getattr(turbo_gnn, alias_name)
+    alias = getattr(skewgnn, alias_name)
     out_alias = alias(graph, lhs, rhs)
     out_generic = gsddmm_edge(graph, lhs, rhs, op=op, lhs_target=lhs_target, rhs_target=rhs_target)
     assert torch.equal(out_alias, out_generic)
@@ -564,8 +564,8 @@ def test_copy_edge_aliases() -> None:
     num_nodes = graph.forward_indptr.numel() - 1
     x = torch.randn(num_nodes, 64, device=DEVICE)
 
-    out_u = turbo_gnn.copy_u_edge(graph, x)
-    out_v = turbo_gnn.copy_v_edge(graph, x)
+    out_u = skewgnn.copy_u_edge(graph, x)
+    out_v = skewgnn.copy_v_edge(graph, x)
 
     assert torch.equal(out_u, gsddmm_edge(graph, x, None, op="copy", lhs_target="src"))
     assert torch.equal(out_v, gsddmm_edge(graph, x, None, op="copy", lhs_target="dst"))
@@ -575,9 +575,9 @@ def test_copy_edge_aliases() -> None:
 
 def test_all_prefilled_edge_ops_exported() -> None:
     # 6 ordered member pairs x 5 binary ops + 2 copy ops, mirrored for _edge.
-    assert len(turbo_gnn.ops._GSDDMM_EDGE_PREFILLED_OPS) == 6 * 5 + 2
+    assert len(skewgnn.ops._GSDDMM_EDGE_PREFILLED_OPS) == 6 * 5 + 2
     for name in ("u_sub_v_edge", "v_dot_u_edge", "e_add_u_edge", "u_mul_e_edge", "copy_u_edge", "copy_v_edge"):
-        assert callable(getattr(turbo_gnn, name))
+        assert callable(getattr(skewgnn, name))
 
 
 # =============================================================================
@@ -591,7 +591,7 @@ def test_gsddmm_edge_autotune_matches_reference() -> None:
     lhs = torch.randn(num_nodes, 64, device=DEVICE)
     rhs = torch.randn(num_nodes, 64, device=DEVICE)
 
-    cfg = turbo_gnn.AutotuneConfig(warmup=1, iters=2)
+    cfg = skewgnn.AutotuneConfig(warmup=1, iters=2)
     out = gsddmm_edge(graph, lhs, rhs, op="mul", lhs_target="src", rhs_target="dst", autotune=True, autotune_config=cfg)
     ref = _reference(graph, lhs, rhs, "mul", "src", "dst")
     assert torch.allclose(out, ref, **_tol(torch.float32))

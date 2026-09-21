@@ -19,8 +19,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from turbo_gnn import gatv2_aggr, graph_transformer_aggr
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as Adjacency
+from skewgnn import gatv2_aggr, graph_transformer_aggr
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets as Adjacency
 
 SLICES = [128, 256, 1024]
 
@@ -161,7 +161,7 @@ def test_bucket_launch_modes(conv, bucket_launch):
 
 
 def _run_min(graph, x, slice_size, **kw):
-    from turbo_gnn import reduction_aggr
+    from skewgnn import reduction_aggr
 
     return reduction_aggr(graph, x, forward_heavy_edge_slice=slice_size, **kw)
 

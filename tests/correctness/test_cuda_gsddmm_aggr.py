@@ -1,6 +1,6 @@
 """Correctness tests for the CUDA backend's raw GSDDMM op harness.
 
-``scripts/benchmark.py --backend cuda --aggr`` drives every sweep row through
+A sweep over raw GSDDMM ops drives every row through
 ``_CudaGsddmmOp`` (``src/backends/cuda_backend/conv.py``) -- one instance per
 op name, launched directly with no projections. These tests pin the harness
 contracts the sweep depends on; the kernels themselves are covered by
@@ -26,9 +26,9 @@ import pytest
 import torch
 
 from src.backends.cuda_backend.conv import _CudaGsddmmOp, gsddmm_op_spec, is_gsddmm_op
-from turbo_gnn import GSDDMMEdgeKernel, gsddmm
-from turbo_gnn._gsddmm import _edge_endpoints
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn import GSDDMMEdgeKernel, gsddmm
+from skewgnn._gsddmm import _edge_endpoints
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
@@ -171,7 +171,7 @@ def test_gsddmm_op_spec_parses_names(name, spec_fields):
 
 
 def test_gsddmm_op_spec_rejects_bad_names():
-    with pytest.raises(KeyError, match="Unknown turbo_gnn gsddmm op"):
+    with pytest.raises(KeyError, match="Unknown skewgnn gsddmm op"):
         gsddmm_op_spec("u_add_w")
     # '_edge' pins a kernel while '_auto' chooses one; asking for both is ambiguous.
     with pytest.raises(KeyError, match="pins a kernel"):
@@ -189,7 +189,7 @@ def test_gsddmm_op_spec_rejects_bad_names():
 def test_conv_forward_is_canonical_and_family_equivalent(name, dtype):
     """A `_edge` row computes the same rows as the bare one: both variants
     renumber to forward-CSR edge order, so only the launch differs. Checked
-    against turbo_gnn's own `gsddmm` with the variant pinned the same way."""
+    against skewgnn's own `gsddmm` with the variant pinned the same way."""
     graph = _make_graph()
     spec = gsddmm_op_spec(name)
     *operands, _ = _operands(graph, spec, 64, dtype)

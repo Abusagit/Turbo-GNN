@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
-from turbo_gnn._functions import (
+from skewgnn._functions import (
     DEFAULT_BLOCKS_PER_SM,
     DEFAULT_BUCKET_LAUNCH,
     DEFAULT_SCHED_CHUNK,
@@ -41,7 +41,7 @@ def _op_kernel_kwargs(op: Any, overrides: dict[str, Any], *, positional: tuple[s
     autotuner choice on those axes measured as an exact no-op while looking correct.
 
     Args:
-        op: The turbo_gnn op whose signature defines the tunable surface.
+        op: The skewgnn op whose signature defines the tunable surface.
         overrides: Construction-time values; anything not named here takes the op default.
         positional: Parameters the caller passes positionally in ``forward``, which must
             be left out or the call raises "got multiple values for argument".
@@ -215,7 +215,7 @@ class _CudaSpMMConv(BaseConvolution):
 
 
 class _CudaSimpleAggr(BaseAggr):
-    """Aggregation-only min/max via turbo_gnn.
+    """Aggregation-only min/max via skewgnn.
 
     Kernel tuning parameters are accepted here and forwarded to the kernel, so
     an aggregation-only benchmark can drive them exactly like a direct call.
@@ -233,7 +233,7 @@ class _CudaSimpleAggr(BaseAggr):
 
 
 class _CudaGATv2Aggr(BaseAggr):
-    """Aggregation-only GATv2 attention via turbo_gnn (no linear projections)."""
+    """Aggregation-only GATv2 attention via skewgnn (no linear projections)."""
 
     def __init__(self, heads: int, head_dim: int, negative_slope: float = 0.2, **kwargs: Any) -> None:
         super().__init__(conv_type="gat_v2")
@@ -258,7 +258,7 @@ class _CudaGATv2Aggr(BaseAggr):
 
 
 class _CudaGTAggr(BaseAggr):
-    """Aggregation-only graph transformer attention via turbo_gnn (no QKV projection)."""
+    """Aggregation-only graph transformer attention via skewgnn (no QKV projection)."""
 
     def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
         super().__init__(conv_type="gt")
@@ -277,7 +277,7 @@ class _CudaGTAggr(BaseAggr):
 
 
 class _CudaSpMMAggr(BaseAggr):
-    """Aggregation-only SpMM via turbo_gnn."""
+    """Aggregation-only SpMM via skewgnn."""
 
     def __init__(self, norm_type: str = "none", **kwargs: Any) -> None:
         super().__init__(conv_type=f"spmm_{norm_type}")
@@ -298,14 +298,14 @@ class _CudaSpMMAggr(BaseAggr):
 
 
 # ---------------------------------------------------------------------------
-# Raw turbo_gnn GSDDMM ops
+# Raw skewgnn GSDDMM ops
 # ---------------------------------------------------------------------------
 
 #: Suffix marking the edge-parallel (one warp per edge) kernel variant.
 _GSDDMM_EDGE_SUFFIX = "_edge"
 #: Suffix marking the auto-dispatching variant (time both kernels once per graph,
 #: then use the faster one). Benchmark-only spelling: it lets a sweep compare the
-#: dispatcher against either pinned kernel without touching scripts/benchmark.py.
+#: dispatcher against either pinned kernel without touching the sweep driver.
 _GSDDMM_AUTO_SUFFIX = "_auto"
 
 
@@ -321,20 +321,20 @@ class _GsddmmOpSpec(NamedTuple):
 
 
 def is_gsddmm_op(name: str) -> bool:
-    """True if *name* is a turbo_gnn gsddmm op name (incl. ``_edge``/``_auto``)."""
+    """True if *name* is a skewgnn gsddmm op name (incl. ``_edge``/``_auto``)."""
     if name.endswith(_GSDDMM_AUTO_SUFFIX):
         name = name[: -len(_GSDDMM_AUTO_SUFFIX)]
     return name in _GSDDMM_PREFILLED_OPS or name in _GSDDMM_EDGE_PREFILLED_OPS
 
 
 def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
-    """Parse a turbo_gnn gsddmm op name into the kernel's constructor arguments.
+    """Parse a skewgnn gsddmm op name into the kernel's constructor arguments.
 
-    Recognizes exactly the names :mod:`turbo_gnn.ops` generates — the binary
+    Recognizes exactly the names :mod:`skewgnn.ops` generates — the binary
     ``{lhs}_{op}_{rhs}`` ops over mixed member pairs (``u_add_v``, ``e_dot_v``,
     ...), the ``copy_u`` / ``copy_v`` copies, and each of those with an
     ``_edge`` suffix selecting the edge-parallel kernel. Membership is checked
-    against turbo_gnn's own op tables, so an op the library does not provide
+    against skewgnn's own op tables, so an op the library does not provide
     is rejected here rather than at launch.
 
     Args:
@@ -351,7 +351,7 @@ def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
             ``_edge`` also means the edge-parallel backward kernel.
 
     Raises:
-        KeyError: If *name* is not a turbo_gnn gsddmm op, or if ``_edge`` and
+        KeyError: If *name* is not a skewgnn gsddmm op, or if ``_edge`` and
             ``_auto`` are combined (one pins a kernel, the other chooses one).
     """
     # "<op>_auto" selects the dispatcher over either pinned kernel; the base name
@@ -367,7 +367,7 @@ def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
     elif name in _GSDDMM_PREFILLED_OPS:
         base, edge_variant = name, False
     else:
-        raise KeyError(f"Unknown turbo_gnn gsddmm op: {name!r}")
+        raise KeyError(f"Unknown skewgnn gsddmm op: {name!r}")
     if edge_variant:
         variant = "edge"
 
@@ -384,7 +384,7 @@ def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
 
 
 class _CudaGsddmmOp(BaseAggr):
-    """Launch a turbo_gnn GSDDMM op directly (no projections).
+    """Launch a skewgnn GSDDMM op directly (no projections).
 
     ``forward(*operands, graph)`` mirrors the DGL raw-op wrapper so one
     benchmarking path drives both backends. ``operand_kinds`` describes each
@@ -510,11 +510,11 @@ class CUDABackend(BaseBackend):
         """Factory for CUDA aggregation-only callables.
 
         Besides the named aggregations (min_aggr, gcn, gat_v2, ...), any
-        turbo_gnn gsddmm op name (u_add_v, e_dot_v, copy_u, and their
+        skewgnn gsddmm op name (u_add_v, e_dot_v, copy_u, and their
         ``_edge`` edge-parallel variants) is launched directly.
 
         Remaining kwargs are kernel tuning parameters and are forwarded to the
-        aggregation, which passes them on to the turbo_gnn kernel.
+        aggregation, which passes them on to the skewgnn kernel.
         """
         feature_dim = kwargs.pop("feature_dim", None)
         ct = conv_type.lower()
@@ -537,7 +537,7 @@ class CUDABackend(BaseBackend):
             case "gcn":
                 return _CudaSpMMAggr(norm_type="both", **kwargs)
             case _:
-                # Raw turbo_gnn gsddmm ops, launched directly (no wrappers).
+                # Raw skewgnn gsddmm ops, launched directly (no wrappers).
                 if is_gsddmm_op(ct):
                     # gsddmm is head-agnostic: it works on the flat [*, D] rows.
                     kwargs.pop("heads", None)

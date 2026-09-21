@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Time the turbo_gnn kernels on this GPU, in the form the cost-model fit consumes.
+"""Time the skewgnn kernels on this GPU, in the form the cost-model fit consumes.
 
-:mod:`turbo_gnn.calibration` needs one number per (graph, conv, pass, head dim): the wall clock
+:mod:`skewgnn.calibration` needs one number per (graph, conv, pass, head dim): the wall clock
 of a launch over a whole graph, alongside that graph's node and edge counts.  This produces
 exactly that, as JSON records interchangeable with ``benchmark_kernels.py --json-out``.
 
@@ -35,8 +35,8 @@ sys.path.append(str(Path(__file__).resolve().parent))
 from simulate_load_imbalance import make_powerlaw_degrees  # noqa: E402
 
 from src.data.datasets import DatasetConfig, load_single_graph  # noqa: E402
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
-from turbo_gnn.ops import gatv2_aggr, graph_transformer_aggr, reduction_aggr  # noqa: E402
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
+from skewgnn.ops import gatv2_aggr, graph_transformer_aggr, reduction_aggr  # noqa: E402
 
 DEFAULT_GRAPHS = ["Cora", "tolokers-2", "city-roads-L", "ogbn-arxiv", "twitch-views"]
 CONVS = ["gt", "gat_v2", "min_aggr"]

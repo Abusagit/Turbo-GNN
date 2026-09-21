@@ -17,8 +17,8 @@ import torch.nn as nn
 
 from src.data.datasets import GraphSample
 
-# Import core autotune infrastructure from turbo_gnn
-from turbo_gnn._autotune import (
+# Import core autotune infrastructure from skewgnn
+from skewgnn._autotune import (
     AutotuneConfig,
     TunableKernel,
     TunableParam,
@@ -52,7 +52,7 @@ class GraphFormat(Enum):
 
 
 # Monkey-patch TunableKernel.autotune for GraphSample-dependent full autotune
-# (not included in turbo_gnn because it depends on GraphSample/research code)
+# (not included in skewgnn because it depends on GraphSample/research code)
 def _tunable_kernel_autotune(
     self, x: torch.Tensor, graph_sample: GraphSample, config: AutotuneConfig | None = None
 ) -> dict:

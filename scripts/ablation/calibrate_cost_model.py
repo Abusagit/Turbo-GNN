@@ -2,7 +2,7 @@
 """Fit the simulator's cost model to measured kernel times.
 
 Produces the ``cost_models.json`` that ``simulate_load_imbalance.py --cost-model`` consumes,
-turning simulated makespans into predicted milliseconds.  See :mod:`turbo_gnn.calibration` for
+turning simulated makespans into predicted milliseconds.  See :mod:`skewgnn.calibration` for
 what is being fitted and why.
 
     # from the checked-in benchmark report
@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-from turbo_gnn.calibration import (  # noqa: E402
+from skewgnn.calibration import (  # noqa: E402
     Measurement,
     fit_all,
     measurements_from_benchmark_json,

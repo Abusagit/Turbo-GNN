@@ -1,1 +1,1 @@
-from .conv import СuSparseBackend, СuSparsePrecomputeBWDBackend
+from .conv import CuSparseBackend, CuSparsePrecomputeBWDBackend

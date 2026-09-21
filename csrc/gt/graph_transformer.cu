@@ -40,7 +40,7 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
 ) {
     at::cuda::CUDAGuard device_guard(Q.device());
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(Q.device().index());
-    namespace sched_ns                   = turbo_gnn::sched;
+    namespace sched_ns                   = skewgnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
 
     TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(), "CSR indices must be CUDA");
@@ -144,7 +144,7 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
         );
     };
 
-    namespace stream_ns = turbo_gnn::streams;
+    namespace stream_ns = skewgnn::streams;
     stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), Q.device());
     buckets.record_all(Q, K, V, O, lse, row_ptr, col_idx, light_nodes, sched_counters);
 
@@ -346,7 +346,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
 
     TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GT backward: unsupported head dim D=", D, "; supported: 32, 64, 128, 256");
 
-    namespace sched_ns                   = turbo_gnn::sched;
+    namespace sched_ns                   = skewgnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
     // Rows: 0 = compute_D, 1 = light bucket / undirected, 2 = heavy bucket.
     at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/3, Q.device());
@@ -456,7 +456,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
             );
         };
 
-        namespace stream_ns = turbo_gnn::streams;
+        namespace stream_ns = skewgnn::streams;
         stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), Q.device());
         buckets.record_all(Q, K, V, O, dO, logsumexp, row_ptr_T, col_idx_T, light_nodes, sched_counters);
 

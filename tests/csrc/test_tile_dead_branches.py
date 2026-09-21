@@ -12,6 +12,7 @@ Marked slow: it shells out to nvcc and is not part of the normal loop.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sysconfig
@@ -44,7 +45,8 @@ ARCH = "sm_100a"
 
 
 def _nvcc() -> str:
-    for candidate in ("/usr/local/cuda-13.2/bin/nvcc",):
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+    for candidate in ("nvcc", f"{cuda_home}/bin/nvcc"):
         found = shutil.which(candidate) or (candidate if Path(candidate).exists() else None)
         if found:
             return found

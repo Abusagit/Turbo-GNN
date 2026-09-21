@@ -1,7 +1,7 @@
-"""Re-export shim: imports from turbo_gnn."""
+"""Re-export shim: imports from skewgnn."""
 
-from turbo_gnn._autotune import TunableKernel, TunableParam, with_autotune
-from turbo_gnn._functions import _FusedGraphAttention
-from turbo_gnn._kernels import GraphTransformerAggrKernel
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
-from turbo_gnn.ops import graph_transformer_aggr
+from skewgnn._autotune import TunableKernel, TunableParam, with_autotune
+from skewgnn._functions import _FusedGraphAttention
+from skewgnn._kernels import GraphTransformerAggrKernel
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn.ops import graph_transformer_aggr

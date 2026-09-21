@@ -15,9 +15,9 @@ import torch
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-from turbo_gnn.calibration import FitResult, anchor_tick_ns, load_cost_models, lookup  # noqa: E402
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
-from turbo_gnn.simulation import (  # noqa: E402
+from skewgnn.calibration import FitResult, anchor_tick_ns, load_cost_models, lookup  # noqa: E402
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets  # noqa: E402
+from skewgnn.simulation import (  # noqa: E402
     Assignment,
     BlockSpec,
     CostModel,
@@ -245,7 +245,7 @@ def resolve_cost_model(args: argparse.Namespace) -> tuple[CostModel, FitResult |
     """Pick the cost model and say where it came from.
 
     The tick duration is *not* decided here: it is anchored later, once the measured baseline
-    configuration has been simulated.  See :func:`turbo_gnn.calibration.anchor_tick_ns`.
+    configuration has been simulated.  See :func:`skewgnn.calibration.anchor_tick_ns`.
     """
     provenance: dict[str, object] = {"cost_model_source": "default D+2"}
     fit: FitResult | None = None

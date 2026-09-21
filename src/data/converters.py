@@ -19,7 +19,7 @@ from torch_geometric.utils import add_self_loops as add_self_loops_pyg
 
 from src._ninja import ensure_ninja_on_path
 from src.utils.triton_constants import ROW_WINDOW_SIZE, TCB_SIZE, TCB_WIDTH
-from turbo_gnn.graph import (  # noqa: E402
+from skewgnn.graph import (  # noqa: E402
     AdjacencyForwardBackwardWithNodeBuckets,
     _bucket_nodes_by_degree,
     build_csr_as_is,
@@ -687,7 +687,7 @@ class WSBFormat:
         c. For each TCB, build bitmap and weight array
 
         Args:
-            adj: sparse СSR tensor of adjacency matrix
+            adj: sparse CSR tensor of adjacency matrix
             dtype: Weight dtype (e.g. float16 for tensor cores)
 
         Returns:

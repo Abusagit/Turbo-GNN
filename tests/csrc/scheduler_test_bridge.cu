@@ -13,7 +13,7 @@
 
 #include "common.cuh"
 
-using namespace turbo_gnn::sched;
+using namespace skewgnn::sched;
 
 namespace {
 

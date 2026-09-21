@@ -8,13 +8,13 @@
 // Unified GATv2 Backward AL kernel (computes grad_a, grad_l, G)
 // =============================================================================
 template <
-    turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
+    skewgnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
     FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
+    skewgnn::sched::SchedulerParams<index_t> sched_params,
     const cuda_t *__restrict__ d_attn_vec,     // [H, D]
     const float *__restrict__ d_logsumexp,     // [N, H],
     float negative_slope,
@@ -272,7 +272,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
@@ -285,13 +285,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_AL(
 // Unified GATv2 Backward R kernel (computes grad_r)
 // =============================================================================
 template <
-    turbo_gnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
+    skewgnn::sched::ScheduleKind SK, int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t, typename index_t,
     FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr_T, const index_t *__restrict__ d_col_idx_T,
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
+    skewgnn::sched::SchedulerParams<index_t> sched_params,
     const cuda_t *__restrict__ d_attn_vec,     // [H, D]
     const float *__restrict__ d_logsumexp,     // [N, H],
     const float *__restrict__ d_G,             // [N, H],
@@ -460,7 +460,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Backward_R(
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
@@ -534,9 +534,9 @@ __global__ void __launch_bounds__(kWarpSize *kWarpSize) ReduceGradAKernel(
 // =============================================================================
 // Undirected GATv2 backward: G computation kernel (extracts pass 1 of AL)
 // =============================================================================
-template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <skewgnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params, size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
+    skewgnn::sched::SchedulerParams<index_t> sched_params, size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
     const cuda_t *__restrict__ d_attn_vec,  // [H, D]
@@ -649,7 +649,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
@@ -664,9 +664,9 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_G_Kernel(
 // direction) in a single pass over forward CSR neighbors.
 // Requires G[j] to be pre-computed globally.
 // =============================================================================
-template <turbo_gnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
+template <skewgnn::sched::ScheduleKind SK, int D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params, size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
+    skewgnn::sched::SchedulerParams<index_t> sched_params, size_t N, size_t H, size_t D, const cuda_t *__restrict__ grad_h, int64_t stride_gh_n, int64_t stride_gh_h, const cuda_t *__restrict__ d_l,
     int64_t stride_l_n, int64_t stride_l_h, const cuda_t *__restrict__ d_r, int64_t stride_r_n, int64_t stride_r_h,
     const index_t *__restrict__ d_row_ptr, const index_t *__restrict__ d_col_idx,
     const cuda_t *__restrict__ d_attn_vec,  // [H, D]
@@ -891,7 +891,7 @@ __global__ void __launch_bounds__(kWarpSize) GATv2Backward_ALR_Undirected(
     }
     };  // process_node
 
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+    using Sched = skewgnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
     __shared__ typename Sched::SharedStorage sched_smem;
     Sched sched(sched_params, sched_smem);
     for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {

@@ -19,10 +19,10 @@ stable-sort bijection that builds that mapping.
 import pytest
 import torch
 
-import turbo_gnn
-from turbo_gnn import gsddmm, gsddmm_edge
-from turbo_gnn._autotune import AutotuneConfig
-from turbo_gnn._gsddmm import (
+import skewgnn
+from skewgnn import gsddmm, gsddmm_edge
+from skewgnn._autotune import AutotuneConfig
+from skewgnn._gsddmm import (
     EdgeBlockParams,
     GsddmmLaunchPlan,
     GsddmmSpec,
@@ -34,7 +34,7 @@ from turbo_gnn._gsddmm import (
     _plan_cache_keys,
     select_variant,
 )
-from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets
+from skewgnn.graph import AdjacencyForwardBackwardWithNodeBuckets
 
 
 def _signed_long(t: torch.Tensor) -> torch.Tensor:
@@ -197,13 +197,13 @@ def test_public_aliases_dispatch_automatically() -> None:
     """The prefilled family forwards ``variant``, and defaults to auto."""
     graph = _make_graph()
     lhs, rhs = _operands(graph, "src", "dst", 64, torch.float32)
-    assert torch.equal(turbo_gnn.u_add_v(graph, lhs, rhs), turbo_gnn.u_add_v(graph, lhs, rhs, variant="node"))
-    assert torch.equal(turbo_gnn.u_add_v(graph, lhs, rhs), turbo_gnn.u_add_v(graph, lhs, rhs, variant="edge"))
+    assert torch.equal(skewgnn.u_add_v(graph, lhs, rhs), skewgnn.u_add_v(graph, lhs, rhs, variant="node"))
+    assert torch.equal(skewgnn.u_add_v(graph, lhs, rhs), skewgnn.u_add_v(graph, lhs, rhs, variant="edge"))
     # One op per operation is public; the *_edge spellings stay importable.
-    assert "u_add_v" in turbo_gnn.__all__
-    assert "u_add_v_edge" not in turbo_gnn.__all__
-    assert "gsddmm_edge" not in turbo_gnn.__all__
-    assert callable(turbo_gnn.u_add_v_edge)
+    assert "u_add_v" in skewgnn.__all__
+    assert "u_add_v_edge" not in skewgnn.__all__
+    assert "gsddmm_edge" not in skewgnn.__all__
+    assert callable(skewgnn.u_add_v_edge)
 
 
 # =============================================================================
@@ -341,7 +341,7 @@ def test_staged_autotune_searches_only_the_winning_variant() -> None:
     """
     graph = _make_graph()
     lhs, rhs = _operands(graph, "src", "dst", 64, torch.float32)
-    kernel = turbo_gnn.GSDDMMKernel(op="mul", lhs_target="src", rhs_target="dst", variant="auto")
+    kernel = skewgnn.GSDDMMKernel(op="mul", lhs_target="src", rhs_target="dst", variant="auto")
 
     launched: list[str] = []
     original_plan = kernel._plan
@@ -407,7 +407,7 @@ def test_autotune_matches_reference_and_reports_its_choice() -> None:
     tuned = gsddmm(graph, lhs, rhs, op="mul", lhs_target="src", rhs_target="dst", autotune=True, autotune_config=config)
     assert torch.equal(reference, tuned)
 
-    kernel = turbo_gnn.GSDDMMKernel._get_or_create(op="mul", lhs_target="src", rhs_target="dst", variant="auto")
+    kernel = skewgnn.GSDDMMKernel._get_or_create(op="mul", lhs_target="src", rhs_target="dst", variant="auto")
     assert kernel.forward_variant in ("node", "edge")
     cached = kernel._inline_cache.lookup(graph, 64, dtype=torch.float32)
     assert cached is not None and cached["kernel_config"]["forward_variant"] == kernel.forward_variant
