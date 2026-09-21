@@ -103,7 +103,7 @@ void GATv2Backward_CSR_Undirected_Impl(
                         d_attn_vec, d_logsumexp, negative_slope, part_G.data_ptr<float>()
                     );
             },
-            MakeIntVariant<0, 2, 3>(pipeline_stages)
+            MakeIntVariant<0, 2, 6, 12>(pipeline_stages)
         );
         GATv2Backward_G_MergeKernel<cuda_t, index_t><<<dim3(num_heavy, H), dim3(kWarpSize), 0, st>>>(
             H, d_row_ptr, heavy_nodes, node_chunk_offset, part_G.data_ptr<float>(), d_G, num_heavy
@@ -127,7 +127,7 @@ void GATv2Backward_CSR_Undirected_Impl(
             part_a.data_ptr<float>(), part_l.data_ptr<float>(), part_r.data_ptr<float>()
                     );
             },
-            MakeIntVariant<0, 2, 3>(pipeline_stages)
+            MakeIntVariant<0, 2, 6, 12>(pipeline_stages)
         );
         GATv2Backward_ALR_MergeKernel<D_CONST, cuda_t, index_t><<<dim3(num_heavy, H), dim3(kWarpSize), 0, st>>>(
             H, d_row_ptr, heavy_nodes, node_chunk_offset,
@@ -275,7 +275,8 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor chunk_start,
     torch::Tensor node_chunk_offset,
     int heavy_edge_slice,
-    int pipeline_stages
+    int pipeline_stages,
+    int heavy_pipeline_stages
 ) {
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
     TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
@@ -341,8 +342,10 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     at::Tensor sched_counters            = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/2, l.device());
     int bucket_id                        = 0;
 
+    // `bucket_stages` rather than the captured `pipeline_stages`: the two buckets size their
+    // staging buffers from different warp counts, so they need independent depths.
     auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
-                             at::cuda::CUDAStream bucket_stream) {
+                             at::cuda::CUDAStream bucket_stream, int bucket_stages) {
         const int this_bucket = bucket_id++;
         if (num_nodes_bucket == 0) return;
         at::cuda::CUDAStreamGuard guard(bucket_stream);
@@ -388,7 +391,7 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
             MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0, 1, 2, 3>(schedule),
-            MakeIntVariant<0, 2, 3>(pipeline_stages)
+            MakeIntVariant<0, 2, 6, 12>(bucket_stages)
         );
     };
 
@@ -447,18 +450,21 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
             MakeIntVariant<32, 64, 128, 256>((int)D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block),
-            MakeIntVariant<0, 2, 3>(pipeline_stages)
+            MakeIntVariant<0, 2, 6, 12>(heavy_pipeline_stages)
         );
     };
 
     stream_ns::run_buckets(
         buckets,
-        [&](at::cuda::CUDAStream st) { launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
+        [&](at::cuda::CUDAStream st) {
+            launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st, pipeline_stages);
+        },
         [&](at::cuda::CUDAStream st) {
             if (heavy_edge_slice > 0) {
                 launch_heavy_split(st);
             } else {
-                launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st);
+                launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st,
+                              heavy_pipeline_stages);
             }
         }
     );
@@ -496,7 +502,9 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor chunk_start,
     torch::Tensor node_chunk_offset,
     int backward_heavy_edge_slice,
-    int pipeline_stages
+    int pipeline_stages,
+    // Separate depth for the heavy bucket; see gatv2_forward_cuda.
+    int backward_heavy_pipeline_stages
 ) {
     TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
     TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");
@@ -596,7 +604,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         // Lambda to launch AL kernel for a bucket
         int launch_al_bucket_id = 0;
         auto launch_al_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
-                          at::cuda::CUDAStream bucket_stream) {
+                          at::cuda::CUDAStream bucket_stream, int bucket_stages) {
             const int this_bucket = launch_al_bucket_id++;
             if (num_nodes_bucket == 0) return;
             at::cuda::CUDAStreamGuard guard(bucket_stream);
@@ -643,14 +651,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
                 MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
                 MakeIntVariant<0, 1, 2, 3>(schedule),
-                MakeIntVariant<0, 2, 3>(pipeline_stages)
+                MakeIntVariant<0, 2, 6, 12>(bucket_stages)
             );
         };
 
         // Lambda to launch R kernel for a bucket
         int launch_r_bucket_id = 2;
         auto launch_r_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
-                          at::cuda::CUDAStream bucket_stream) {
+                          at::cuda::CUDAStream bucket_stream, int bucket_stages) {
             const int this_bucket = launch_r_bucket_id++;
             if (num_nodes_bucket == 0) return;
             at::cuda::CUDAStreamGuard guard(bucket_stream);
@@ -697,7 +705,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
                 MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
                 MakeIntVariant<0, 1, 2, 3>(schedule),
-                MakeIntVariant<0, 2, 3>(pipeline_stages)
+                MakeIntVariant<0, 2, 6, 12>(bucket_stages)
             );
         };
 
@@ -710,8 +718,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
             buckets.record_all(grad_h, l, r, row_ptr, col_idx, attn_vec, logsumexp, fwd_light_nodes, sched_counters);
             stream_ns::run_buckets(
                 buckets,
-                [&](at::cuda::CUDAStream st) { launch_al_bucket(fwd_light_nodes, fwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
-                [&](at::cuda::CUDAStream st) { launch_al_bucket(fwd_heavy_nodes, fwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+                [&](at::cuda::CUDAStream st) {
+                    launch_al_bucket(fwd_light_nodes, fwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st,
+                                     pipeline_stages);
+                },
+                [&](at::cuda::CUDAStream st) {
+                    launch_al_bucket(fwd_heavy_nodes, fwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st,
+                                     backward_heavy_pipeline_stages);
+                }
             );
         }
 
@@ -722,8 +736,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
             buckets.record_all(grad_h, l, r, row_ptr_T, col_idx_T, attn_vec, logsumexp, bwd_light_nodes, sched_counters);
             stream_ns::run_buckets(
                 buckets,
-                [&](at::cuda::CUDAStream st) { launch_r_bucket(bwd_light_nodes, bwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st); },
-                [&](at::cuda::CUDAStream st) { launch_r_bucket(bwd_heavy_nodes, bwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st); }
+                [&](at::cuda::CUDAStream st) {
+                    launch_r_bucket(bwd_light_nodes, bwd_light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st,
+                                    pipeline_stages);
+                },
+                [&](at::cuda::CUDAStream st) {
+                    launch_r_bucket(bwd_heavy_nodes, bwd_heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st,
+                                    backward_heavy_pipeline_stages);
+                }
             );
         }
 

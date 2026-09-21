@@ -136,7 +136,9 @@ def gatv2_aggr(
     backward_heavy_edge_slice: int = 0,
     backward_heavy_slice_blocks_per_sm: float = 0.0,
     pipeline_stages: int = 0,
+    heavy_pipeline_stages: int = 0,
     backward_pipeline_stages: int = 0,
+    backward_heavy_pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
@@ -217,7 +219,9 @@ def gatv2_aggr(
         bwd_table.chunk_start if bwd_table is not None else None,
         bwd_table.node_chunk_offset if bwd_table is not None else None,
         pipeline_stages,
+        heavy_pipeline_stages,
         backward_pipeline_stages,
+        backward_heavy_pipeline_stages,
     )
 
 
@@ -243,7 +247,9 @@ def graph_transformer_aggr(
     backward_heavy_edge_slice: int = 0,
     backward_heavy_slice_blocks_per_sm: float = 0.0,
     pipeline_stages: int = 0,
+    heavy_pipeline_stages: int = 0,
     backward_pipeline_stages: int = 0,
+    backward_heavy_pipeline_stages: int = 0,
 ) -> torch.Tensor:
     """Fused multi-head graph transformer attention.
 
@@ -327,7 +333,9 @@ def graph_transformer_aggr(
         bwd_table.chunk_start if bwd_table is not None else None,
         bwd_table.node_chunk_offset if bwd_table is not None else None,
         pipeline_stages,
+        heavy_pipeline_stages,
         backward_pipeline_stages,
+        backward_heavy_pipeline_stages,
     )
 
 

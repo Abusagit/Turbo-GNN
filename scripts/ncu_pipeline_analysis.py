@@ -89,8 +89,10 @@ def run_one(graph: str, cfg: str, conv: str, dim: int, mode: str, stages: int, g
         "--quantile",
         "0.99",
     ]
+    # Absolute path: under sudo the CUDA bin dir is not reliably on PATH.
+    ncu = next((c for c in ("/usr/local/cuda/bin/ncu", "ncu") if Path(c).exists() or c == "ncu"), "ncu")
     cmd = [
-        "ncu",
+        ncu,
         "--target-processes",
         "all",
         "--csv",
@@ -98,7 +100,11 @@ def run_one(graph: str, cfg: str, conv: str, dim: int, mode: str, stages: int, g
         "raw",
         "--metrics",
         ",".join(METRICS),
-        # Only the aggregation kernels matter; skip PyTorch's own launches.
+        # Profile ONLY our kernels. Without this ncu instruments every launch including
+        # PyTorch's elementwise fills, one of which fails to profile and takes the whole
+        # process down with error code 9 -- and each extra kernel costs a full replay pass.
+        "--kernel-name",
+        "regex:GATv2|GraphAttention|graph_attn|reduction_aggr",
         "--kernel-name-base",
         "demangled",
         *bench,

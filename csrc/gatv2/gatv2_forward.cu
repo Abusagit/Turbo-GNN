@@ -5,6 +5,35 @@
 
 #include "common.cuh"
 
+/// Registers cap occupancy for this kernel at every D: the compiler settles on 64 registers,
+/// which at 8 warps allows only 65536/(64*32*8) = 4 blocks per SM -- 50% occupancy. Supplying
+/// `minBlocksPerMultiprocessor` forces the allocator lower: asking for B blocks of T threads
+/// caps it at 65536/(B*T) registers per thread.
+///
+/// Applied only at D_CONST >= 256, where the measured d=256 results are flat while d=128 gains
+/// 1.0055x: at d=128 each lane owns exactly one tile and the kernel is already at its best
+/// occupancy for the register count, so constraining it there would only risk spills. The target
+/// is ~51 registers (a 5th block at 8 warps, 50% -> 62%), expressed as 40/WARPS_PER_BLOCK so
+/// wider blocks are not asked for something unsatisfiable -- 16 warps would otherwise be capped
+/// at 25 registers, which buys occupancy back with a local-memory spill and loses.
+template <int WARPS_PER_BLOCK, int D_CONST, FloatingNum cuda_t>
+inline constexpr int kGATv2FwdMinBlocksPerSM = [] {
+    // Condition the register budget on tile geometry, not on D_CONST. TILES = D/TW, and TW
+    // depends on the dtype, so D_CONST alone does not describe the kernel's register profile:
+    //   TILES == 32 (one tile per lane, saturated) -- fp32/d=128, fp16/d=256. Already the
+    //       winning shape; squeezing registers here spilled 14 of 16 depth-6 instantiations
+    //       and cost fp16/d=256 3% (1.0091x -> 0.9773x). Leave it at nvcc's own 64.
+    //   TILES  > 32 (two or more tiles per lane) -- fp32/d=256. Cannot saturate, and the extra
+    //       block per SM is worth +0.3% there (0.9988x -> 1.0024x). Cap to 48.
+    // Never emit 1: that asserts a single resident block suffices and the allocator spends
+    // freely (measured 64 -> 119 registers, occupancy 50% -> 25%).
+    constexpr int kTiles = static_cast<int>(D_CONST / SelectTW<D_CONST, cuda_t>::value);
+    constexpr int want   = (kTiles > 32) ? 40 : 32;   // 40/W => 48 regs, 32/W => 64 regs
+    constexpr int blocks = want / WARPS_PER_BLOCK;
+    return blocks < 1 ? 1 : (blocks > 32 ? 32 : blocks);
+}();
+
+
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
 // =============================================================================
@@ -15,7 +44,7 @@ template <
     // PIPELINE_STAGES == 0 disables the async-copy pipeline (plain warp-strided loop);
     // PIPELINE_STAGES >= 1 enables it with that many ping-pong stages for r[j].
     int PIPELINE_STAGES = 0>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kernel(
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize, kGATv2FwdMinBlocksPerSM<WARPS_PER_BLOCK, D_CONST, cuda_t>) GATv2Forward_Kernel(
     size_t N,
     size_t H,
     size_t D,
@@ -121,25 +150,47 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
     OnlineSoftmaxState softmax_state;
 
     if constexpr (USE_PIPELINE) {
-        const int loop_iters =
-            (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
+        // Blocked, not strided: each warp owns a contiguous run of this node's edges. That makes
+        // the warp's upcoming column indices contiguous in memory, so all 32 can be fetched in one
+        // coalesced transaction and broadcast from registers -- see idx_of() below.
+        const int per_warp  = (num_neighbors + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        const int my_start  = warp_id * per_warp;
+        const int my_end    = min(my_start + per_warp, static_cast<int>(num_neighbors));
+        const int loop_iters = (my_end > my_start) ? (my_end - my_start) : 0;
 
         if (loop_iters > 0) {
-            cuda_t *rows[NUM_STAGES];
-#pragma unroll
-            for (int s = 0; s < NUM_STAGES; ++s) {
-                rows[s] = r_dbuf + (warp_id * NUM_STAGES + s) * D_CONST;
-            }
+            // Affine in the slot, so compute the address instead of holding an array indexed by
+            // a runtime value -- such an array lands in local memory and the spill grows with depth.
+            auto slot_row = [r_dbuf, warp_id](int slot) -> cuda_t * {
+                return r_dbuf + (warp_id * NUM_STAGES + slot) * D_CONST;
+            };
+
+            // The column index used to be loaded synchronously inside prefetch(), so the cp.async
+            // for the neighbour row could not even be *issued* until that load returned from DRAM:
+            // the two-hop chain col_idx[e] -> X[col_idx[e]] was only half covered. Here lane L
+            // pre-loads the index for edge (base + L) in a single coalesced 32-wide load, and each
+            // edge's index is then broadcast from a register. The async issue no longer waits on
+            // global memory at all.
+            index_t idx_reg{};
+            int idx_base = -1;
+            auto idx_of = [&idx_reg, &idx_base, d_col_idx, edge_start, my_start, my_end, lane](int i) -> index_t {
+                const int b = i & ~31;
+                if (b != idx_base) {
+                    const int pos = my_start + b + lane;
+                    idx_reg  = (pos < my_end) ? d_col_idx[edge_start + static_cast<index_t>(pos)] : index_t{};
+                    idx_base = b;
+                }
+                return __shfl_sync(0xffffffffu, idx_reg, i & 31);
+            };
 
             cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-            auto prefetch = [&pipe, loop_iters, warp_id, d_col_idx, edge_start, d_r, stride_r_n, head_h, stride_r_h, rows, lane](int it) {
+            auto prefetch = [&pipe, &idx_of, loop_iters, d_r, stride_r_n, head_h, stride_r_h, slot_row, lane](int it) {
                 pipe.producer_acquire();
                 if (it < loop_iters) {
-                    const int k         = warp_id + it * WARPS_PER_BLOCK;
-                    const index_t j     = d_col_idx[edge_start + static_cast<index_t>(k)];
+                    const index_t j     = idx_of(it);
                     const cuda_t *r_src = d_r + j * stride_r_n + head_h * stride_r_h;
-                    async_copy_row_warp<D_CONST, cuda_t>(rows[it % NUM_STAGES], r_src, pipe, lane);
+                    async_copy_row_warp<D_CONST, cuda_t>(slot_row(it % NUM_STAGES), r_src, pipe, lane);
                 }
                 pipe.producer_commit();
             };
@@ -149,24 +200,77 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
                 prefetch(s);
             }
 
-            vec_t r_regs[TILES_PER_THREAD];
+            // Two edges per iteration when the pipeline holds at least two rows. This is the
+            // reason to pipeline at all here: the per-edge critical path is a five-step
+            // warp_reduce_sum shuffle chain, and a single edge cannot overlap it with anything.
+            // Two staged rows give two *independent* reduction chains that the scheduler
+            // interleaves, and l[i]/a are read once per pair instead of once per edge. The
+            // register path cannot do this -- holding two neighbour rows in registers costs
+            // 2 * TILES_PER_THREAD vectors in a kernel where registers already bind occupancy.
+            int iter = 0;
+            if constexpr (NUM_STAGES >= 2) {
+                for (; iter + 1 < loop_iters; iter += 2) {
+                    cuda::pipeline_consumer_wait_prior<NUM_STAGES - 2>(pipe);
+                    __syncwarp();
+                    cuda_t const *r0 = slot_row(iter % NUM_STAGES);
+                    cuda_t const *r1 = slot_row((iter + 1) % NUM_STAGES);
 
-            for (int iter = 0; iter < loop_iters; ++iter) {
+                    accum_t d0{}, d1{};
+#pragma unroll
+                    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                        int v = lane + kWarpSize * t;
+                        if (v < TILES) {
+                            const vec_t lv = Tile::read(l_sh, v);
+                            const vec_t av = Tile::read(a_base, v);
+                            d0 += Tile::gatv2_dot_leaky_relu(lv, Tile::read(r0, v), av, negative_slope);
+                            d1 += Tile::gatv2_dot_leaky_relu(lv, Tile::read(r1, v), av, negative_slope);
+                        }
+                    }
+                    // Independent, so the two shuffle chains overlap instead of serialising.
+                    const accum_t dot0 = warp_reduce_sum(d0);
+                    const accum_t dot1 = warp_reduce_sum(d1);
+
+                    const accum_t rescale0 = softmax_state.update(dot0);
+#pragma unroll
+                    for (int i = 0; i < ACCS_PER_THREAD; ++i) {
+                        h_acc[i] *= rescale0;
+                    }
+                    const accum_t c0 = AccumOps::exp(dot0 - softmax_state.max_val);
+#pragma unroll
+                    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                        int v = lane + kWarpSize * t;
+                        if (v < TILES) {
+                            Tile::read(r0, v).template weighted_accum_<accum_t>(&h_acc[t * TW], c0);
+                        }
+                    }
+
+                    const accum_t rescale1 = softmax_state.update(dot1);
+#pragma unroll
+                    for (int i = 0; i < ACCS_PER_THREAD; ++i) {
+                        h_acc[i] *= rescale1;
+                    }
+                    const accum_t c1 = AccumOps::exp(dot1 - softmax_state.max_val);
+#pragma unroll
+                    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                        int v = lane + kWarpSize * t;
+                        if (v < TILES) {
+                            Tile::read(r1, v).template weighted_accum_<accum_t>(&h_acc[t * TW], c1);
+                        }
+                    }
+
+                    __syncwarp();
+                    pipe.consumer_release();
+                    pipe.consumer_release();
+                    prefetch(iter + NUM_STAGES);
+                    prefetch(iter + NUM_STAGES + 1);
+                }
+            }
+
+            // Odd tail (and the whole loop when NUM_STAGES == 1, which no longer occurs).
+            for (; iter < loop_iters; ++iter) {
                 cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
                 __syncwarp();
-                cuda_t *r_cur = rows[iter % NUM_STAGES];
-
-#pragma unroll
-                for (int t = 0; t < TILES_PER_THREAD; ++t) {
-                    int v = lane + kWarpSize * t;
-                    if (v < TILES) {
-                        r_regs[t] = Tile::read(r_cur, v);
-                    }
-                }
-
-                __syncwarp();
-                pipe.consumer_release();
-                prefetch(iter + NUM_STAGES);
+                cuda_t const *r_cur = slot_row(iter % NUM_STAGES);
 
                 accum_t dot_lane{};
 #pragma unroll
@@ -175,7 +279,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
                     if (v < TILES) {
                         const vec_t lv = Tile::read(l_sh, v);
                         const vec_t av = Tile::read(a_base, v);
-                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, r_regs[t], av, negative_slope);
+                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, Tile::read(r_cur, v), av, negative_slope);
                     }
                 }
                 const accum_t dot = warp_reduce_sum(dot_lane);
@@ -191,9 +295,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2Forward_Kerne
                 for (int t = 0; t < TILES_PER_THREAD; ++t) {
                     int v = lane + kWarpSize * t;
                     if (v < TILES) {
-                        r_regs[t].template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
+                        Tile::read(r_cur, v).template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
                     }
                 }
+
+                __syncwarp();
+                pipe.consumer_release();
+                prefetch(iter + NUM_STAGES);
             }
         }
     } else {
@@ -323,7 +431,7 @@ template <
     // PIPELINE_STAGES == 0 keeps the plain warp-strided loop; >= 1 stages r[j] through shared
     // memory with that many ping-pong buffers, as GATv2Forward_Kernel does for the light bucket.
     int PIPELINE_STAGES = 0>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2ForwardSlice_Kernel(
+__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize, kGATv2FwdMinBlocksPerSM<WARPS_PER_BLOCK, D_CONST, cuda_t>) GATv2ForwardSlice_Kernel(
     size_t N, size_t H, size_t D,
     const cuda_t *__restrict__ d_l, const cuda_t *__restrict__ d_r,
     int64_t stride_l_n, int64_t stride_l_h, int64_t stride_r_n, int64_t stride_r_h,
@@ -419,28 +527,44 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2ForwardSlice_
     OnlineSoftmaxState softmax_state;
 
     if constexpr (USE_PIPELINE) {
-        // Edges this warp owns within [local_start, local_end), strided by WARPS_PER_BLOCK.
+        // Blocked within this slice so each warp's column indices are contiguous and can be
+        // fetched 32 at a time in one coalesced load (see idx_of()).
         const int slice_len = local_end - local_start;
-        const int loop_iters =
-            (slice_len > warp_id) ? (slice_len - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
+        const int per_warp  = (slice_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        const int my_start  = local_start + warp_id * per_warp;
+        const int my_end    = min(my_start + per_warp, local_end);
+        const int loop_iters = (my_end > my_start) ? (my_end - my_start) : 0;
 
         if (loop_iters > 0) {
-            cuda_t *rows[NUM_STAGES];
-#pragma unroll
-            for (int st = 0; st < NUM_STAGES; ++st) {
-                rows[st] = r_dbuf + (warp_id * NUM_STAGES + st) * D_CONST;
-            }
+            // Affine in the slot, so compute the address instead of holding an array indexed by
+            // a runtime value -- such an array lands in local memory and the spill grows with depth.
+            auto slot_row = [r_dbuf, warp_id](int slot) -> cuda_t * {
+                return r_dbuf + (warp_id * NUM_STAGES + slot) * D_CONST;
+            };
+
+            // Index prefetch: one coalesced 32-wide load per 32 edges, broadcast from a register,
+            // so issuing the row copy never waits on a global load. Without this the cp.async is
+            // gated by col_idx[e] and only half of the two-hop chain is actually covered.
+            index_t idx_reg{};
+            int idx_base = -1;
+            auto idx_of = [&idx_reg, &idx_base, d_col_idx, edge_start, my_start, my_end, lane](int i) -> index_t {
+                const int b = i & ~31;
+                if (b != idx_base) {
+                    const int pos = my_start + b + lane;
+                    idx_reg  = (pos < my_end) ? d_col_idx[edge_start + static_cast<index_t>(pos)] : index_t{};
+                    idx_base = b;
+                }
+                return __shfl_sync(0xffffffffu, idx_reg, i & 31);
+            };
 
             cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-            auto prefetch = [&pipe, loop_iters, warp_id, d_col_idx, edge_start, local_start, d_r, stride_r_n, head_h,
-                             stride_r_h, rows, lane](int it) {
+            auto prefetch = [&pipe, &idx_of, loop_iters, d_r, stride_r_n, head_h, stride_r_h, slot_row, lane](int it) {
                 pipe.producer_acquire();
                 if (it < loop_iters) {
-                    const int k         = local_start + warp_id + it * WARPS_PER_BLOCK;
-                    const index_t j     = d_col_idx[edge_start + static_cast<index_t>(k)];
+                    const index_t j     = idx_of(it);
                     const cuda_t *r_src = d_r + j * stride_r_n + head_h * stride_r_h;
-                    async_copy_row_warp<D_CONST, cuda_t>(rows[it % NUM_STAGES], r_src, pipe, lane);
+                    async_copy_row_warp<D_CONST, cuda_t>(slot_row(it % NUM_STAGES), r_src, pipe, lane);
                 }
                 pipe.producer_commit();
             };
@@ -450,26 +574,78 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2ForwardSlice_
                 prefetch(st);
             }
 
-            vec_t r_regs[TILES_PER_THREAD];
+            // Same paired-edge structure as the light-bucket kernel: two staged rows give two
+            // independent reduction chains. See there for the rationale. Two edges per iteration
+            // reason to pipeline at all here: the per-edge critical path is a five-step
+            // warp_reduce_sum shuffle chain, and a single edge cannot overlap it with anything.
+            // Two staged rows give two *independent* reduction chains that the scheduler
+            // interleaves, and l[i]/a are read once per pair instead of once per edge. The
+            // register path cannot do this -- holding two neighbour rows in registers costs
+            // 2 * TILES_PER_THREAD vectors in a kernel where registers already bind occupancy.
+            int iter = 0;
+            if constexpr (NUM_STAGES >= 2) {
+                for (; iter + 1 < loop_iters; iter += 2) {
+                    cuda::pipeline_consumer_wait_prior<NUM_STAGES - 2>(pipe);
+                    __syncwarp();
+                    cuda_t const *r0 = slot_row(iter % NUM_STAGES);
+                    cuda_t const *r1 = slot_row((iter + 1) % NUM_STAGES);
 
-            for (int iter = 0; iter < loop_iters; ++iter) {
+                    accum_t d0{}, d1{};
+#pragma unroll
+                    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                        int v = lane + kWarpSize * t;
+                        if (v < TILES) {
+                            const vec_t lv = Tile::read(l_sh, v);
+                            const vec_t av = Tile::read(a_base, v);
+                            d0 += Tile::gatv2_dot_leaky_relu(lv, Tile::read(r0, v), av, negative_slope);
+                            d1 += Tile::gatv2_dot_leaky_relu(lv, Tile::read(r1, v), av, negative_slope);
+                        }
+                    }
+                    // Independent, so the two shuffle chains overlap instead of serialising.
+                    const accum_t dot0 = warp_reduce_sum(d0);
+                    const accum_t dot1 = warp_reduce_sum(d1);
+
+                    const accum_t rescale0 = softmax_state.update(dot0);
+#pragma unroll
+                    for (int i = 0; i < ACCS_PER_THREAD; ++i) {
+                        h_acc[i] *= rescale0;
+                    }
+                    const accum_t c0 = AccumOps::exp(dot0 - softmax_state.max_val);
+#pragma unroll
+                    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                        int v = lane + kWarpSize * t;
+                        if (v < TILES) {
+                            Tile::read(r0, v).template weighted_accum_<accum_t>(&h_acc[t * TW], c0);
+                        }
+                    }
+
+                    const accum_t rescale1 = softmax_state.update(dot1);
+#pragma unroll
+                    for (int i = 0; i < ACCS_PER_THREAD; ++i) {
+                        h_acc[i] *= rescale1;
+                    }
+                    const accum_t c1 = AccumOps::exp(dot1 - softmax_state.max_val);
+#pragma unroll
+                    for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                        int v = lane + kWarpSize * t;
+                        if (v < TILES) {
+                            Tile::read(r1, v).template weighted_accum_<accum_t>(&h_acc[t * TW], c1);
+                        }
+                    }
+
+                    __syncwarp();
+                    pipe.consumer_release();
+                    pipe.consumer_release();
+                    prefetch(iter + NUM_STAGES);
+                    prefetch(iter + NUM_STAGES + 1);
+                }
+            }
+
+            // Odd tail (and the whole loop when NUM_STAGES == 1, which no longer occurs).
+            for (; iter < loop_iters; ++iter) {
                 cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
                 __syncwarp();
-                cuda_t *r_cur = rows[iter % NUM_STAGES];
-
-                // Staged into registers so the neighbour row is read once, not twice: the plain
-                // loop below re-reads r_base from global for the weighted accumulation.
-#pragma unroll
-                for (int t = 0; t < TILES_PER_THREAD; ++t) {
-                    int v = lane + kWarpSize * t;
-                    if (v < TILES) {
-                        r_regs[t] = Tile::read(r_cur, v);
-                    }
-                }
-
-                __syncwarp();
-                pipe.consumer_release();
-                prefetch(iter + NUM_STAGES);
+                cuda_t const *r_cur = slot_row(iter % NUM_STAGES);
 
                 accum_t dot_lane{};
 #pragma unroll
@@ -478,7 +654,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2ForwardSlice_
                     if (v < TILES) {
                         const vec_t lv = Tile::read(l_sh, v);
                         const vec_t av = Tile::read(a_base, v);
-                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, r_regs[t], av, negative_slope);
+                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, Tile::read(r_cur, v), av, negative_slope);
                     }
                 }
                 const accum_t dot = warp_reduce_sum(dot_lane);
@@ -494,9 +670,51 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) GATv2ForwardSlice_
                 for (int t = 0; t < TILES_PER_THREAD; ++t) {
                     int v = lane + kWarpSize * t;
                     if (v < TILES) {
-                        r_regs[t].template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
+                        Tile::read(r_cur, v).template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
                     }
                 }
+
+                __syncwarp();
+                pipe.consumer_release();
+                prefetch(iter + NUM_STAGES);
+            }
+
+            // Odd tail: one edge left over when loop_iters is odd.
+            for (; iter < loop_iters; ++iter) {
+                cuda::pipeline_consumer_wait_prior<NUM_STAGES - 1>(pipe);
+                __syncwarp();
+                cuda_t const *r_cur = slot_row(iter % NUM_STAGES);
+
+                accum_t dot_lane{};
+#pragma unroll
+                for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                    int v = lane + kWarpSize * t;
+                    if (v < TILES) {
+                        const vec_t lv = Tile::read(l_sh, v);
+                        const vec_t av = Tile::read(a_base, v);
+                        dot_lane += Tile::gatv2_dot_leaky_relu(lv, Tile::read(r_cur, v), av, negative_slope);
+                    }
+                }
+                const accum_t dot = warp_reduce_sum(dot_lane);
+
+                const accum_t rescale = softmax_state.update(dot);
+#pragma unroll
+                for (int i = 0; i < ACCS_PER_THREAD; ++i) {
+                    h_acc[i] *= rescale;
+                }
+
+                const accum_t contrib = AccumOps::exp(dot - softmax_state.max_val);
+#pragma unroll
+                for (int t = 0; t < TILES_PER_THREAD; ++t) {
+                    int v = lane + kWarpSize * t;
+                    if (v < TILES) {
+                        Tile::read(r_cur, v).template weighted_accum_<accum_t>(&h_acc[t * TW], contrib);
+                    }
+                }
+
+                __syncwarp();
+                pipe.consumer_release();
+                prefetch(iter + NUM_STAGES);
             }
         }
     } else {

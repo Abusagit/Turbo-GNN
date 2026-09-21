@@ -448,7 +448,7 @@ def _make_gt_pipeline_graph(kind: str, num_nodes: int, device: str = "cuda"):
 
 
 @pytest.mark.parametrize("graph_kind", _GT_PIPE_GRAPHS)
-@pytest.mark.parametrize("pipeline_stages", [2, 3])
+@pytest.mark.parametrize("pipeline_stages", [2, 6])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_gt_pipeline_vs_baseline_forward(graph_kind, pipeline_stages, dtype):
     """Forward: pipeline (any stage count) must match the pipeline_stages=0 baseline."""
@@ -480,7 +480,7 @@ def test_gt_pipeline_vs_baseline_forward(graph_kind, pipeline_stages, dtype):
 
 
 @pytest.mark.parametrize("graph_kind", _GT_PIPE_GRAPHS)
-@pytest.mark.parametrize("pipeline_stages", [2, 3])
+@pytest.mark.parametrize("pipeline_stages", [2, 6])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_gt_backward_pipeline_vs_baseline(graph_kind, pipeline_stages, dtype):
     """Backward kernels' own pipeline: gradients must match between

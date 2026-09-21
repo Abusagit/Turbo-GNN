@@ -247,6 +247,28 @@ class TunableKernel(ABC):
         excluded = set(getattr(config, "exclude", ()) or ())
         tune_bwd = bool(getattr(config, "tune_backward", False))
 
+        # Validate against the union of every declared parameter, not just the direction being
+        # tuned, so a backward-only name stays legal during a forward pass. Unknown names used
+        # to be dropped in silence, which makes an ablation look like it pinned an axis while
+        # the autotuner went on searching it -- the excluded knob then shows up in
+        # `autotune_selected` and the "feature off" arm is quietly the "feature on" arm.
+        known = {
+            p.name
+            for group in (
+                self.get_tunable_forward_kernel_params(),
+                self.get_tunable_forward_graph_params(),
+                self.get_tunable_backward_kernel_params(),
+                self.get_tunable_backward_graph_params(),
+            )
+            for p in group
+        }
+        unknown = excluded - known
+        if unknown:
+            raise ValueError(
+                f"autotune exclude names {sorted(unknown)} match no tunable parameter of "
+                f"{type(self).__name__}; valid names: {', '.join(sorted(known))}"
+            )
+
         if tune_bwd:
             kernel_params = self.get_tunable_backward_kernel_params()
             graph_params = self.get_tunable_backward_graph_params()

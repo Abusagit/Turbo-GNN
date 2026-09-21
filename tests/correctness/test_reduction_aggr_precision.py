@@ -372,7 +372,7 @@ def test_forward_block_sizes_vs_fp32_reference(warps, dtype, reduce, use_2d_kern
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("reduce", ["min", "max"])
-@pytest.mark.parametrize("pipeline_stages", [2, 3])
+@pytest.mark.parametrize("pipeline_stages", [2, 6])
 def test_forward_pipeline_vs_baseline(dtype, reduce, pipeline_stages):
     """Forward: pipeline (any stage count) must match the pipeline_stages=0 baseline,
     for both the light (atomic) and packed-atomics heavy kernels."""
@@ -407,7 +407,7 @@ def test_forward_pipeline_vs_baseline(dtype, reduce, pipeline_stages):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("reduce", ["min", "max"])
-@pytest.mark.parametrize("pipeline_stages", [2, 3])
+@pytest.mark.parametrize("pipeline_stages", [2, 6])
 def test_backward_pipeline_vs_baseline(dtype, reduce, pipeline_stages):
     """Backward: scattered gradients must match between pipeline and the
     pipeline_stages=0 baseline (backward itself has no pipeline; this

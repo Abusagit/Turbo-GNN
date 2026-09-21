@@ -223,7 +223,6 @@ SETUPS = {
         "--autotune",
         "--autotune-exclude",
         "schedule,forward_bucket_launch,backward_bucket_launch,"
-        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
         "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
         "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
         "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile,"
@@ -256,7 +255,6 @@ SETUPS = {
         "--autotune",
         "--autotune-exclude",
         "schedule,forward_bucket_launch,backward_bucket_launch,"
-        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
         "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
         "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
         "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile,"
@@ -284,7 +282,6 @@ SETUPS = {
         "--autotune",
         "--autotune-exclude",
         "schedule,forward_bucket_launch,backward_bucket_launch,"
-        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
         "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
         "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
         "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile"
@@ -308,7 +305,6 @@ SETUPS = {
         "--autotune",
         "--autotune-exclude",
         "schedule,forward_bucket_launch,backward_bucket_launch,"
-        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
         "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
         "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
         "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile"
@@ -326,13 +322,12 @@ SETUPS = {
         "--sweep",
         "node_order=degree,locality",
         "-K",
-        "pipeline_stages=3",
+        "pipeline_stages=6",
         "-K",
-        "backward_pipeline_stages=3",
+        "backward_pipeline_stages=6",
         "--autotune",
         "--autotune-exclude",
         "schedule,forward_bucket_launch,backward_bucket_launch,"
-        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
         "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
         "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
         "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile"
@@ -353,7 +348,6 @@ SETUPS = {
         "--autotune",
         "--autotune-exclude",
         "schedule,forward_bucket_launch,backward_bucket_launch,"
-        "forward_light_warps,forward_heavy_warps,backward_light_warps,backward_heavy_warps,"
         "forward_warps_per_block,forward_use_2d_kernel,forward_features_per_block,forward_tiles_y,"
         "forward_edges_per_block_heavy_nodes,backward_grad_A_reduce_row_chunk_size,"
         "forward_huge_degree_threshold_quantile,backward_huge_degree_threshold_quantile",
@@ -427,6 +421,33 @@ def _error_summary(stderr: str, returncode: int) -> str:
     return lines[-1][:200] if lines else f"exit {returncode}"
 
 
+def _drop_unsupported_kernel_args(setup_args: list[str], conv: str) -> list[str]:
+    """Strip `-K name=value` pairs this conv does not declare.
+
+    The three convs do not share a `-K` schema: GATv2 exposes `forward_heavy_edge_slice` but
+    reaches backward slicing through the undirected impl rather than a separate knob, so a
+    setup that pins `backward_heavy_edge_slice=0` is meaningful for GT and a hard error for
+    GATv2. Rather than fork the arm per conv -- which silently drifts -- resolve each pin
+    against the real schema and drop the ones that do not apply. `--autotune-exclude` names
+    are tunable names, not CLI names, and are left alone.
+    """
+    valid = {param.name for param in CUDA_CONV_PARAMS[conv]}
+    out: list[str] = []
+    i = 0
+    while i < len(setup_args):
+        if setup_args[i] == "-K" and i + 1 < len(setup_args):
+            name = setup_args[i + 1].split("=", 1)[0]
+            if name not in valid:
+                i += 2
+                continue
+            out.extend(setup_args[i : i + 2])
+            i += 2
+            continue
+        out.append(setup_args[i])
+        i += 1
+    return out
+
+
 def run_one(
     gpu: int, graph: str, cfg: str, conv: str, dim: int, mode: str, setup: str, out_dir: Path, args
 ) -> tuple[str, bool, str]:
@@ -448,6 +469,8 @@ def run_one(
         str(dim),
         "--heads",
         "1",
+        "--dtype",
+        args.dtype,
         "--mode",
         mode,
         "--iters",
@@ -456,7 +479,7 @@ def run_one(
         str(args.warmup),
         "--json-out",
         str(dest),
-        *SETUPS[setup],
+        *_drop_unsupported_kernel_args(SETUPS[setup], conv),
     ]
     if setup in ("slice-bps", "slice-abs"):
         cmd += SLICE_BPS_PINS.get(conv, [])
@@ -547,6 +570,8 @@ def main() -> int:
     p.add_argument("--graphs", nargs="+", default=[g for g, _ in GRAPHS])
     p.add_argument("--conv", nargs="+", default=CONVS)
     p.add_argument("--head-dims", type=int, nargs="+", default=[128, 256])
+    p.add_argument("--dtype", default="fp32", choices=("fp32", "fp16", "bf16"),
+                   help="feature dtype; halving it halves the pipeline's shared-memory cost per stage")
     p.add_argument("--modes", nargs="+", default=["forward", "backward"])
     p.add_argument("--setups", nargs="+", default=list(SETUPS))
     # Default 1, unlike the kernel matrix runner. The autotuning search is dominated by Python

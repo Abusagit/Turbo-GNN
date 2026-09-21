@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.benchmarking.microbench import MicrobenchResult, get_gpu_info, time_callable
 from turbo_gnn import AdjacencyForwardBackwardWithNodeBuckets, AutotuneConfig
+from turbo_gnn._functions import DEFAULT_BLOCKS_PER_SM
 
 doc = """
 Kernel microbenchmark launcher.
@@ -238,7 +239,12 @@ _SCHEDULE_PARAMS = (
         "Node->block policy: one_per_block (grid.x == node count) | grid_stride | precomputed | dynamic.",
         choices=("one_per_block", "grid_stride", "precomputed", "dynamic"),
     ),
-    KernelParam("blocks_per_sm", int, 1024, "Resident blocks per SM targeted by the persistent policies."),
+    KernelParam(
+        "blocks_per_sm",
+        int,
+        DEFAULT_BLOCKS_PER_SM,
+        "Resident blocks per SM targeted by the persistent policies; inert under one_per_block.",
+    ),
     KernelParam("sched_chunk", int, 4, "Work items claimed per atomic (dynamic policy only)."),
     KernelParam(
         "forward_bucket_launch",
@@ -315,10 +321,36 @@ _GATV2_PARAMS = (
         "cp.async pipeline depth for the forward neighbour scan; 0 disables the pipeline.",
     ),
     KernelParam(
+        "heavy_pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the forward HEAVY bucket only. The staging buffer is "
+        "warps*stages*D*sizeof(T), so 8-32 heavy warps exhaust shared memory at a depth the "
+        "1-4 light warps absorb; 0 disables the pipeline for that bucket.",
+    ),
+    KernelParam(
+        "backward_heavy_edge_slice",
+        int,
+        0,
+        "Edges per block in the backward heavy bucket; 0 keeps one block per heavy node.",
+    ),
+    KernelParam(
+        "backward_heavy_pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the backward HEAVY bucket only; 0 disables it there.",
+    ),
+    KernelParam(
         "backward_pipeline_stages",
         int,
         0,
         "cp.async pipeline depth for the backward neighbour scan; 0 disables the pipeline.",
+    ),
+    KernelParam(
+        "backward_heavy_slice_blocks_per_sm",
+        float,
+        0.0,
+        "Backward heavy slice as E_heavy/(blocks_per_sm*SMs); 0 keeps one block per heavy node.",
     ),
 ) + _SCHEDULE_PARAMS
 
@@ -357,6 +389,18 @@ _GT_PARAMS = (
         int,
         0,
         "cp.async pipeline depth for the forward neighbour scan; 0 disables the pipeline.",
+    ),
+    KernelParam(
+        "heavy_pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the forward HEAVY bucket only; 0 disables it there.",
+    ),
+    KernelParam(
+        "backward_heavy_pipeline_stages",
+        int,
+        0,
+        "cp.async pipeline depth for the backward HEAVY bucket only; 0 disables it there.",
     ),
     KernelParam(
         "backward_pipeline_stages",
@@ -614,6 +658,23 @@ SWEEPABLE_KERNEL: dict[str, Callable[[str], Any]] = {
     # against the device-relative blocks-per-SM form under identical pins.
     "forward_heavy_edge_slice": int,
     "backward_heavy_edge_slice": int,
+    # Pipeline depth, so the async-copy arms are timed against ONE loaded graph seconds apart
+    # rather than in separate processes minutes apart. On a shared box the load drifts across
+    # that gap and the drift lands entirely in the ratio: an identical-binary control read
+    # 1.0055x, 1.0047x and 0.9971x across runs. Paired in-process sampling cancels most of it.
+    "pipeline_stages": int,
+    "backward_pipeline_stages": int,
+    "heavy_pipeline_stages": int,
+    "backward_heavy_pipeline_stages": int,
+    # Warp counts, because they set the pipeline's shared-memory footprint: the staging
+    # buffer is warps x stages x row_bytes, so at D=256/fp32 eight heavy warps at depth 6
+    # need 48 KB -- the whole cap -- while D=128 needs 24 KB. Sweeping depth without
+    # sweeping warps therefore cannot separate "pipelining does not help here" from
+    # "this depth does not fit here".
+    "forward_heavy_warps": int,
+    "backward_heavy_warps": int,
+    "forward_light_warps": int,
+    "backward_light_warps": int,
 }
 
 
@@ -1329,10 +1390,9 @@ def prepare_target(args: argparse.Namespace, device: torch.device) -> BenchTarge
                 # Without this the backward parameters are never searched, so a --mode backward
                 # run would report the *default* backward configuration under an "autotuned"
                 # label. Tie it to what is actually being timed.
-                # NOTE: the inline autotuner never reads this and never searches the backward
-                # parameters -- it optimises forward time only, whatever --mode says. Set here
-                # so the intent survives if that is ever fixed; see reports/ for what it means
-                # for the backward numbers.
+                # Verified 2026-09-04: `_inline_autotune` branches on this and searches the
+                # backward parameter set, so `--mode backward --autotune` really does tune
+                # backward. (An older note here claimed the opposite; it was stale.)
                 tune_backward=args.mode in ("backward", "forward_backward"),
                 exclude=tuple(n.strip() for n in (args.autotune_exclude or "").split(",") if n.strip()),
             ),
@@ -1353,7 +1413,11 @@ def prepare_target(args: argparse.Namespace, device: torch.device) -> BenchTarge
         ) from exc
     except TypeError as exc:
         raise SystemExit(f"Backend {args.backend!r} rejected the arguments for conv {args.conv!r}: {exc}") from exc
-    aggr = aggr.to(device)
+    # Move parameters to the feature dtype as well as the device. GATv2's attention vector is
+    # a module parameter, not one of the tensors build_inputs() creates, so at --dtype fp16 it
+    # would stay fp32 and the kernel would reject the mismatch ("l, r, and attn_vec must have
+    # the same dtype"). Only floating-point parameters are cast; integer buffers stay as they are.
+    aggr = aggr.to(device=device, dtype=FEATURE_DTYPES[args.dtype])
 
     def _make_forward(
         graph: BenchGraph, inputs: dict[str, torch.Tensor], overrides: dict[str, Any] | None = None
@@ -1516,8 +1580,23 @@ def main() -> int:
             # decides bucket membership, ordering decides the walk within each bucket.
             graph = reorder_nodes(graph, graph_cfg.get("node_order", args.node_order))
 
-            _forward = target.make_forward(graph, inputs, kernel_cfg)
-            timed = build_timed_callable(_forward, args.mode, differentiable)
+            # Some points in a sweep are simply unlaunchable: the pipeline staging buffer is
+            # warps*stages*D*sizeof(T), so e.g. GT at D=256 with 16 heavy warps at depth 6 asks
+            # for 214 KB against a 163 KB opt-in cap and the kernel refuses. Skipping the point
+            # keeps the other configurations in the cell; letting it propagate throws the whole
+            # cell away. `build_timed_callable` invokes the op eagerly to set up the backward
+            # graph, so it has to sit inside the guard too -- that is where the check fires.
+            try:
+                _forward = target.make_forward(graph, inputs, kernel_cfg)
+                timed = build_timed_callable(_forward, args.mode, differentiable)
+                timed()
+                torch.cuda.synchronize(device)
+            except RuntimeError as exc:
+                if "shared memory" not in str(exc) and "out of memory" not in str(exc):
+                    raise
+                print(f"skipping infeasible point {point}: {str(exc)[:90]}", file=sys.stderr)
+                torch.cuda.empty_cache()
+                continue
 
             if timing.exact:
                 # No do_bench, so the allocator's high-water mark across the timing
@@ -1600,12 +1679,21 @@ def main() -> int:
     if args.autotune:
         result["autotune_selected"] = autotune_selection()
 
-    if sweep:
-        # Reported values are the winning point; `sweep` carries every trial.
-        result["graph_config"] = best["graph_config"]
+    if sweep or kernel_sweep:
+        # Reported values are the winning point; `sweep` carries every trial. Gating this on
+        # `sweep` alone silently threw away every --sweep-kernel trial but the winner, which
+        # defeats the whole reason the kernel grid runs in one process: the trials are the
+        # paired samples, taken seconds apart against one loaded graph, and the ratio between
+        # them is the measurement. Splitting the point also stops the winning kernel override
+        # from being reported as the base `kernel_params` value it overrode.
+        best_graph_cfg, best_kernel_cfg = split_point(best["graph_config"])
+        result["graph_config"] = best_graph_cfg
+        result["kernel_config"] = best_kernel_cfg
+        result["kernel_params"] = result["kernel_params"] | best_kernel_cfg
         result["sweep"] = [
             {
-                "graph_config": t["graph_config"],
+                "graph_config": split_point(t["graph_config"])[0],
+                "kernel_config": split_point(t["graph_config"])[1],
                 "ms_per_iter": t["res"].ms_per_iter,
                 "heavy_nodes": t["graph"].stats.get("forward_heavy_nodes"),
             }

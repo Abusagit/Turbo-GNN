@@ -38,7 +38,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0
+        py::arg("pipeline_stages") = 0, py::arg("heavy_pipeline_stages") = 0
     );
 
     m.def(
@@ -49,7 +49,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("backward_heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0
+        py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0
     );
 
     // Graph Transformer aggregation
@@ -60,7 +60,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0
+        py::arg("pipeline_stages") = 0, py::arg("heavy_pipeline_stages") = 0
     );
 
     m.def(
@@ -70,7 +70,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0
+        py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0
     );
 
     // SpMM

@@ -162,7 +162,7 @@ class ReductionAggrKernel(TunableKernel):
             TunableParam("forward_use_2d_kernel", [True, False], default=False),
             TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
             TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
-            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
+            TunableParam("forward_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -207,7 +207,9 @@ class GATv2AggrKernel(TunableKernel):
         self.forward_heavy_slice_blocks_per_sm = kwargs.get("forward_heavy_slice_blocks_per_sm", 0.0)
         self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
+        self.forward_heavy_pipeline_stages = kwargs.get("heavy_pipeline_stages", 0)
         self.backward_pipeline_stages = kwargs.get("backward_pipeline_stages", 0)
+        self.backward_heavy_pipeline_stages = kwargs.get("backward_heavy_pipeline_stages", 0)
 
     def _execute(self, graph, x, *, x_neighbors=None, attention_weights=None, negative_slope=None, **kwargs):
         # An explicit edge count wins; otherwise size the slice from the heavy-degree
@@ -252,7 +254,9 @@ class GATv2AggrKernel(TunableKernel):
             bwd_table.chunk_start if bwd_table is not None else None,
             bwd_table.node_chunk_offset if bwd_table is not None else None,
             self.forward_pipeline_stages,
+            self.forward_heavy_pipeline_stages,
             self.backward_pipeline_stages,
+            self.backward_heavy_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -277,7 +281,11 @@ class GATv2AggrKernel(TunableKernel):
             # edge count. Degree statistics do not predict the optimum (1125x spread for the
             # bucketing threshold); block count does (7x). 0 disables slicing.
             TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
-            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
+            TunableParam("forward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so
+            # its staging buffer hits the shared-memory ceiling at a depth the light bucket
+            # (1-4 warps) absorbs without losing occupancy.
+            TunableParam("forward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -305,7 +313,11 @@ class GATv2AggrKernel(TunableKernel):
             # The undirected backward's heavy bucket is ~81% of that pass at ~7% occupancy;
             # slicing it is the point of this axis. 0 keeps one block per heavy node.
             TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
-            TunableParam("backward_pipeline_stages", [0, 2, 3], default=0),
+            TunableParam("backward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so
+            # its staging buffer hits the shared-memory ceiling at a depth the light bucket
+            # (1-4 warps) absorbs without losing occupancy.
+            TunableParam("backward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:
@@ -366,6 +378,8 @@ class GraphTransformerAggrKernel(TunableKernel):
         self.backward_heavy_slice_blocks_per_sm = kwargs.get("backward_heavy_slice_blocks_per_sm", 0.0)
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
         self.backward_pipeline_stages = kwargs.get("backward_pipeline_stages", 0)
+        self.forward_heavy_pipeline_stages = kwargs.get("heavy_pipeline_stages", 0)
+        self.backward_heavy_pipeline_stages = kwargs.get("backward_heavy_pipeline_stages", 0)
 
     def _execute(self, graph, x, *, Q=None, K=None, V=None, scale=None, **kwargs):
         # A positive slice size switches the heavy bucket from one block per node to one block
@@ -414,7 +428,9 @@ class GraphTransformerAggrKernel(TunableKernel):
             bwd_table.chunk_start if bwd_table is not None else None,
             bwd_table.node_chunk_offset if bwd_table is not None else None,
             self.forward_pipeline_stages,
+            self.forward_heavy_pipeline_stages,
             self.backward_pipeline_stages,
+            self.backward_heavy_pipeline_stages,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -440,7 +456,10 @@ class GraphTransformerAggrKernel(TunableKernel):
             # edge count. Degree statistics do not predict the optimum (1125x spread for the
             # bucketing threshold); block count does (7x). 0 disables slicing.
             TunableParam("forward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
-            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
+            TunableParam("forward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so its
+            # staging buffer hits the shared-memory ceiling at a depth the light bucket absorbs.
+            TunableParam("forward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -467,7 +486,11 @@ class GraphTransformerAggrKernel(TunableKernel):
             # Backward slices the transpose CSR, so it gets its own size. 0 keeps the
             # node-per-block heavy path.
             TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
-            TunableParam("backward_pipeline_stages", [0, 2, 3], default=0),
+            TunableParam("backward_pipeline_stages", [0, 2, 6, 12], default=0),
+            # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so
+            # its staging buffer hits the shared-memory ceiling at a depth the light bucket
+            # (1-4 warps) absorbs without losing occupancy.
+            TunableParam("backward_heavy_pipeline_stages", [0, 2, 6, 12], default=0),
         ]
 
     def get_tunable_backward_graph_params(self) -> list[TunableParam]:

@@ -204,10 +204,16 @@ __device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int&
 // Packed heavy kernel: blockIdx.x = node, blockIdx.y = edge chunk
 // Only for 32-bit index types (packs float32 + int32 into uint64)
 // PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
+// EDGES_PER_BLOCK is a runtime argument, not a template parameter: it appears only in the two
+// chunk-bound expressions below and in host-side grid sizing -- no array extent, no unroll bound,
+// no launch_bounds. Specialising on it multiplied this translation unit by 7 for nothing, which
+// is the same reason FlashAttention passes seqlen/strides at runtime and reserves compile-time
+// parameters for head dim, dtype and feature flags.
 template <
-    size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float,
+    size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float,
     int PIPELINE_STAGES = 0>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
+    size_t EDGES_PER_BLOCK,
     index_t const *const __restrict__ heavy_nodes_indices,
     index_t const *const __restrict__ edge_ptr,
     index_t const *const __restrict__ edge_idx,
@@ -794,7 +800,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
             MakeTypeVariant<float, at::Half, at::BFloat16>(X.scalar_type()),
             MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block),
             MakeIntVariant<0, 1, 2, 3>(schedule),
-            MakeIntVariant<0, 2, 3>(pipeline_stages)
+            MakeIntVariant<0, 2, 6>(pipeline_stages)
         );
     };
 
@@ -879,8 +885,9 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                             }
                         } else {
                         std::visit(
-                            [&](auto edges_const, auto warps_const, auto stages_c) {
-                                constexpr int EDGES_PER_BLOCK   = edges_const.value;
+                            [&](auto warps_const, auto stages_c) {
+                                // Runtime now: read from the launch argument, not specialised on.
+                                const size_t EDGES_PER_BLOCK    = static_cast<size_t>(edges_per_block_heavy_nodes);
                                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
                                 constexpr int STAGES            = decltype(stages_c)::value;
@@ -892,12 +899,13 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                 size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
 
                                 ensure_dynamic_shmem(
-                                    reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>,
+                                    reduction_aggr_forward_heavy_kernel<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>,
                                     shmem, "reduction_aggr heavy"
                                 );
 
-                                reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>
+                                reduction_aggr_forward_heavy_kernel<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>
                                     <<<grid, THREADS_PER_BLOCK, shmem>>>(
+                                        EDGES_PER_BLOCK,
                                         index_ptr<index_t>(heavy_nodes),
                                         index_ptr<index_t>(edge_ptr),
                                         index_ptr<index_t>(edge_idx),
@@ -906,8 +914,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                         d
                                     );
                             },
-                            MakeIntVariant<32, 64, 128, 256, 512, 1024, 2048>(edges_per_block_heavy_nodes),
-                            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block), MakeIntVariant<0, 2, 3>(pipeline_stages)
+                            MakeIntVariant<1, 2, 4, 8, 16, 32, 64>(warps_per_block), MakeIntVariant<0, 2, 6>(pipeline_stages)
                         );
                         }
 

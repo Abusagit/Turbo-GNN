@@ -59,29 +59,26 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
     const int loop_iters = (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
     if (loop_iters == 0) return;
 
-    cuda_t *rows[NUM_ROWS][NUM_STAGES];
-#pragma unroll
-    for (int r = 0; r < NUM_ROWS; ++r) {
-#pragma unroll
-        for (int s = 0; s < NUM_STAGES; ++s) {
-            rows[r][s] = dbuf + (r * NUM_STAGES + s) * D_CONST;
-        }
-    }
-
-    index_t neighbor_idx_buf[NUM_STAGES];
+    // No local arrays here, deliberately. A `cuda_t *rows[NUM_ROWS][NUM_STAGES]` indexed by a
+    // runtime slot, or a `neighbor_idx_buf[NUM_STAGES]` ring, cannot stay in registers -- nvcc
+    // places them in local memory, and the spill grows with NUM_STAGES (measured: STACK:96 at
+    // NUM_STAGES=3, NUM_ROWS=3). The slot address is affine in the slot, so compute it; the
+    // neighbour index is re-read from col_idx, which the prefetch just touched and is an L1 hit.
+    auto slot_row = [dbuf](int r, int slot) -> cuda_t * { return dbuf + (r * NUM_STAGES + slot) * D_CONST; };
+    auto neighbor_at = [col_idx, edge_start, warp_id](int it) -> index_t {
+        return col_idx[edge_start + static_cast<index_t>(warp_id + it * WARPS_PER_BLOCK)];
+    };
 
     cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
     auto prefetch = [&](int it) {
         pipe.producer_acquire();
         if (it < loop_iters) {
-            const int k                       = warp_id + it * WARPS_PER_BLOCK;
-            const index_t nb                  = col_idx[edge_start + static_cast<index_t>(k)];
-            neighbor_idx_buf[it % NUM_STAGES] = nb;
+            const index_t nb = neighbor_at(it);
 #pragma unroll
             for (int r = 0; r < NUM_ROWS; ++r) {
                 const cuda_t *src = row_bases[r] + nb * stride_n[r] + head_h * stride_h[r];
-                async_copy_row_warp<D_CONST, cuda_t>(rows[r][it % NUM_STAGES], src, pipe, lane);
+                async_copy_row_warp<D_CONST, cuda_t>(slot_row(r, it % NUM_STAGES), src, pipe, lane);
             }
         }
         pipe.producer_commit();
@@ -99,13 +96,15 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
         __syncwarp();
 
         const int slot = iter % NUM_STAGES;
+        // Built fresh each iteration from affine arithmetic; NUM_ROWS is a small compile-time
+        // constant and the loop is unrolled, so these stay in registers.
         cuda_t const *cur_rows[NUM_ROWS];
 #pragma unroll
         for (int r = 0; r < NUM_ROWS; ++r) {
-            cur_rows[r] = rows[r][slot];
+            cur_rows[r] = slot_row(r, slot);
         }
 
-        consume(neighbor_idx_buf[slot], cur_rows);
+        consume(neighbor_at(iter), cur_rows);
 
         // All lanes must finish reading the slot before prefetch() reuses it.
         __syncwarp();

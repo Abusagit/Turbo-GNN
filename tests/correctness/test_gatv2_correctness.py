@@ -390,7 +390,7 @@ def _make_pipeline_graph(kind: str, num_nodes: int, device: str = "cuda"):
 
 
 @pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
-@pytest.mark.parametrize("pipeline_stages", [2, 3])
+@pytest.mark.parametrize("pipeline_stages", [2, 6])
 @pytest.mark.parametrize("feature_dim", [64, 256])
 @pytest.mark.parametrize("heads", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -435,7 +435,7 @@ def test_gatv2_pipeline_vs_baseline_forward(graph_kind, pipeline_stages, feature
 
 
 @pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
-@pytest.mark.parametrize("pipeline_stages", [2, 3])
+@pytest.mark.parametrize("pipeline_stages", [2, 6])
 @pytest.mark.parametrize("feature_dim", [64, 256])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_gatv2_pipeline_vs_baseline_backward(graph_kind, pipeline_stages, feature_dim, dtype):
@@ -499,7 +499,7 @@ def test_gatv2_pipeline_vs_baseline_backward(graph_kind, pipeline_stages, featur
 
 
 @pytest.mark.parametrize("graph_kind", _PIPE_GRAPHS)
-@pytest.mark.parametrize("pipeline_stages", [2, 3])
+@pytest.mark.parametrize("pipeline_stages", [2, 6])
 @pytest.mark.parametrize("feature_dim", [64, 256])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_gatv2_backward_pipeline_vs_baseline(graph_kind, pipeline_stages, feature_dim, dtype):

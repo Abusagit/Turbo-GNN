@@ -54,7 +54,15 @@ DEFAULT_SCHEDULE = "one_per_block"
 #: GPU. It flattens out above ~128 and 1024 was the best single value in the sweep, which is
 #: also why sizing the grid from ``cudaOccupancyMaxActiveBlocksPerMultiprocessor`` was tried
 #: and dropped: above the knee the exact grid size stops mattering.
-DEFAULT_BLOCKS_PER_SM = 1024
+# Target resident blocks per SM for the persistent schedules. 32 is the sm_80 hardware limit,
+# so it is the largest value for which the name is truthful: persistent_grid_x computes
+# SM_count * this as a *total* grid size and never checks it against the limit, so anything
+# above 32 silently stops being persistent (at 1024 the grid is 32 waves deep -- effectively
+# one-block-per-node with extra steps). Below 32 the GPU is simply under-filled: the light
+# bucket uses 1-warp blocks, so 8 blocks/SM is 8 of 64 warps.
+# Historical note: C++ defaulted to 8 and Python to 1024; since every call arrives from
+# Python, 1024 is what actually ran, and neither value was measured.
+DEFAULT_BLOCKS_PER_SM = 32
 
 #: Consecutive work items ``dynamic`` claims per atomic. Read by that policy only.
 #:
@@ -292,7 +300,9 @@ class gatv2_function(torch.autograd.Function):
         bwd_chunk_start=None,
         bwd_node_chunk_offset=None,
         pipeline_stages=0,
+        heavy_pipeline_stages=0,
         backward_pipeline_stages=0,
+        backward_heavy_pipeline_stages=0,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
@@ -318,6 +328,7 @@ class gatv2_function(torch.autograd.Function):
             fwd_node_chunk_offset if fwd_node_chunk_offset is not None else _empty_i32(x_left.device),
             forward_heavy_edge_slice,
             pipeline_stages,
+            heavy_pipeline_stages,
         )
         ctx.schedule = schedule_id
         ctx.blocks_per_sm = blocks_per_sm
@@ -336,6 +347,7 @@ class gatv2_function(torch.autograd.Function):
         ctx.backward_light_warps = backward_light_warps
         ctx.backward_heavy_warps = backward_heavy_warps
         ctx.backward_pipeline_stages = backward_pipeline_stages
+        ctx.backward_heavy_pipeline_stages = backward_heavy_pipeline_stages
         ctx.is_directed = is_directed
         ctx.heads = x_left.shape[1]
         ctx.head_dim = x_left.shape[2]
@@ -408,11 +420,12 @@ class gatv2_function(torch.autograd.Function):
             ctx.bwd_node_chunk_offset,
             ctx.backward_heavy_edge_slice,
             ctx.backward_pipeline_stages,
+            ctx.backward_heavy_pipeline_stages,
         )
 
         # 16 trailing forward args, the 4 carrying the heavy-node edge-slice table, and
         # backward_pipeline_stages from the async-copy work.
-        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 26
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 28
 
 
 _EMPTY_I32: dict[torch.device, torch.Tensor] = {}
@@ -479,7 +492,9 @@ class _FusedGraphAttention(torch.autograd.Function):
         bwd_chunk_start=None,
         bwd_node_chunk_offset=None,
         pipeline_stages=0,
+        heavy_pipeline_stages=0,
         backward_pipeline_stages=0,
+        backward_heavy_pipeline_stages=0,
     ):
         scale = scale or 1 / (Q.shape[-1] ** 0.5)
         schedule_id = resolve_schedule(schedule)
@@ -504,6 +519,7 @@ class _FusedGraphAttention(torch.autograd.Function):
             fwd_node_chunk_offset if fwd_node_chunk_offset is not None else empty,
             forward_heavy_edge_slice,
             pipeline_stages,
+            heavy_pipeline_stages,
         )
 
         ctx.schedule = schedule_id
@@ -524,6 +540,7 @@ class _FusedGraphAttention(torch.autograd.Function):
         ctx.bwd_chunk_start = bwd_chunk_start if bwd_chunk_start is not None else empty
         ctx.bwd_node_chunk_offset = bwd_node_chunk_offset if bwd_node_chunk_offset is not None else empty
         ctx.backward_pipeline_stages = backward_pipeline_stages
+        ctx.backward_heavy_pipeline_stages = backward_heavy_pipeline_stages
         ctx.save_for_backward(
             edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp, bwd_light_nodes, bwd_heavy_nodes
         )
@@ -577,10 +594,11 @@ class _FusedGraphAttention(torch.autograd.Function):
             ctx.bwd_node_chunk_offset,
             ctx.backward_heavy_edge_slice,
             ctx.backward_pipeline_stages,
+            ctx.backward_heavy_pipeline_stages,
         )
 
         # 15 trailing forward args, plus the 4 forward-table and 4 backward-table arguments.
-        return (None,) * 4 + (dQ, dK, dV) + (None,) * 25
+        return (None,) * 4 + (dQ, dK, dV) + (None,) * 27
 
 
 class _CudaSpMMConvFn(torch.autograd.Function):

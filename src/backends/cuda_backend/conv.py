@@ -1,3 +1,4 @@
+import inspect
 from typing import Any, Literal
 
 import torch
@@ -21,6 +22,33 @@ from .spmm_aggr.utils import spmm_aggr
 doc = """
 CUDA backend: wraps cuda-written kernels .
 """
+
+
+def _op_kernel_kwargs(op: Any, overrides: dict[str, Any], *, positional: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Every tunable ``op`` accepts, taking the op's own default unless overridden.
+
+    Derived from the signature rather than a hand-maintained allow-list. The list this
+    replaces silently dropped every parameter added after it was written -- the whole
+    pipelining axis (``pipeline_stages``, ``backward_pipeline_stages``) and the whole
+    heavy-slice axis. Those values were still *reported* as applied by the benchmark
+    harness, which reports what was requested, so ``-K pipeline_stages=6`` and every
+    autotuner choice on those axes measured as an exact no-op while looking correct.
+
+    Args:
+        op: The turbo_gnn op whose signature defines the tunable surface.
+        overrides: Construction-time values; anything not named here takes the op default.
+        positional: Parameters the caller passes positionally in ``forward``, which must
+            be left out or the call raises "got multiple values for argument".
+
+    Returns:
+        dict[str, Any]: Keyword arguments to forward to ``op``.
+    """
+    params = inspect.signature(op).parameters
+    return {
+        name: overrides.get(name, prm.default)
+        for name, prm in params.items()
+        if name not in positional and prm.kind is not prm.VAR_KEYWORD and prm.default is not prm.empty
+    }
 
 
 class _CudaSimpleAggrConv(BaseConvolution):
@@ -191,21 +219,8 @@ class _CudaSimpleAggr(BaseAggr):
     def __init__(self, reduce: str = "min", **kwargs: Any) -> None:
         super().__init__(conv_type=f"{reduce}_aggr")
         self.reduce = reduce
-        self.kernel_kwargs = {
-            "warps_per_block": kwargs.get("warps_per_block", 8),
-            "edges_per_block_heavy_nodes": kwargs.get("edges_per_block_heavy_nodes", 128),
-            "use_2d_kernel": kwargs.get("use_2d_kernel", False),
-            "features_per_block": kwargs.get("features_per_block", 32),
-            "tiles_y": kwargs.get("tiles_y", 8),
-            # Node->block scheduling. Forwarded like any other kernel parameter so an
-            # aggregation-only benchmark can drive the scheduler exactly as a direct call
-            # does; defaults match the turbo_gnn op.
-            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
-            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
-            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
-            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
-            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
-        }
+        # `reduce` is passed explicitly by forward().
+        self.kernel_kwargs = _op_kernel_kwargs(reduction_aggr, kwargs, positional=("reduce",))
 
     def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
         return reduction_aggr(graph, x, reduce=self.reduce, **{**self.kernel_kwargs, **kwargs})
@@ -222,21 +237,8 @@ class _CudaGATv2Aggr(BaseAggr):
         self.attn_weights = nn.Parameter(torch.empty(heads, head_dim))
         nn.init.xavier_normal_(self.attn_weights, gain=nn.init.calculate_gain("relu"))
         # Forwarded to the kernel; defaults match gatv2_aggr.
-        self.kernel_kwargs = {
-            "grad_A_reduce_row_chunk_size": kwargs.get("grad_A_reduce_row_chunk_size", 512),
-            "forward_light_warps": kwargs.get("forward_light_warps", 1),
-            "forward_heavy_warps": kwargs.get("forward_heavy_warps", 8),
-            "backward_light_warps": kwargs.get("backward_light_warps", 1),
-            "backward_heavy_warps": kwargs.get("backward_heavy_warps", 8),
-            # Node->block scheduling. Forwarded like any other kernel parameter so an
-            # aggregation-only benchmark can drive the scheduler exactly as a direct call
-            # does; defaults match the turbo_gnn op.
-            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
-            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
-            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
-            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
-            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
-        }
+        # `negative_slope` is passed positionally by forward().
+        self.kernel_kwargs = _op_kernel_kwargs(gatv2_aggr, kwargs, positional=("negative_slope",))
 
     def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
         return gatv2_aggr(
@@ -259,20 +261,8 @@ class _CudaGTAggr(BaseAggr):
         scale = kwargs.get("scale")
         self.scale = head_dim**-0.5 if scale is None else scale
         # Forwarded to the kernel; defaults match graph_transformer_aggr.
-        self.kernel_kwargs = {
-            "forward_light_warps": kwargs.get("forward_light_warps", 4),
-            "forward_heavy_warps": kwargs.get("forward_heavy_warps", 8),
-            "backward_light_warps": kwargs.get("backward_light_warps", 1),
-            "backward_heavy_warps": kwargs.get("backward_heavy_warps", 8),
-            # Node->block scheduling. Forwarded like any other kernel parameter so an
-            # aggregation-only benchmark can drive the scheduler exactly as a direct call
-            # does; defaults match the turbo_gnn op.
-            "schedule": kwargs.get("schedule", DEFAULT_SCHEDULE),
-            "blocks_per_sm": kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM),
-            "sched_chunk": kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK),
-            "forward_bucket_launch": kwargs.get("forward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
-            "backward_bucket_launch": kwargs.get("backward_bucket_launch", DEFAULT_BUCKET_LAUNCH),
-        }
+        # `scale` is passed positionally by forward().
+        self.kernel_kwargs = _op_kernel_kwargs(graph_transformer_aggr, kwargs, positional=("scale",))
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
         # A view, not a copy: the kernel ignores it and only its trailing dim is read.
