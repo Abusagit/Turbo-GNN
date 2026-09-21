@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/extension.h>
 
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -23,6 +24,84 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int tiles_y                     = 8,
     std::string reduce              = "min",
     int pipeline_stages             = 0
+);
+
+// ============================================================================
+// GSDDMM aggregation
+// ============================================================================
+
+torch::Tensor gsddmm_forward_cuda(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    uint32_t light_warps_per_block                 = 4,
+    uint32_t heavy_warps_per_block                 = 32,
+    uint32_t pipeline_stages                       = 0,
+    std::optional<torch::Tensor> heavy_block_parts = std::nullopt,
+    uint32_t heavy_edges_per_block                 = 0,
+    bool overlap_buckets                           = false
+);
+
+torch::Tensor gsddmm_forward_edge_blocks(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor edge_list,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t pipeline_stages                        = 0,
+    uint32_t edges_per_warp                         = 4,
+    uint32_t warps_per_block                        = 4,
+    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
+);
+
+// Node-parallel GSDDMM backward: one block per node, fp32 register reduction, no
+// atomics. Returns {dL, dR} (dR empty for "copy", which never reads R).
+std::vector<torch::Tensor> gsddmm_backward_cuda(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor d_out,
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    torch::Tensor row_ptr_T,
+    torch::Tensor col_idx_T,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    torch::Tensor light_nodes_T,
+    torch::Tensor heavy_nodes_T,
+    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt,
+    uint32_t light_warps_per_block                  = 4,
+    uint32_t heavy_warps_per_block                  = 32
+);
+
+// Edge-parallel GSDDMM backward: one warp per edge chunk, node gradients
+// accumulated with atomics in fp32 and cast back. Returns {dL, dR}.
+// op / lhs_target / rhs_target / N carry the operation's meaning, so they take
+// no defaults: a caller that omits one silently gets a different computation.
+std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor d_out,
+    torch::Tensor edge_list_dst,
+    std::optional<torch::Tensor> edge_list_src,
+    std::optional<torch::Tensor> canonical_edge_idx,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t pipeline_stages = 0,
+    uint32_t edges_per_warp  = 4,
+    uint32_t warps_per_block = 4
 );
 
 at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);

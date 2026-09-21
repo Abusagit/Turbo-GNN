@@ -98,6 +98,12 @@ graph_i32 = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
 ).to("cuda")
 ```
 
+`index_dtype` is not only a cuSPARSE constraint: the edge-parallel `gsddmm` kernels are
+templated on it and derive their `(src, dst)` pair type from it, so a 32-bit graph moves
+8 bytes per edge of index traffic instead of 16 (and 4 instead of 8 for the canonical-id
+permutation), and broadcasts each id with one warp shuffle instead of two. Prefer
+`torch.int32` whenever the node and edge counts fit it.
+
 ### Kernel calls
 
 ```python
@@ -119,11 +125,86 @@ out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
                 norm_type="none", cu_sparse_algorithm_id=-1, block_dim=256)
 ```
 
+### GSDDMM: per-edge binary ops
+
+`gsddmm` applies a binary op per edge, taking each operand's row from the source node
+(`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). D must be one of
+32, 64, 128, 256; dtypes are fp32/fp16/bf16. Differentiable in both operands — the
+backward's two kernels are picked by `backward_variant` (see below).
+
+```python
+from turbo_gnn import gsddmm, u_add_v, copy_u
+
+out = gsddmm(graph, x, y, op="mul", lhs_target="src", rhs_target="dst")  # [E, D]
+out = gsddmm(graph, x, y, op="dot", lhs_target="src", rhs_target="dst")  # [E]
+
+# DGL-style aliases for every (lhs, op, rhs) combination, plus copy_u / copy_v
+out = u_add_v(graph, x, y)      # [E, D]
+out = copy_u(graph, x)          # [E, D]
+```
+
+Two CUDA kernels implement this — one thread block per bucketed CSR row, or one warp per
+chunk of an explicit edge list. Which is faster depends on the graph's geometry, the
+feature width and the dtype (on a 3136-cell A100 sweep, always picking the row-per-block
+kernel costs 1.40x geomean and up to 9x; always picking the edge kernel costs 1.04x and up
+to 1.9x). So `gsddmm` times the candidates **once per (graph, feature width, dtype, op)**,
+memoizes the verdict on the graph object, and uses the winner from then on. For an op with
+no `dst` operand the edge kernel's traversal order is a third candidate: grouping edges by
+source shares the source row across a warp's chunk, but then needs an index indirection to
+keep the output in forward-CSR order, which measured as a 5–23% win at D=128 and a 6–29%
+loss at D=32 — so it is timed rather than assumed. Output rows are always numbered by
+forward-CSR edge position, whichever candidate wins, so the choice cannot change results.
+
+```python
+out = gsddmm(graph, x, y, op="mul")                     # auto: probe once, then reuse
+out = gsddmm(graph, x, y, op="mul", variant="node")     # pin the row-per-block kernel
+out = gsddmm(graph, x, y, op="mul", variant="edge")     # pin the edge-parallel kernel
+```
+
+The probe costs two extra launches (~20 ms) on the first such call; pinning `variant`
+skips it entirely. `AutotuneConfig(measure_variant=False)` falls back to a geometry
+heuristic instead (1.01x geomean on the same sweep), and `share_variant_probe=True` lets
+ops with the same operand shape reuse one probe per graph (off by default, so a per-op
+measurement never depends on which op ran first). Parameters belonging to the other
+kernel are rejected when `variant` is pinned.
+
+`gsddmm` is differentiable in both operands, and the backward has its own two kernels,
+selected by `backward_variant` independently of the forward — it is a *reduction* (each
+node's gradient sums over its incident edges) rather than a map, so the forward's winner
+says nothing about it. An operand read per edge (`"edge"`) needs no reduction at all and
+gets a plain per-edge gradient.
+
+```python
+out = gsddmm(graph, x, y, op="mul")                            # backward_variant="node"
+out = gsddmm(graph, x, y, op="mul", backward_variant="edge")   # load-balanced, atomic
+out.backward(grad)
+```
+
+- `"node"` (default) gives one block per bucketed node and reduces in fp32 registers, so
+  it uses **no atomics** and is deterministic. It inherits the forward's load imbalance,
+  and deliberately has no heavy-node chunking: splitting a node across blocks would make
+  them all write its row, which is the thing this variant exists to avoid.
+- `"edge"` gives one warp per edge chunk and is perfectly load balanced, accumulating into
+  an fp32 buffer with `atomicAdd` (cast back on return). Because the edge list is grouped
+  by the node being reduced, a chunk is a short sequence of **runs** of edges sharing a
+  target row — usually exactly one — and the warp sums each run in registers, so it issues
+  one set of atomics per run rather than per edge, and reads the reduced node's own row
+  once per run rather than once or twice per edge. The atomics are staged through shared
+  memory so each is one contiguous 128-byte request instead of 32 scattered sectors. Its
+  result is deterministic only up to fp32 atomic ordering.
+  `pipeline_stages` applies here too: it prefetches each edge's `d_out` and other-operand
+  rows that many edges ahead with `cp.async`, as the forward edge kernel does.
+
+`add`, `sub` and `copy` have constant partials, so their backward saves **no** feature
+tensors — the difference between keeping one and two `[E, D]` activations alive per op.
+
 ### Autotuning
 
-All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`) support
-autotuning, which grid-searches over kernel parameters (warps per block, edges per block,
-etc.) and graph repartitioning quantiles to find the fastest configuration.
+All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`, `gsddmm`)
+support autotuning, which grid-searches over kernel parameters (warps per block, edges per
+block, etc.) and graph repartitioning quantiles to find the fastest configuration. For
+`gsddmm` the search is staged: it picks the kernel variant first, then searches only that
+variant's parameters (the other variant's knobs would be dead axes).
 
 ```python
 from turbo_gnn import AutotuneConfig
@@ -136,9 +217,13 @@ config = AutotuneConfig(warmup=5, iters=20, tune_backward=True)
 out = graph_transformer_aggr(graph, x, Q=Q, K=K, V=V, scale=scale,
                               autotune=True, autotune_config=config)
 
-# Results are cached per graph + feature shape — subsequent calls are fast
+# Results are cached per graph + feature shape + dtype — subsequent calls are fast
 out = reduction_aggr(graph, X, reduce="min", autotune=True)  # cache hit
 ```
+
+The dtype is part of the cache key rather than something that gets searched: it is a
+property of the caller's tensors, and the best configuration genuinely differs between
+fp16 and fp32, so a graph tuned in one dtype does not hand its configuration to the other.
 
 `spmm_aggr` and `csr_SPMM_normalized` are cuSPARSE wrappers and do not support autotuning.
 
@@ -283,22 +368,39 @@ Merges one or more training YAMLs, builds dataset/model, attaches hooks (metrics
 
 ### `benchmark.py` — Microbenchmark a single conv layer
 
-Creates a random graph (or loads one from a dataset YAML), instantiates a conv, and times forward or forward+backward using CUDA events.
+Creates a random graph (or loads one from a dataset YAML), instantiates a conv — or, with
+`--aggr`, a raw op — and times the forward or the backward pass using CUDA events. In
+backward mode the forward runs once, untimed, to build the autograd graph; the timed loop
+calls `out.backward(grad)`.
 
 ```
---layer         Conv type: gcn, mean_aggr, gat_v2, gt, ... (required)
+--layer         Conv type: gcn, mean_aggr, gat_v2, gt, ... (required). With --aggr may be a
+                comma-separated op list, e.g. 'u_add_v,u_add_v_edge,copy_u'
 --backend       Backend name (required)
+--aggr          Launch a raw aggregation op (backend.create_aggr) instead of a conv: for
+                dgl, any dgl.ops gspmm/gsddmm name; for cuda, any turbo_gnn gsddmm name
+                (incl. the _edge edge-parallel variants). Operands are generated automatically.
 --dataset       Dataset YAML path (optional; if omitted, generates a random graph)
 --num-nodes     Nodes in random graph (default: 20000)
 --avg-degree    Average degree (default: 10)
 --feature_dim   Feature dimension (default: 128)
 --heads         Attention heads for gat_v2/gt (default: 1)
---mode          forward | train (default: forward)
+--mode          forward | backward (default: forward)
 --iters         Timing iterations (default: 100)
 --warmup        Warmup iterations (default: 20)
---amp           none | bf16 | fp16 (default: none)
+--amp           none | bf16 | fp16 (default: none); wraps the call in torch.autocast
+--dtype         fp32 | fp16 | bf16 (default: fp32); materializes the inputs in that
+                precision so custom CUDA kernels dispatch on it (--amp does not reach them)
+--exact-iters   Issue exactly --warmup + --iters calls instead of triton.testing.do_bench
+                (whose warmup/rep are milliseconds); use under a kernel profiler such as ncu
 --json-out      Optional path to write JSON result
+--csv-out       Optional CSV to append results to (header written on first use)
 --device        CUDA device index (default: 0)
+--pipeline-stages              Forward cp.async pipeline stage count for CUDA convs (default: 0)
+--backward-pipeline-stages     Backward cp.async pipeline stage count for CUDA convs (default: 0)
+--autotune      Autotune kernel/graph params (incl. pipeline stages) via grid search first
+--autotune-warmup              Autotune warmup iters per trial (default: 5)
+--autotune-iters               Autotune timed iters per trial (default: 15)
 ```
 
 ### `benchmark_kernels.py` — Microbenchmark graph convolutions (no projections)

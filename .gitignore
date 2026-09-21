@@ -9,6 +9,7 @@ CLAUDE.md
 .env
 
 __examples
+scratch_*
 thirdparty
 results*
 logs
