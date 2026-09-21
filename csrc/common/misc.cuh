@@ -192,7 +192,7 @@ struct OnlineSoftmaxState {
 //     fp16 saturates the 11-bit mantissa long before the reduction ends.
 // =============================================================================
 
-enum class ReductionOp { MIN, MAX, SUM };
+enum class ReductionOp : uint8_t { MIN, MAX, SUM };
 
 template <ReductionOp Op>
 struct ReductionOps;

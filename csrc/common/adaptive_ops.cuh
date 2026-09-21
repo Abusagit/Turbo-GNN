@@ -1,7 +1,5 @@
 #pragma once
 
-// cuda::std::log / exp / fma live here. CUDA 12.9's libcu++ pulls it in transitively, 12.2's
-// does not, so the build fails on the older toolkit without this.
 #include <cuda/std/cmath>
 
 #include "common/misc.cuh"

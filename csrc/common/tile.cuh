@@ -28,6 +28,7 @@ struct alignas(sizeof(num_type) * N) Vec {
             data[i] = num;
         }
     }
+    __device__ Vec(wide_t input_data) noexcept { data = *reinterpret_cast<num_type const *>(&input_data); }
     Vec(const Vec& other) noexcept            = default;
     Vec(Vec&& other) noexcept                 = default;
     Vec& operator=(const Vec& other) noexcept = default;
@@ -38,7 +39,7 @@ struct alignas(sizeof(num_type) * N) Vec {
     __device__ num_type& operator[](size_t n) noexcept { return data[n]; }
 
     __device__ void store_zero_() noexcept { *reinterpret_cast<wide_t *>(data) = 0; }
-    static constexpr __device__ vec_t get_zero() { return vec_t{}; };
+    static constexpr __device__ vec_t get_zero() { return vec_t{}; }
 
     // Loads N scalars to this vector
     constexpr __device__ void load_scalars(num_type const *const __restrict__ src) noexcept {
@@ -62,11 +63,11 @@ static_assert(std::is_trivially_destructible_v<Vec<8, nv_bfloat16>>);
 // SelectTW: pick widest TW where all threads are working but not wider than 128 bits
 // ==================================================================================
 
-template <int D_CONST, typename cuda_t, int THREADS_PER_D = kWarpSize>
+template <int D_CONST, FloatingNum cuda_t, int THREADS_PER_D = kWarpSize>
 struct SelectTW {
    private:
     static consteval int calculate_tile_width(size_t type_size, size_t d, size_t thread_count) {
-        size_t elems_per_thread = (d + thread_count - 1) / thread_count;
+        size_t elems_per_thread = ceil_div(d, thread_count);
 
         return std::min(elems_per_thread, Vec<1, float>::max_vec_size_bytes / type_size);  // 16 bytes is the most wide load/store
     }
@@ -361,7 +362,7 @@ struct alignas(sizeof(num_type) * N) VecFloat: Vec<N, num_type> {
         return src0;
     }
     constexpr __device__ vec_t& operator-=(vec_t other) noexcept {
-        if constexpr (can_be_packed_new) {
+        if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
@@ -449,7 +450,7 @@ struct alignas(sizeof(num_type) * N) VecFloat: Vec<N, num_type> {
         return src0;
     }
     constexpr __device__ vec_t& operator/=(vec_t other) {
-        if constexpr (can_be_packed_new) {
+        if constexpr (can_be_packed) {
             using adops_   = AdOpsPacked<num_type>;
             using packed_t = deduce_packed_type_t<num_type>;
 #pragma unroll
@@ -921,6 +922,15 @@ static_assert(std::is_trivially_destructible_v<VecFloat<4, float>>);
 
 // Operations with whole tiles
 
+template <size_t bytes>
+struct HintedAccessType {
+    using type = deduce_uint_type_t<bytes>;
+};
+template <>
+struct HintedAccessType<16> {
+    using type = ulonglong2;
+};
+
 template <size_t N, FloatingNum num_type, FloatingNum accum_t = float>
 struct TileOps {
    private:
@@ -944,15 +954,60 @@ struct TileOps {
 
     static constexpr int TW = N;
 
+    enum class MemoryHint : uint8_t {
+        NoHint,
+        AllCache,
+        L2Only,
+        Streaming,
+        NoCache,
+        ReadOnly,  // Only for reads
+    };
+
     // Common
+    template <MemoryHint hint = MemoryHint::NoHint>
     static __device__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
-        return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
+        using access_t = typename HintedAccessType<TW * sizeof(num_type)>::type;
+        auto from_raw  = [](access_t raw) -> vec_t {
+            vec_t out;
+            *reinterpret_cast<access_t *>(&out) = raw;
+            return out;
+        };
+        if constexpr (hint == MemoryHint::AllCache) {
+            return from_raw(__ldca(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
+        } else if constexpr (hint == MemoryHint::L2Only) {
+            return from_raw(__ldcg(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
+        } else if constexpr (hint == MemoryHint::Streaming) {
+            return from_raw(__ldcs(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
+        } else if constexpr (hint == MemoryHint::NoCache) {
+            return from_raw(__ldcv(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
+        } else if constexpr (hint == MemoryHint::ReadOnly) {
+            return from_raw(__ldg(reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW])));
+        } else {
+            return *reinterpret_cast<vec_t const *>(&src_arr[vec_idx * TW]);
+        }
     }
     static __device__ void write_zero(num_type *const __restrict__ dst_arr, size_t vec_idx) {
         reinterpret_cast<vec_t *>(&dst_arr[vec_idx * TW])->store_zero_();
     }
+    template <MemoryHint hint = MemoryHint::NoHint>
     static __device__ void write(num_type *const __restrict__ dst_arr, size_t vec_idx, vec_t src_val) {
-        *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(&src_val);
+        static_assert(
+            hint == MemoryHint::NoHint || hint == MemoryHint::AllCache || hint == MemoryHint::L2Only || hint == MemoryHint::Streaming ||
+                hint == MemoryHint::NoCache,
+            "Only AllCache, L2Only, Streaming, NoCache and NoHint options are available for stores."
+        );
+        using access_t = typename HintedAccessType<TW * sizeof(num_type)>::type;
+        if constexpr (hint == MemoryHint::AllCache) {
+            __stwb(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
+        } else if constexpr (hint == MemoryHint::L2Only) {
+            __stcg(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
+        } else if constexpr (hint == MemoryHint::Streaming) {
+            __stcs(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
+        } else if constexpr (hint == MemoryHint::NoCache) {
+            __stwt(reinterpret_cast<access_t *>(&dst_arr[vec_idx * TW]), *reinterpret_cast<access_t const *>(&src_val));
+        } else {
+            *reinterpret_cast<wide_t *>(&dst_arr[vec_idx * TW]) = *reinterpret_cast<wide_t const *>(&src_val);
+        }
     }
     static __device__ void write_convert_to_accum(accum_t *const __restrict__ dst, num_type const *const __restrict__ src) {
         constexpr size_t compact_N  = std::min(N, VecFloat<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));

@@ -333,6 +333,84 @@ class _DglGTAggr(BaseAggr):
         return ops.u_mul_e_sum(graph, V, attn_probs).view(n, -1)
 
 
+# ---------------------------------------------------------------------------
+# Raw dgl.ops gspmm / gsddmm functions
+# ---------------------------------------------------------------------------
+
+#: Binary message ops DGL generates for gsddmm (edge-producing): ``{lhs}_{op}_{rhs}``.
+_GSDDMM_BINARY_OPS = frozenset({"add", "sub", "mul", "div", "dot"})
+#: Binary message ops DGL generates for gspmm (node-aggregating): ``u_{op}_e_{reduce}``.
+_GSPMM_BINARY_OPS = frozenset({"add", "sub", "mul", "div"})
+_GSPMM_REDUCERS = frozenset({"sum", "max", "min", "mean"})
+_OPERAND_KINDS = frozenset({"u", "v", "e"})
+
+
+def dgl_op_operand_kinds(op: str) -> tuple[str, ...]:
+    """Infer the operands of a raw ``dgl.ops`` gspmm/gsddmm function name.
+
+    Each returned kind is ``"u"``/``"v"`` (node features, shape [N, d]) or
+    ``"e"`` (edge features, shape [E, d]), in the order the function takes
+    them after the graph argument.  Supported name shapes:
+
+    - ``copy_u`` / ``copy_v`` / ``copy_e``                     (gsddmm copies)
+    - ``copy_u_<reduce>`` / ``copy_e_<reduce>``                (gspmm copies)
+    - ``{lhs}_{op}_{rhs}``, op in add/sub/mul/div/dot          (gsddmm binary)
+    - ``u_{op}_e_{reduce}``, op in add/sub/mul/div             (gspmm binary)
+
+    Args:
+        op (str): Name of a function in ``dgl.ops`` (e.g. ``"u_add_v"``,
+            ``"e_dot_v"``, ``"copy_v"``, ``"u_mul_e_sum"``).
+
+    Returns:
+        tuple[str, ...]: Operand kinds, e.g. ``("u",)`` or ``("e", "v")``.
+
+    Raises:
+        ValueError: If the name does not match a simple gspmm/gsddmm pattern.
+    """
+    parts = op.split("_")
+    if parts[0] == "copy":
+        if len(parts) < 2 or parts[1] not in _OPERAND_KINDS:
+            raise ValueError(f"Malformed DGL copy op name: {op!r}")
+        if len(parts) > 2 and (len(parts) > 3 or parts[1] == "v" or parts[2] not in _GSPMM_REDUCERS):
+            raise ValueError(f"Malformed DGL copy op name: {op!r}")
+        return (parts[1],)
+    if len(parts) == 3 and parts[1] in _GSDDMM_BINARY_OPS and parts[0] in _OPERAND_KINDS and parts[2] in _OPERAND_KINDS:
+        return (parts[0], parts[2])
+    if (
+        len(parts) == 4
+        and parts[0] == "u"
+        and parts[2] == "e"
+        and parts[1] in _GSPMM_BINARY_OPS
+        and parts[3] in _GSPMM_REDUCERS
+    ):
+        return ("u", "e")
+    raise ValueError(f"Cannot infer operands for DGL op: {op!r}")
+
+
+class _DglGspmmOp(BaseAggr):
+    """Launch a raw ``dgl.ops`` gspmm/gsddmm function directly (no projections).
+
+    ``forward(*operands, graph)`` calls ``dgl.ops.<op>(graph, *operands)``.
+    The ``operand_kinds`` attribute describes each operand ("u"/"v": node
+    features [N, d], "e": edge features [E, d]) so that benchmarking code can
+    generate matching inputs.
+    """
+
+    def __init__(self, op: str, **kwargs: Any) -> None:
+        super().__init__(conv_type=op)
+        fn = getattr(dgl.ops, op, None)
+        if not callable(fn):
+            raise KeyError(f"Unknown dgl.ops function: {op!r}")
+        self.op = op
+        self.operand_kinds = dgl_op_operand_kinds(op)
+        self._fn = fn
+
+    def forward(self, *args: Any) -> torch.Tensor:
+        """Run the op; the last positional argument must be the DGLGraph."""
+        *operands, graph = args
+        return self._fn(graph, *operands)
+
+
 @BackendRegistry.register_backend("dgl")
 class DglBackend(BaseBackend):
     """Backend that instantiates DGL-based convolutions."""
@@ -378,6 +456,12 @@ class DglBackend(BaseBackend):
         raise KeyError(f"Unsupported conv_type for DGL backend: {conv_type}")
 
     def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        """Factory for DGL aggregation-only callables.
+
+        Besides the named aggregations (min_aggr, gcn, gat_v2, ...), any raw
+        ``dgl.ops`` gspmm/gsddmm function name (u_add_v, e_dot_v, copy_v,
+        u_mul_e_sum, copy_u_max, ...) is wrapped as-is and launched directly.
+        """
         feature_dim = kwargs.pop("feature_dim", None)
         ct = conv_type.lower()
         match ct:
@@ -399,4 +483,7 @@ class DglBackend(BaseBackend):
             case "sum_aggr":
                 return _DglGraphConvAggr(norm="none")
             case _:
+                # Raw dgl.ops gspmm/gsddmm ops, launched directly (no wrappers).
+                if hasattr(dgl.ops, ct):
+                    return _DglGspmmOp(ct)
                 raise KeyError(f"Unsupported conv_type for DGL aggr: {conv_type}")

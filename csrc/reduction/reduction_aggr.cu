@@ -69,9 +69,9 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                 const size_t tile_x   = std::min<size_t>(std::max<size_t>(d_vec_l, 1), THREADS_PER_BLOCK);
                 const size_t node_y   = std::max<size_t>(THREADS_PER_BLOCK / tile_x, 1);
                 const dim3 threads_l(static_cast<unsigned>(tile_x), static_cast<unsigned>(node_y));
-                const unsigned blocks_l = static_cast<unsigned>((num_light + node_y - 1) / node_y);
+                const unsigned blocks_l = static_cast<unsigned>(ceil_div<size_t>(num_light, node_y));
                 // val_dbuf (STAGES == 0 makes this term vanish)
-                size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
+                size_t shmem = THREADS_PER_BLOCK * pipelined_ring_elems(STAGES, 1, TW, /*early_release=*/true) * sizeof(cuda_t);
 
                 ensure_dynamic_shmem(
                     reduction_aggr_forward_light_kernel_1d<WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>, shmem, "reduction_aggr light"
@@ -114,7 +114,10 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                         dim3 grid(num_heavy);
                         dim3 block(features_per_block, tiles_y);
 
-                        size_t shmem_size = aggr_heavy_shmem_bytes<index_t>((size_t)tiles_y * (size_t)features_per_block * TW);
+                        // Padded (float region, index region) layout; the kernel
+                        // derives its index pointer from the same helper.
+                        const size_t shmem_size =
+                            aggr_heavy_shmem_bytes<index_t>(static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW);
 
                         reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                             index_ptr<index_t>(heavy_nodes),
@@ -140,10 +143,10 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                 constexpr int STAGES            = decltype(stages_c)::value;
                                 constexpr size_t TW             = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
 
-                                dim3 grid(num_heavy, (max_degree + EDGES_PER_BLOCK - 1) / EDGES_PER_BLOCK);
+                                dim3 grid(num_heavy, ceil_div(max_degree, EDGES_PER_BLOCK));
 
                                 // val_dbuf (STAGES == 0 makes this term vanish)
-                                size_t shmem = THREADS_PER_BLOCK * STAGES * TW * sizeof(cuda_t);
+                                size_t shmem = THREADS_PER_BLOCK * pipelined_ring_elems(STAGES, 1, TW, /*early_release=*/true) * sizeof(cuda_t);
 
                                 ensure_dynamic_shmem(
                                     reduction_aggr_forward_heavy_kernel<EDGES_PER_BLOCK, WARPS_PER_BLOCK, cuda_t, Op, index_t, float, STAGES>,
@@ -169,7 +172,7 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                                 constexpr int WARPS_PER_BLOCK   = warps_const.value;
                                 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * kWarpSize;
 
-                                int unpack_blocks = (num_heavy * d + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+                                int unpack_blocks = ceil_div(num_heavy * d, THREADS_PER_BLOCK);
                                 unpack_results_kernel<WARPS_PER_BLOCK, cuda_t, index_t><<<unpack_blocks, THREADS_PER_BLOCK>>>(
                                     reinterpret_cast<uint64_t *>(packed.template data_ptr<int64_t>()),
                                     index_ptr<index_t>(heavy_nodes),
@@ -192,7 +195,8 @@ void reduction_aggr_forward_partitioned_cuda_impl(
                     dim3 grid(num_heavy);
                     dim3 block(features_per_block, tiles_y);
 
-                    size_t shmem_size = aggr_heavy_shmem_bytes<index_t>((size_t)tiles_y * (size_t)features_per_block * TW);
+                    const size_t shmem_size =
+                        aggr_heavy_shmem_bytes<index_t>(static_cast<size_t>(tiles_y) * static_cast<size_t>(features_per_block) * TW);
 
                     reduction_aggr_forward_heavy_kernel_2d<cuda_t, Op, index_t><<<grid, block, shmem_size>>>(
                         index_ptr<index_t>(heavy_nodes),

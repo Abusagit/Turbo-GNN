@@ -84,8 +84,8 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
 
                 // k_shared + qv_dbuf (2 rows, STAGES == 0 makes this term vanish) + neighbor_out + warp_sum_storage + neighbor_max +
                 // neighbor_sum
-                size_t shmem = DC * sizeof(cuda_t) + y_dim * 2 * STAGES * DC * sizeof(cuda_t) + y_dim * DC * sizeof(float) +
-                               2 * y_dim * sizeof(float) + y_dim * sizeof(float) * 2;
+                size_t shmem = DC * sizeof(cuda_t) + y_dim * pipelined_ring_elems(STAGES, 2, DC, kGtForwardEarlyRelease) * sizeof(cuda_t) +
+                               y_dim * DC * sizeof(float) + 2 * y_dim * sizeof(float) + y_dim * sizeof(float) * 2;
 
                 ensure_dynamic_shmem(GraphAttentionForward_CSR_MH_v2_D<y_dim, DC, cuda_t, index_t, float, STAGES>, shmem, "GT forward");
 
@@ -268,7 +268,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                     float *dK_ptr        = dK_f32.data_ptr<float>();
 
                     // qj + vj (read-only) + ki_dOi_dbuf (2 rows, STAGES == 0 makes this term vanish) + W * (gq + gv) per-warp accumulators
-                    size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + W * 2 * STAGES * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
+                    size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + W * pipelined_ring_elems(STAGES, 2, DC) * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
 
                     ensure_dynamic_shmem(
                         graph_attn_backward_csrT_kernel_D<W, DC, cuda_t, index_t, float, STAGES>, shmem_bwd, "GT backward (directed)"
@@ -315,7 +315,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
                 cuda_t *dK_ptr       = reinterpret_cast<cuda_t *>(dK_typed.data_ptr<torch_t>());
 
                 // 3 cuda_t vectors (K,Q,V) + qkvOs_dbuf (4 rows, STAGES == 0 makes this term vanish) + 3 float accumulators (dK,dQ,dV)
-                size_t shmem_bwd = 3 * DC * sizeof(cuda_t) + 4 * STAGES * DC * sizeof(cuda_t) + 3 * DC * sizeof(float);
+                size_t shmem_bwd = 3 * DC * sizeof(cuda_t) + pipelined_ring_elems(STAGES, 4, DC) * sizeof(cuda_t) + 3 * DC * sizeof(float);
 
                 ensure_dynamic_shmem(
                     graph_attn_backward_fwd_csr_undirected_kernel_D<DC, cuda_t, index_t, float, STAGES>, shmem_bwd, "GT backward (undirected)"
