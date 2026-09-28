@@ -37,7 +37,7 @@ from typing import Literal, Union
 
 import torch
 
-import turbo_gnn._C as _C
+from turbo_gnn._extension import _C
 from turbo_gnn._timer import time_callable
 
 logger = logging.getLogger(__name__)

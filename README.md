@@ -5,6 +5,10 @@ Includes custom CUDA and Triton kernels for SpMM/attention, wrappers for PyG, DG
 TCGNN, DFGNN, and FuseGNN, plus Optuna-based kernel autotuning. Models, datasets, and training
 are all driven by YAML configs.
 
+The measurements reported in the paper are reproduced by the commands in
+[REPRODUCING.md](REPRODUCING.md): the attention ablation, the generalized primitives against DGL
+and PyG, the pipelining sweeps, the hardware counters and the utilization simulator.
+
 ## Installation
 
 Requires Python >= 3.10 and a CUDA-capable GPU.
@@ -745,8 +749,10 @@ See the YAML files in each directory for the full set of available options.
 
 ```
 .
+├── benchmarks/paper/     # Runners for the paper's measurements (see REPRODUCING.md)
 ├── configs/              # YAML configurations (datasets, models, training, benchmarks, optuna)
 ├── scripts/              # Entry-point scripts (train, validate, benchmark, profile, autotune)
+│   └── ablation/         # Load-imbalance simulator: measure, calibrate, sweep, plot
 ├── src/
 │   ├── backends/         # Backend implementations (one subdir per backend)
 │   ├── benchmarking/     # Microbench, memory profiling, autotuner

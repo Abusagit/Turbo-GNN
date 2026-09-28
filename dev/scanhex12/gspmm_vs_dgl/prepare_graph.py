@@ -15,6 +15,10 @@ Sources, picked by name:
   * OGB (ogbn-*): the raw edge.csv.gz of the download, under --ogb-root, with
     reverse edges added for the datasets ogb marks add_inverse_edge.
   * Planetoid (cora, citeseer, pubmed): via DGL, which ships them.
+  * The other node-classification benchmarks of the g-SDDMM suite (CoraFull, WikiCS,
+    amazon-*, coauthor-*, Flickr, reddit): via PyG, under --pyg-root, with one self-loop
+    per node added by torch_geometric.utils.add_self_loops -- which is how the cache the
+    paper measured was built.
 """
 
 from __future__ import annotations
@@ -32,6 +36,17 @@ GRAPHLAND = {
     "avazu-ctr", "twitch-views",
 }
 PLANETOID = {"cora": "CoraGraphDataset", "citeseer": "CiteseerGraphDataset", "pubmed": "PubmedGraphDataset"}
+# name -> (torch_geometric.datasets class, constructor argument after root, or None)
+PYG = {
+    "CoraFull": ("CoraFull", None),
+    "WikiCS": ("WikiCS", None),
+    "amazon-photo": ("Amazon", "Photo"),
+    "amazon-computers": ("Amazon", "Computers"),
+    "coauthor-cs": ("Coauthor", "CS"),
+    "coauthor-physics": ("Coauthor", "Physics"),
+    "Flickr": ("Flickr", None),
+    "reddit": ("Reddit", None),
+}
 
 
 def _read_csv_pairs(path: Path, skip_header: bool) -> np.ndarray:
@@ -116,6 +131,17 @@ def load_planetoid(name: str) -> tuple[np.ndarray, int]:
     return np.stack([src.numpy().astype(np.int64), dst.numpy().astype(np.int64)]), int(g.num_nodes())
 
 
+def load_pyg(name: str, root: str) -> tuple[np.ndarray, int]:
+    import torch_geometric.datasets as datasets  # only needed for these, and only here
+    from torch_geometric.utils import add_self_loops
+
+    cls, arg = PYG[name]
+    ds = getattr(datasets, cls)(root, arg) if arg else getattr(datasets, cls)(str(Path(root) / cls))
+    g = ds[0]
+    edge_index, _ = add_self_loops(g.edge_index, num_nodes=g.num_nodes)
+    return edge_index.numpy().astype(np.int64), int(g.num_nodes)
+
+
 def prepare(name: str, args) -> Path:
     out = Path(args.out_dir) / f"{name}.npz"
     if out.exists() and not args.force:
@@ -129,8 +155,10 @@ def prepare(name: str, args) -> Path:
         edge_index, num_nodes = load_ogb(name, args.ogb_root)
     elif name in GRAPHLAND:
         edge_index, num_nodes = load_graphland(name, args.graphland_root)
+    elif name in PYG:
+        edge_index, num_nodes = load_pyg(name, args.pyg_root)
     else:
-        raise SystemExit(f"{name}: unknown graph. Known: GraphLand, ogbn-*, {', '.join(PLANETOID)}")
+        raise SystemExit(f"{name}: unknown graph. Known: GraphLand, ogbn-*, {', '.join([*PLANETOID, *PYG])}")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, edge_index=edge_index, num_nodes=np.int64(num_nodes))
@@ -146,6 +174,7 @@ def main() -> int:
     p.add_argument("--out-dir", default=os.environ.get("GRAPH_CACHE", "data/graph_cache"))
     p.add_argument("--graphland-root", default=os.environ.get("GRAPHLAND_ROOT", "data/graphland"))
     p.add_argument("--ogb-root", default=os.environ.get("OGB_ROOT", "data/ogb"))
+    p.add_argument("--pyg-root", default=os.environ.get("PYG_ROOT", "data"))
     p.add_argument("--force", action="store_true")
     args = p.parse_args()
     for name in args.names:

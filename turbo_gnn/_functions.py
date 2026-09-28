@@ -12,7 +12,7 @@ from math import ceil
 
 import torch
 
-import turbo_gnn._C as _C
+from turbo_gnn._extension import _C
 
 WARP_SIZE = 32
 FOUR_BYTES_CONSTANT = 4
