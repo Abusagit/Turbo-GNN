@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/extension.h>
 
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -25,6 +26,84 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int pipeline_stages             = 0
 );
 
+// ============================================================================
+// GSDDMM aggregation
+// ============================================================================
+
+torch::Tensor gsddmm_forward_cuda(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    uint32_t light_warps_per_block                 = 4,
+    uint32_t heavy_warps_per_block                 = 32,
+    uint32_t pipeline_stages                       = 0,
+    std::optional<torch::Tensor> heavy_block_parts = std::nullopt,
+    uint32_t heavy_edges_per_block                 = 0,
+    bool overlap_buckets                           = false
+);
+
+torch::Tensor gsddmm_forward_edge_blocks(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor edge_list,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t pipeline_stages                        = 0,
+    uint32_t edges_per_warp                         = 4,
+    uint32_t warps_per_block                        = 4,
+    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt
+);
+
+// Node-parallel GSDDMM backward: one block per node, fp32 register reduction, no
+// atomics. Returns {dL, dR} (dR empty for "copy", which never reads R).
+std::vector<torch::Tensor> gsddmm_backward_cuda(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor d_out,
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    torch::Tensor row_ptr_T,
+    torch::Tensor col_idx_T,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    torch::Tensor light_nodes,
+    torch::Tensor heavy_nodes,
+    torch::Tensor light_nodes_T,
+    torch::Tensor heavy_nodes_T,
+    std::optional<torch::Tensor> canonical_edge_idx = std::nullopt,
+    uint32_t light_warps_per_block                  = 4,
+    uint32_t heavy_warps_per_block                  = 32
+);
+
+// Edge-parallel GSDDMM backward: one warp per edge chunk, node gradients
+// accumulated with atomics in fp32 and cast back. Returns {dL, dR}.
+// op / lhs_target / rhs_target / N carry the operation's meaning, so they take
+// no defaults: a caller that omits one silently gets a different computation.
+std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
+    torch::Tensor l,
+    torch::Tensor r,
+    torch::Tensor d_out,
+    torch::Tensor edge_list_dst,
+    std::optional<torch::Tensor> edge_list_src,
+    std::optional<torch::Tensor> canonical_edge_idx,
+    std::string op,
+    std::string lhs_target,
+    std::string rhs_target,
+    uint64_t N,
+    uint32_t pipeline_stages = 0,
+    uint32_t edges_per_warp  = 4,
+    uint32_t warps_per_block = 4
+);
+
 at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8);
 
 // ============================================================================
@@ -40,9 +119,22 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     float negative_slope,
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
-    int light_warps_per_block = 1,
-    int heavy_warps_per_block = 8,
-    int pipeline_stages       = 0
+    int light_warps_per_block       = 1,
+    int heavy_warps_per_block       = 8,
+    int schedule                    = 3,
+    int blocks_per_sm               = 8,
+    int sched_chunk                 = 1,
+    int bucket_launch               = 0,
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int heavy_edge_slice            = 0,
+    int pipeline_stages = 0,
+    /// Depth for the heavy bucket alone. The staging buffer is warps*stages*D*sizeof(T),
+    /// so the heavy bucket (8-32 warps) exhausts shared memory at a depth the light
+    /// bucket (1-4 warps) handles comfortably: at D=256/fp32 depth 6 costs the heavy
+    /// bucket 57 KB/block and drops it from 64 to 16 resident warps per SM.
+    int heavy_pipeline_stages = 0
 );
 
 std::vector<torch::Tensor> gatv2_backward_cuda(
@@ -64,7 +156,17 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
     bool is_directed          = true,
-    int pipeline_stages       = 0
+    int schedule              = 3,
+    int blocks_per_sm         = 8,
+    int sched_chunk           = 1,
+    int bucket_launch         = 0,
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int backward_heavy_edge_slice   = 0,
+    int pipeline_stages       = 0,
+    /// Separate pipeline depth for the heavy bucket; see gatv2_forward_cuda.
+    int backward_heavy_pipeline_stages = 0
 );
 
 // ============================================================================
@@ -82,14 +184,26 @@ std::tuple<torch::Tensor, torch::Tensor> graph_attention_forward_csr_mh_cuda(
     torch::Tensor heavy_nodes,
     int light_warps_per_block = 4,
     int heavy_warps_per_block = 8,
-    int pipeline_stages       = 0
+    int schedule              = 3,
+    int blocks_per_sm         = 8,
+    int sched_chunk           = 1,
+    int bucket_launch         = 0,
+    // Edge-slice table for the heavy bucket; see AdjacencyForwardBackwardWithNodeBuckets
+    // .heavy_edge_slices(). heavy_edge_slice == 0 selects the node-per-block heavy path.
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int heavy_edge_slice            = 0,
+    int pipeline_stages       = 0,
+    /// Separate pipeline depth for the heavy bucket; see gatv2_forward_cuda.
+    int heavy_pipeline_stages = 0
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward_csr_mh_cuda(
-    torch::Tensor row_ptr,    // forward CSR [N+1]
-    torch::Tensor col_idx,    // forward CSR [E]
-    torch::Tensor row_ptr_T,  // backward CSR^T [N+1]
-    torch::Tensor col_idx_T,  // backward CSR^T [E]
+    torch::Tensor row_ptr,    // forward CSR [N+1],
+    torch::Tensor col_idx,    // forward CSR [E],
+    torch::Tensor row_ptr_T,  // backward CSR^T [N+1],
+    torch::Tensor col_idx_T,  // backward CSR^T [E],
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -102,7 +216,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> graph_attention_backward
     int light_warps_per_block = 1,
     int heavy_warps_per_block = 8,
     bool is_directed          = true,
-    int pipeline_stages       = 0
+    int schedule              = 3,
+    int blocks_per_sm         = 8,
+    int sched_chunk           = 1,
+    int bucket_launch               = 0,
+    torch::Tensor chunk_node        = torch::Tensor(),
+    torch::Tensor chunk_start       = torch::Tensor(),
+    torch::Tensor node_chunk_offset = torch::Tensor(),
+    int heavy_edge_slice            = 0,
+    int pipeline_stages       = 0,
+    /// Separate pipeline depth for the heavy bucket; see gatv2_forward_cuda.
+    int backward_heavy_pipeline_stages = 0
 );
 
 // ============================================================================

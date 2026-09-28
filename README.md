@@ -5,6 +5,10 @@ Includes custom CUDA and Triton kernels for SpMM/attention, wrappers for PyG, DG
 TCGNN, DFGNN, and FuseGNN, plus Optuna-based kernel autotuning. Models, datasets, and training
 are all driven by YAML configs.
 
+The measurements reported in the paper are reproduced by the commands in
+[REPRODUCING.md](REPRODUCING.md): the attention ablation, the generalized primitives against DGL
+and PyG, the pipelining sweeps, the hardware counters and the utilization simulator.
+
 ## Installation
 
 Requires Python >= 3.10 and a CUDA-capable GPU.
@@ -98,6 +102,12 @@ graph_i32 = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
 ).to("cuda")
 ```
 
+`index_dtype` is not only a cuSPARSE constraint: the edge-parallel `gsddmm` kernels are
+templated on it and derive their `(src, dst)` pair type from it, so a 32-bit graph moves
+8 bytes per edge of index traffic instead of 16 (and 4 instead of 8 for the canonical-id
+permutation), and broadcasts each id with one warp shuffle instead of two. Prefer
+`torch.int32` whenever the node and edge counts fit it.
+
 ### Kernel calls
 
 ```python
@@ -119,11 +129,86 @@ out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
                 norm_type="none", cu_sparse_algorithm_id=-1, block_dim=256)
 ```
 
+### GSDDMM: per-edge binary ops
+
+`gsddmm` applies a binary op per edge, taking each operand's row from the source node
+(`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). D must be one of
+32, 64, 128, 256; dtypes are fp32/fp16/bf16. Differentiable in both operands — the
+backward's two kernels are picked by `backward_variant` (see below).
+
+```python
+from turbo_gnn import gsddmm, u_add_v, copy_u
+
+out = gsddmm(graph, x, y, op="mul", lhs_target="src", rhs_target="dst")  # [E, D]
+out = gsddmm(graph, x, y, op="dot", lhs_target="src", rhs_target="dst")  # [E]
+
+# DGL-style aliases for every (lhs, op, rhs) combination, plus copy_u / copy_v
+out = u_add_v(graph, x, y)      # [E, D]
+out = copy_u(graph, x)          # [E, D]
+```
+
+Two CUDA kernels implement this — one thread block per bucketed CSR row, or one warp per
+chunk of an explicit edge list. Which is faster depends on the graph's geometry, the
+feature width and the dtype (on a 3136-cell A100 sweep, always picking the row-per-block
+kernel costs 1.40x geomean and up to 9x; always picking the edge kernel costs 1.04x and up
+to 1.9x). So `gsddmm` times the candidates **once per (graph, feature width, dtype, op)**,
+memoizes the verdict on the graph object, and uses the winner from then on. For an op with
+no `dst` operand the edge kernel's traversal order is a third candidate: grouping edges by
+source shares the source row across a warp's chunk, but then needs an index indirection to
+keep the output in forward-CSR order, which measured as a 5–23% win at D=128 and a 6–29%
+loss at D=32 — so it is timed rather than assumed. Output rows are always numbered by
+forward-CSR edge position, whichever candidate wins, so the choice cannot change results.
+
+```python
+out = gsddmm(graph, x, y, op="mul")                     # auto: probe once, then reuse
+out = gsddmm(graph, x, y, op="mul", variant="node")     # pin the row-per-block kernel
+out = gsddmm(graph, x, y, op="mul", variant="edge")     # pin the edge-parallel kernel
+```
+
+The probe costs two extra launches (~20 ms) on the first such call; pinning `variant`
+skips it entirely. `AutotuneConfig(measure_variant=False)` falls back to a geometry
+heuristic instead (1.01x geomean on the same sweep), and `share_variant_probe=True` lets
+ops with the same operand shape reuse one probe per graph (off by default, so a per-op
+measurement never depends on which op ran first). Parameters belonging to the other
+kernel are rejected when `variant` is pinned.
+
+`gsddmm` is differentiable in both operands, and the backward has its own two kernels,
+selected by `backward_variant` independently of the forward — it is a *reduction* (each
+node's gradient sums over its incident edges) rather than a map, so the forward's winner
+says nothing about it. An operand read per edge (`"edge"`) needs no reduction at all and
+gets a plain per-edge gradient.
+
+```python
+out = gsddmm(graph, x, y, op="mul")                            # backward_variant="node"
+out = gsddmm(graph, x, y, op="mul", backward_variant="edge")   # load-balanced, atomic
+out.backward(grad)
+```
+
+- `"node"` (default) gives one block per bucketed node and reduces in fp32 registers, so
+  it uses **no atomics** and is deterministic. It inherits the forward's load imbalance,
+  and deliberately has no heavy-node chunking: splitting a node across blocks would make
+  them all write its row, which is the thing this variant exists to avoid.
+- `"edge"` gives one warp per edge chunk and is perfectly load balanced, accumulating into
+  an fp32 buffer with `atomicAdd` (cast back on return). Because the edge list is grouped
+  by the node being reduced, a chunk is a short sequence of **runs** of edges sharing a
+  target row — usually exactly one — and the warp sums each run in registers, so it issues
+  one set of atomics per run rather than per edge, and reads the reduced node's own row
+  once per run rather than once or twice per edge. The atomics are staged through shared
+  memory so each is one contiguous 128-byte request instead of 32 scattered sectors. Its
+  result is deterministic only up to fp32 atomic ordering.
+  `pipeline_stages` applies here too: it prefetches each edge's `d_out` and other-operand
+  rows that many edges ahead with `cp.async`, as the forward edge kernel does.
+
+`add`, `sub` and `copy` have constant partials, so their backward saves **no** feature
+tensors — the difference between keeping one and two `[E, D]` activations alive per op.
+
 ### Autotuning
 
-All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`) support
-autotuning, which grid-searches over kernel parameters (warps per block, edges per block,
-etc.) and graph repartitioning quantiles to find the fastest configuration.
+All custom kernels (`reduction_aggr`, `gatv2_aggr`, `graph_transformer_aggr`, `gsddmm`)
+support autotuning, which grid-searches over kernel parameters (warps per block, edges per
+block, etc.) and graph repartitioning quantiles to find the fastest configuration. For
+`gsddmm` the search is staged: it picks the kernel variant first, then searches only that
+variant's parameters (the other variant's knobs would be dead axes).
 
 ```python
 from turbo_gnn import AutotuneConfig
@@ -136,11 +221,65 @@ config = AutotuneConfig(warmup=5, iters=20, tune_backward=True)
 out = graph_transformer_aggr(graph, x, Q=Q, K=K, V=V, scale=scale,
                               autotune=True, autotune_config=config)
 
-# Results are cached per graph + feature shape — subsequent calls are fast
+# Results are cached per graph + feature shape + dtype — subsequent calls are fast
 out = reduction_aggr(graph, X, reduce="min", autotune=True)  # cache hit
 ```
 
+The dtype is part of the cache key rather than something that gets searched: it is a
+property of the caller's tensors, and the best configuration genuinely differs between
+fp16 and fp32, so a graph tuned in one dtype does not hand its configuration to the other.
+
 `spmm_aggr` and `csr_SPMM_normalized` are cuSPARSE wrappers and do not support autotuning.
+
+### Node scheduling
+
+Output nodes are mapped one per thread block (`schedule="one_per_block"`, the only policy
+compiled). What is worth varying is the order in which the buckets are visited.
+
+```python
+# One thread block per node, grid.x == node count.
+out = reduction_aggr(graph, X, reduce="min")
+
+# Node visit order. This is the single largest scheduling lever here.
+# sorted_by_degree() balances (cost tracks degree, so descending order is LPT);
+# sorted_by_locality() clusters connected nodes via reverse Cuthill-McKee so that
+# neighbouring feature rows stay in L2. Both are bit-exact; neither always wins.
+out = reduction_aggr(graph.sorted_by_degree(), X, reduce="min")
+out = reduction_aggr(graph.sorted_by_locality(), X, reduce="min")   # needs scipy
+```
+
+**Visit order is worth more than the policy.** Over the same 108 cells, adding the two orders
+takes the best-per-cell geomean from 1.02x to **1.09x** and the cells at or above baseline from
+66/108 to **96/108**. On the forward pass at the head dims that matter it is decisive:
+
+| | geomean | cells at or above baseline |
+| --- | --- | --- |
+| head dim 128, forward | **1.125x** | 25/27 |
+| head dim 256, forward | **1.170x** | 26/27 |
+| head dim 128, backward | 1.046x | 24/27 |
+| head dim 256, backward | 1.026x | 21/27 |
+
+The biggest single result is ogbn-products with GT at head dim 256: **573 ms to 322 ms (1.78x)**,
+from `sorted_by_locality()` alone. Reordering costs 0.1 s on ogbn-arxiv and 6.4 s on
+ogbn-products, one-off — cache the reordered graph and reuse it, since it shares its CSR
+tensors with the original.
+
+Neither order is a safe default: ogbn-proteins is already stored in a locality-friendly order
+and *loses* 21% under descending-degree. Measure per graph with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_kernels.py \
+  --backend cuda --conv min_aggr --dataset configs/datasets/main/ogbn_arxiv.yaml \
+  --mode forward --sweep node_order=natural,degree,locality
+```
+
+Nodes are assigned one block each (`schedule="one_per_block"`). The persistent policies this
+repository once carried -- `grid_stride`, `precomputed` and `dynamic` -- are no longer
+instantiated: measured over 108 (graph, conv, head dim, direction) cells none of them broke even
+as a blanket default, because the hardware block scheduler is already a dynamic *and*
+locality-optimal work queue at zero cost, and keeping them as a template axis quadrupled the
+attention kernels' build time. Load balance comes from degree bucketing, degree ordering,
+concurrent bucket launch and edge slicing instead.
 
 ## Quick Start
 
@@ -156,6 +295,10 @@ python scripts/train.py \
 
 # Benchmark a single conv layer
 python scripts/benchmark.py --layer gcn --backend pyg --num-nodes 20000 --feature_dim 128
+
+# Benchmark the convolution alone (no projections), comparing backends at the same level
+python scripts/benchmark_kernels.py --backend cuda --conv max_aggr -K warps_per_block=4
+python scripts/benchmark_kernels.py --backend pyg  --conv gcn
 
 # Validate a trained checkpoint
 python scripts/validate.py \
@@ -200,23 +343,239 @@ Merges one or more training YAMLs, builds dataset/model, attaches hooks (metrics
 
 ### `benchmark.py` — Microbenchmark a single conv layer
 
-Creates a random graph (or loads one from a dataset YAML), instantiates a conv, and times forward or forward+backward using CUDA events.
+Creates a random graph (or loads one from a dataset YAML), instantiates a conv — or, with
+`--aggr`, a raw op — and times the forward or the backward pass using CUDA events. In
+backward mode the forward runs once, untimed, to build the autograd graph; the timed loop
+calls `out.backward(grad)`.
 
 ```
---layer         Conv type: gcn, mean_aggr, gat_v2, gt, ... (required)
+--layer         Conv type: gcn, mean_aggr, gat_v2, gt, ... (required). With --aggr may be a
+                comma-separated op list, e.g. 'u_add_v,u_add_v_edge,copy_u'
 --backend       Backend name (required)
+--aggr          Launch a raw aggregation op (backend.create_aggr) instead of a conv: for
+                dgl, any dgl.ops gspmm/gsddmm name; for cuda, any turbo_gnn gsddmm name
+                (incl. the _edge edge-parallel variants). Operands are generated automatically.
 --dataset       Dataset YAML path (optional; if omitted, generates a random graph)
 --num-nodes     Nodes in random graph (default: 20000)
 --avg-degree    Average degree (default: 10)
 --feature_dim   Feature dimension (default: 128)
 --heads         Attention heads for gat_v2/gt (default: 1)
---mode          forward | train (default: forward)
+--mode          forward | backward (default: forward)
 --iters         Timing iterations (default: 100)
 --warmup        Warmup iterations (default: 20)
---amp           none | bf16 | fp16 (default: none)
+--amp           none | bf16 | fp16 (default: none); wraps the call in torch.autocast
+--dtype         fp32 | fp16 | bf16 (default: fp32); materializes the inputs in that
+                precision so custom CUDA kernels dispatch on it (--amp does not reach them)
+--exact-iters   Issue exactly --warmup + --iters calls instead of triton.testing.do_bench
+                (whose warmup/rep are milliseconds); use under a kernel profiler such as ncu
 --json-out      Optional path to write JSON result
+--csv-out       Optional CSV to append results to (header written on first use)
 --device        CUDA device index (default: 0)
+--pipeline-stages              Forward cp.async pipeline stage count for CUDA convs (default: 0)
+--backward-pipeline-stages     Backward cp.async pipeline stage count for CUDA convs (default: 0)
+--autotune      Autotune kernel/graph params (incl. pipeline stages) via grid search first
+--autotune-warmup              Autotune warmup iters per trial (default: 5)
+--autotune-iters               Autotune timed iters per trial (default: 15)
 ```
+
+### `benchmark_kernels.py` — Microbenchmark graph convolutions (no projections)
+
+The kernel-level counterpart to `benchmark.py`. Where `benchmark.py` times a whole conv layer, this
+times only the aggregation — the projection-free `BaseBackend.create_aggr` from `src/backends`, with
+no linear/QKV projections, no bias, no framework dispatch. Every backend goes through the same path,
+so implementations compare at the same level:
+
+```bash
+# turbo_gnn kernels
+python scripts/benchmark_kernels.py --backend cuda --conv min_aggr -K warps_per_block=4
+
+# any other backend, same interface
+python scripts/benchmark_kernels.py --backend dgl --conv gat_v2 --heads 4
+python scripts/benchmark_kernels.py --backend pyg --conv gcn --dataset configs/datasets/pyg_cora.yaml
+```
+
+`--backend cuda` reaches the turbo_gnn kernels, and its aggregations forward every kernel parameter,
+so `-K` and `--autotune` work there exactly as a direct kernel call would. Autotuning is **off by
+default**, so a run measures exactly the configuration you asked for.
+
+Results go to stdout as JSON — stdout carries **only** JSON, with backend chatter such as
+`ninja: no work to do.` redirected to stderr, so output is safe to pipe.
+
+#### Target selection
+
+```
+--backend       Backend name: cuda, pyg, dgl, cusparse, torch_native, ... (required)
+--conv          Conv type (required): `gcn`, `sum_aggr`, `mean_aggr`, `min_aggr`, `max_aggr`,
+                `gat_v2`, `gt`
+-K NAME=VALUE   Kernel argument, repeatable. For `--backend cuda` these are validated against
+                the conv's schema (see --help); for other backends they are forwarded to
+                create_aggr unvalidated, and a backend that does not use one ignores it
+--device        CUDA device ordinal (default: 0)
+--json-out      Optional path to write the JSON result
+```
+
+Not every backend implements every conv; those that don't say so rather than guessing. `--help`
+lists the backends actually registered in your environment.
+
+PyG's `gat_v2` and `gt` aggregations are the scoring/softmax/weighted-sum code lifted out of
+`GATv2Conv.edge_update`/`message` and `TransformerConv.message`, rebuilt on PyG's own `softmax` and
+`scatter` primitives. No `GATv2Conv`/`TransformerConv` is instantiated, so the projection layers are
+never created — `gat_v2` holds only the attention vector (`glorot`-initialised as PyG does), `gt`
+holds no parameters. They match the real PyG layers to ~1e-7.
+
+Because PyG's `MessagePassing.propagate` dispatch is bypassed along with the projections, these
+numbers are the aggregation math alone; they are noticeably faster than routing through the layer
+(gat_v2 at 20k nodes: 5.4 ms extracted vs 16.6 ms via `propagate`). That is the right comparison
+against a fused kernel, but it is not what a PyG user experiences end to end.
+
+#### Graph
+
+```
+--dataset         Dataset YAML path (optional; if omitted, a random graph is generated)
+--num-nodes       Nodes in the random graph (default: 20000)
+--avg-degree      Average out-degree of the random graph (default: 10)
+--quantile        Degree quantile splitting light from heavy nodes; -1 disables bucketing
+                  so every node is "light" (default: 0.99)
+--index-dtype     CSR index dtype: int32 | int64 | uint32 | uint64 (default: int32)
+--no-self-loops   Skip adding one self-loop per node. Self-loops are added by default so
+                  random graphs, datasets, and every backend see the same edge set
+--sweep NAME=V1,V2,...   Sweep a graph-construction parameter, repeatable (see below)
+```
+
+#### Inputs
+
+```
+--feature-dim   Total feature width (default: 128)
+--heads         Attention heads, attention convs only (default: 1)
+--dtype         fp32 | fp16 | bf16 (default: fp32)
+--seed          Seed for the generated graph and inputs (default: 0)
+```
+
+Inputs are synthesized already-projected, in whatever shape the aggregation expects:
+
+| conv | aggregation receives | per-head width |
+| --- | --- | --- |
+| `gcn`, `sum/mean/min/max_aggr` | `(x, graph)` | n/a — `x` is `[N, feature_dim]` |
+| `gat_v2` | `(x_left, x_right, graph)` | `feature_dim` (total `heads * feature_dim`) |
+| `gt` | `(Q, K, V, graph)` | `feature_dim // heads` |
+
+`gat_v2` treating `--feature-dim` as the *per-head* width is the convention `create_aggr` already
+uses across all backends; it is not a typo. Note `gt` on the cuda backend only supports head dims of
+32, 64, 128 or 256.
+
+#### Measurement
+
+```
+--mode      forward | backward | forward_backward (default: forward)
+            'backward' reuses one forward graph and times only the gradient kernels
+--iters     Timed budget in MILLISECONDS of repetition (default: 100)
+--warmup    Warmup budget in MILLISECONDS (default: 20)
+
+--launch-ncu-override-iters N    Issue exactly N timed calls instead of timing
+                                 against the --iters budget. Overrides --iters/--warmup
+--launch-ncu-override-warmup M   Exact warmup calls (default: N // 4, at least 1)
+```
+
+There are two ways to bound the measurement, and they use different units:
+
+| | `--iters` / `--warmup` | `--launch-ncu-override-iters` / `-warmup` |
+| --- | --- | --- |
+| unit | milliseconds of repetition | exact call counts |
+| timed by | `triton.testing.do_bench` | CUDA events around each call |
+| launch count | derived by do_bench, plus 6 calibration calls | exactly `1 + M + N` |
+| use for | normal benchmarking (do_bench flushes L2 between reps, so its numbers are the more trustworthy ones) | profiling under `ncu`, where the launch count must be small and deterministic |
+
+`do_bench` interprets its `warmup`/`rep` arguments as time budgets and derives its own repeat counts,
+so it cannot produce a fixed number of launches — hence the override. Under the override the total
+is `1 + M + N`: one priming call (which builds lazily-initialised state such as cuSPARSE descriptors
+outside the measured region), then `M` warmup and `N` timed calls.
+
+The JSON says which mode ran, and populates only the matching pair:
+
+```json
+"iters_are_exact": true,  "iters": 20,   "warmup_calls": 5,
+"timed_budget_ms": null,  "warmup_budget_ms": null
+```
+
+```bash
+# under ncu: 1 + 5 + 20 = 26 launches, every time
+ncu --kernel-name regex:reduction_aggr_forward .venv/bin/python scripts/benchmark_kernels.py \
+    --backend cuda --conv min_aggr --launch-ncu-override-iters 20 --launch-ncu-override-warmup 5
+```
+
+A memory breakdown is always reported — peak, steady-state resident, and the difference:
+
+```json
+"memory": {
+  "peak_mb": 42.14, "resident_mb": 31.60, "kernel_transient_mb": 10.54,
+  "graph_mb": 1.83, "inputs_mb": 29.30
+}
+```
+
+`kernel_transient_mb` (peak − resident) is what one call adds on top of the graph and inputs — the
+figure to compare across configurations, since `peak_mb` alone moves whenever `--feature-dim` does.
+`graph_mb` is `null` for representations that expose no reachable tensors (e.g. a DGL graph).
+
+There is no flag for this because it is essentially free. Under
+`--launch-ncu-override-iters` the peak is read straight off the allocator's high-water mark across
+the timing loop, costing zero extra launches — so the total stays exactly `1 + M + N`. In the
+`do_bench` path it comes from one isolated call *outside* the loop instead, because do_bench
+allocates a ~256 MB buffer to flush L2 between reps, which would otherwise swamp the number
+(291 MB reported instead of 35 MB). Both paths give identical figures for the same configuration.
+
+#### Tuning
+
+Two independent mechanisms, both off by default.
+
+**`--sweep`** measures a graph-construction parameter at every value you give and reports all of
+them. It works for any backend and any conv, including those with no tunable kernel parameters:
+
+```bash
+python scripts/benchmark_kernels.py --backend cuda --conv min_aggr \
+    --num-nodes 200000 --avg-degree 15 --sweep quantile=-1,0.9,0.95,0.99,0.999
+```
+
+```
+--sweep quantile=...            Heavy-node threshold, both directions
+--sweep forward_quantile=...    Forward CSR only
+--sweep backward_quantile=...   Backward CSR only
+--sweep index_dtype=...         int32 | int64 | uint32 | uint64
+```
+
+Repeating `--sweep` forms a grid. Top-level `ms_per_iter`/`graph` report the winning point,
+`graph_config` names it, and `sweep` lists every trial sorted fastest-first with its `heavy_nodes`
+count. Quantile sweeps reuse the CSR arrays via `repartition()`, so each extra point costs a quantile
+computation rather than a graph rebuild; `index_dtype` falls back to a full rebuild automatically.
+
+Note the quantile is only meaningful for representations that have light/heavy node buckets — the
+`cuda` backend. Sweeping it against PyG/DGL/torch_native yields flat noise.
+
+**`--autotune`** runs turbo_gnn's inline grid search over kernel parameters *and* the node
+partitioning before timing. Requires `--backend cuda`, and a conv whose kernel has an autotuning
+path (`min_aggr`, `max_aggr`, `gat_v2`, `gt` — the SpMM-based convs have none).
+
+```
+--autotune          Grid-search tunable parameters before timing
+--autotune-warmup   Warmup iterations per autotuning trial (default: 10)
+--autotune-iters    Timed iterations per autotuning trial (default: 50)
+```
+
+The selected configuration is reported under `autotune_selected`, including the partitioning that
+won — which the kernel applies to the graph, so it is worth seeing:
+
+```json
+"autotune_selected": {
+  "kernel_config": {"forward_warps_per_block": 8, "forward_edges_per_block_heavy_nodes": 1024},
+  "graph_config": {"forward_huge_degree_threshold_quantile": -1},
+  "ms_per_iter": 0.0587
+}
+```
+
+#### Discovering options
+
+`--help` lists every `--conv` with its input convention, the `-K` arguments and defaults for each
+conv on the cuda backend, and the backends actually registered in your environment (optional
+dependencies such as DGL or cuGraph are simply absent when not installed).
 
 ### `validate.py` — Validate a trained checkpoint
 
@@ -330,7 +689,7 @@ Requires: `pandas`, `comet_ml` (if `--use_comet`), and all backends listed in `-
 
 | Backend | Type | Registered names | Supported conv types |
 |---------|------|------------------|----------------------|
-| PyG | Library wrapper | `pyg` | gcn, mean_aggr, sum_aggr, gat, gat_v2, gin, sage |
+| PyG | Library wrapper | `pyg` | gcn, mean_aggr, sum_aggr, gat, gat_v2, gt, gin, sage |
 | DGL | Library wrapper | `dgl` | gcn, mean_aggr, sum_aggr, min_aggr, max_aggr, gat, gat_v2, gt |
 | cuGraph | Library wrapper | `cugraph` | gcn, mean_aggr, sum_aggr, min_aggr, max_aggr, gat_v2, gt |
 | cuSPARSE | Library wrapper | `cusparse`, `cusparse_precomputed_bwd` | gcn, sum_aggr, mean_aggr, random_walk |
@@ -361,8 +720,10 @@ See the YAML files in each directory for the full set of available options.
 
 ```
 .
+├── benchmarks/paper/     # Runners for the paper's measurements (see REPRODUCING.md)
 ├── configs/              # YAML configurations (datasets, models, training, benchmarks, optuna)
 ├── scripts/              # Entry-point scripts (train, validate, benchmark, profile, autotune)
+│   └── ablation/         # Load-imbalance simulator: measure, calibrate, sweep, plot
 ├── src/
 │   ├── backends/         # Backend implementations (one subdir per backend)
 │   ├── benchmarking/     # Microbench, memory profiling, autotuner

@@ -1,0 +1,387 @@
+"""Fit the simulator's cost model to measured kernel times.
+
+A launch over a whole bucket costs ``t(N, E) = c + a * N + b * E`` nanoseconds, so regressing
+measured time on node and edge counts identifies all three.  The simulator's tick is one
+neighbour, so ``beta = 1``, ``alpha = a / b`` and ``ns_per_tick = b``.
+
+``c`` is launch overhead, which the simulator does not model but which must stay in the
+regression: without it the smallest graphs are pure overhead and drag ``alpha`` up.  Fitting is
+weighted by ``1 / t`` because measured times span four orders of magnitude, and coefficients
+are constrained non-negative.
+
+``alpha`` and ``beta`` are constants with no notion of cache locality, so what a visit order
+buys through L2 reuse lands in the residual: see :attr:`FitResult.worst_graphs`.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Iterable, Literal, Sequence
+
+import numpy as np
+
+from turbo_gnn.simulation import CostModel
+
+Weighting = Literal["relative", "uniform"]
+
+SCHEMA = "turbo-gnn-cost-model/1"
+
+MIN_EDGE_TIME_SHARE = 0.2
+"""Below this, the kernel's time does not scale with degree and the tick loses its meaning.
+
+min-aggregation's backward pass is the case in point: it propagates one gradient per output
+node, to the argmin neighbour, so its cost is O(N) and not O(E).  Its measured time per node is
+flat across four orders of magnitude of edge count, and no ``alpha + beta * degree`` model can
+describe it."""
+
+MAX_USABLE_REL_ERROR = 0.35
+"""Median relative error above which a fit should not be used to predict wall clock."""
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """One timed kernel launch over a whole graph."""
+
+    conv: str
+    pass_name: str
+    head_dim: int
+    graph: str
+    num_nodes: int
+    num_edges: int
+    time_ms: float
+
+    @property
+    def key(self) -> str:
+        return f"{self.conv}/{self.pass_name}/{self.head_dim}"
+
+
+@dataclass(frozen=True)
+class FitResult:
+    """Cost model fitted to one (conv, pass, head dim) cell."""
+
+    alpha: float
+    beta: float
+    ns_per_tick: float
+    ns_per_node: float
+    ns_per_edge: float
+    launch_overhead_ns: float
+    r2: float
+    median_rel_error: float
+    p90_rel_error: float
+    max_rel_error: float
+    num_samples: int
+    edge_time_share: float
+    weighting: Weighting = "relative"
+    note: str = ""
+    worst_graphs: list[tuple[str, float]] = field(default_factory=list)
+
+    @property
+    def trustworthy(self) -> bool:
+        """Whether this cell can be used to predict wall clock.  See :attr:`note` for why not."""
+        return not self.note
+
+    @property
+    def cost_model(self) -> CostModel:
+        return CostModel(alpha=self.alpha, beta=self.beta)
+
+    def predict_ms(self, num_nodes: int, num_edges: int) -> float:
+        """Measured wall clock this fit expects, launch overhead included."""
+        return (self.launch_overhead_ns + self.ns_per_node * num_nodes + self.ns_per_edge * num_edges) / 1e6
+
+
+def _nnls(design: np.ndarray, target: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Least squares over a few non-negative coefficients, by enumerating the active set.
+
+    A negative per-node cost would mean an isolated node makes the kernel finish sooner.
+    """
+    num_coefficients = design.shape[1]
+    weighted_design = design * weights[:, None]
+    weighted_target = target * weights
+    best: np.ndarray | None = None
+    best_sse = np.inf
+
+    for mask in range(1 << num_coefficients):
+        free = [i for i in range(num_coefficients) if mask >> i & 1]
+        solution = np.zeros(num_coefficients)
+        if free:
+            partial, *_ = np.linalg.lstsq(weighted_design[:, free], weighted_target, rcond=None)
+            if np.any(partial < 0):
+                continue
+            solution[free] = partial
+        sse = float(np.sum((weighted_design @ solution - weighted_target) ** 2))
+        if sse < best_sse:
+            best, best_sse = solution, sse
+
+    assert best is not None  # the all-zero solution is always feasible
+    return best
+
+
+def fit_cost_model(
+    measurements: Sequence[Measurement],
+    weighting: Weighting = "relative",
+    fit_launch_overhead: bool = True,
+) -> FitResult:
+    """Regress measured launch time on node and edge counts.
+
+    Args:
+        measurements: Timings for one (conv, pass, head dim) cell, on at least three graphs.
+        weighting: ``"relative"`` minimises percentage error; ``"uniform"`` is dominated by the
+            largest graph.
+        fit_launch_overhead: Fit the constant term.  Off, launch overhead lands in ``alpha``.
+
+    Returns:
+        FitResult: The fitted constants and how well they explain the measurements.
+
+    Raises:
+        ValueError: Too few measurements, a non-positive time, or a zero per-edge cost.
+    """
+    num_coefficients = 3 if fit_launch_overhead else 2
+    if len(measurements) < num_coefficients:
+        raise ValueError(
+            f"need at least {num_coefficients} measurements to fit {num_coefficients} coefficients, "
+            f"got {len(measurements)}"
+        )
+    if any(m.time_ms <= 0 for m in measurements):
+        raise ValueError("measured times must be positive")
+
+    counts = np.array([[m.num_nodes, m.num_edges] for m in measurements], dtype=np.float64)
+    design = np.column_stack([np.ones(len(measurements)), counts]) if fit_launch_overhead else counts
+    target = np.array([m.time_ms * 1e6 for m in measurements], dtype=np.float64)
+    weights = 1.0 / target if weighting == "relative" else np.ones_like(target)
+
+    solution = _nnls(design, target, weights)
+    launch_overhead, ns_per_node, ns_per_edge = solution if fit_launch_overhead else (0.0, *solution)
+    if ns_per_edge <= 0:
+        raise ValueError(
+            "fit produced a non-positive per-edge cost, so one tick has no duration; "
+            "the measurements are probably all on graphs of near-identical edge count"
+        )
+
+    predicted = design @ solution
+    relative_error = np.abs(predicted - target) / target
+    weighted_mean = float(np.sum(weights**2 * target) / np.sum(weights**2))
+    residual = float(np.sum((weights * (predicted - target)) ** 2))
+    total = float(np.sum((weights * (target - weighted_mean)) ** 2))
+
+    edge_time_share = float(np.mean(ns_per_edge * counts[:, 1] / predicted))
+    median_rel_error = float(np.median(relative_error))
+    notes = []
+    if ns_per_node == 0:
+        notes.append("per-node cost pinned to zero by the non-negativity constraint")
+    if edge_time_share < MIN_EDGE_TIME_SHARE:
+        notes.append(
+            f"node-dominated: edges explain only {edge_time_share:.0%} of the predicted time, so a tick "
+            "is not a neighbour here and alpha is not meaningful"
+        )
+    if median_rel_error > MAX_USABLE_REL_ERROR:
+        notes.append(f"median error {median_rel_error:.0%} is too large to predict wall clock")
+
+    worst = sorted(zip((m.graph for m in measurements), relative_error), key=lambda pair: -pair[1])
+    return FitResult(
+        alpha=float(ns_per_node / ns_per_edge),
+        beta=1.0,
+        ns_per_tick=float(ns_per_edge),
+        ns_per_node=float(ns_per_node),
+        ns_per_edge=float(ns_per_edge),
+        launch_overhead_ns=float(launch_overhead),
+        r2=1.0 - residual / total if total > 0 else 1.0,
+        median_rel_error=median_rel_error,
+        p90_rel_error=float(np.quantile(relative_error, 0.9)),
+        max_rel_error=float(relative_error.max()),
+        num_samples=len(measurements),
+        edge_time_share=edge_time_share,
+        weighting=weighting,
+        note="; ".join(notes),
+        worst_graphs=[(graph, float(error)) for graph, error in worst[:3]],
+    )
+
+
+def anchor_tick_ns(fit: FitResult, num_nodes: int, num_edges: int, baseline_ticks: int) -> float:
+    """Tick duration that makes the simulator reproduce the measurement it was calibrated on.
+
+    ``ns_per_edge`` is an aggregate rate over thousands of concurrent blocks, while the tick is
+    per-block, so using it directly counts the machine's parallelism twice.  Anchor it instead:
+    simulate the configuration that was measured and scale the tick so that run matches.  Every
+    other configuration is then in the same units, and the simulator predicts *changes* from a
+    measured baseline rather than absolute time from nothing.
+
+    Launch overhead is excluded -- it does not move with the scheduling policy, so it is added
+    back as a constant instead of smeared across ticks.
+
+    Args:
+        fit: Calibration for the (conv, pass, head dim) being simulated.
+        num_nodes: Nodes in the simulated graph.
+        num_edges: Edges in the simulated graph.
+        baseline_ticks: Makespan of the simulated baseline, in ticks.
+
+    Returns:
+        float: Nanoseconds per tick.
+    """
+    if baseline_ticks <= 0:
+        raise ValueError("baseline_ticks must be positive")
+    work_ns = fit.ns_per_node * num_nodes + fit.ns_per_edge * num_edges
+    if work_ns <= 0:
+        raise ValueError("the fit attributes no time to this graph's nodes and edges")
+    return work_ns / baseline_ticks
+
+
+def fit_all(
+    measurements: Iterable[Measurement],
+    weighting: Weighting = "relative",
+    min_samples: int = 3,
+    fit_launch_overhead: bool = True,
+) -> tuple[dict[str, FitResult], dict[str, str]]:
+    """Fit one cost model per (conv, pass, head dim).
+
+    Returns:
+        tuple: The fits, and the cells that could not be fitted mapped to the reason why.
+    """
+    cells: dict[str, list[Measurement]] = {}
+    for measurement in measurements:
+        cells.setdefault(measurement.key, []).append(measurement)
+
+    fits: dict[str, FitResult] = {}
+    skipped: dict[str, str] = {}
+    for key, cell in sorted(cells.items()):
+        if len(cell) < min_samples:
+            skipped[key] = f"only {len(cell)} measurement(s), need {min_samples}"
+            continue
+        try:
+            fits[key] = fit_cost_model(cell, weighting, fit_launch_overhead)
+        except ValueError as error:
+            skipped[key] = str(error)
+    return fits, skipped
+
+
+def save_cost_models(path: Path, fits: dict[str, FitResult], source: str, weighting: Weighting) -> None:
+    payload = {
+        "schema": SCHEMA,
+        "source": source,
+        "weighting": weighting,
+        "models": {key: asdict(fit) for key, fit in sorted(fits.items())},
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def load_cost_models(path: Path) -> dict[str, FitResult]:
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"{path}: no calibration file. It is not checked in -- it is derived from measurements, so it "
+            "goes stale. Build one with scripts/ablation/calibrate_cost_model.py, e.g. from the kernel "
+            "benchmark report:\n"
+            "  git show pr/55:reports/kernel-benchmarks/summary.txt > /tmp/kernel-benchmarks.txt\n"
+            f"  python scripts/ablation/calibrate_cost_model.py --from-summary /tmp/kernel-benchmarks.txt --out {path}"
+        )
+    payload = json.loads(Path(path).read_text())
+    if payload.get("schema") != SCHEMA:
+        raise ValueError(f"{path}: expected schema {SCHEMA!r}, got {payload.get('schema')!r}")
+    return {
+        key: FitResult(**(model | {"worst_graphs": [tuple(pair) for pair in model.get("worst_graphs", [])]}))
+        for key, model in payload["models"].items()
+    }
+
+
+def lookup(fits: dict[str, FitResult], conv: str, pass_name: str, head_dim: int) -> FitResult:
+    key = f"{conv}/{pass_name}/{head_dim}"
+    if key not in fits:
+        raise KeyError(f"no cost model for {key!r}; calibrated cells are {sorted(fits)}")
+    return fits[key]
+
+
+# --------------------------------------------------------------------------------------------
+# Loaders
+# --------------------------------------------------------------------------------------------
+
+_GRAPH_HEADER = re.compile(r"^###\s+(\S+)")
+_GRAPH_STATS = re.compile(r"^\s+N=([\d,]+)\s+E=([\d,]+)")
+_CELL_ROW = re.compile(
+    r"^\s+(?P<conv>\S+)\s+(?P<dim>\d+)\s+(?P<pass>forward|backward)\s+(?P<baseline>[\d.]+)\s+[\d.]+\s"
+)
+
+
+def measurements_from_kernel_benchmark_summary(path: Path) -> list[Measurement]:
+    """Parse ``reports/kernel-benchmarks/summary.txt`` from ``benchmark_kernels.py``.
+
+    Fits the baseline column -- ``one_per_block`` in natural order, which is what the simulator
+    reproduces as ``contiguous`` with one vertex per block.
+    """
+    measurements: list[Measurement] = []
+    graph: str | None = None
+    num_nodes = num_edges = 0
+    for line in Path(path).read_text().splitlines():
+        header = _GRAPH_HEADER.match(line)
+        if header:
+            graph, num_nodes, num_edges = header.group(1), 0, 0
+            continue
+        stats = _GRAPH_STATS.match(line)
+        if stats:
+            num_nodes = int(stats.group(1).replace(",", ""))
+            num_edges = int(stats.group(2).replace(",", ""))
+            continue
+        row = _CELL_ROW.match(line)
+        if row and graph and num_edges:
+            measurements.append(
+                Measurement(
+                    conv=row.group("conv"),
+                    pass_name=row.group("pass"),
+                    head_dim=int(row.group("dim")),
+                    graph=graph,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
+                    time_ms=float(row.group("baseline")),
+                )
+            )
+    return measurements
+
+
+def measurements_from_benchmark_json(paths: Iterable[Path]) -> list[Measurement]:
+    """Read records written by ``scripts/benchmark_kernels.py --json-out``.
+
+    Accepts one record per file, a JSON array of records, or a ``.jsonl`` file.
+    """
+    measurements: list[Measurement] = []
+    for path in paths:
+        text = Path(path).read_text()
+        if path.suffix == ".jsonl":
+            records = [json.loads(line) for line in text.splitlines() if line.strip()]
+        else:
+            parsed = json.loads(text)
+            records = parsed if isinstance(parsed, list) else [parsed]
+        for record in records:
+            stats = record.get("graph") or {}
+            missing = [f for f in ("conv", "mode", "head_dim", "ms_per_iter") if record.get(f) is None]
+            if missing or not stats.get("num_edges"):
+                raise ValueError(f"{path}: record is missing {missing or ['graph.num_edges']}")
+            measurements.append(
+                Measurement(
+                    conv=str(record["conv"]),
+                    pass_name=str(record["mode"]),
+                    head_dim=int(record["head_dim"]),
+                    graph=str(record.get("dataset", path.stem)),
+                    num_nodes=int(stats["num_nodes"]),
+                    num_edges=int(stats["num_edges"]),
+                    time_ms=float(record["ms_per_iter"]),
+                )
+            )
+    return measurements
+
+
+def measurements_from_csv(path: Path) -> list[Measurement]:
+    """Read a CSV with columns conv, pass, head_dim, graph, num_nodes, num_edges, time_ms."""
+    with Path(path).open(newline="") as stream:
+        return [
+            Measurement(
+                conv=row["conv"],
+                pass_name=row["pass"],
+                head_dim=int(row["head_dim"]),
+                graph=row.get("graph", "?"),
+                num_nodes=int(row["num_nodes"]),
+                num_edges=int(row["num_edges"]),
+                time_ms=float(row["time_ms"]),
+            )
+            for row in csv.DictReader(stream)
+        ]
