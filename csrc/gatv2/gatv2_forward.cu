@@ -800,7 +800,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize, kGATv2FwdMinBlocks
         // Lane 0 rewrote warp_sum in shared memory and every lane reads it below. A shuffle
         // converges the warp but is not a memory fence; under Volta's independent thread
         // scheduling that ordering has to be established explicitly. (The in-place kernel above
-        // is missing this -- see KERNEL_ISSUES; the same hazard was confirmed in GT forward.)
+        // is missing this, and the same hazard was confirmed in GT forward.)
         __syncwarp();
 
         accum_t *const o_base = part_o + part_base * D_CONST;
