@@ -1673,3 +1673,168 @@ class TestTunableKernelCallAutotune:
         result = kernel(graph_repr, x)
         assert len(kernel.execute_calls) == 1
         assert torch.equal(result, x * 2)
+
+
+# ===================================================================
+# Tests — optuna search strategy
+# ===================================================================
+
+
+class LargeSpaceConv(BaseConvolution):
+    """Kernel-only conv whose 6^3 = 216-config space exceeds the default optuna budget."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.forward_a = 0
+        self.forward_b = 0
+        self.forward_c = 0
+
+    def forward(self, x: torch.Tensor, graph: Any, **kwargs: Any) -> torch.Tensor:
+        return x
+
+    def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+        return [TunableParam(f"forward_{n}", list(range(6)), default=0) for n in "abc"]
+
+    def cost(self) -> float:
+        return 1.0 + (self.forward_a - 2) ** 2 + (self.forward_b - 4) ** 2 + (self.forward_c - 1) ** 2
+
+
+def _make_cost_time_callable(conv: LargeSpaceConv, invalid=lambda c: False):
+    timed: list[float] = []
+
+    def fake(fn, warmup=10, iters=50, do_memory_profile=False):
+        if invalid(conv):
+            raise RuntimeError("invalid launch config")
+        timed.append(conv.cost())
+        return FakeMicrobenchResult(iters=iters, ms_per_iter=timed[-1])
+
+    return fake, timed
+
+
+class TestOptunaStrategy:
+    def test_default_strategy_is_grid(self):
+        assert AutotuneConfig().strategy == "grid"
+
+    def test_unknown_strategy_raises(self):
+        with pytest.raises(ValueError, match="strategy"):
+            AutotuneConfig(strategy="random")
+
+    @patch("src.backends.autotune._microbench")
+    def test_small_space_falls_back_to_grid(self, mock_mb, graph_sample, x_tensor):
+        mock_mb.time_callable, ctr = _make_time_callable_mock([5.0, 2.0, 8.0])
+
+        conv = KernelOnlyConv()
+        result = run_autotune(conv, x_tensor, graph_sample, AutotuneConfig(strategy="optuna", n_trials=3))
+
+        assert ctr["n"] == 3
+        assert result == {"forward_block_size": 128}
+
+    @patch("src.backends.autotune._microbench")
+    def test_respects_trial_budget_and_returns_best_seen(self, mock_mb, graph_sample, x_tensor):
+        pytest.importorskip("optuna")
+        conv = LargeSpaceConv()
+        mock_mb.time_callable, timed = _make_cost_time_callable(conv)
+
+        cfg = AutotuneConfig(strategy="optuna", n_trials=40, seed=0)
+        result = run_autotune(conv, x_tensor, graph_sample, cfg)
+
+        assert 0 < len(timed) <= 40
+        assert set(result) == {"forward_a", "forward_b", "forward_c"}
+        # best config is applied and is the fastest one actually timed
+        assert conv.cost() == min(timed)
+
+    @patch("src.backends.autotune._microbench")
+    def test_finds_optimum(self, mock_mb, graph_sample, x_tensor):
+        pytest.importorskip("optuna")
+        conv = LargeSpaceConv()
+        mock_mb.time_callable, _ = _make_cost_time_callable(conv)
+
+        cfg = AutotuneConfig(strategy="optuna", n_trials=150, seed=0)
+        result = run_autotune(conv, x_tensor, graph_sample, cfg)
+
+        assert result == {"forward_a": 2, "forward_b": 4, "forward_c": 1}
+
+    @patch("src.backends.autotune._microbench")
+    def test_skips_invalid_configs(self, mock_mb, graph_sample, x_tensor):
+        pytest.importorskip("optuna")
+        conv = LargeSpaceConv()
+        mock_mb.time_callable, timed = _make_cost_time_callable(conv, invalid=lambda c: c.forward_a == 2)
+
+        result = run_autotune(conv, x_tensor, graph_sample, AutotuneConfig(strategy="optuna", n_trials=60, seed=0))
+
+        assert timed
+        assert result["forward_a"] != 2
+        assert conv.cost() == min(timed)
+
+    @patch("src.backends.autotune._microbench")
+    def test_logs_trial_where_best_found(self, mock_mb, graph_sample, x_tensor, caplog):
+        conv = LargeSpaceConv()
+        mock_mb.time_callable, timed = _make_cost_time_callable(conv)
+
+        with caplog.at_level("INFO", logger="turbo_gnn._autotune"):
+            run_autotune(conv, x_tensor, graph_sample, AutotuneConfig(strategy="optuna", n_trials=20, seed=0))
+
+        best_unique = timed.index(min(timed)) + 1
+        assert any(
+            r.message.startswith("Optuna search: best")
+            and r.message.endswith(f"(unique config {best_unique}/{len(timed)} timed)")
+            for r in caplog.records
+        )
+
+    @patch("src.backends.autotune._microbench")
+    def test_grid_logs_trial_where_best_found(self, mock_mb, graph_sample, x_tensor, caplog):
+        mock_mb.time_callable, _ = _make_time_callable_mock([5.0, 2.0, 8.0])
+
+        with caplog.at_level("INFO", logger="turbo_gnn._autotune"):
+            run_autotune(KernelOnlyConv(), x_tensor, graph_sample, AutotuneConfig())
+
+        assert "Grid search: best 2.000 ms found at trial 2/3" in caplog.messages
+
+    @patch("src.backends.autotune._microbench")
+    def test_disk_cache_reused(self, mock_mb, graph_sample, x_tensor, tmp_cache_dir):
+        pytest.importorskip("optuna")
+        conv = LargeSpaceConv()
+        mock_mb.time_callable, timed = _make_cost_time_callable(conv)
+
+        cfg = AutotuneConfig(strategy="optuna", n_trials=30, seed=0, cache_dir=tmp_cache_dir)
+        r1 = run_autotune(conv, x_tensor, graph_sample, cfg)
+        n_first = len(timed)
+        r2 = run_autotune(conv, x_tensor, graph_sample, cfg)
+
+        # same seed -> same trials -> all served from the per-trial cache
+        assert len(timed) == n_first
+        assert r1 == r2
+
+    @patch("turbo_gnn._timer.time_callable")
+    def test_inline_autotune_optuna(self, mock_tc, graph_repr):
+        pytest.importorskip("optuna")
+
+        class _LargeKernel(TunableKernel):
+            def __init__(self):
+                super().__init__()
+                self.forward_a = 0
+                self.forward_b = 0
+
+            def _execute(self, graph, x, **kwargs):
+                return x
+
+            def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
+                return [TunableParam(f"forward_{n}", list(range(8)), default=0) for n in "ab"]
+
+        kernel = _LargeKernel()
+        timed: list[float] = []
+
+        def fake(fn, warmup=10, iters=50, do_memory_profile=False):
+            timed.append(1.0 + abs(kernel.forward_a - 5) + abs(kernel.forward_b - 3))
+            return FakeMicrobenchResult(iters=iters, ms_per_iter=timed[-1])
+
+        mock_tc.side_effect = fake
+
+        cfg = AutotuneConfig(strategy="optuna", n_trials=20, seed=0)
+        result = kernel._inline_autotune(torch.randn(100, 16), graph_repr, cfg)
+
+        assert 0 < len(timed) <= 20
+        assert result["graph_repr"] is graph_repr
+        cfg_a, cfg_b = result["kernel_config"]["forward_a"], result["kernel_config"]["forward_b"]
+        assert 1.0 + abs(cfg_a - 5) + abs(cfg_b - 3) == min(timed)
+        assert (kernel.forward_a, kernel.forward_b) == (cfg_a, cfg_b)
