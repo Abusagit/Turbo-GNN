@@ -1,13 +1,26 @@
-from typing import Any, Literal
+import inspect
+from typing import Any, Literal, NamedTuple
 
 import torch
 from torch import nn
 
 from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
+from turbo_gnn._functions import (
+    DEFAULT_BLOCKS_PER_SM,
+    DEFAULT_BUCKET_LAUNCH,
+    DEFAULT_SCHED_CHUNK,
+    DEFAULT_SCHEDULE,
+)
 
 from ..base import BaseAggr, BaseBackend, BaseConvolution
 from ..registry import BackendRegistry
 from .gatv2_aggr.utils import GATv2AggrKernel, gatv2_aggr
+from .gsddmm_aggr.utils import (
+    _GSDDMM_EDGE_PREFILLED_OPS,
+    _GSDDMM_NAME_TO_MEMBER,
+    _GSDDMM_PREFILLED_OPS,
+    GSDDMMKernel,
+)
 from .gt_aggr.utils import GraphTransformerAggrKernel, graph_transformer_aggr
 from .reduction_aggr.utils import ReductionAggrKernel, reduction_aggr
 from .spmm_aggr.utils import spmm_aggr
@@ -15,6 +28,33 @@ from .spmm_aggr.utils import spmm_aggr
 doc = """
 CUDA backend: wraps cuda-written kernels .
 """
+
+
+def _op_kernel_kwargs(op: Any, overrides: dict[str, Any], *, positional: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Every tunable ``op`` accepts, taking the op's own default unless overridden.
+
+    Derived from the signature rather than a hand-maintained allow-list. The list this
+    replaces silently dropped every parameter added after it was written -- the whole
+    pipelining axis (``pipeline_stages``, ``backward_pipeline_stages``) and the whole
+    heavy-slice axis. Those values were still *reported* as applied by the benchmark
+    harness, which reports what was requested, so ``-K pipeline_stages=6`` and every
+    autotuner choice on those axes measured as an exact no-op while looking correct.
+
+    Args:
+        op: The turbo_gnn op whose signature defines the tunable surface.
+        overrides: Construction-time values; anything not named here takes the op default.
+        positional: Parameters the caller passes positionally in ``forward``, which must
+            be left out or the call raises "got multiple values for argument".
+
+    Returns:
+        dict[str, Any]: Keyword arguments to forward to ``op``.
+    """
+    params = inspect.signature(op).parameters
+    return {
+        name: overrides.get(name, prm.default)
+        for name, prm in params.items()
+        if name not in positional and prm.kind is not prm.VAR_KEYWORD and prm.default is not prm.empty
+    }
 
 
 class _CudaSimpleAggrConv(BaseConvolution):
@@ -175,51 +215,76 @@ class _CudaSpMMConv(BaseConvolution):
 
 
 class _CudaSimpleAggr(BaseAggr):
-    """Aggregation-only min/max via turbo_gnn."""
+    """Aggregation-only min/max via turbo_gnn.
+
+    Kernel tuning parameters are accepted here and forwarded to the kernel, so
+    an aggregation-only benchmark can drive them exactly like a direct call.
+    Defaults match ``reduction_aggr``.
+    """
 
     def __init__(self, reduce: str = "min", **kwargs: Any) -> None:
-        super().__init__(conv_type=f"{reduce}_aggr", **kwargs)
+        super().__init__(conv_type=f"{reduce}_aggr")
         self.reduce = reduce
+        # `reduce` is passed explicitly by forward().
+        self.kernel_kwargs = _op_kernel_kwargs(reduction_aggr, kwargs, positional=("reduce",))
 
     def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
-        return reduction_aggr(graph, x, reduce=self.reduce)
+        return reduction_aggr(graph, x, reduce=self.reduce, **{**self.kernel_kwargs, **kwargs})
 
 
 class _CudaGATv2Aggr(BaseAggr):
     """Aggregation-only GATv2 attention via turbo_gnn (no linear projections)."""
 
     def __init__(self, heads: int, head_dim: int, negative_slope: float = 0.2, **kwargs: Any) -> None:
-        super().__init__(conv_type="gat_v2", **kwargs)
+        super().__init__(conv_type="gat_v2")
         self.heads = heads
         self.head_dim = head_dim
         self.negative_slope = negative_slope
         self.attn_weights = nn.Parameter(torch.empty(heads, head_dim))
         nn.init.xavier_normal_(self.attn_weights, gain=nn.init.calculate_gain("relu"))
+        # Forwarded to the kernel; defaults match gatv2_aggr.
+        # `negative_slope` is passed positionally by forward().
+        self.kernel_kwargs = _op_kernel_kwargs(gatv2_aggr, kwargs, positional=("negative_slope",))
 
     def forward(self, x_left: torch.Tensor, x_right: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
-        return gatv2_aggr(graph, x_left, x_right, self.attn_weights.data, self.negative_slope)
+        return gatv2_aggr(
+            graph,
+            x_left,
+            x_right,
+            self.attn_weights.data,
+            self.negative_slope,
+            **{**self.kernel_kwargs, **kwargs},
+        )
 
 
 class _CudaGTAggr(BaseAggr):
     """Aggregation-only graph transformer attention via turbo_gnn (no QKV projection)."""
 
     def __init__(self, heads: int, head_dim: int, **kwargs: Any) -> None:
-        super().__init__(conv_type="gt", **kwargs)
+        super().__init__(conv_type="gt")
         self.heads = heads
         self.head_dim = head_dim
-        self.scale = head_dim**-0.5
+        scale = kwargs.get("scale")
+        self.scale = head_dim**-0.5 if scale is None else scale
+        # Forwarded to the kernel; defaults match graph_transformer_aggr.
+        # `scale` is passed positionally by forward().
+        self.kernel_kwargs = _op_kernel_kwargs(graph_transformer_aggr, kwargs, positional=("scale",))
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
+        # A view, not a copy: the kernel ignores it and only its trailing dim is read.
         x_dummy = Q.view(Q.shape[0], -1)
-        return graph_transformer_aggr(graph, x_dummy, Q, K, V, self.scale)
+        return graph_transformer_aggr(graph, x_dummy, Q, K, V, self.scale, **{**self.kernel_kwargs, **kwargs})
 
 
 class _CudaSpMMAggr(BaseAggr):
     """Aggregation-only SpMM via turbo_gnn."""
 
     def __init__(self, norm_type: str = "none", **kwargs: Any) -> None:
-        super().__init__(conv_type=f"spmm_{norm_type}", **kwargs)
+        super().__init__(conv_type=f"spmm_{norm_type}")
         self.norm_type = norm_type
+        # Forwarded to the kernel; defaults match spmm_aggr.
+        self.cu_sparse_algorithm_id = kwargs.get("cu_sparse_algorithm_id", -1)
+        self.block_dim = kwargs.get("block_dim", 256)
 
     def forward(self, x: torch.Tensor, graph, **kwargs: Any) -> torch.Tensor:
         return spmm_aggr(
@@ -227,9 +292,150 @@ class _CudaSpMMAggr(BaseAggr):
             graph.forward_indptr.int(),
             graph.forward_indices.int(),
             self.norm_type,
-            -1,
-            256,
+            self.cu_sparse_algorithm_id,
+            self.block_dim,
         )
+
+
+# ---------------------------------------------------------------------------
+# Raw turbo_gnn GSDDMM ops
+# ---------------------------------------------------------------------------
+
+#: Suffix marking the edge-parallel (one warp per edge) kernel variant.
+_GSDDMM_EDGE_SUFFIX = "_edge"
+#: Suffix marking the auto-dispatching variant (time both kernels once per graph,
+#: then use the faster one). Benchmark-only spelling: it lets a sweep compare the
+#: dispatcher against either pinned kernel without touching scripts/benchmark.py.
+_GSDDMM_AUTO_SUFFIX = "_auto"
+
+
+class _GsddmmOpSpec(NamedTuple):
+    """Kernel arguments and operand layout behind a DGL-style gsddmm op name."""
+
+    op: str
+    lhs_target: str
+    rhs_target: str
+    edge_variant: bool
+    operand_kinds: tuple[str, ...]
+    variant: str = "node"
+
+
+def is_gsddmm_op(name: str) -> bool:
+    """True if *name* is a turbo_gnn gsddmm op name (incl. ``_edge``/``_auto``)."""
+    if name.endswith(_GSDDMM_AUTO_SUFFIX):
+        name = name[: -len(_GSDDMM_AUTO_SUFFIX)]
+    return name in _GSDDMM_PREFILLED_OPS or name in _GSDDMM_EDGE_PREFILLED_OPS
+
+
+def gsddmm_op_spec(name: str) -> _GsddmmOpSpec:
+    """Parse a turbo_gnn gsddmm op name into the kernel's constructor arguments.
+
+    Recognizes exactly the names :mod:`turbo_gnn.ops` generates — the binary
+    ``{lhs}_{op}_{rhs}`` ops over mixed member pairs (``u_add_v``, ``e_dot_v``,
+    ...), the ``copy_u`` / ``copy_v`` copies, and each of those with an
+    ``_edge`` suffix selecting the edge-parallel kernel. Membership is checked
+    against turbo_gnn's own op tables, so an op the library does not provide
+    is rejected here rather than at launch.
+
+    Args:
+        name (str): Op name, e.g. ``"u_sub_v"``, ``"copy_u"``, ``"e_mul_v_edge"``,
+            ``"u_add_v_auto"``.
+
+    Returns:
+        _GsddmmOpSpec: Op, lhs/rhs targets ("src"/"dst"/"edge"), whether the
+            edge-parallel variant was requested, the operand kinds ("u"/"v":
+            node features [N, D]; "e": edge features [E, D]) in the order the
+            wrapper takes them, and the kernel variant to launch ("node" for a
+            bare name, "edge" for ``_edge``, "auto" for ``_auto``). The consumer
+            (:class:`_CudaGsddmmOp`) pins the backward to the same family:
+            ``_edge`` also means the edge-parallel backward kernel.
+
+    Raises:
+        KeyError: If *name* is not a turbo_gnn gsddmm op, or if ``_edge`` and
+            ``_auto`` are combined (one pins a kernel, the other chooses one).
+    """
+    # "<op>_auto" selects the dispatcher over either pinned kernel; the base name
+    # still has to be a real op, so it is validated below like any other.
+    variant = "node"
+    if name.endswith(_GSDDMM_AUTO_SUFFIX):
+        name, variant = name[: -len(_GSDDMM_AUTO_SUFFIX)], "auto"
+
+    if name in _GSDDMM_EDGE_PREFILLED_OPS:
+        base, edge_variant = name[: -len(_GSDDMM_EDGE_SUFFIX)], True
+        if variant == "auto":
+            raise KeyError(f"gsddmm op {name + _GSDDMM_AUTO_SUFFIX!r}: '_edge' pins a kernel, '_auto' chooses one")
+    elif name in _GSDDMM_PREFILLED_OPS:
+        base, edge_variant = name, False
+    else:
+        raise KeyError(f"Unknown turbo_gnn gsddmm op: {name!r}")
+    if edge_variant:
+        variant = "edge"
+
+    parts = base.split("_")
+    if parts[0] == "copy":
+        # copy_u / copy_v take a single operand; rhs is allocated by the op
+        # wrapper to satisfy the binding's shape check but never read.
+        return _GsddmmOpSpec("copy", _GSDDMM_NAME_TO_MEMBER[parts[1]], "edge", edge_variant, (parts[1],), variant)
+
+    lhs, op, rhs = parts
+    return _GsddmmOpSpec(
+        op, _GSDDMM_NAME_TO_MEMBER[lhs], _GSDDMM_NAME_TO_MEMBER[rhs], edge_variant, (lhs, rhs), variant
+    )
+
+
+class _CudaGsddmmOp(BaseAggr):
+    """Launch a turbo_gnn GSDDMM op directly (no projections).
+
+    ``forward(*operands, graph)`` mirrors the DGL raw-op wrapper so one
+    benchmarking path drives both backends. ``operand_kinds`` describes each
+    operand ("u"/"v": node features [N, D], "e": edge features [E, D]) so
+    callers can generate matching inputs; ``copy_*`` takes a single operand.
+
+    Feature dim D must be one of 32, 64, 128, 256, and both operands must
+    share a dtype (float32, float16 or bfloat16) — the kernels dispatch on it.
+
+    Differentiable: ``forward`` routes through ``GSDDMMKernel.forward``, so the
+    output carries a ``grad_fn`` and ``--mode backward`` times the reduction
+    kernels. The name suffix pins a kernel *family* used in both directions --
+    a bare name runs the CSR node-block kernel forward and the node-parallel
+    (deterministic, no atomics) backward; ``_edge`` runs the edge-parallel
+    kernel forward, in canonical CSR edge order, and the edge-parallel
+    (load-balanced, fp32 atomics) backward; ``_auto`` dispatches the forward
+    between the two and keeps the default node-parallel backward.
+
+    ``_edge`` is therefore *not* the legacy traversal-order ``gsddmm_edge``:
+    these two launch identically whenever an operand reads the destination
+    vertex, and differ only by the canonical-id remap on the no-``dst`` ops over
+    directed graphs -- the numbering the backward needs anyway. The legacy
+    numbering cannot serve ``--mode backward`` (its ``d_out`` would be
+    CSC-ordered while the backward kernels read by forward-CSR position), which
+    is why the sweep rows now measure the canonical edge kernel.
+    """
+
+    def __init__(self, op: str, **kwargs: Any) -> None:
+        super().__init__(conv_type=op)
+        spec = gsddmm_op_spec(op)
+        self.op = op
+        self.operand_kinds = spec.operand_kinds
+        self.edge_variant = spec.edge_variant
+        self.variant = spec.variant
+        # The suffix pins the family for BOTH passes: "node" for a bare name,
+        # "edge" for "_edge" (canonical output -- see the class docstring), and
+        # "_auto" benchmarks the forward dispatcher with the default backward.
+        self.kernel = GSDDMMKernel(
+            op=spec.op,
+            lhs_target=spec.lhs_target,
+            rhs_target=spec.rhs_target,
+            variant=spec.variant,
+            backward_variant="edge" if spec.edge_variant else "node",
+            **kwargs,
+        )
+
+    def forward(self, *args: Any) -> torch.Tensor:
+        """Run the op; the last positional argument must be the graph."""
+        *operands, graph = args
+        rhs = operands[1] if len(operands) > 1 else None
+        return self.kernel.forward(graph, operands[0], rhs)
 
 
 @BackendRegistry.register_backend("cuda")
@@ -267,7 +473,7 @@ class CUDABackend(BaseBackend):
                     **kwargs,
                 )
             case "max_aggr":
-                return _CudaSimpleAggrConv(
+                conv = _CudaSimpleAggrConv(
                     aggr_type="max",
                     **kwargs,
                 )
@@ -275,19 +481,19 @@ class CUDABackend(BaseBackend):
                 heads = kwargs.pop("heads")
                 conv = _CudaGraphTransformerConv(feature_dim=feature_dim, heads=heads, **kwargs)
             case "sum_aggr":
-                return _CudaSpMMConv(
+                conv = _CudaSpMMConv(
                     norm_type="none",
                     cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
                     block_dim=kwargs.get("block_dim", 256),
                 )
             case "mean_aggr":
-                return _CudaSpMMConv(
+                conv = _CudaSpMMConv(
                     norm_type="right",
                     cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
                     block_dim=kwargs.get("block_dim", 256),
                 )
             case "gcn":
-                return _CudaSpMMConv(
+                conv = _CudaSpMMConv(
                     norm_type="both",
                     cu_sparse_algorithm_id=kwargs.get("cu_sparse_algorithm_id", -1),
                     block_dim=kwargs.get("block_dim", 256),
@@ -301,6 +507,15 @@ class CUDABackend(BaseBackend):
         return conv
 
     def create_aggr(self, conv_type: str, **kwargs: Any) -> BaseAggr:
+        """Factory for CUDA aggregation-only callables.
+
+        Besides the named aggregations (min_aggr, gcn, gat_v2, ...), any
+        turbo_gnn gsddmm op name (u_add_v, e_dot_v, copy_u, and their
+        ``_edge`` edge-parallel variants) is launched directly.
+
+        Remaining kwargs are kernel tuning parameters and are forwarded to the
+        aggregation, which passes them on to the turbo_gnn kernel.
+        """
         feature_dim = kwargs.pop("feature_dim", None)
         ct = conv_type.lower()
         match ct:
@@ -312,14 +527,19 @@ class CUDABackend(BaseBackend):
                 head_dim = feature_dim // heads
                 return _CudaGTAggr(heads=heads, head_dim=head_dim, **kwargs)
             case "min_aggr":
-                return _CudaSimpleAggr(reduce="min")
+                return _CudaSimpleAggr(reduce="min", **kwargs)
             case "max_aggr":
-                return _CudaSimpleAggr(reduce="max")
+                return _CudaSimpleAggr(reduce="max", **kwargs)
             case "sum_aggr":
-                return _CudaSpMMAggr(norm_type="none")
+                return _CudaSpMMAggr(norm_type="none", **kwargs)
             case "mean_aggr":
-                return _CudaSpMMAggr(norm_type="right")
+                return _CudaSpMMAggr(norm_type="right", **kwargs)
             case "gcn":
-                return _CudaSpMMAggr(norm_type="both")
+                return _CudaSpMMAggr(norm_type="both", **kwargs)
             case _:
+                # Raw turbo_gnn gsddmm ops, launched directly (no wrappers).
+                if is_gsddmm_op(ct):
+                    # gsddmm is head-agnostic: it works on the flat [*, D] rows.
+                    kwargs.pop("heads", None)
+                    return _CudaGsddmmOp(ct, **kwargs)
                 raise KeyError(f"Unsupported conv_type for CUDA aggr: {conv_type}")
