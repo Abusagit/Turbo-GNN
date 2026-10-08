@@ -173,6 +173,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--autotune-warmup", type=int, default=5, help="Warmup iters for each autotune grid-search trial.")
     p.add_argument("--autotune-iters", type=int, default=15, help="Timed iters for each autotune grid-search trial.")
+    p.add_argument(
+        "--autotune-strategy",
+        type=str,
+        default="grid",
+        choices=["grid", "optuna"],
+        help="Autotune search strategy: exhaustive grid or Optuna TPE sampling.",
+    )
+    p.add_argument("--autotune-n-trials", type=int, default=50, help="Trial budget for --autotune-strategy optuna.")
     return p.parse_args()
 
 
@@ -350,6 +358,8 @@ def main() -> int:
                     iters=args.autotune_iters,
                     tune_backward=(args.mode == "backward"),
                     cache_dir=None,
+                    strategy=args.autotune_strategy,
+                    n_trials=args.autotune_n_trials,
                 )
                 autotuned_config = conv.autotune(x, sample, config=tune_cfg)
                 graph = sample.graph_repr
