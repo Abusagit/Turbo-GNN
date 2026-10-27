@@ -89,7 +89,7 @@ def test_copy_ops_are_faithful(bridge, op_name, n, dtype_name):
     dt = TORCH_DTYPE[dtype_name]
     m = 64
 
-    src = torch.arange(1, m * n + 1, dtype=torch.float64).reshape(m, n).to(dt).to(dev)
+    src = torch.arange(1, m * n + 1, dtype=torch.float64, device=dev).reshape(m, n).to(dt)
     dst = torch.zeros((m, n), dtype=dt, device=dev)
 
     _run(mod, op_name, n, dst, src)

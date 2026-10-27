@@ -268,7 +268,8 @@ torch::Tensor gsddmm_forward_edge_blocks(
                              : torch::empty({static_cast<int64_t>(E), static_cast<int64_t>(D)}, L.options());
 
     TORCH_CHECK(
-        D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward (edge blocks): unsupported feature dim D=", D, "; supported: 32, 64, 128, 256"
+        D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward (edge blocks): unsupported feature dim D=", D,
+        "; supported: 32, 64, 128, 256"
     );
 
     TORCH_CHECK(pipeline_stages <= 3, "GSDDMM forward (edge blocks): pipeline_stages must be in [0, 3], got ", pipeline_stages);
@@ -670,7 +671,8 @@ torch::Tensor gsddmm_forward_edge_blocks(
     uint32_t pipeline_stages,
     uint32_t edges_per_warp,
     uint32_t warps_per_block,
-    std::optional<torch::Tensor> canonical_edge_idx
+    std::optional<torch::Tensor>
+        canonical_edge_idx
 ) {
     return gsddmm::gsddmm_forward_edge_blocks(
         std::move(L), std::move(R), std::move(edge_list), std::move(op), std::move(lhs_target), std::move(rhs_target), N, pipeline_stages,
@@ -693,7 +695,8 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
     torch::Tensor heavy_nodes,
     torch::Tensor light_nodes_T,
     torch::Tensor heavy_nodes_T,
-    std::optional<torch::Tensor> canonical_edge_idx,
+    std::optional<torch::Tensor>
+        canonical_edge_idx,
     uint32_t light_warps_per_block,
     uint32_t heavy_warps_per_block
 ) {
@@ -709,8 +712,10 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     torch::Tensor R,
     torch::Tensor dO,
     torch::Tensor edge_list_dst,
-    std::optional<torch::Tensor> edge_list_src,
-    std::optional<torch::Tensor> canonical_edge_idx,
+    std::optional<torch::Tensor>
+        edge_list_src,
+    std::optional<torch::Tensor>
+        canonical_edge_idx,
     std::string op,
     std::string lhs_target,
     std::string rhs_target,

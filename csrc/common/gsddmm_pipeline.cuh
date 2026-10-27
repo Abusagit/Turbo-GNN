@@ -175,7 +175,9 @@ __device__ __forceinline__ void async_copy_slice_thread(cuda_t *dst, const cuda_
 // dbuf: this warp's private shared scratch,
 //       pipelined_ring_elems(NUM_STAGES, NUM_ROWS, D_CONST, EARLY_RELEASE) elements.
 // =============================================================================
-template <size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, bool EARLY_RELEASE = false, typename AddrFn, typename ConsumeFn>
+template <
+    size_t D_CONST, size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, bool EARLY_RELEASE = false, typename AddrFn, typename ConsumeFn
+>
 __device__ __forceinline__ void pipelined_row_loop(
     size_t lane, uint32_t loop_iters, cuda_t *__restrict__ dbuf, AddrFn&& addr, ConsumeFn&& consume
 ) {
@@ -322,10 +324,10 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
     };
 
     if constexpr (EARLY_RELEASE) {
-        auto consume_it = [&](uint32_t it, cuda_t const *const (&rows)[NUM_ROWS], auto&& release) { consume(neighbor_of(it), rows, release); };
+        auto consume_it = [&](uint32_t it, cuda_t const *const(&rows)[NUM_ROWS], auto&& release) { consume(neighbor_of(it), rows, release); };
         pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t, true>(lane, loop_iters, dbuf, addr, consume_it);
     } else {
-        auto consume_it = [&](uint32_t it, cuda_t const *const (&rows)[NUM_ROWS]) { consume(neighbor_of(it), rows); };
+        auto consume_it = [&](uint32_t it, cuda_t const *const(&rows)[NUM_ROWS]) { consume(neighbor_of(it), rows); };
         pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t, false>(lane, loop_iters, dbuf, addr, consume_it);
     }
 }

@@ -135,7 +135,7 @@ def test_write_row_copies_the_whole_row(bridge, src_name, dst_name, row_width, w
     device = torch.device("cuda")
     slack = 64
 
-    src = (torch.arange(1, row_width + 1, dtype=torch.float64) / 8.0).to(TORCH_DTYPE[src_name]).to(device)
+    src = (torch.arange(1, row_width + 1, dtype=torch.float64, device=device) / 8.0).to(TORCH_DTYPE[src_name])
     out = mod.write_row_run(row_width, worker_cnt, src, DST_CODE[dst_name], row_width + slack)
 
     want = src.to(TORCH_DTYPE[dst_name])
@@ -161,7 +161,7 @@ def test_write_row_does_not_overrun_a_ragged_row(bridge, src_name, dst_name):
     device = torch.device("cuda")
     slack = 64
 
-    src = (torch.arange(1, row_width + 1, dtype=torch.float64) / 8.0).to(TORCH_DTYPE[src_name]).to(device)
+    src = (torch.arange(1, row_width + 1, dtype=torch.float64, device=device) / 8.0).to(TORCH_DTYPE[src_name])
     # The source must be readable for the whole final tile, or the kernel reads OOB on
     # its own account; pad it so the only thing under test is the *write* extent.
     padded = torch.zeros(row_width + copy_n, dtype=TORCH_DTYPE[src_name], device=device)

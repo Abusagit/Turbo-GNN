@@ -238,7 +238,8 @@ struct GsddmmBackwardPlan {
 
     // The reduced operand's own row is needed by Div's -1/self^2 factor and by
     // the edge operand's gradient (where the node row is its "other" operand).
-    static constexpr bool KEEP_SELF_ROW = NEEDS_SELF_ROW || (WRITE_EDGE_GRAD && (op == GSDDMM_OP::Mul || op == GSDDMM_OP::Div || op == GSDDMM_OP::Dot));
+    static constexpr bool KEEP_SELF_ROW =
+        NEEDS_SELF_ROW || (WRITE_EDGE_GRAD && (op == GSDDMM_OP::Mul || op == GSDDMM_OP::Div || op == GSDDMM_OP::Dot));
 
     // Rows the edge-parallel backward gathers PER EDGE, and so the width of its
     // cp.async ring: the edge's dO row -- Dot's dO is one scalar per edge, not a
@@ -278,7 +279,10 @@ inline consteval size_t gsddmm_backward_shmem_bytes() {
 // The flush row comes first and is a multiple of 16 bytes (D_CONST >= 32,
 // sizeof(accum_t) >= 4), so the ring stays 16-byte aligned for cp.async and the
 // per-warp stride does too.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
+template <
+    GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t,
+    uint8_t PIPELINE_STAGES
+>
 inline consteval size_t gsddmm_backward_edge_shmem_bytes_per_warp() {
     using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
     return D_CONST * sizeof(accum_t) + gsddmm_pipe::pipelined_ring_elems(PIPELINE_STAGES, Plan::NUM_EDGE_ROWS, D_CONST) * sizeof(cuda_t);

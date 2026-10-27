@@ -1,3 +1,21 @@
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_default_device():
+    """Undo any ``torch.set_default_device`` a test leaves behind.
+
+    A leaked default device silently changes where later tests allocate: the
+    tests/csrc suite, for one, fails when CUDA leaks into its CPU-generator draws.
+    """
+    import torch
+
+    prev = torch.get_default_device()
+    yield
+    # None removes the global DeviceContext entirely; "cpu" would leave one installed.
+    torch.set_default_device(None if prev.type == "cpu" else prev)
+
+
 def pytest_make_parametrize_id(config, val, argname):
     """Generate short, readable IDs for parametrized test values."""
     import torch

@@ -77,8 +77,8 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
                 );
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
-            MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-            warp_variant, MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
+            MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)), warp_variant,
+            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
         );
     };
 
@@ -142,7 +142,7 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             // The remap flag as a template parameter: the no-remap instantiation
             // compiles the canonical-id select away entirely. See the kernel body
             // for why a runtime flag here cost 20%+ of the whole kernel.
-            constexpr bool REMAP_IDS   = decltype(remap_c)::value != 0;
+            constexpr bool REMAP_IDS = decltype(remap_c)::value != 0;
 
             cuda_t const *L_ptr = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
             cuda_t const *R_ptr = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
@@ -178,8 +178,7 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
         },
         lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
         MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-        MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
-        MakeIntVariant<0, 1>(args.canonical_edge_idx != nullptr ? 1 : 0)
+        MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages), MakeIntVariant<0, 1>(args.canonical_edge_idx != nullptr ? 1 : 0)
     );
 }
 
@@ -247,8 +246,7 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
                 }
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
-            MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-            warp_variant
+            MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)), warp_variant
         );
     };
 
@@ -282,19 +280,19 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
 
         std::visit(
             [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto stages_c, auto remap_c) {
-                constexpr GSDDMM_OP OP         = decltype(lro_c)::value.op;
-                constexpr GSDDMM_MEMBER LL     = decltype(lro_c)::value.l;
-                constexpr GSDDMM_MEMBER RR     = decltype(lro_c)::value.r;
+                constexpr GSDDMM_OP OP          = decltype(lro_c)::value.op;
+                constexpr GSDDMM_MEMBER LL      = decltype(lro_c)::value.l;
+                constexpr GSDDMM_MEMBER RR      = decltype(lro_c)::value.r;
                 constexpr GSDDMM_REDUCE REDUCE_ = decltype(reduce_c)::value;
-                using Plan                     = GsddmmBackwardPlan<OP, LL, RR, REDUCE_>;
+                using Plan                      = GsddmmBackwardPlan<OP, LL, RR, REDUCE_>;
 
                 if constexpr (Plan::HAS_SELF) {
-                    using index_t         = typename decltype(idxInfo)::Type;
-                    using pair_t          = index_pair_t<index_t>;
-                    using torch_t         = typename decltype(typeInfo)::TorchType;
-                    using cuda_t          = typename decltype(typeInfo)::CudaType;
-                    constexpr size_t DC   = decltype(d_c)::value;
-                    constexpr int STAGES  = decltype(stages_c)::value;
+                    using index_t        = typename decltype(idxInfo)::Type;
+                    using pair_t         = index_pair_t<index_t>;
+                    using torch_t        = typename decltype(typeInfo)::TorchType;
+                    using cuda_t         = typename decltype(typeInfo)::CudaType;
+                    constexpr size_t DC  = decltype(d_c)::value;
+                    constexpr int STAGES = decltype(stages_c)::value;
                     // The remap flag as a template parameter; see the forward dispatch.
                     constexpr bool REMAP_IDS = decltype(remap_c)::value != 0;
 
@@ -338,8 +336,7 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
             MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
-            MakeIntVariant<0, 1>(canonical != nullptr ? 1 : 0)
+            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages), MakeIntVariant<0, 1>(canonical != nullptr ? 1 : 0)
         );
     };
 

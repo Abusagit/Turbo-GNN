@@ -39,7 +39,7 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
     int heavy_pipeline_stages
 ) {
     at::cuda::CUDAGuard device_guard(Q.device());
-    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(Q.device().index());
+    at::cuda::CUDAStream stream          = at::cuda::getCurrentCUDAStream(Q.device().index());
     namespace sched_ns                   = turbo_gnn::sched;
     const sched_ns::ScheduleKind SK_KIND = sched_ns::schedule_from_int(schedule);
 
@@ -83,8 +83,8 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
     at::Tensor sched_counters = sched_ns::make_counters(SK_KIND, static_cast<int>(H), /*num_launches=*/2, Q.device());
     int bucket_id             = 0;
 
-    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
-                             at::cuda::CUDAStream bucket_stream, int bucket_stages) {
+    auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant, at::cuda::CUDAStream bucket_stream,
+                             int bucket_stages) {
         const int this_bucket = bucket_id++;
         if (num_nodes_bucket == 0) return;
         // Guarded so the host-side prep below allocates on this bucket's stream too.
@@ -101,12 +101,12 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
 
         std::visit(
             [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c, auto stages_c) {
-                using index_t       = typename decltype(idxInfo)::Type;
-                using torch_t       = typename decltype(typeInfo)::TorchType;
-                using cuda_t        = typename decltype(typeInfo)::CudaType;
-                constexpr size_t DC = decltype(d_c)::value;
-                constexpr size_t W  = decltype(warp_c)::value;
-                constexpr auto SK   = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+                using index_t        = typename decltype(idxInfo)::Type;
+                using torch_t        = typename decltype(typeInfo)::TorchType;
+                using cuda_t         = typename decltype(typeInfo)::CudaType;
+                constexpr size_t DC  = decltype(d_c)::value;
+                constexpr size_t W   = decltype(warp_c)::value;
+                constexpr auto SK    = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
                 constexpr int STAGES = decltype(stages_c)::value;
 
                 cuda_t const *Q_ptr = reinterpret_cast<const cuda_t *>(Q.data_ptr<torch_t>());
@@ -121,26 +121,26 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
                 constexpr int y_dim = std::max(std::min(W, kMaxThreadsInBlock / (x_dim)), 1ul);
                 dim3 threads(x_dim, y_dim);
 
-                // k_shared + qv_dbuf (2 rows, STAGES == 0 makes this term vanish) + neighbor_out + warp_sum_storage + neighbor_max + neighbor_sum
+                // k_shared + qv_dbuf (2 rows, STAGES == 0 makes this term vanish) + neighbor_out + warp_sum_storage + neighbor_max +
+                // neighbor_sum
                 size_t shmem = DC * sizeof(cuda_t) + y_dim * 2 * STAGES * DC * sizeof(cuda_t) + y_dim * DC * sizeof(float) +
                                2 * y_dim * sizeof(float) + y_dim * sizeof(float) * 2;
 
                 auto sp = sched_ns::make_params<index_t>(
-                    SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H),
-                    this_bucket, offs, sched_chunk
+                    SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs,
+                    sched_chunk
                 );
 
                 ensure_dynamic_shmem(GraphAttentionForward_CSR_MH_v2_D<SK, y_dim, DC, cuda_t, index_t, float, STAGES>, shmem, "GT forward");
 
                 GraphAttentionForward_CSR_MH_v2_D<SK, y_dim, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, shmem, stream>>>(
                     N, H, Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1],
-                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), sp, O_ptr, o_strides[0],
-                    o_strides[1], lse.data_ptr<float>(), scale
+                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), sp, O_ptr, o_strides[0], o_strides[1], lse.data_ptr<float>(),
+                    scale
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(D), warp_variant, MakeIntVariant<0>(schedule),
-            MakeIntVariant<0, 2, 6, 12>(bucket_stages)
+            MakeIntVariant<32, 64, 128, 256>(D), warp_variant, MakeIntVariant<0>(schedule), MakeIntVariant<0, 2, 6, 12>(bucket_stages)
         );
     };
 
@@ -167,7 +167,7 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
 
         std::visit(
             [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto stages_c) {
-                using index_t       = typename decltype(idxInfo)::Type;
+                using index_t        = typename decltype(idxInfo)::Type;
                 using torch_t        = typename decltype(typeInfo)::TorchType;
                 using cuda_t         = typename decltype(typeInfo)::CudaType;
                 constexpr size_t DC  = decltype(d_c)::value;
@@ -186,26 +186,23 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
                 dim3 blocks(num_slices, H);
 
                 // k_shared + qv_dbuf (STAGES == 0 makes this term vanish) + y_dim * D float + 2 * y_dim float
-                size_t shmem = DC * sizeof(cuda_t) + y_dim * 2 * STAGES * DC * sizeof(cuda_t) + y_dim * DC * sizeof(float) +
-                               2 * y_dim * sizeof(float);
+                size_t shmem =
+                    DC * sizeof(cuda_t) + y_dim * 2 * STAGES * DC * sizeof(cuda_t) + y_dim * DC * sizeof(float) + 2 * y_dim * sizeof(float);
 
                 ensure_dynamic_shmem(
                     GraphAttentionForwardSlice_CSR_MH_D<y_dim, DC, cuda_t, index_t, float, STAGES>, shmem, "GT forward (slice)"
                 );
 
-                GraphAttentionForwardSlice_CSR_MH_D<y_dim, DC, cuda_t, index_t, float, STAGES>
-                    <<<blocks, threads, shmem, bucket_stream>>>(
+                GraphAttentionForwardSlice_CSR_MH_D<y_dim, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, shmem, bucket_stream>>>(
                     N, H, Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1],
-                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(heavy_nodes),
-                    chunk_node.data_ptr<int>(), chunk_start.data_ptr<int>(), heavy_edge_slice, num_slices,
-                    part_o.data_ptr<float>(), part_ml.data_ptr<float>(), scale
+                    index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), index_ptr<index_t>(heavy_nodes), chunk_node.data_ptr<int>(),
+                    chunk_start.data_ptr<int>(), heavy_edge_slice, num_slices, part_o.data_ptr<float>(), part_ml.data_ptr<float>(), scale
                 );
 
                 dim3 merge_blocks(num_heavy, H);
                 GraphAttentionMergeSlices_D<DC, cuda_t, index_t><<<merge_blocks, kWarpSize, 0, bucket_stream>>>(
                     H, index_ptr<index_t>(row_ptr), index_ptr<index_t>(heavy_nodes), node_chunk_offset.data_ptr<int>(),
-                    part_o.data_ptr<float>(), part_ml.data_ptr<float>(), O_ptr, o_strides[0], o_strides[1],
-                    lse.data_ptr<float>(), num_heavy
+                    part_o.data_ptr<float>(), part_ml.data_ptr<float>(), O_ptr, o_strides[0], o_strides[1], lse.data_ptr<float>(), num_heavy
                 );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
@@ -217,15 +214,13 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
     stream_ns::run_buckets(
         buckets,
         [&](at::cuda::CUDAStream st) {
-            launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st,
-                          pipeline_stages);
+            launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st, pipeline_stages);
         },
         [&](at::cuda::CUDAStream st) {
             if (heavy_edge_slice > 0) {
                 launch_heavy_split(st);
             } else {
-                launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st,
-                              heavy_pipeline_stages);
+                launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st, heavy_pipeline_stages);
             }
         }
     );
@@ -378,8 +373,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
                     spD, dO_ptr, O_ptr, Delta.data_ptr<float>(), N, H, stride_do_n, stride_do_h, stride_o_n, stride_o_h
                 );
             },
-            MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(D),
-            MakeIntVariant<0>(schedule)
+            MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>(D), MakeIntVariant<0>(schedule)
         );
     }
 
@@ -397,8 +391,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
     if (is_directed) {
         // Directed path: warp-parallel bucketed backward using CSR^T
         int bucket_id      = 1;  // rows 1 and 2 of the counter slab
-        auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant,
-                                 at::cuda::CUDAStream bucket_stream, int bucket_stages) {
+        auto launch_bucket = [&](torch::Tensor& node_indices, int num_nodes_bucket, auto warp_variant, at::cuda::CUDAStream bucket_stream,
+                                 int bucket_stages) {
             const int this_bucket = bucket_id++;
             if (num_nodes_bucket == 0) return;
             at::cuda::CUDAStreamGuard guard(bucket_stream);
@@ -412,12 +406,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
 
             std::visit(
                 [&](auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto sched_c, auto stages_c) {
-                    using index_t     = typename decltype(idxInfo)::Type;
-                    using torch_t     = typename decltype(typeInfo)::TorchType;
-                    using cuda_t      = typename decltype(typeInfo)::CudaType;
-                    constexpr int DC  = decltype(d_c)::value;
-                    constexpr int W   = decltype(warp_c)::value;
-                    constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+                    using index_t        = typename decltype(idxInfo)::Type;
+                    using torch_t        = typename decltype(typeInfo)::TorchType;
+                    using cuda_t         = typename decltype(typeInfo)::CudaType;
+                    constexpr int DC     = decltype(d_c)::value;
+                    constexpr int W      = decltype(warp_c)::value;
+                    constexpr auto SK    = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
                     constexpr int STAGES = decltype(stages_c)::value;
 
                     auto cuda_stream = at::cuda::getDefaultCUDAStream();
@@ -433,26 +427,26 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
                     // qj + vj (read-only) + ki_dOi_dbuf (2 rows, STAGES == 0 makes this term vanish) + W * (gq + gv) per-warp accumulators
                     size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + W * 2 * STAGES * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
 
-                    ensure_dynamic_shmem(graph_attn_backward_csrT_kernel_D<SK, W, DC, cuda_t, index_t, float, STAGES>, shmem_bwd, "GT backward (directed)");
+                    ensure_dynamic_shmem(
+                        graph_attn_backward_csrT_kernel_D<SK, W, DC, cuda_t, index_t, float, STAGES>, shmem_bwd, "GT backward (directed)"
+                    );
 
                     dim3 blocks(gx, H);
                     dim3 threads(W * kWarpSize);
 
                     auto sp = sched_ns::make_params<index_t>(
-                        SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H),
-                        this_bucket, offs, sched_chunk
+                        SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs,
+                        sched_chunk
                     );
 
                     graph_attn_backward_csrT_kernel_D<SK, W, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, shmem_bwd, cuda_stream>>>(
-                        N, H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), sp, Q_ptr, K_ptr,
-                        V_ptr, q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr,
-                        logsumexp.data_ptr<float>(), Delta.data_ptr<float>(), scale, dQ_ptr, dK_ptr, dV_ptr
+                        N, H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), sp, Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1],
+                        k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr, logsumexp.data_ptr<float>(), Delta.data_ptr<float>(),
+                        scale, dQ_ptr, dK_ptr, dV_ptr
                     );
                 },
-                MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant,
-                MakeIntVariant<0>(schedule),
-                MakeIntVariant<0, 2, 6, 12>(bucket_stages)
+                MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
+                MakeIntVariant<32, 64, 128, 256>((int)D), warp_variant, MakeIntVariant<0>(schedule), MakeIntVariant<0, 2, 6, 12>(bucket_stages)
             );
         };
 
@@ -493,33 +487,27 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
                     float *dK_ptr        = dK_f32.data_ptr<float>();
 
                     // qj + vj + ki_dOi_dbuf (STAGES == 0 makes this term vanish) + W * 2 * D float
-                    size_t shmem_bwd =
-                        2 * DC * sizeof(cuda_t) + W * 2 * STAGES * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
+                    size_t shmem_bwd = 2 * DC * sizeof(cuda_t) + W * 2 * STAGES * DC * sizeof(cuda_t) + W * 2 * DC * sizeof(float);
 
                     ensure_dynamic_shmem(
-                        graph_attn_backward_csrT_slice_kernel_D<W, DC, cuda_t, index_t, float, STAGES>, shmem_bwd,
-                        "GT backward (slice)"
+                        graph_attn_backward_csrT_slice_kernel_D<W, DC, cuda_t, index_t, float, STAGES>, shmem_bwd, "GT backward (slice)"
                     );
 
                     graph_attn_backward_csrT_slice_kernel_D<W, DC, cuda_t, index_t, float, STAGES>
                         <<<dim3(num_slices, H), dim3(W * kWarpSize), shmem_bwd, cuda_stream>>>(
-                            N, H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
-                            index_ptr<index_t>(heavy_nodes), chunk_node.data_ptr<int>(), chunk_start.data_ptr<int>(),
-                            heavy_edge_slice, num_slices, Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1],
-                            k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr,
-                            logsumexp.data_ptr<float>(), Delta.data_ptr<float>(), scale,
-                            part_gq.data_ptr<float>(), part_gv.data_ptr<float>(), dK_ptr
+                            N, H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), index_ptr<index_t>(heavy_nodes),
+                            chunk_node.data_ptr<int>(), chunk_start.data_ptr<int>(), heavy_edge_slice, num_slices, Q_ptr, K_ptr, V_ptr,
+                            q_strides[0], q_strides[1], k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr,
+                            logsumexp.data_ptr<float>(), Delta.data_ptr<float>(), scale, part_gq.data_ptr<float>(), part_gv.data_ptr<float>(),
+                            dK_ptr
                         );
 
-                    graph_attn_backward_merge_slices_D<DC, cuda_t, index_t>
-                        <<<dim3(num_heavy, H), kWarpSize, 0, cuda_stream>>>(
-                            H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(heavy_nodes),
-                            node_chunk_offset.data_ptr<int>(), part_gq.data_ptr<float>(), part_gv.data_ptr<float>(),
-                            dQ_ptr, dV_ptr, num_heavy
-                        );
+                    graph_attn_backward_merge_slices_D<DC, cuda_t, index_t><<<dim3(num_heavy, H), kWarpSize, 0, cuda_stream>>>(
+                        H, index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(heavy_nodes), node_chunk_offset.data_ptr<int>(),
+                        part_gq.data_ptr<float>(), part_gv.data_ptr<float>(), dQ_ptr, dV_ptr, num_heavy
+                    );
                 },
-                MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
-                MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
+                MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
                 MakeIntVariant<32, 64, 128, 256>((int)D), MakeIntVariant<8, 16, 32>(heavy_warps_per_block),
                 MakeIntVariant<0, 2, 6, 12>(backward_heavy_pipeline_stages)
             );
@@ -528,15 +516,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
         stream_ns::run_buckets(
             buckets,
             [&](at::cuda::CUDAStream st) {
-                launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st,
-                              pipeline_stages);
+                launch_bucket(light_nodes, light_nodes.numel(), MakeIntVariant<1, 2, 4>(light_warps_per_block), st, pipeline_stages);
             },
             [&](at::cuda::CUDAStream st) {
                 if (heavy_edge_slice > 0) {
                     launch_heavy_split(st);
                 } else {
-                    launch_bucket(heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st,
-                                  backward_heavy_pipeline_stages);
+                    launch_bucket(
+                        heavy_nodes, heavy_nodes.numel(), MakeIntVariant<8, 16, 32>(heavy_warps_per_block), st, backward_heavy_pipeline_stages
+                    );
                 }
             }
         );
@@ -544,11 +532,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
         // Undirected path: forward CSR, no atomics, no bucketing
         std::visit(
             [&](auto idxInfo, auto typeInfo, auto d_c, auto sched_c, auto stages_c) {
-                using index_t     = typename decltype(idxInfo)::Type;
-                using torch_t     = typename decltype(typeInfo)::TorchType;
-                using cuda_t      = typename decltype(typeInfo)::CudaType;
-                constexpr int DC  = decltype(d_c)::value;
-                constexpr auto SK = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
+                using index_t        = typename decltype(idxInfo)::Type;
+                using torch_t        = typename decltype(typeInfo)::TorchType;
+                using cuda_t         = typename decltype(typeInfo)::CudaType;
+                constexpr int DC     = decltype(d_c)::value;
+                constexpr auto SK    = static_cast<sched_ns::ScheduleKind>(decltype(sched_c)::value);
                 constexpr int STAGES = decltype(stages_c)::value;
 
                 auto cuda_stream = at::cuda::getDefaultCUDAStream();
@@ -565,7 +553,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
                 size_t shmem_bwd = 3 * DC * sizeof(cuda_t) + 4 * STAGES * DC * sizeof(cuda_t) + 3 * DC * sizeof(float);
 
                 ensure_dynamic_shmem(
-                    graph_attn_backward_fwd_csr_undirected_kernel_D<SK, DC, cuda_t, index_t, float, STAGES>, shmem_bwd, "GT backward (undirected)"
+                    graph_attn_backward_fwd_csr_undirected_kernel_D<SK, DC, cuda_t, index_t, float, STAGES>, shmem_bwd,
+                    "GT backward (undirected)"
                 );
 
                 const int gxU = sched_ns::persistent_grid_x(SK_KIND, static_cast<int>(N), blocks_per_sm, static_cast<int>(H), sched_chunk);
@@ -582,14 +571,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
 
                 graph_attn_backward_fwd_csr_undirected_kernel_D<SK, DC, cuda_t, index_t, float, STAGES>
                     <<<blocks_bwd, threads_bwd, shmem_bwd, cuda_stream>>>(
-                    spU, N, H, index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1],
-                    k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr, logsumexp.data_ptr<float>(), Delta.data_ptr<float>(), scale,
-                    dQ_ptr, dK_ptr, dV_ptr
-                );
+                        spU, N, H, index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx), Q_ptr, K_ptr, V_ptr, q_strides[0], q_strides[1],
+                        k_strides[0], k_strides[1], v_strides[0], v_strides[1], dO_ptr, logsumexp.data_ptr<float>(), Delta.data_ptr<float>(),
+                        scale, dQ_ptr, dK_ptr, dV_ptr
+                    );
             },
             MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
-            MakeIntVariant<32, 64, 128, 256>(D), MakeIntVariant<0>(schedule),
-            MakeIntVariant<0, 2, 6, 12>(pipeline_stages)
+            MakeIntVariant<32, 64, 128, 256>(D), MakeIntVariant<0>(schedule), MakeIntVariant<0, 2, 6, 12>(pipeline_stages)
         );
     }
 

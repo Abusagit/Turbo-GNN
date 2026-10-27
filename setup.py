@@ -188,8 +188,14 @@ if not SKIP_CUDA_BUILD:
         if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
             os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0 8.6 8.9 9.0"
 
-        # Find headers/libs from pip-installed nvidia packages
-        _extra_include = []
+        # Find headers/libs from pip-installed nvidia packages.
+        # The headers are only a FALLBACK (e.g. CI with an nvcc-only toolkit
+        # that lacks cusparse.h), so they are passed via -idirafter and never
+        # shadow $CUDA_HOME/include: nvidia/cu13/include ships cuda_runtime*.h
+        # for torch's CUDA version, and CCCL errors out ("CUDA compiler and
+        # CUDA toolkit headers are incompatible") if it differs from nvcc's.
+        _fallback_cxx = []
+        _fallback_nvcc = []
         _extra_libdir = []
         try:
             import nvidia
@@ -199,7 +205,8 @@ if not SKIP_CUDA_BUILD:
                 _inc = os.path.join(_nvidia_root, _pkg, "include")
                 _lib = os.path.join(_nvidia_root, _pkg, "lib")
                 if os.path.isdir(_inc):
-                    _extra_include.append(_inc)
+                    _fallback_cxx += ["-idirafter", _inc]
+                    _fallback_nvcc += ["-Xcompiler", f"-idirafter,{_inc}"]
                 if os.path.isdir(_lib):
                     _extra_libdir.append(_lib)
         except ImportError:
@@ -259,12 +266,12 @@ if not SKIP_CUDA_BUILD:
                     "csrc/spmm/gspmm.cu",
                     "csrc/spmm/edge_norm_kernels.cu",
                 ],
-                include_dirs=[os.path.join(this_dir, "csrc")] + _extra_include,
+                include_dirs=[os.path.join(this_dir, "csrc")],
                 library_dirs=_extra_libdir,
                 libraries=["cusparse"],
                 extra_compile_args={
-                    "cxx": ["-O3", "-std=c++20"] + UNDEFINE_FLAGS,
-                    "nvcc": _nvcc_flags,
+                    "cxx": ["-O3", "-std=c++20"] + UNDEFINE_FLAGS + _fallback_cxx,
+                    "nvcc": _nvcc_flags + _fallback_nvcc,
                 },
             ),
         ]

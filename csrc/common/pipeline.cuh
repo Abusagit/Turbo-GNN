@@ -17,9 +17,7 @@
 
 // Lane i copies 16B chunks i, i+32, ... of one ROW_ELEMS-wide row
 template <int ROW_ELEMS, FloatingNum cuda_t>
-__device__ __forceinline__ void async_copy_row_warp(
-    cuda_t *dst, const cuda_t *src, cuda::pipeline<cuda::thread_scope_thread> &pipe, int lane
-) {
+__device__ __forceinline__ void async_copy_row_warp(cuda_t *dst, const cuda_t *src, cuda::pipeline<cuda::thread_scope_thread>& pipe, int lane) {
     constexpr int ROW_BYTES = ROW_ELEMS * static_cast<int>(sizeof(cuda_t));
     static_assert(ROW_BYTES % 16 == 0, "Row width must be a multiple of 16 bytes for aligned async copies");
     constexpr int F4_PER_ROW = ROW_BYTES / 16;
@@ -34,7 +32,7 @@ __device__ __forceinline__ void async_copy_row_warp(
 
 // Single-thread copy of one <=16B slice.
 template <int ELEMS, FloatingNum cuda_t>
-__device__ __forceinline__ void async_copy_slice_thread(cuda_t *dst, const cuda_t *src, cuda::pipeline<cuda::thread_scope_thread> &pipe) {
+__device__ __forceinline__ void async_copy_slice_thread(cuda_t *dst, const cuda_t *src, cuda::pipeline<cuda::thread_scope_thread>& pipe) {
     constexpr int SLICE_BYTES = ELEMS * static_cast<int>(sizeof(cuda_t));
     static_assert(SLICE_BYTES <= 16, "async_copy_slice_thread is for small (<=16B) per-thread slices; use async_copy_row_warp for full rows");
     static_assert(16 % SLICE_BYTES == 0, "Slice width must evenly divide 16 bytes");
@@ -54,7 +52,7 @@ template <int WARPS_PER_BLOCK, int D_CONST, int NUM_STAGES, int NUM_ROWS, Floati
 __device__ __forceinline__ void pipelined_neighbor_row_loop(
     int warp_id, int lane, int num_neighbors, index_t edge_start, index_t const *__restrict__ col_idx,
     cuda_t const *const (&row_bases)[NUM_ROWS], int64_t const (&stride_n)[NUM_ROWS], int64_t const (&stride_h)[NUM_ROWS], int head_h,
-    cuda_t *dbuf, ConsumeFn &&consume
+    cuda_t *dbuf, ConsumeFn&& consume
 ) {
     const int loop_iters = (num_neighbors > warp_id) ? (num_neighbors - warp_id + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK : 0;
     if (loop_iters == 0) return;
@@ -64,7 +62,7 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
     // places them in local memory, and the spill grows with NUM_STAGES (measured: STACK:96 at
     // NUM_STAGES=3, NUM_ROWS=3). The slot address is affine in the slot, so compute it; the
     // neighbour index is re-read from col_idx, which the prefetch just touched and is an L1 hit.
-    auto slot_row = [dbuf](int r, int slot) -> cuda_t * { return dbuf + (r * NUM_STAGES + slot) * D_CONST; };
+    auto slot_row    = [dbuf](int r, int slot) -> cuda_t    *{ return dbuf + (r * NUM_STAGES + slot) * D_CONST; };
     auto neighbor_at = [col_idx, edge_start, warp_id](int it) -> index_t {
         return col_idx[edge_start + static_cast<index_t>(warp_id + it * WARPS_PER_BLOCK)];
     };
