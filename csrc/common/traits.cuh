@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -238,4 +239,28 @@ using index_pair_t = typename IndexPair<T>::type;
 template <typename... IndexTypes>
 std::variant<IndexTypeInfo<IndexTypes>...> MakeIndexVariant(at::ScalarType type) {
     return MakeVariantOf<std::variant<IndexTypeInfo<IndexTypes>...>>(type, [] { return "Unsupported index scalar type"; });
+}
+
+// Runtime dispatch on the index *width* alone: int32 and uint32 tensors share int32_t kernels,
+// int64 and uint64 tensors int64_t ones, so a kernel templated on the index type compiles half as
+// many variants as with MakeIndexVariant over all four types. Unsigned indices read as signed are
+// exact while every value is below 2^31 (2^63) -- for a CSR, while it has fewer nodes and edges
+// than that, which callers taking uint32 must check (see check_index_range) -- and the -1 sentinel
+// of IndexSentinel has the bits of the unsigned maximum it stands for there.
+//
+// Signed rather than unsigned kernels: ptxas allocates registers differently for the two, and the
+// unsigned variants of the graph transformer backward ran up to 1.5x slower on identical inputs
+// (80 registers and three blocks per SM against 96 and two), as signed index arithmetic, which
+// cannot wrap, is the better-optimised form.
+inline std::variant<IndexTypeInfo<int32_t>, IndexTypeInfo<int64_t>> MakeIndexWidthVariant(at::ScalarType type) {
+    switch (type) {
+        case c10::ScalarType::Int:
+        case c10::ScalarType::UInt32:
+            return IndexTypeInfo<int32_t>{};
+        case c10::ScalarType::Long:
+        case c10::ScalarType::UInt64:
+            return IndexTypeInfo<int64_t>{};
+        default:
+            throw std::runtime_error("Unsupported index scalar type");
+    }
 }

@@ -149,12 +149,12 @@ class GATv2AggrKernel(TunableKernel):
 
     Tunable backward parameter:
 
-    - ``backward_grad_A_reduce_row_chunk_size``: number of destination-node
-      rows reduced per shared-memory pass when computing attention gradients.
-      Larger chunks reduce kernel launches but increase shared memory usage.
     - ``backward_pipeline_stages``: async-copy pipeline stage count for the
-      backward AL/R (directed) and G/ALR (undirected) kernels, mirroring
-      ``forward_pipeline_stages`` (0 disables the pipeline).
+      backward kernels, mirroring ``forward_pipeline_stages`` (0 disables the
+      pipeline).
+
+    ``grad_A_reduce_row_chunk_size`` is still accepted and passed through, but the
+    kernels no longer use it: the attention-vector gradient is reduced in-kernel.
 
     Tunable graph parameters (forward and backward):
 
@@ -259,14 +259,14 @@ class GATv2AggrKernel(TunableKernel):
 
     def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("backward_grad_A_reduce_row_chunk_size", [512, 1024], default=512),
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
             TunableParam("backward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
             TunableParam("backward_light_warps", [1, 2, 4], default=1),
             TunableParam("backward_heavy_warps", [8, 16, 32], default=8),
-            # The undirected backward's heavy bucket is ~81% of that pass at ~7% occupancy;
-            # slicing it is the point of this axis. 0 keeps one block per heavy node.
+            # Slices the heavy bucket of the backward kernels that walk the forward CSR (the
+            # x_left / attention-vector gradient, and on an undirected graph the x_right one).
+            # 0 keeps one block per heavy node.
             TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
             TunableParam("backward_pipeline_stages", [0, 2, 6, 12], default=0),
             # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so

@@ -149,27 +149,45 @@ def gatv2_aggr(
         out[v] = sum_{u in N(v)} alpha_{uv} * x_neighbors[u]
 
     The forward pass fuses edge score computation, numerically stable softmax
-    (via log-sum-exp), and weighted aggregation into a single kernel.
+    (via log-sum-exp), and weighted aggregation into a single kernel. The score's
+    elementwise part is computed in float32 from inputs of any of the supported dtypes.
+
+    Any head dim ``D`` from 1 to 65536 is supported. Rows of up to 256 (fp32) or 512
+    (fp16/bf16) features are processed in a single pass with every row in registers;
+    longer rows take a two-pass path that stores one or two scalars per edge and head in a
+    temporary ``[H, E]`` float32 buffer. Rows that are not whole, 16-byte-aligned vectors --
+    an odd ``D``, or a view offset into a larger tensor -- are read element by element,
+    which is slower.
+
+    The backward needs ``<grad_output, output>`` per row and saves the output for it.
 
     Args:
         graph: CSR graph with forward + backward adjacency for fwd/bwd passes.
-        x: Destination (left) node features after projection, shape ``[N, H, D]``.
+        x: Destination (left) node features after projection, shape ``[N, H, D]``; the last
+            dim must have unit stride.
         x_neighbors: Source (right) node features after projection, shape ``[N, H, D]``.
         attention_weights: Learnable attention vector per head, shape ``[H, D]``.
         negative_slope: LeakyReLU negative slope (typically 0.2).
-        grad_A_reduce_row_chunk_size: Row chunk size for backward attention gradient
-            reduction. Larger values use more shared memory but fewer kernel launches.
+        grad_A_reduce_row_chunk_size: Unused; kept for signature stability. The
+            attention-vector gradient is reduced inside the backward kernels.
         schedule: Node-to-block scheduling policy. Only ``"one_per_block"`` (one block per
             node) is available.
         blocks_per_sm: Unused by ``"one_per_block"``; kept for signature stability.
+        backward_heavy_edge_slice: Edges per block in the heavy bucket of the backward
+            kernels that walk the forward adjacency: the x / attention-vector gradient
+            kernel, and on an undirected graph the x_neighbors one too. ``0`` keeps one
+            block per heavy node.
         pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
-            r[j] prefetch. 0 disables the pipeline (plain warp-strided loop).
+            x_neighbors[u] prefetch. 0 disables the pipeline. Applies to rows of 16-byte
+            vectors that span at least a warp (and at most the single-pass limit); other
+            rows ignore it. A depth whose staging buffer does not fit the device's shared
+            memory is lowered to the deepest one that does.
         backward_pipeline_stages: Number of async-copy pipeline stages for the backward
-            kernels' neighbor-row prefetch (AL/R when directed, G/ALR when undirected).
-            0 disables the pipeline.
+            kernels' neighbor-row prefetch. 0 disables the pipeline. Same applicability
+            as ``pipeline_stages``.
 
     Returns:
-        Aggregated features, shape ``[N, H*D]`` (heads concatenated).
+        Aggregated features, shape ``[N, H, D]``.
     """
     # An explicit edge count wins; otherwise derive it from the heavy-degree threshold.
     forward_heavy_edge_slice = forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(

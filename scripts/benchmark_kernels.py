@@ -297,7 +297,7 @@ _SPMM_PARAMS = (
 
 _GATV2_PARAMS = (
     KernelParam("negative_slope", float, 0.2, "LeakyReLU negative slope."),
-    KernelParam("grad_A_reduce_row_chunk_size", int, 512, "Row chunk size for the backward attention reduction."),
+    KernelParam("grad_A_reduce_row_chunk_size", int, 512, "Unused; the attention gradient is reduced in-kernel."),
     KernelParam("forward_light_warps", int, 1, "Warps per block, forward light-node kernel."),
     KernelParam("forward_heavy_warps", int, 8, "Warps per block, forward heavy-node kernel."),
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),

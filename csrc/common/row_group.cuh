@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <bit>
+#include <cfloat>
 #include <cstdint>
 #include <type_traits>
 
@@ -95,6 +97,21 @@ struct RowGroup {
         }
     }
 
+    // The lane's share of a row, widened to accum_t: for rows a kernel uses on every edge, so the
+    // conversion is paid once rather than per use.
+    static __device__ __forceinline__ void to_accum(Frag const& f, accum_t (&out)[kAccs]) {
+        constexpr size_t kChunk = std::min(VEC, VecFloat<1, float>::max_vec_size_bytes / std::max(sizeof(accum_t), sizeof(cuda_t)));
+        using src_t             = VecFloat<kChunk, cuda_t>;
+        using dst_t             = VecFloat<kChunk, accum_t>;
+#pragma unroll
+        for (size_t s = 0; s < S; ++s) {
+#pragma unroll
+            for (size_t c = 0; c < VEC / kChunk; ++c) {
+                reinterpret_cast<dst_t *>(&out[s * VEC])[c] = reinterpret_cast<src_t const *>(&f.v[s])[c].template convert_vec<accum_t>();
+            }
+        }
+    }
+
     static __device__ __forceinline__ void scale(accum_t (&acc)[kAccs], accum_t c) {
 #pragma unroll
         for (size_t e = 0; e < kAccs; ++e) {
@@ -141,6 +158,40 @@ struct RowGroup {
         }
     }
 
+    // row[v] += acc in accum_t for the lane's vectors below nvec: one vector atomic per 16 bytes on
+    // sm_90+, scalar atomics before. row + v * VEC must be aligned to min(16, VEC * 4) bytes, which
+    // holds for any row of a contiguous fp32 [rows, D] tensor whose D is a multiple of VEC.
+    static __device__ __forceinline__ void atomic_add_accum(
+        accum_t *const __restrict__ row, accum_t const (&acc)[kAccs], uint32_t r, uint32_t nvec
+    ) {
+        static_assert(std::is_same_v<accum_t, float>, "fp32 atomics only");
+        // Dependent on accum_t, so the sm_90-only vector overloads are looked up at instantiation,
+        // i.e. only in the branch that is kept.
+        using f4_t = std::conditional_t<sizeof(accum_t) == 4, float4, accum_t>;
+        using f2_t = std::conditional_t<sizeof(accum_t) == 4, float2, accum_t>;
+#pragma unroll
+        for (size_t s = 0; s < S; ++s) {
+            const uint32_t v = vec_index(r, s);
+            if (v < nvec) {
+                accum_t *const dst      = row + static_cast<size_t>(v) * VEC;
+                accum_t const *const sv = &acc[s * VEC];
+                if constexpr (kCudaArch >= 900 && VEC % 4 == 0) {
+#pragma unroll
+                    for (size_t i = 0; i < VEC; i += 4) {
+                        atomicAdd(reinterpret_cast<f4_t *>(dst + i), *reinterpret_cast<f4_t const *>(sv + i));
+                    }
+                } else if constexpr (kCudaArch >= 900 && VEC == 2) {
+                    atomicAdd(reinterpret_cast<f2_t *>(dst), *reinterpret_cast<f2_t const *>(sv));
+                } else {
+#pragma unroll
+                    for (size_t i = 0; i < VEC; ++i) {
+                        atomicAdd(dst + i, sv[i]);
+                    }
+                }
+            }
+        }
+    }
+
     // row[v] = acc, unconverted: for the fp32 partials of the split-K kernels.
     static __device__ __forceinline__ void store_accum(
         accum_t *const __restrict__ row, accum_t const (&acc)[kAccs], uint32_t r, uint32_t nvec
@@ -179,8 +230,12 @@ struct RowGroup {
             if constexpr (kPairedAtomics) {
                 using half_t = VecFloat<VEC / 2, cuda_t>;
                 using quad_t = VecFloat<4, accum_t>;
-                quad_t lo    = reinterpret_cast<half_t const *>(&f.v[s])[0].template convert_vec<accum_t>();
-                quad_t hi    = reinterpret_cast<half_t const *>(&f.v[s])[1].template convert_vec<accum_t>();
+                // Dependent on accum_t, so the sm_90-only float4 overload is looked up at
+                // instantiation, i.e. only where this branch is kept. Spelled float4, the call is
+                // resolved when the template is parsed and fails to compile for sm_80-sm_89.
+                using f4_t = std::conditional_t<sizeof(accum_t) == 4, float4, accum_t>;
+                quad_t lo  = reinterpret_cast<half_t const *>(&f.v[s])[0].template convert_vec<accum_t>();
+                quad_t hi  = reinterpret_cast<half_t const *>(&f.v[s])[1].template convert_vec<accum_t>();
                 lo *= w;
                 hi *= w;
                 const bool odd    = (r & 1u) != 0;
@@ -195,10 +250,10 @@ struct RowGroup {
                 accum_t *const even_sector = row + static_cast<size_t>(v & ~1u) * VEC + (odd ? 4 : 0);
                 accum_t *const odd_sector  = row + static_cast<size_t>(v | 1u) * VEC + (odd ? 4 : 0);
                 if (odd ? partner_valid : valid) {
-                    atomicAdd(reinterpret_cast<float4 *>(even_sector), *reinterpret_cast<float4 const *>(odd ? &got : &lo));
+                    atomicAdd(reinterpret_cast<f4_t *>(even_sector), *reinterpret_cast<f4_t const *>(odd ? &got : &lo));
                 }
                 if (odd ? valid : partner_valid) {
-                    atomicAdd(reinterpret_cast<float4 *>(odd_sector), *reinterpret_cast<float4 const *>(odd ? &hi : &got));
+                    atomicAdd(reinterpret_cast<f4_t *>(odd_sector), *reinterpret_cast<f4_t const *>(odd ? &hi : &got));
                 }
             } else if (valid) {
                 Tile::atomic_add_scaled_vec(row, v, w, f.v[s]);
@@ -330,6 +385,75 @@ __device__ __forceinline__ uint2 warp_share(uint32_t n, uint32_t warp, uint32_t 
 // =============================================================================
 // Combining per-warp partials
 // =============================================================================
+
+// Online-softmax states and their accumulators, groups -> warp: a merge with each xor partner.
+// Afterwards every group of the warp holds the warp's state and accumulator. Warp-uniform.
+template <size_t G, size_t E, FloatingNum accum_t>
+__device__ __forceinline__ void merge_groups_softmax(OnlineSoftmaxState& st, accum_t (&acc)[E]) {
+    if constexpr (G < kWarpSize) {
+#pragma unroll
+        for (uint32_t off = G; off < kWarpSize; off <<= 1) {
+            const float2 c = st.merge(__shfl_xor_sync(FULL_WARP_MASK, st.max_val, off), __shfl_xor_sync(FULL_WARP_MASK, st.sum_exp, off));
+#pragma unroll
+            for (size_t e = 0; e < E; ++e) {
+                const accum_t other = __shfl_xor_sync(FULL_WARP_MASK, acc[e], off);
+                acc[e]              = AdOps<accum_t>::fma(acc[e], c.x, other * c.y);
+            }
+        }
+    }
+}
+
+// Merges the softmax states of a block's warps -- lane 0 of each holding its warp's -- into `st`
+// of every thread, and returns exp(m_warp - M): the factor that rescales this warp's accumulators
+// to the block-wide max M. stats: 2 * W floats of shared memory. Must be called by every thread.
+template <size_t W>
+__device__ __forceinline__ float merge_block_softmax(OnlineSoftmaxState& st, float *const __restrict__ stats, uint32_t warp, uint32_t lane) {
+    if constexpr (W == 1) {
+        return 1.0f;
+    } else {
+        if (lane == 0) {
+            stats[warp]     = st.max_val;
+            stats[W + warp] = st.sum_exp;
+        }
+        __syncthreads();
+        float block_max = -FLT_MAX;
+#pragma unroll
+        for (size_t w = 0; w < W; ++w) {
+            block_max = fmaxf(block_max, stats[w]);
+        }
+        float block_sum = 0.0f;
+#pragma unroll
+        for (size_t w = 0; w < W; ++w) {
+            block_sum = fmaf(stats[W + w], __expf(stats[w] - block_max), block_sum);
+        }
+        const float rescale = __expf(st.max_val - block_max);
+        st.max_val          = block_max;
+        st.sum_exp          = block_sum;
+        return rescale;
+    }
+}
+
+// The W warps of a block as teams for a chunked sweep over nchunks feature chunks: one chunk per
+// team at a time, the T warps of a team splitting the edges. The team count is a power of two no
+// larger than the chunk count (rounded up) or W, so with at least as many chunks as warps T == 1
+// and the warps never need to combine anything; with fewer, the edges are still spread over all
+// warps. Identical in every thread of the block.
+struct ChunkTeams {
+    uint32_t teams;   // chunks in flight at once
+    uint32_t T;       // warps per team
+    uint32_t team;    // this warp's team
+    uint32_t member;  // this warp's place in it
+};
+
+template <size_t W>
+__device__ __forceinline__ ChunkTeams chunk_teams(uint32_t nchunks, uint32_t warp) {
+    uint32_t teams = 1;
+    while (teams < W && teams < nchunks) {
+        teams <<= 1;
+    }
+    const uint32_t T = static_cast<uint32_t>(W) / teams;
+    return {teams, T, warp / T, warp % T};
+}
 
 // Shared scratch, in accum_t elements, per round of team_sum: the per-round width is chosen so one
 // round never needs more than kTeamSumBudgetBytes, whatever W and E are. A block-wide merge of a

@@ -20,36 +20,6 @@
 
 namespace turbo_gnn::gt {
 
-// Merges the softmax states of a block's warps -- lane 0 of each holding its warp's -- into `st`
-// of every thread, and returns exp(m_warp - M): the factor that rescales this warp's accumulators
-// to the block-wide max M. stats: 2 * W accum_t of shared memory. Must be called by every thread.
-template <size_t W>
-__device__ __forceinline__ float merge_block_softmax(OnlineSoftmaxState& st, float *const __restrict__ stats, uint32_t warp, uint32_t lane) {
-    if constexpr (W == 1) {
-        return 1.0f;
-    } else {
-        if (lane == 0) {
-            stats[warp]     = st.max_val;
-            stats[W + warp] = st.sum_exp;
-        }
-        __syncthreads();
-        float block_max = -FLT_MAX;
-#pragma unroll
-        for (size_t w = 0; w < W; ++w) {
-            block_max = fmaxf(block_max, stats[w]);
-        }
-        float block_sum = 0.0f;
-#pragma unroll
-        for (size_t w = 0; w < W; ++w) {
-            block_sum = fmaf(stats[W + w], __expf(stats[w] - block_max), block_sum);
-        }
-        const float rescale = __expf(st.max_val - block_max);
-        st.max_val          = block_max;
-        st.sum_exp          = block_sum;
-        return rescale;
-    }
-}
-
 // ------------------------------------------------------------------------------------------------
 // Fused path. Each lane group runs an online softmax over its edges with K[i], Q[j], V[j] and the
 // accumulator in registers; the partial states are merged group -> warp (shuffles) -> block
@@ -140,18 +110,8 @@ struct ForwardFused {
             });
         }
 
-        // Groups -> warp: an online-softmax merge with each xor partner.
-        if constexpr (G < kWarpSize) {
-#pragma unroll
-            for (uint32_t off = G; off < kWarpSize; off <<= 1) {
-                const float2 c = st.merge(__shfl_xor_sync(FULL_WARP_MASK, st.max_val, off), __shfl_xor_sync(FULL_WARP_MASK, st.sum_exp, off));
-#pragma unroll
-                for (size_t e = 0; e < kAccs; ++e) {
-                    const accum_t other = __shfl_xor_sync(FULL_WARP_MASK, acc[e], off);
-                    acc[e]              = AdOps<accum_t>::fma(acc[e], c.x, other * c.y);
-                }
-            }
-        }
+        // Groups -> warp.
+        merge_groups_softmax<G>(st, acc);
 
         // Warps -> warp 0. The barrier in merge_block_softmax also retires every warp's use of the
         // ring, which the merge buffer aliases.
@@ -231,21 +191,14 @@ struct ForwardChunked {
 
         // ---- pass 2: chunked accumulation
         const uint32_t nchunks = ceil_div(p.nvec, static_cast<uint32_t>(kWarpSize));
-        // Teams: a power of two no larger than the chunk count (rounded up) or the warp count.
-        uint32_t teams = 1;
-        while (teams < W && teams < nchunks) {
-            teams <<= 1;
-        }
-        const uint32_t T      = static_cast<uint32_t>(W) / teams;
-        const uint32_t team   = warp / T;
-        const uint32_t member = warp % T;
-        const uint2 my_edges  = warp_share(n, member, T, kWarpSize);
+        const ChunkTeams ct    = chunk_teams<W>(nchunks, warp);
+        const uint2 my_edges   = warp_share(n, ct.member, ct.T, kWarpSize);
 
         // Weight of a slot, computed once per slot by the lane that fetches its id.
         auto weight = [&](index_t, uint32_t slot) -> accum_t { return AccumOps::exp(scores[slot] - st.max_val); };
 
-        for (uint32_t c0 = 0; c0 < nchunks; c0 += teams) {
-            const uint32_t c     = c0 + team;
+        for (uint32_t c0 = 0; c0 < nchunks; c0 += ct.teams) {
+            const uint32_t c     = c0 + ct.team;
             const bool has_chunk = c < nchunks;
             const int64_t coff   = static_cast<int64_t>(c) * kWarpSize * VEC;
             const uint32_t cnvec = has_chunk ? min(p.nvec - c * static_cast<uint32_t>(kWarpSize), static_cast<uint32_t>(kWarpSize)) : 0;
@@ -260,8 +213,8 @@ struct ForwardChunked {
                     RG::fma(acc, vf, w);
                 });
             }
-            team_sum<W, kWarpSize, kAccs, /*TRAILING_SYNC=*/true>(acc, reinterpret_cast<accum_t *>(smem), warp, lane, T);
-            if (has_chunk && member == 0) {
+            team_sum<W, kWarpSize, kAccs, /*TRAILING_SYNC=*/true>(acc, reinterpret_cast<accum_t *>(smem), warp, lane, ct.T);
+            if (has_chunk && ct.member == 0) {
                 flush(coff, cnvec, acc);
             }
         }
@@ -270,7 +223,7 @@ struct ForwardChunked {
 
 // ------------------------------------------------------------------------------------------------
 // Kernel. SLICED selects the split-K heavy path: one block per slice of a heavy node's edge list,
-// writing an un-normalised partial (accumulator, max, sum) that gt_forward_merge_slices_kernel
+// writing an un-normalised partial (accumulator, max, sum) that rows::softmax_merge_slices_kernel
 // folds into the node's row. Otherwise one block per node, through the node scheduler.
 // ------------------------------------------------------------------------------------------------
 template <
@@ -380,62 +333,6 @@ __global__ void __launch_bounds__(W *kWarpSize, kForwardMinBlocksPerSM<W>) gt_fo
             process_row(node, row_begin, static_cast<uint32_t>(p.row_ptr[node + 1] - row_begin), node);
         }
     }
-}
-
-// Folds every slice partial of one heavy node into its output row and logsumexp: the same n-way
-// online-softmax merge the slice kernel ran across warps, across slices, followed by the
-// normalisation the slices deliberately skipped. Grid (num_heavy, H, vector blocks), one vector of
-// the row per thread. A node whose slices are all empty comes out as a zero row with -inf
-// logsumexp, as in the in-place kernel.
-
-template <bool WIDE, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
-__global__ void __launch_bounds__(kMergeThreads) gt_forward_merge_slices_kernel(
-    ForwardParams<cuda_t, index_t, accum_t> const p, int const *__restrict__ node_chunk_offset, int num_heavy
-) {
-    static constexpr size_t VEC = WIDE ? 16 / sizeof(cuda_t) : 1;
-    using Tile                  = TileOps<VEC, cuda_t, accum_t>;
-    using AccumOps              = AdOps<accum_t>;
-
-    const int slot     = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    if (slot >= num_heavy || head >= p.H) [[unlikely]] {
-        return;
-    }
-    const int64_t node = static_cast<int64_t>(p.heavy_nodes[slot]);
-    const int lo       = node_chunk_offset[slot];
-    const int hi       = node_chunk_offset[slot + 1];
-
-    accum_t m = -FLT_MAX;
-    for (int s = lo; s < hi; ++s) {
-        m = AccumOps::max(m, p.part_ml[2 * (s * p.H + head)]);
-    }
-    accum_t l{};
-    for (int s = lo; s < hi; ++s) {
-        l = AccumOps::fma(p.part_ml[2 * (s * p.H + head) + 1], AccumOps::exp(p.part_ml[2 * (s * p.H + head)] - m), l);
-    }
-    if (blockIdx.z == 0 && threadIdx.x == 0) {
-        p.logsumexp[node * p.H + head] = l > accum_t{} ? m + AccumOps::log(l) : -INFINITY;
-    }
-
-    const uint32_t v = blockIdx.z * blockDim.x + threadIdx.x;
-    if (v >= p.nvec) {
-        return;
-    }
-    alignas(16) accum_t acc[VEC] = {};
-    for (int s = lo; s < hi; ++s) {
-        const accum_t c          = AccumOps::exp(p.part_ml[2 * (s * p.H + head)] - m);
-        accum_t const *const row = p.part_o + dense_row(s, head, p.H, p.D) + static_cast<int64_t>(v) * VEC;
-#pragma unroll
-        for (size_t e = 0; e < VEC; ++e) {
-            acc[e] = AccumOps::fma(c, row[e], acc[e]);
-        }
-    }
-    const accum_t inv = l > accum_t{} ? accum_t{1} / l : accum_t{};
-#pragma unroll
-    for (size_t e = 0; e < VEC; ++e) {
-        acc[e] *= inv;
-    }
-    Tile::write(p.O + node * p.stride_o_n + head * p.stride_o_h, v, Tile::convert_from_accum(acc));
 }
 
 }  // namespace turbo_gnn::gt

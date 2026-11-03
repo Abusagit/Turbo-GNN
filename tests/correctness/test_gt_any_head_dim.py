@@ -1,7 +1,7 @@
 """Graph transformer attention for any head dim.
 
 The kernels take the head dim D as a runtime value in [1, 65536] and lay a row out across lanes
-by shape, picked per launch (csrc/gt/gt_common.cuh):
+by shape, picked per launch (csrc/common/row_shape.cuh):
 
   * fused shapes keep a node's rows in registers -- lane groups of 4..32 for short rows, one or
     two 16-byte vectors per lane for longer ones;

@@ -24,46 +24,6 @@
 
 namespace turbo_gnn::gt {
 
-// ------------------------------------------------------------------------------------------------
-// Delta[n, h] = <dO[n, h], O[n, h]>. One lane group per row; groups of a warp take consecutive rows.
-// ------------------------------------------------------------------------------------------------
-inline constexpr uint32_t kDeltaThreads = 256;
-
-template <size_t G, bool WIDE, FloatingNum cuda_t, FloatingNum accum_t = float>
-__global__ void __launch_bounds__(kDeltaThreads) gt_compute_delta_kernel(
-    int64_t rows, int64_t H, uint32_t nvec, cuda_t const *const __restrict__ dO, int64_t stride_do_n, int64_t stride_do_h,
-    cuda_t const *const __restrict__ O, int64_t stride_o_n, int64_t stride_o_h, accum_t *const __restrict__ delta
-) {
-    static constexpr size_t VEC = WIDE ? 16 / sizeof(cuda_t) : 1;
-    using RG                    = RowGroup<G, 1, VEC, cuda_t, accum_t>;
-    using Tile                  = typename RG::Tile;
-
-    const uint32_t lane         = threadIdx.x % kWarpSize;
-    const uint32_t r            = lane % G;
-    const int64_t warp_global   = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / kWarpSize;
-    const int64_t warps_total   = static_cast<int64_t>(gridDim.x) * blockDim.x / kWarpSize;
-    constexpr int64_t kRowsWarp = RG::kGroupsPerWarp;
-
-    // Warp-uniform trip count: the group reduction shuffles across the whole warp.
-    for (int64_t base = warp_global * kRowsWarp; base < rows; base += warps_total * kRowsWarp) {
-        const int64_t row = base + lane / G;
-        accum_t part{};
-        if (row < rows) {
-            const int64_t n            = row / H;
-            const int64_t h            = row - n * H;
-            cuda_t const *const do_row = dO + n * stride_do_n + h * stride_do_h;
-            cuda_t const *const o_row  = O + n * stride_o_n + h * stride_o_h;
-            for (uint32_t v = r; v < nvec; v += G) {
-                Tile::read(do_row, v).dot_product_(&part, Tile::read(o_row, v));
-            }
-        }
-        part = RG::reduce(part);
-        if (row < rows && r == 0) {
-            delta[row] = part;
-        }
-    }
-}
-
 // Gradient accumulators of a row, by index.
 enum : size_t { kGradQ = 0, kGradV = 1, kGradK = 2 };
 
@@ -332,14 +292,8 @@ struct BackwardChunked {
 
         // ---- pass 2: chunked accumulation
         const uint32_t nchunks = ceil_div(p.nvec, static_cast<uint32_t>(kWarpSize));
-        uint32_t teams         = 1;
-        while (teams < W && teams < nchunks) {
-            teams <<= 1;
-        }
-        const uint32_t T      = static_cast<uint32_t>(W) / teams;
-        const uint32_t team   = warp / T;
-        const uint32_t member = warp % T;
-        const uint2 my_edges  = warp_share(n, member, T, kWarpSize);
+        const ChunkTeams ct    = chunk_teams<W>(nchunks, warp);
+        const uint2 my_edges   = warp_share(n, ct.member, ct.T, kWarpSize);
 
         auto scalars_of = [&](index_t, uint32_t slot) -> scalars_t {
             if constexpr (kUndirected) {
@@ -349,8 +303,8 @@ struct BackwardChunked {
             }
         };
 
-        for (uint32_t c0 = 0; c0 < nchunks; c0 += teams) {
-            const uint32_t c     = c0 + team;
+        for (uint32_t c0 = 0; c0 < nchunks; c0 += ct.teams) {
+            const uint32_t c     = c0 + ct.team;
             const bool has_chunk = c < nchunks;
             const int64_t coff   = static_cast<int64_t>(c) * kWarpSize * VEC;
             const uint32_t cnvec = has_chunk ? min(p.nvec - c * static_cast<uint32_t>(kWarpSize), static_cast<uint32_t>(kWarpSize)) : 0;
@@ -385,8 +339,8 @@ struct BackwardChunked {
                     }
                 });
             }
-            team_sum<W, kWarpSize, kGrads * kAccs, /*TRAILING_SYNC=*/true>(&grads[0][0], reinterpret_cast<accum_t *>(smem), warp, lane, T);
-            if (has_chunk && member == 0) {
+            team_sum<W, kWarpSize, kGrads * kAccs, /*TRAILING_SYNC=*/true>(&grads[0][0], reinterpret_cast<accum_t *>(smem), warp, lane, ct.T);
+            if (has_chunk && ct.member == 0) {
                 flush(coff, cnvec, grads);
             }
         }
@@ -395,7 +349,7 @@ struct BackwardChunked {
 
 // ------------------------------------------------------------------------------------------------
 // Kernel. SLICED selects the split-K heavy path: one block per slice of a heavy node's edge list,
-// writing fp32 partial gradients that gt_backward_merge_slices_kernel sums. The partials are plain
+// writing fp32 partial gradients that rows::sum_merge_slices_kernel sums. The partials are plain
 // sums -- alpha comes from the saved logsumexp, not from a running max -- so slicing changes only
 // the order of additions. A directed launch's dK scatter is unaffected by slicing.
 // ------------------------------------------------------------------------------------------------
@@ -492,41 +446,6 @@ __global__ void __launch_bounds__(W *kWarpSize) gt_backward_kernel(
             const index_t row_begin = p.row_ptr[node];
             process_row(node, row_begin, static_cast<uint32_t>(p.row_ptr[node + 1] - row_begin), node);
         }
-    }
-}
-
-// Sums every slice partial of one heavy node into its gradient rows. Grid (num_heavy, H, vector
-// blocks), one vector of the row per thread.
-template <size_t NUM_GRADS, bool WIDE, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
-__global__ void __launch_bounds__(kMergeThreads) gt_backward_merge_slices_kernel(
-    BackwardParams<cuda_t, index_t, accum_t> const p, int const *__restrict__ node_chunk_offset, int num_heavy
-) {
-    static constexpr size_t VEC = WIDE ? 16 / sizeof(cuda_t) : 1;
-    using Tile                  = TileOps<VEC, cuda_t, accum_t>;
-
-    const int slot     = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const uint32_t v   = blockIdx.z * blockDim.x + threadIdx.x;
-    if (slot >= num_heavy || head >= p.H || v >= p.nvec) [[unlikely]] {
-        return;
-    }
-    const int64_t node = static_cast<int64_t>(p.heavy_nodes[slot]);
-    const int lo       = node_chunk_offset[slot];
-    const int hi       = node_chunk_offset[slot + 1];
-
-    cuda_t *const outs[3]         = {p.dQ, p.dV, p.dK};
-    accum_t const *const parts[3] = {p.part_q, p.part_v, p.part_k};
-#pragma unroll
-    for (size_t k = 0; k < NUM_GRADS; ++k) {
-        alignas(16) accum_t acc[VEC] = {};
-        for (int s = lo; s < hi; ++s) {
-            accum_t const *const row = parts[k] + dense_row(s, head, p.H, p.D) + static_cast<int64_t>(v) * VEC;
-#pragma unroll
-            for (size_t e = 0; e < VEC; ++e) {
-                acc[e] += row[e];
-            }
-        }
-        Tile::write(outs[k] + dense_row(node, head, p.H, p.D), v, Tile::convert_from_accum(acc));
     }
 }
 

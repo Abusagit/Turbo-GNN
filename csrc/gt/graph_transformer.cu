@@ -10,12 +10,14 @@
 
 #include <cstdint>
 
+#include "common/row_kernels.cuh"
 #include "gt/gt_backward.cu"
 #include "gt/gt_forward.cu"
 
 namespace {
 
 namespace gt        = turbo_gnn::gt;
+namespace rows      = turbo_gnn::rows;
 namespace sched_ns  = turbo_gnn::sched;
 namespace stream_ns = turbo_gnn::streams;
 
@@ -28,49 +30,20 @@ void check_schedule(int schedule) {
     );
 }
 
-void check_head_dim(int64_t D, char const *what) {
-    TORCH_CHECK(D >= 1 && D <= gt::kMaxHeadDim, what, ": head dim D=", D, " is out of range; supported: 1..", gt::kMaxHeadDim);
+// Whether a launch with `warps` warps per block takes the chunked path (see rows::kMaxSteps).
+bool chunked_for(int64_t D, at::Tensor const& t, bool wide, int warps) {
+    return rows::is_chunked(rows::plan_shape(D, t.element_size(), wide, rows::kMaxSteps(warps)));
 }
-
-// Unit stride over the head dim; a size-1 dim may carry any stride.
-bool features_contiguous(torch::Tensor const& t) { return t.size(2) == 1 || t.stride(2) == 1; }
-
-bool is_chunked(int shape) { return shape % 1000 == 0; }
-
-// Row shape of a launch with W warps per block (see gt::kMaxSteps).
-int shape_for(int64_t D, at::Tensor const& t, bool wide, int warps) { return gt::plan_shape(D, t.element_size(), wide, gt::kMaxSteps(warps)); }
 
 // Runs fn(shape_c) for the row shape of a W-warp launch, shape_c an integral_constant.
 template <size_t W, typename Fn>
 void with_shape(int64_t D, at::Tensor const& t, bool wide, Fn&& fn) {
-    constexpr int kSteps = gt::kMaxSteps(static_cast<int>(W));
-    std::visit(std::forward<Fn>(fn), gt::make_shape_variant<kSteps>(gt::plan_shape(D, t.element_size(), wide, kSteps)));
+    rows::with_shape<rows::kMaxSteps(static_cast<int>(W))>(D, t.element_size(), wide, std::forward<Fn>(fn));
 }
 
-// Warps per block for the light bucket. Rows too long for one pass are swept chunk by chunk, and a
-// chunked block's warps split the chunks as well as the edges. Huge head dims leave memory for few
-// nodes, so one node per block of one or two warps then leaves most of the device idle -- measured
-// at D = 65536: 1.8x (fp16) to 1.9x (fp32) faster with 4 warps than with 1. For chunked rows the
-// requested count is raised, to at most the light bucket's 4 and to no more warps than chunks,
-// until the launch holds about 32 warps per SM. Fused rows keep the requested count.
+// Light-bucket warps; see rows::light_warps_for.
 int light_warps_for(int requested, int64_t D, at::Tensor const& t, bool wide, int64_t blocks) {
-    if (!is_chunked(shape_for(D, t, wide, requested))) {
-        return requested;
-    }
-    const int64_t nvec    = D / (wide ? static_cast<int64_t>(16 / t.element_size()) : 1);
-    const int64_t nchunks = ceil_div(nvec, static_cast<int64_t>(kWarpSize));
-    const int64_t target  = int64_t{32} * sched_ns::sm_count();
-    int warps             = requested;
-    while (warps < 4 && warps < nchunks && blocks * warps < target) {
-        warps <<= 1;
-    }
-    return warps;
-}
-
-// Grid for the slice-merge kernels: one thread per row vector.
-std::pair<dim3, uint32_t> merge_launch(int num_heavy, int64_t H, uint32_t nvec) {
-    const uint32_t threads = std::min(gt::kMergeThreads, ceil_div(nvec, static_cast<uint32_t>(kWarpSize)) * static_cast<uint32_t>(kWarpSize));
-    return {dim3(num_heavy, static_cast<unsigned>(H), ceil_div(nvec, threads)), threads};
+    return rows::light_warps_for(requested, D, t.element_size(), wide, blocks, rows::kMaxSteps(requested));
 }
 
 }  // namespace
@@ -111,16 +84,19 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
     TORCH_CHECK(
         Q.dtype() == torch::kFloat32 || Q.dtype() == torch::kFloat16 || Q.dtype() == torch::kBFloat16, "Q must be float32, float16, or bfloat16"
     );
-    TORCH_CHECK(features_contiguous(Q) && features_contiguous(K) && features_contiguous(V), "Feature dim must be contiguous");
+    TORCH_CHECK(rows::features_contiguous(Q) && rows::features_contiguous(K) && rows::features_contiguous(V), "Feature dim must be contiguous");
 
     const auto idx_dtype = row_ptr.scalar_type();
     TORCH_CHECK(is_supported_index_type(idx_dtype), "row_ptr must be int32, int64, uint32, or uint64");
     TORCH_CHECK(col_idx.scalar_type() == idx_dtype, "col_idx must have same dtype as row_ptr");
+    rows::check_index_range(row_ptr, col_idx, "GT forward");
+    rows::check_node_list(light_nodes, row_ptr, "light_nodes");
+    rows::check_node_list(heavy_nodes, row_ptr, "heavy_nodes");
 
     const int64_t N = Q.size(0);
     const int64_t H = Q.size(1);
     const int64_t D = Q.size(2);
-    check_head_dim(D, "GT forward");
+    rows::check_head_dim(D, "GT forward");
 
     // O matches the input dtype, logsumexp is always float32.
     auto f32          = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
@@ -131,14 +107,14 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
     }
 
     // Row layout. O is a fresh allocation: its rows are aligned whenever Q's are.
-    const bool wide       = gt::rows_16b_aligned(Q) && gt::rows_16b_aligned(K) && gt::rows_16b_aligned(V);
+    const bool wide       = rows::rows_16b_aligned(Q) && rows::rows_16b_aligned(K) && rows::rows_16b_aligned(V);
     const uint32_t vec    = wide ? static_cast<uint32_t>(16 / Q.element_size()) : 1u;
     const uint32_t nvec   = static_cast<uint32_t>(D) / vec;
     const int64_t n_edges = col_idx.numel();
     const bool any_heavy  = heavy_edge_slice > 0 ? chunk_node.numel() > 0 : heavy_nodes.numel() > 0;
     // Each bucket plans its own shape from its warp count; the scratch is needed if either chunks.
-    const bool chunked = (light_nodes.numel() > 0 && is_chunked(shape_for(D, Q, wide, light_warps_per_block))) ||
-                         (any_heavy && is_chunked(shape_for(D, Q, wide, heavy_warps_per_block)));
+    const bool chunked = (light_nodes.numel() > 0 && chunked_for(D, Q, wide, light_warps_per_block)) ||
+                         (any_heavy && chunked_for(D, Q, wide, heavy_warps_per_block));
 
     // Chunked path: per-edge scores, [H, E].
     torch::Tensor scores = chunked ? torch::empty({H, n_edges}, f32) : torch::Tensor();
@@ -179,23 +155,12 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
         }
     };
 
-    // Launches `kernel<STAGES>` through `launch`, with the deepest pipeline the shape supports
-    // and the device's shared memory fits, no deeper than `stages`.
+    // Launches `launch<STAGES>` with the deepest pipeline the shape supports and the device's
+    // shared memory fits, no deeper than `stages`.
     auto with_stages = [&]<size_t W, int SHAPE, typename cuda_t, typename index_t>(int stages, auto&& launch) {
-        if constexpr (gt::Shape<SHAPE>::kPipelinable) {
-            const int fitted = gt::fit_pipeline_stages(
-                stages,
-                [&](int s) {
-                    size_t bytes = 0;
-                    gt::with_pipeline_stages(s, [&]<int S>() { bytes = smem_of.template operator()<W, SHAPE, S, cuda_t, index_t>(); });
-                    return bytes;
-                },
-                Q.device()
-            );
-            gt::with_pipeline_stages(fitted, launch);
-        } else {
-            launch.template operator()<0>();
-        }
+        rows::with_fitted_stages<SHAPE>(
+            stages, Q.device(), [&]<int S>() { return smem_of.template operator()<W, SHAPE, S, cuda_t, index_t>(); }, launch
+        );
     };
 
     stream_ns::BucketStreams buckets(stream_ns::bucket_launch_from_int(bucket_launch), Q.device());
@@ -228,7 +193,7 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
                     });
                 });
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), warp_variant
+            MakeIndexWidthVariant(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), warp_variant
         );
     };
 
@@ -273,16 +238,12 @@ std::tuple<torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_attention_forward_c
                     });
                 });
 
-                const auto [grid, threads] = merge_launch(num_heavy, H, nvec);
-                if (wide) {
-                    gt::gt_forward_merge_slices_kernel<true, cuda_t, index_t>
-                        <<<grid, threads, 0, stream>>>(p, node_chunk_offset.data_ptr<int>(), num_heavy);
-                } else {
-                    gt::gt_forward_merge_slices_kernel<false, cuda_t, index_t>
-                        <<<grid, threads, 0, stream>>>(p, node_chunk_offset.data_ptr<int>(), num_heavy);
-                }
+                const rows::SliceTable<index_t> table{p.heavy_nodes, node_chunk_offset.data_ptr<int>(), num_heavy};
+                rows::launch_softmax_merge<cuda_t, index_t>(
+                    table, H, p.D, nvec, wide, p.part_o, p.part_ml, p.O, p.stride_o_n, p.stride_o_h, p.logsumexp, stream
+                );
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
+            MakeIndexWidthVariant(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
             MakeIntVariant<8, 16, 32>(heavy_warps_per_block)
         );
     };
@@ -364,6 +325,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
     TORCH_CHECK(is_supported_index_type(idx_dtype), "row_ptr_T must be int32, int64, uint32, or uint64");
     TORCH_CHECK(col_idx_T.scalar_type() == idx_dtype, "col_idx_T must have same dtype as row_ptr_T");
     TORCH_CHECK(row_ptr.scalar_type() == idx_dtype && col_idx.scalar_type() == idx_dtype, "forward CSR must have the same dtype as CSR^T");
+    rows::check_index_range(row_ptr_T, col_idx_T, "GT backward");
+    rows::check_node_list(light_nodes, row_ptr_T, "light_nodes");
+    rows::check_node_list(heavy_nodes, row_ptr_T, "heavy_nodes");
 
     TORCH_CHECK(logsumexp.dtype() == torch::kFloat32, "logsumexp must be float32");
     TORCH_CHECK(logsumexp.dim() == 2, "logsumexp must be [N, H]");
@@ -371,7 +335,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
     const int64_t N = Q.size(0);
     const int64_t H = Q.size(1);
     const int64_t D = Q.size(2);
-    check_head_dim(D, "GT backward");
+    rows::check_head_dim(D, "GT backward");
 
     TORCH_CHECK(row_ptr_T.dim() == 1 && row_ptr_T.size(0) == N + 1, "row_ptr_T must be [N+1]");
     TORCH_CHECK(col_idx_T.dim() == 1, "col_idx_T must be [E]");
@@ -380,7 +344,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
     TORCH_CHECK(logsumexp.size(0) == N && logsumexp.size(1) == H, "logsumexp must be [N, H]");
 
     TORCH_CHECK(
-        features_contiguous(Q) && features_contiguous(K) && features_contiguous(V) && features_contiguous(O),
+        rows::features_contiguous(Q) && rows::features_contiguous(K) && rows::features_contiguous(V) && rows::features_contiguous(O),
         "feature dim (D) must be contiguous (stride(2) == 1) for Q, K, V, O"
     );
     TORCH_CHECK(dO.is_contiguous(), "dO must be contiguous [N, H, D]");
@@ -407,33 +371,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(Q.device().index());
 
     // Row layout. dO is contiguous; the gradients are fresh allocations, aligned whenever dO is.
-    const bool wide     = gt::rows_16b_aligned(Q) && gt::rows_16b_aligned(K) && gt::rows_16b_aligned(V) && gt::rows_16b_aligned(dO);
+    const bool wide     = rows::rows_16b_aligned(Q) && rows::rows_16b_aligned(K) && rows::rows_16b_aligned(V) && rows::rows_16b_aligned(dO);
     const uint32_t vec  = wide ? static_cast<uint32_t>(16 / Q.element_size()) : 1u;
     const uint32_t nvec = static_cast<uint32_t>(D) / vec;
 
-    // Delta[i,h] = <O[i,h,:], dO[i,h,:]>, on the caller's stream.
+    // Delta[i,h] = <O[i,h,:], dO[i,h,:]>, on the caller's stream. O and dO have their own layout: Q
+    // may be an offset view while they are not.
     torch::Tensor Delta = torch::empty({N, H}, f32_options);
-    {
-        // O and dO have their own layout: Q may be an offset view while they are not.
-        const bool delta_wide = gt::rows_16b_aligned(O) && gt::rows_16b_aligned(dO);
-        const uint32_t dnvec  = static_cast<uint32_t>(D) / (delta_wide ? static_cast<uint32_t>(16 / Q.element_size()) : 1u);
-        const int64_t rows    = N * H;
-        const int group       = dnvec <= 4 ? 4 : dnvec <= 8 ? 8 : dnvec <= 16 ? 16 : 32;
-        const int64_t per_blk = (gt::kDeltaThreads / kWarpSize) * (kWarpSize / group);
-        const int64_t blocks  = std::min<int64_t>(ceil_div(rows, per_blk), static_cast<int64_t>(sched_ns::sm_count()) * 32);
-        std::visit(
-            [&](auto typeInfo, auto group_c, auto wide_c) {
-                using cuda_t        = typename decltype(typeInfo)::CudaType;
-                constexpr size_t G  = decltype(group_c)::value;
-                constexpr bool WIDE = decltype(wide_c)::value;
-                gt::gt_compute_delta_kernel<G, WIDE, cuda_t><<<static_cast<unsigned>(blocks), gt::kDeltaThreads, 0, stream>>>(
-                    rows, H, dnvec, reinterpret_cast<cuda_t const *>(dO.data_ptr()), dO.stride(0), dO.stride(1),
-                    reinterpret_cast<cuda_t const *>(O.data_ptr()), O.stride(0), O.stride(1), Delta.data_ptr<float>()
-                );
-            },
-            MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), MakeIntVariant<4, 8, 16, 32>(group), MakeBoolVariant<false, true>(delta_wide)
-        );
-    }
+    std::visit(
+        [&](auto typeInfo) { rows::launch_row_dot<typename decltype(typeInfo)::CudaType>(dO, O, Delta, stream); },
+        MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type())
+    );
 
     // The CSR a launch walks: the transpose when directed, the forward CSR -- its own transpose --
     // when undirected. The light/heavy buckets and slice tables passed in are the backward ones,
@@ -443,8 +391,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
     torch::Tensor const& walk_idx = is_directed ? col_idx_T : col_idx;
     const int64_t n_edges         = walk_idx.numel();
     const bool any_heavy          = heavy_edge_slice > 0 ? chunk_node.numel() > 0 : heavy_nodes.numel() > 0;
-    const bool chunked            = (light_nodes.numel() > 0 && is_chunked(shape_for(D, Q, wide, light_warps_per_block))) ||
-                                    (any_heavy && is_chunked(shape_for(D, Q, wide, heavy_warps_per_block)));
+    const bool chunked            = (light_nodes.numel() > 0 && chunked_for(D, Q, wide, light_warps_per_block)) ||
+                                    (any_heavy && chunked_for(D, Q, wide, heavy_warps_per_block));
 
     // Chunked path: per-edge scalars, [scalars, H, E].
     torch::Tensor edge_scalars = chunked ? torch::empty({is_directed ? 2 : 3, H, n_edges}, f32_options) : torch::Tensor();
@@ -488,20 +436,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
     };
 
     auto with_stages = [&]<gt::BackwardMode MODE, size_t W, int SHAPE, typename cuda_t, typename index_t>(int stages, auto&& launch) {
-        if constexpr (gt::Shape<SHAPE>::kPipelinable) {
-            const int fitted = gt::fit_pipeline_stages(
-                stages,
-                [&](int s) {
-                    size_t bytes = 0;
-                    gt::with_pipeline_stages(s, [&]<int S>() { bytes = smem_of.template operator()<MODE, W, SHAPE, S, cuda_t, index_t>(); });
-                    return bytes;
-                },
-                Q.device()
-            );
-            gt::with_pipeline_stages(fitted, launch);
-        } else {
-            launch.template operator()<0>();
-        }
+        rows::with_fitted_stages<SHAPE>(
+            stages, Q.device(), [&]<int S>() { return smem_of.template operator()<MODE, W, SHAPE, S, cuda_t, index_t>(); }, launch
+        );
     };
 
     auto mode_variant = [&] { return MakeEnumVariant<gt::BackwardMode, gt::BackwardMode::Directed, gt::BackwardMode::Undirected>(mode); };
@@ -536,8 +473,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
                     });
                 });
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), warp_variant,
-            mode_variant()
+            MakeIndexWidthVariant(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()), warp_variant, mode_variant()
         );
     };
 
@@ -584,17 +520,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ATTN_SHARD_FN(graph_atte
                     });
                 });
 
-                const auto [grid, threads] = merge_launch(num_heavy, H, nvec);
-                constexpr size_t kGrads    = gt::kBackwardGrads<MODE>;
-                if (wide) {
-                    gt::gt_backward_merge_slices_kernel<kGrads, true, cuda_t, index_t>
-                        <<<grid, threads, 0, bucket_stream>>>(p, node_chunk_offset.data_ptr<int>(), num_heavy);
-                } else {
-                    gt::gt_backward_merge_slices_kernel<kGrads, false, cuda_t, index_t>
-                        <<<grid, threads, 0, bucket_stream>>>(p, node_chunk_offset.data_ptr<int>(), num_heavy);
+                constexpr size_t kGrads = gt::kBackwardGrads<MODE>;
+                const rows::SliceTable<index_t> table{p.heavy_nodes, node_chunk_offset.data_ptr<int>(), num_heavy};
+                rows::SumSlices<kGrads, cuda_t, float> io{};
+                cuda_t *const outs[3]       = {p.dQ, p.dV, p.dK};
+                float const *const parts[3] = {p.part_q, p.part_v, p.part_k};
+                for (size_t k = 0; k < kGrads; ++k) {
+                    io.parts[k] = parts[k];
+                    io.outs[k]  = outs[k];
                 }
+                rows::launch_sum_merge<kGrads, cuda_t, index_t>(table, H, p.D, nvec, wide, io, bucket_stream);
             },
-            MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
+            MakeIndexWidthVariant(idx_dtype), MakeTypeVariant<ATTN_SHARD_TYPE>(Q.scalar_type()),
             MakeIntVariant<8, 16, 32>(heavy_warps_per_block), mode_variant()
         );
     };

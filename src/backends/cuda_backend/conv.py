@@ -126,7 +126,8 @@ class _CUDAGATv2Conv(BaseConvolution):
             graph,
             x_left,
             x_neighbors=x_right,
-            attention_weights=self.attn_weights.data,
+            # The parameter itself: `.data` would detach it and the attention vectors would never train.
+            attention_weights=self.attn_weights,
             negative_slope=self.negative_slope,
         ).view(-1, self.heads * self.head_dim)
 
@@ -251,7 +252,7 @@ class _CudaGATv2Aggr(BaseAggr):
             graph,
             x_left,
             x_right,
-            self.attn_weights.data,
+            self.attn_weights,
             self.negative_slope,
             **{**self.kernel_kwargs, **kwargs},
         )

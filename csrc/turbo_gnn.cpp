@@ -61,7 +61,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gatv2_forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)", py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),
         py::arg("attn_vec"), py::arg("negative_slope") = 0.2f, py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 3,
+        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 0,
         py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
@@ -70,10 +70,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def(
         "gatv2_backward", &gatv2_backward_cuda, "GATv2 backward pass (CUDA)", py::arg("grad_h"), py::arg("l"), py::arg("r"), py::arg("row_ptr"),
-        py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("attn_vec"), py::arg("logsumexp"),
+        py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("attn_vec"), py::arg("logsumexp"), py::arg("out"),
         py::arg("negative_slope") = 0.2f, py::arg("grad_A_reduce_row_chunk_size") = 512, py::arg("fwd_light_nodes"), py::arg("fwd_heavy_nodes"),
         py::arg("bwd_light_nodes"), py::arg("bwd_heavy_nodes"), py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8,
-        py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
+        py::arg("is_directed") = true, py::arg("schedule") = 0, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("backward_heavy_edge_slice") = 0,
         py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0

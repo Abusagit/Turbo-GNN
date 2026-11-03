@@ -266,10 +266,12 @@ class gatv2_function(torch.autograd.Function):
     ``out[v] = sum alpha_{uv} * x_right[u]``.
 
     Backward (``_C.gatv2_backward``): computes gradients for x_left, x_right,
-    and attention weights. The backward kernel walks the *transposed* CSR
-    (backward adjacency) to scatter gradients to source nodes. The
-    ``grad_A_reduce_row_chunk_size`` parameter controls shared-memory usage
-    in the attention-gradient reduction kernel.
+    and attention weights. On a directed graph the x_right gradient is gathered
+    over the *transposed* CSR (backward adjacency); an undirected graph needs
+    only the forward one. The softmax term uses ``<grad_output, output>`` per
+    row, so the output is saved for the backward. ``grad_A_reduce_row_chunk_size``
+    is accepted for compatibility and unused: the attention-weight gradient is
+    reduced inside the backward kernels.
     """
 
     @staticmethod
@@ -369,6 +371,7 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            output,
             fwd_light_nodes,
             fwd_heavy_nodes,
             bwd_light_nodes,
@@ -389,6 +392,7 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            output,
             fwd_light_nodes,
             fwd_heavy_nodes,
             bwd_light_nodes,
@@ -398,7 +402,11 @@ class gatv2_function(torch.autograd.Function):
         num_heads = ctx.heads
         head_dim = ctx.head_dim
 
-        grad_output = grad_output.view(-1, num_heads, head_dim)
+        # The kernels read the gradient through its row strides but need unit stride over the
+        # head dim; autograd may hand over any layout.
+        grad_output = grad_output.reshape(-1, num_heads, head_dim)
+        if grad_output.stride(-1) != 1:
+            grad_output = grad_output.contiguous()
 
         grad_x_left, grad_x_right, grad_attention = _C.gatv2_backward(
             grad_output,
@@ -410,6 +418,7 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            output,
             ctx.negative_slope,
             ctx.grad_A_reduce_row_chunk_size,
             fwd_light_nodes,
