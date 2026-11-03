@@ -356,7 +356,7 @@ _GATV2_PARAMS = (
 
 _GT_PARAMS = (
     KernelParam("scale", _parse_optional_float, None, "Score scale; 'none' means 1/sqrt(head_dim)."),
-    KernelParam("forward_light_warps", int, 4, "Warps per block, forward light-node kernel."),
+    KernelParam("forward_light_warps", int, 1, "Warps per block, forward light-node kernel."),
     KernelParam("forward_heavy_warps", int, 8, "Warps per block, forward heavy-node kernel."),
     KernelParam("backward_light_warps", int, 1, "Warps per block, backward light-node kernel."),
     KernelParam("backward_heavy_warps", int, 8, "Warps per block, backward heavy-node kernel."),

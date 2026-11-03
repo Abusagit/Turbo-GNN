@@ -931,6 +931,21 @@ struct HintedAccessType<16> {
     using type = ulonglong2;
 };
 
+// The raw bits of a vector as 32-bit words where it is that wide (uint4 / uint2 / uint32_t), so
+// that 16-bit elements are halves of a register rather than of a 64-bit pair.
+template <size_t bytes>
+struct RawWords {
+    using type = deduce_uint_type_t<bytes>;
+};
+template <>
+struct RawWords<16> {
+    using type = uint4;
+};
+template <>
+struct RawWords<8> {
+    using type = uint2;
+};
+
 template <size_t N, FloatingNum num_type, FloatingNum accum_t = float>
 struct TileOps {
    private:
@@ -964,6 +979,35 @@ struct TileOps {
     };
 
     // Common
+
+    // The raw word(s) behind one vector, and the conversion back. Selecting on the raw words -- e.g.
+    // data or zero -- is a register select per word; selecting on a vec_t of 16-bit elements is one
+    // per element.
+    using access_t = typename RawWords<TW * sizeof(num_type)>::type;
+
+    template <MemoryHint hint = MemoryHint::NoHint>
+    static __device__ access_t read_raw(num_type const *const __restrict__ src_arr, size_t vec_idx) {
+        access_t const *const src = reinterpret_cast<access_t const *>(&src_arr[vec_idx * TW]);
+        if constexpr (hint == MemoryHint::AllCache) {
+            return __ldca(src);
+        } else if constexpr (hint == MemoryHint::L2Only) {
+            return __ldcg(src);
+        } else if constexpr (hint == MemoryHint::Streaming) {
+            return __ldcs(src);
+        } else if constexpr (hint == MemoryHint::NoCache) {
+            return __ldcv(src);
+        } else if constexpr (hint == MemoryHint::ReadOnly) {
+            return __ldg(src);
+        } else {
+            return *src;
+        }
+    }
+    static __device__ vec_t from_raw(access_t raw) {
+        vec_t out;
+        *reinterpret_cast<access_t *>(&out) = raw;
+        return out;
+    }
+
     template <MemoryHint hint = MemoryHint::NoHint>
     static __device__ vec_t read(num_type const *const __restrict__ src_arr, size_t vec_idx) {
         using access_t = typename HintedAccessType<TW * sizeof(num_type)>::type;
@@ -1026,6 +1070,21 @@ struct TileOps {
             reinterpret_cast<VecFloat<compact_N, num_type> *>(dst)[i] =
                 reinterpret_cast<VecFloat<compact_N, accum_t> const *>(src)[i].template convert_vec<num_type>();
         }
+    }
+    // N accum_t values -> one vec_t, so the caller issues a single N * sizeof(num_type)-byte store.
+    // write_convert_from_accum stores in accum_t-sized pieces instead: two 8-byte stores for 8 halves.
+    // src must be aligned like VecFloat<compact_N, accum_t>.
+    static __device__ vec_t convert_from_accum(accum_t const *const __restrict__ src) {
+        constexpr size_t compact_N  = std::min(N, VecFloat<1, num_type>::max_vec_size_bytes / std::max(sizeof(num_type), sizeof(accum_t)));
+        constexpr size_t repeat_cnt = N / compact_N;
+
+        vec_t out;
+#pragma unroll
+        for (size_t i = 0; i < repeat_cnt; ++i) {
+            reinterpret_cast<VecFloat<compact_N, num_type> *>(out.data)[i] =
+                reinterpret_cast<VecFloat<compact_N, accum_t> const *>(src)[i].template convert_vec<num_type>();
+        }
+        return out;
     }
 
     // GATv2
@@ -1110,6 +1169,42 @@ struct TileOps {
 #pragma unroll
             for (size_t j = 0; j < compact_N; ++j) {
                 atomicAdd(&ptr[vec_idx + i * compact_N + j], buf[j]);
+            }
+        }
+    }
+    // ptr[vec_idx * N + i] += scalar * v[i] over the N elements of vector vec_idx. Unlike
+    // atomic_add_scaled_f32, vec_idx is a vector index, as for read()/write().
+    //
+    // sm_90 adds float2/float4 atomics: one vector reduction per 16 bytes instead of one scalar
+    // atomic per element, which is what bounds an attention backward that scatters a whole row per
+    // edge. They need ptr + vec_idx * N aligned to the vector width, which holds whenever the row
+    // length and the row offsets are multiples of N. Before sm_90 this is the scalar loop.
+    template <FloatingNum atomic_t = float>
+    static __device__ void atomic_add_scaled_vec(atomic_t *const __restrict__ ptr, size_t vec_idx, atomic_t scalar, vec_t v) {
+        static_assert(std::is_same_v<std::remove_cvref_t<atomic_t>, float>, "atomic add is only implememnted for float atomic type.");
+
+        constexpr size_t compact_N  = std::min(N, sizeof(atomic_t));
+        constexpr size_t repeat_cnt = N / compact_N;
+        using vec_compact_t         = VecFloat<compact_N, num_type>;
+        // Dependent on atomic_t, so the sm_90-only overloads are looked up at instantiation, i.e.
+        // only in the branch that is kept.
+        using float4_t = std::conditional_t<sizeof(atomic_t) == 4, float4, atomic_t>;
+        using float2_t = std::conditional_t<sizeof(atomic_t) == 4, float2, atomic_t>;
+
+        atomic_t *const dst = ptr + vec_idx * N;
+#pragma unroll
+        for (size_t i = 0; i < repeat_cnt; ++i) {
+            VecFloat<compact_N, atomic_t> buf = reinterpret_cast<vec_compact_t const *>(&v)[i].template convert_vec<atomic_t>();
+            buf *= scalar;
+            if constexpr (kCudaArch >= 900 && compact_N == 4) {
+                atomicAdd(reinterpret_cast<float4_t *>(dst + i * compact_N), *reinterpret_cast<float4_t const *>(&buf));
+            } else if constexpr (kCudaArch >= 900 && compact_N == 2) {
+                atomicAdd(reinterpret_cast<float2_t *>(dst + i * compact_N), *reinterpret_cast<float2_t const *>(&buf));
+            } else {
+#pragma unroll
+                for (size_t j = 0; j < compact_N; ++j) {
+                    atomicAdd(&dst[i * compact_N + j], buf[j]);
+                }
             }
         }
     }

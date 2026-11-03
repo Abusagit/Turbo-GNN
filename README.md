@@ -460,8 +460,9 @@ Inputs are synthesized already-projected, in whatever shape the aggregation expe
 | `gt` | `(Q, K, V, graph)` | `feature_dim // heads` |
 
 `gat_v2` treating `--feature-dim` as the *per-head* width is the convention `create_aggr` already
-uses across all backends; it is not a typo. Note `gt` on the cuda backend only supports head dims of
-32, 64, 128 or 256.
+uses across all backends; it is not a typo. `gt` on the cuda backend takes any head dim from 1 to
+65536; widths whose rows are not whole 16-byte vectors (e.g. an odd head dim) run a slower
+element-wise path.
 
 #### Measurement
 

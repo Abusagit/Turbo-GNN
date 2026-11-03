@@ -27,6 +27,11 @@ inline constexpr bool is_device_pass = false;
 inline constexpr int kCudaArch       = 0;
 #endif
 
+// Resident blocks per SM of the architecture being compiled (CUDA Programming Guide, compute
+// capability table): 16 on sm_86, 24 on sm_87/89 and sm_12x, 32 elsewhere from sm_80 on. A
+// __launch_bounds__ minimum above it is ignored by ptxas -- register cap included.
+inline constexpr int kMaxResidentBlocksPerSM = kCudaArch == 860 ? 16 : (kCudaArch == 870 || kCudaArch == 890 || kCudaArch >= 1200) ? 24 : 32;
+
 #ifdef CUDA_KERNEL_DEBUG
 #define CUDA_KERNEL_CHECK()                                                    \
   do {                                                                         \
@@ -151,6 +156,28 @@ struct OnlineSoftmaxState {
         sum_exp          = sum_exp * correction + __expf(logit - max_val);
 
         return correction;
+    }
+
+    // update() with the new logit's weight exp(logit - max) handed back instead of recomputed by
+    // the caller: two exponentials per logit rather than three. Returns the rescale factor for
+    // accumulators built against the previous max.
+    __device__ float update(float logit, float& weight) {
+        const float new_max    = fmaxf(max_val, logit);
+        const float correction = __expf(max_val - new_max);
+        weight                 = __expf(logit - new_max);
+        sum_exp                = fmaf(sum_exp, correction, weight);
+        max_val                = new_max;
+        return correction;
+    }
+
+    // Folds another partial state (max, sum) into this one. Returns the factors that rescale this
+    // state's and the other state's accumulators to the merged max.
+    __device__ float2 merge(float other_max, float other_sum) {
+        const float new_max = fmaxf(max_val, other_max);
+        const float2 c      = make_float2(__expf(max_val - new_max), __expf(other_max - new_max));
+        sum_exp             = fmaf(sum_exp, c.x, other_sum * c.y);
+        max_val             = new_max;
+        return c;
     }
 
     __device__ float get_alpha(float logit) const { return __expf(logit - max_val) / sum_exp; }

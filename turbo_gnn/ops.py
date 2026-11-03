@@ -229,7 +229,7 @@ def graph_transformer_aggr(
     K: torch.Tensor,
     V: torch.Tensor,
     scale: float | None = None,
-    forward_light_warps: int = 4,
+    forward_light_warps: int = 1,
     forward_heavy_warps: int = 8,
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
@@ -258,11 +258,19 @@ def graph_transformer_aggr(
     The entire forward pass (dot-product scores, numerically stable softmax,
     weighted value aggregation) is fused into a single CSR-based CUDA kernel.
 
+    Any head dim ``D`` from 1 to 65536 is supported. Rows of up to 256 (fp32) or 512
+    (fp16/bf16) features are processed in a single pass with every row in registers;
+    longer rows take a two-pass path that stores one score per edge and head (and, in the
+    backward, two or three scalars) in a temporary ``[H, E]`` float32 buffer. Rows that are
+    not whole, 16-byte-aligned vectors -- an odd ``D``, or a view offset into a larger
+    tensor -- are read element by element, which is slower.
+
     Args:
         graph: CSR graph with forward + backward adjacency for fwd/bwd passes.
         x: Original node features (unused by the kernel but passed through the
             autotuning wrapper for shape inference), shape ``[N, F]``.
-        Q: Query tensor, shape ``[N, H, D]`` where ``H * D = F``.
+        Q: Query tensor, shape ``[N, H, D]`` where ``H * D = F``; the last dim must
+            have unit stride.
         K: Key tensor, shape ``[N, H, D]``.
         V: Value tensor, shape ``[N, H, D]``.
         scale: Scaling factor, typically ``1 / sqrt(D)``.
@@ -274,9 +282,13 @@ def graph_transformer_aggr(
             into slices of that size, one block each, merged by a second kernel. Balances
             the heavy bucket and sizes its grid by edge count rather than node count.
         pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
-            Q[j]/V[j] prefetch. 0 disables the pipeline.
+            Q[j]/V[j] prefetch. 0 disables the pipeline. Applies to rows of 16-byte
+            vectors that span at least a warp (and at most the single-pass limit); other
+            rows ignore it. A depth whose staging buffer does not fit the device's shared
+            memory is lowered to the deepest one that does.
         backward_pipeline_stages: Number of async-copy pipeline stages for the backward
-            kernels' neighbor-row prefetch. 0 disables the pipeline.
+            kernels' neighbor-row prefetch. 0 disables the pipeline. Same applicability
+            as ``pipeline_stages``.
 
     Returns:
         Attended features, shape ``[N, H, D]``.

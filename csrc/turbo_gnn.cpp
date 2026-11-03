@@ -83,7 +83,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gt_forward_csr_mh", &graph_attention_forward_csr_mh_cuda, "Graph Transformer forward (CSR, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 3,
+        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 0,
         py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
@@ -94,7 +94,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "gt_backward_csr_mh", &graph_attention_backward_csr_mh_cuda, "Graph Transformer backward (CSR + CSR^T, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("dO"),
         py::arg("logsumexp"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("light_warps_per_block") = 1,
-        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
+        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("schedule") = 0, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
         py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
         py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
         py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0

@@ -1,617 +1,441 @@
 #include <cstdint>
 
 #include "common.cuh"
+#include "common/pipeline.cuh"
+#include "common/row_group.cuh"
+#include "gt/gt_common.cuh"
 
-/// Resident blocks per SM to ask the compiler for, so the persistent loop does not cost
-/// occupancy.
-///
-/// This kernel sits exactly on an occupancy cliff, and only this one does. At 4 warps per
-/// block the one-block-per-node build uses **32** registers -- precisely the budget for 2048
-/// resident threads, i.e. full occupancy on an A100. Wrapping the body in the scheduler's loop
-/// lengthens live ranges and pushes it to 38 (grid_stride) or 48 (dynamic), which drops the
-/// SM to 52 and 40 warps -- 81% and 62% of what the baseline got. At D_CONST=256 dynamic
-/// reaches 56 registers and 56%. That is the whole of GT's forward regression: measured 0.81x
-/// to 0.98x against occupancy ratios of 0.62 to 0.81.
-///
-/// `__launch_bounds__` with only a thread count, which is what every kernel in `csrc/` had,
-/// constrains nothing about registers. Supplying the second argument does: asking for B blocks
-/// of T threads caps the compiler at 65536/(B*T) registers per thread.
-///
-/// Applied only where the baseline was already register-cheap enough for the target to be
-/// reachable. The 8-warp heavy instantiation needs 47 registers by itself, so demanding 32
-/// there would trade an occupancy loss for a local-memory spill, which is worse; it gets 1,
-/// meaning no constraint. The reduction and GATv2 kernels are left alone entirely -- their
-/// register use is flat across policies (47.6 -> 48.2 and 55.9 -> 54.5) and they do not
-/// regress.
-/// Clamped to 32, the hardware's resident-blocks-per-SM limit: a 1-warp block would otherwise
-/// ask for 64, which is unsatisfiable and constrains nothing useful anyway.
-template <size_t N_PER_BLOCK>
-inline constexpr int kGtFwdMinBlocksPerSM =
-    (N_PER_BLOCK <= 4) ? static_cast<int>(2048 / (N_PER_BLOCK * kWarpSize) < 32 ? 2048 / (N_PER_BLOCK * kWarpSize) : 32) : 1;
+// ================================================================================================
+// Graph transformer forward, for any head dim D in [1, kMaxHeadDim].
+//
+//   score(i, j) = scale * <K[i], Q[j]>        over the incoming edges j -> i of node i
+//   O[i]        = sum_j softmax_j(score(i, j)) * V[j]
+//   lse[i]      = log sum_j exp(score(i, j))   saved for the backward
+//
+// One block of W warps per (node, head) -- or per slice of a heavy node's edge list -- with the
+// edges split into contiguous per-warp shares. Rows are laid out across lanes as described in
+// gt/gt_common.cuh: the fused path keeps everything in registers and visits each edge once, the
+// chunked path handles rows too long for that in two passes.
+// ================================================================================================
 
-template <
-    turbo_gnn::sched::ScheduleKind SK, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t,
-    FloatingNum accum_t = float, int PIPELINE_STAGES = 0>
-__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize, kGtFwdMinBlocksPerSM<N_PER_BLOCK>)
-    GraphAttentionForward_CSR_MH_v2_D( // no-format
-    size_t N, size_t H,
-    const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
-    int64_t stride_q_n, int64_t stride_q_h,
-    int64_t stride_k_n, int64_t stride_k_h,
-    int64_t stride_v_n, int64_t stride_v_h,
-    const index_t *__restrict__ row_ptr, const index_t *__restrict__ col_idx,
-    turbo_gnn::sched::SchedulerParams<index_t> sched_params,
-    cuda_t *__restrict__ O, int64_t stride_o_n, int64_t stride_o_h,
-    accum_t *__restrict__ logsumexp, accum_t scale
-) {
-    static_assert(D_CONST % 32 == 0, "D_CONST must be multiple of 32 for this fast path");
+namespace turbo_gnn::gt {
 
-    using TW_SELECTOR = SelectTW<D_CONST, cuda_t>;
-
-    constexpr size_t TW = TW_SELECTOR::value;  // Tile width
-    static_assert(D_CONST % TW == 0, "Per-head features dim should be divisible by Tile width");
-    constexpr size_t TILES            = D_CONST / TW;                                                             // Total tiles count
-    constexpr size_t TILES_PER_THREAD = (TILES + (TW_SELECTOR::threads_per_d)-1) / (TW_SELECTOR::threads_per_d);  // Tiles per thread
-    constexpr size_t ACCS_PER_THREAD  = TW * TILES_PER_THREAD;  // Accumulatores used by one thread
-
-    using AccumOps = AdOps<accum_t>;
-    using Tile     = TileOps<TW, cuda_t, accum_t>;
-
-    const size_t head_h = blockIdx.y;
-
-    // Body in a lambda: its `return`s become per-node `continue` semantics.
-    auto process_node = [&](const size_t node_i) {
-        __builtin_assume(threadIdx.y < static_cast<unsigned>(N_PER_BLOCK));
-        const size_t lane_id = threadIdx.x;
-        __builtin_assume(lane_id < static_cast<size_t>(kWarpSize));
-        constexpr size_t lane_cnt            = kWarpSize;
-        const size_t block_neighbor_id       = threadIdx.y;
-        constexpr size_t neighbor_block_size = N_PER_BLOCK;
-
-        if (node_i >= N || head_h >= H) [[unlikely]] {
-            return;
-        }
-
-        const index_t edge_start   = row_ptr[node_i];
-        const index_t edge_end     = row_ptr[node_i + 1];
-        const size_t num_neighbors = static_cast<int>(edge_end - edge_start);
-
-        static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
-        constexpr bool USE_PIPELINE     = PIPELINE_STAGES > 0;
-        constexpr int NUM_STAGES        = PIPELINE_STAGES;
-        constexpr int NUM_PREFETCH_ROWS = 2;  // Q[j], V[j]
-
-        // Shared memory layout. Ordered so that every array written through a vector
-        // (VecFloat<N>/float4) store starts on a 16-byte boundary; the scalar-only arrays go last:
-        // k_shared[D_CONST] as cuda_t                                    -- float4 loads, needs 16B
-        // qv_dbuf[N_PER_BLOCK * 2 * NUM_STAGES * D_CONST] as cuda_t      -- ping-pong for Q[j]/V[j], only when USE_PIPELINE
-        // neighbor_out[neighbor_block_size * D_CONST] as accum_t         -- VecFloat<compact_N> stores, needs up to 16B
-        // warp_sum_storage[2 * neighbor_block_size * neighbor_warp_cnt] as accum_t -- scalar, double-buffered on (r & 1)
-        // neighbor_max[neighbor_block_size] as accum_t                   -- scalar
-        // neighbor_sum[neighbor_block_size] as accum_t                   -- scalar
-        //
-        // D_CONST * sizeof(cuda_t) is a multiple of 16 for every supported (D, dtype),
-        // so neighbor_out lands 16B-aligned; putting the scalar arrays first would offset
-        // it by a single accum_t and misalign the wide stores below.
-        extern __shared__ __align__(16) uint8_t sh_raw[];
-        cuda_t *const k_shared = reinterpret_cast<cuda_t *>(sh_raw);  // Loading K_i into shared memory, because it's the same in one block
-        cuda_t *const qv_dbuf  = k_shared + D_CONST;                  // only meaningful when USE_PIPELINE
-
-        constexpr size_t qv_dbuf_bytes = USE_PIPELINE ? N_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
-        accum_t *const neighbor_out    = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t) + qv_dbuf_bytes);
-        accum_t *const warp_sum_storage =
-            neighbor_out + neighbor_block_size * D_CONST;  // Space to store warp sums to agregate them later (2 round buffers)
-        accum_t *const neighbor_max = warp_sum_storage + 2 * neighbor_block_size;  // Space to store local neighbor maximums of scores
-        accum_t *const neighbor_sum = neighbor_max + neighbor_block_size;          // Space to store local neighbor sums of score
-
-        accum_t *const my_out = neighbor_out + block_neighbor_id * D_CONST;
-
-        // handle isolated nodes
-        if (num_neighbors == 0) [[unlikely]] {
-            if (block_neighbor_id == 0) {
-                cuda_t *out_base = O + node_i * stride_o_n + head_h * stride_o_h;
-                for (size_t vi = lane_id; vi < TILES; vi += lane_cnt) {
-                    Tile::write_zero(out_base, vi);
-                }
-                if (lane_id == 0) {
-                    logsumexp[node_i * H + head_h] = -INFINITY;
-                }
-            }
-            return;
-        }
-
-        // cooperative load of K_i via 128-bit transactions (unchanged)
-        // TODO: make separate function
-        if (block_neighbor_id == 0) {
-            constexpr size_t ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);  // remainder is guaranteed to be zero
-            static_assert(D_CONST % ELEMS_PER_F4 == 0, "Per-head feature dim should be divisible by 8");
-            constexpr size_t NUM_K_LOADS = D_CONST / ELEMS_PER_F4;
-            cuda_t const *const k_base   = K + node_i * stride_k_n + head_h * stride_k_h;
-            float4 const *const k_src    = reinterpret_cast<float4 const *>(k_base);
-            float4 *const k_sh           = reinterpret_cast<float4 *>(k_shared);
-            for (size_t i = lane_id; i < NUM_K_LOADS; i += lane_cnt) {
-                k_sh[i] = k_src[i];
-            }
+// Merges the softmax states of a block's warps -- lane 0 of each holding its warp's -- into `st`
+// of every thread, and returns exp(m_warp - M): the factor that rescales this warp's accumulators
+// to the block-wide max M. stats: 2 * W accum_t of shared memory. Must be called by every thread.
+template <size_t W>
+__device__ __forceinline__ float merge_block_softmax(OnlineSoftmaxState& st, float *const __restrict__ stats, uint32_t warp, uint32_t lane) {
+    if constexpr (W == 1) {
+        return 1.0f;
+    } else {
+        if (lane == 0) {
+            stats[warp]     = st.max_val;
+            stats[W + warp] = st.sum_exp;
         }
         __syncthreads();
-
-        OnlineSoftmaxState softmax_state;
-
-        accum_t o_acc[ACCS_PER_THREAD] = {0};
-
-        // neighbor loop
-        auto consume = [&](index_t /*j*/, cuda_t const *const(&rows)[NUM_PREFETCH_ROWS]) {
-            const cuda_t *q_base = rows[0];
-            const cuda_t *v_base = rows[1];
-
-            accum_t s_partial{};
-
-            // Q*K dot product (uses improved dot_product with native mul)
+        float block_max = -FLT_MAX;
 #pragma unroll
-            for (size_t tile_id = lane_id; tile_id < TILES; tile_id += lane_cnt) {
-                const typename Tile::vec_t kv = Tile::read(k_shared, tile_id);
-                const typename Tile::vec_t qv = Tile::read(q_base, tile_id);
-                kv.dot_product_(&s_partial, qv);
-            }
-
-            accum_t score = warp_reduce_sum(s_partial) * scale;
-
-            const accum_t correction = softmax_state.update(score);
-            const accum_t w          = AccumOps::exp(score - softmax_state.max_val);
-
-            // V accumulation (keeps fmaf via weighted_accum)
-#pragma unroll
-            for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
-                const size_t vi = lane_id + lane_cnt * t;
-                if (vi < TILES) [[likely]] {
-#pragma unroll
-                    for (size_t ep = 0; ep < TW; ++ep) {
-                        o_acc[t * TW + ep] *= correction;
-                    }
-                    const typename Tile::vec_t vv = Tile::read(v_base, vi);
-                    vv.template weighted_accum_<accum_t>(&o_acc[t * TW], w);
-                }
-            }
-        };
-
-        if constexpr (USE_PIPELINE) {
-            cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {Q, V};
-            int64_t const row_stride_n[NUM_PREFETCH_ROWS]    = {stride_q_n, stride_v_n};
-            int64_t const row_stride_h[NUM_PREFETCH_ROWS]    = {stride_q_h, stride_v_h};
-            cuda_t *warp_dbuf                                = qv_dbuf + block_neighbor_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
-            pipelined_neighbor_row_loop<
-                static_cast<int>(N_PER_BLOCK), static_cast<int>(D_CONST), NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t
-            >(static_cast<int>(block_neighbor_id), static_cast<int>(lane_id), static_cast<int>(num_neighbors), edge_start, col_idx, row_bases,
-                row_stride_n, row_stride_h, static_cast<int>(head_h), warp_dbuf, consume);
-        } else {
-            const size_t rounds = (num_neighbors + neighbor_block_size - 1) / neighbor_block_size;
-            for (size_t r = 0; r < rounds; ++r) {
-                const size_t neighbor_id = r * neighbor_block_size + block_neighbor_id;
-                if (neighbor_id >= num_neighbors) [[unlikely]] {
-                    break;
-                }
-                const index_t j                             = col_idx[edge_start + neighbor_id];
-                const cuda_t *q_base                        = Q + j * stride_q_n + head_h * stride_q_h;
-                const cuda_t *v_base                        = V + j * stride_v_n + head_h * stride_v_h;
-                cuda_t const *const rows[NUM_PREFETCH_ROWS] = {q_base, v_base};
-                consume(j, rows);
-            }
+        for (size_t w = 0; w < W; ++w) {
+            block_max = fmaxf(block_max, stats[w]);
         }
-
-        __syncthreads();
-
-// write per-warp results to float32 shared
+        float block_sum = 0.0f;
 #pragma unroll
-        for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
-            const size_t vi = lane_id + lane_cnt * t;
-            if (vi < TILES) [[likely]] {
-                constexpr size_t compact_N  = std::min(TW, VecFloat<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
-                constexpr size_t repeat_cnt = TW / compact_N;
-
-                for (size_t i = 0; i < repeat_cnt; ++i) {
-                    TileOps<compact_N, accum_t>::write(
-                        my_out, vi * repeat_cnt + i, reinterpret_cast<VecFloat<compact_N, accum_t> const *>(o_acc)[t * repeat_cnt + i]
-                    );
-                }
-            }
+        for (size_t w = 0; w < W; ++w) {
+            block_sum = fmaf(stats[W + w], __expf(stats[w] - block_max), block_sum);
         }
-
-        if (lane_id == 0) {
-            neighbor_max[block_neighbor_id] = softmax_state.max_val;
-            neighbor_sum[block_neighbor_id] = softmax_state.sum_exp;
-        }
-        __syncthreads();
-
-        // cross-warp reduction (warp 0 only)
-        if (block_neighbor_id == 0) {
-            accum_t global_max = -FLT_MAX;
-            accum_t global_sum{};
-            accum_t inv_sum{};
-
-            if (lane_id == 0) {
-                for (size_t w = 0; w < neighbor_block_size; ++w) {
-                    global_max = AccumOps::max(global_max, neighbor_max[w]);
-                }
-                for (size_t w = 0; w < neighbor_block_size; ++w) {
-                    global_sum = AccumOps::fma(neighbor_sum[w], AccumOps::exp(neighbor_max[w] - global_max), global_sum);
-                }
-                for (size_t w = 0; w < neighbor_block_size; ++w) {
-                    neighbor_sum[w] = AccumOps::exp(neighbor_max[w] - global_max);  // scale_w
-                }
-
-                inv_sum = AccumOps::max(1.0f / global_sum, 0.0f);
-                // This is correct for node that has at least 1 neighbour
-                // (global_sum > 0.0f) ? (global_max + logf(global_sum)) : -INFINITY; - always correct
-                logsumexp[node_i * H + head_h] = AccumOps::max(global_max + AccumOps::log(global_sum), -INFINITY);
-            }
-
-            // Lane 0 rewrote `neighbor_sum` in shared memory just above, and every lane of this
-            // warp reads it below. A shuffle converges the warp but is not a memory fence, so
-            // relying on it for that ordering is the classic warp-synchronous assumption that
-            // Volta's independent thread scheduling no longer honours. `__syncwarp()` provides
-            // both. `compute-sanitizer --tool racecheck` reported 169,312 hazards here without it.
-            __syncwarp();
-
-            inv_sum = __shfl_sync(FULL_WARP_MASK, inv_sum, 0);
-
-            // cross-neighbor output write (uses write_typed for vec2 stores)
-            cuda_t *const out_base = O + node_i * stride_o_n + head_h * stride_o_h;
-#pragma unroll
-            for (size_t t = 0; t < (TILES + lane_cnt - 1) / lane_cnt; ++t) {
-                const size_t vi = lane_id + t * kWarpSize;
-                if (vi < TILES) [[likely]] {
-                    accum_t combined[TW] = {0};
-#pragma unroll
-                    for (size_t ep = 0; ep < TW; ++ep) {
-                        size_t d_idx = vi * TW + ep;
-#pragma unroll
-                        for (size_t w = 0; w < neighbor_block_size; ++w) {
-                            combined[ep] = AccumOps::fma(neighbor_sum[w], neighbor_out[w * D_CONST + d_idx], combined[ep]);
-                        }
-                        combined[ep] *= inv_sum;
-                    }
-                    Tile::write_convert_from_accum(&out_base[vi * TW], combined);
-                }
-            }
-        }
-    };  // process_node
-
-    using Sched = turbo_gnn::sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
-    __shared__ typename Sched::SharedStorage sched_smem;
-    Sched sched(sched_params, sched_smem);
-    for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
-        process_node(static_cast<int>(sched.node(work)));
+        const float rescale = __expf(st.max_val - block_max);
+        st.max_val          = block_max;
+        st.sum_exp          = block_sum;
+        return rescale;
     }
 }
 
-// ================================================================================================
-// Split-K heavy path
-//
-// The heavy bucket is assigned one block per node, so a graph with 1,715 heavy nodes launches
-// 1,715 blocks whose runtimes differ by the whole degree spread -- a grid far too small to fill
-// the device, waiting on its longest row. These two kernels replace that with one block per
-// fixed-size *slice* of a node's edge list: balanced, and as many blocks as the work warrants.
-//
-// A slice never spans two nodes, so its partial state -- slice max, slice sum of exps, and the
-// output accumulator scaled by that max -- is exactly the state the existing cross-warp
-// reduction already merges across warps. The merge kernel below runs the same n-way arithmetic
-// across slices instead. The one difference from the in-place kernel is that the slice kernel
-// stops *before* normalising: it writes the un-normalised accumulator, because dividing by a
-// slice-local sum would have to be undone.
-//
-// These take no SchedulerParams. The grid is exactly the slice count, so there is nothing for a
-// node->block policy to decide, and the persistent loop's register cost (documented above as the
-// whole of GT's forward regression) is avoided.
-// ================================================================================================
+// ------------------------------------------------------------------------------------------------
+// Fused path. Each lane group runs an online softmax over its edges with K[i], Q[j], V[j] and the
+// accumulator in registers; the partial states are merged group -> warp (shuffles) -> block
+// (shared memory) at the end.
+// ------------------------------------------------------------------------------------------------
+template <size_t W, int SHAPE, int STAGES, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t>
+struct ForwardFused {
+    using Sh = Shape<SHAPE>;
+    static_assert(!Sh::kChunked, "ForwardFused takes a fused shape");
+    static_assert(STAGES == 0 || Sh::kPipelinable, "The cp.async ring needs whole-warp rows of 16-byte vectors");
 
-template <
-    size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float,
-    // PIPELINE_STAGES == 0 keeps the plain warp-strided loop; >= 1 stages Q[j]/V[j] through
-    // shared memory, exactly as GraphAttentionForward_CSR_MH_v2_D does for the in-place path.
-    int PIPELINE_STAGES = 0>
-__global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GraphAttentionForwardSlice_CSR_MH_D( // no-format
-    size_t N, size_t H,
-    const cuda_t *__restrict__ Q, const cuda_t *__restrict__ K, const cuda_t *__restrict__ V,
-    int64_t stride_q_n, int64_t stride_q_h,
-    int64_t stride_k_n, int64_t stride_k_h,
-    int64_t stride_v_n, int64_t stride_v_h,
-    const index_t *__restrict__ row_ptr, const index_t *__restrict__ col_idx,
-    const index_t *__restrict__ heavy_nodes,
-    const int *__restrict__ chunk_node, const int *__restrict__ chunk_start,
-    int slice_size, int num_slices,
-    accum_t *__restrict__ part_o, accum_t *__restrict__ part_ml, accum_t scale
-) {
-    static_assert(D_CONST % 32 == 0, "D_CONST must be multiple of 32 for this fast path");
+    static constexpr size_t G     = Sh::G;
+    static constexpr size_t VEC   = Sh::template vec<cuda_t>;
+    using RG                      = RowGroup<G, Sh::S, VEC, cuda_t, accum_t>;
+    using Frag                    = typename RG::Frag;
+    using Params                  = ForwardParams<cuda_t, index_t, accum_t>;
+    static constexpr size_t kAccs = RG::kAccs;
+    static constexpr size_t kRows = 2;  // staged per edge: Q[j], V[j]
 
-    using TW_SELECTOR   = SelectTW<D_CONST, cuda_t>;
-    constexpr size_t TW = TW_SELECTOR::value;
-    static_assert(D_CONST % TW == 0, "Per-head features dim should be divisible by Tile width");
-    constexpr size_t TILES            = D_CONST / TW;
-    constexpr size_t TILES_PER_THREAD = (TILES + (TW_SELECTOR::threads_per_d)-1) / (TW_SELECTOR::threads_per_d);
-    constexpr size_t ACCS_PER_THREAD  = TW * TILES_PER_THREAD;
-
-    using AccumOps = AdOps<accum_t>;
-    using Tile     = TileOps<TW, cuda_t, accum_t>;
-
-    const size_t slice_id = blockIdx.x;
-    const size_t head_h   = blockIdx.y;
-    if (slice_id >= static_cast<size_t>(num_slices) || head_h >= H) [[unlikely]] {
-        return;
+    // [ cp.async ring | cross-warp merge buffer ] (aliased: the merge starts only once every warp
+    // has left its edge loop) followed by 2 * W floats of softmax stats.
+    static __host__ __device__ size_t stats_offset(uint32_t D) {
+        const size_t ring  = W * pipelined_rows_ring_elems(STAGES, kRows, D) * sizeof(cuda_t);
+        const size_t merge = kTeamSumBufferElems<W, G, kAccs, accum_t> * sizeof(accum_t);
+        return ceil_div(ring > merge ? ring : merge, size_t{16}) * 16;
     }
+    static __host__ __device__ size_t smem_bytes(uint32_t D) { return stats_offset(D) + 2 * W * sizeof(accum_t); }
 
-    const size_t lane_id                 = threadIdx.x;
-    const size_t block_neighbor_id       = threadIdx.y;
-    constexpr size_t lane_cnt            = kWarpSize;
-    constexpr size_t neighbor_block_size = N_PER_BLOCK;
+    // Runs the block over the n edges of one row (ids at `edges`). On return warp 0 holds the
+    // block's softmax state in every lane and, in lanes [0, G), the un-normalised accumulator for
+    // vectors lane, lane + G, ...
+    static __device__ __forceinline__ void run(
+        Params const& p, int64_t node, int64_t head, index_t const *const __restrict__ edges, uint32_t n, uint8_t *smem, OnlineSoftmaxState& st,
+        accum_t (&acc)[kAccs]
+    ) {
+        const uint32_t lane = threadIdx.x % kWarpSize;
+        const uint32_t warp = threadIdx.x / kWarpSize;
+        const uint32_t r    = lane % G;
 
-    const size_t slot   = static_cast<size_t>(chunk_node[slice_id]);
-    const size_t node_i = static_cast<size_t>(heavy_nodes[slot]);
-    if (node_i >= N) [[unlikely]] {
-        return;
-    }
+        // Every group owns the same vectors of every row, so each needs the same part of K[i].
+        Frag kf;
+        RG::load(kf, p.K + node * p.stride_k_n + head * p.stride_k_h, r, p.nvec);
+        st = OnlineSoftmaxState{};
+        RG::zero(acc);
 
-    const index_t edge_start   = row_ptr[node_i];
-    const size_t num_neighbors = static_cast<size_t>(row_ptr[node_i + 1] - edge_start);
+        // The head's offset is loop-invariant; folded into the per-edge expression it was not hoisted.
+        cuda_t const *const q_head = p.Q + head * p.stride_q_h;
+        cuda_t const *const v_head = p.V + head * p.stride_v_h;
+        auto q_row                 = [&](index_t j) { return q_head + static_cast<int64_t>(j) * p.stride_q_n; };
+        auto v_row                 = [&](index_t j) { return v_head + static_cast<int64_t>(j) * p.stride_v_n; };
 
-    // This slice's half-open range within the node's own edge list. The final slice of a node
-    // whose degree is not a multiple of slice_size is simply shorter; a node with no edges has
-    // one empty slice, which falls straight through to the identity partial below.
-    const size_t local_start = static_cast<size_t>(chunk_start[slice_id]);
-    const size_t local_end   = min(local_start + static_cast<size_t>(slice_size), num_neighbors);
-
-    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
-    constexpr bool USE_PIPELINE     = PIPELINE_STAGES > 0;
-    constexpr int NUM_STAGES        = PIPELINE_STAGES;
-    constexpr int NUM_PREFETCH_ROWS = 2;  // Q[j] and V[j]
-
-    // Same layout as the in-place kernel, minus its unused warp_sum_storage.
-    extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *const k_shared = reinterpret_cast<cuda_t *>(sh_raw);
-    cuda_t *const qv_dbuf  = k_shared + D_CONST;  // only meaningful when USE_PIPELINE
-
-    constexpr size_t qv_dbuf_bytes = USE_PIPELINE ? N_PER_BLOCK * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST * sizeof(cuda_t) : 0;
-    accum_t *const neighbor_out    = reinterpret_cast<accum_t *>(sh_raw + D_CONST * sizeof(cuda_t) + qv_dbuf_bytes);
-    accum_t *const neighbor_max    = neighbor_out + neighbor_block_size * D_CONST;
-    accum_t *const neighbor_sum    = neighbor_max + neighbor_block_size;
-    accum_t *const my_out          = neighbor_out + block_neighbor_id * D_CONST;
-
-    const size_t part_base = (slice_id * H + head_h);
-
-    if (local_start >= local_end) [[unlikely]] {
-        if (block_neighbor_id == 0) {
-            // Scalar: the partials are always accum_t, whose vector width need not match the
-            // input dtype's TW (at fp16 TW is 8, and 8 floats exceed the 128-bit vector limit).
-            // This runs once per slice, not per edge, so the width costs nothing here.
-            for (size_t f = lane_id; f < D_CONST; f += lane_cnt) {
-                part_o[part_base * D_CONST + f] = accum_t{};
+        // Both rows are loaded before the score's shuffle chain starts, so the V gather is already
+        // in flight while the reduction runs.
+        auto edge = [&](bool active, Frag const& qf, Frag const& vf) {
+            const accum_t score = RG::reduce(RG::dot(kf, qf)) * p.scale;
+            if (active) {
+                accum_t w;
+                const accum_t rescale = st.update(score, w);
+                RG::rescale_fma(acc, rescale, vf, w);
             }
-            if (lane_id == 0) {
-                part_ml[part_base * 2 + 0] = -FLT_MAX;
-                part_ml[part_base * 2 + 1] = accum_t{};
-            }
-        }
-        return;
-    }
+        };
 
-    // K_i is shared by every slice of this node; each block loads its own copy.
-    if (block_neighbor_id == 0) {
-        constexpr size_t ELEMS_PER_F4 = sizeof(float4) / sizeof(cuda_t);
-        static_assert(D_CONST % ELEMS_PER_F4 == 0, "Per-head feature dim should be divisible by 8");
-        constexpr size_t NUM_K_LOADS = D_CONST / ELEMS_PER_F4;
-        cuda_t const *const k_base   = K + node_i * stride_k_n + head_h * stride_k_h;
-        float4 const *const k_src    = reinterpret_cast<float4 const *>(k_base);
-        float4 *const k_sh           = reinterpret_cast<float4 *>(k_shared);
-        for (size_t i = lane_id; i < NUM_K_LOADS; i += lane_cnt) {
-            k_sh[i] = k_src[i];
-        }
-    }
-    __syncthreads();
-
-    OnlineSoftmaxState softmax_state;
-    accum_t o_acc[ACCS_PER_THREAD] = {0};
-
-    // One body, two drivers: the pipelined helper stages Q[j]/V[j] into shared memory and hands
-    // back the staged rows; the plain loop passes pointers straight into global.
-    auto consume = [&](index_t /*j*/, cuda_t const *const(&rows)[NUM_PREFETCH_ROWS]) {
-        const cuda_t *q_base = rows[0];
-        const cuda_t *v_base = rows[1];
-
-        accum_t s_partial{};
-#pragma unroll
-        for (size_t tile_id = lane_id; tile_id < TILES; tile_id += lane_cnt) {
-            const typename Tile::vec_t kv = Tile::read(k_shared, tile_id);
-            const typename Tile::vec_t qv = Tile::read(q_base, tile_id);
-            kv.dot_product_(&s_partial, qv);
-        }
-
-        accum_t score = warp_reduce_sum(s_partial) * scale;
-
-        const accum_t correction = softmax_state.update(score);
-        const accum_t w          = AccumOps::exp(score - softmax_state.max_val);
-
-#pragma unroll
-        for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
-            const size_t vi = lane_id + lane_cnt * t;
-            if (vi < TILES) [[likely]] {
-#pragma unroll
-                for (size_t ep = 0; ep < TW; ++ep) {
-                    o_acc[t * TW + ep] *= correction;
+        const uint2 share = warp_share(n, warp, W, RG::kGroupsPerWarp);
+        if constexpr (STAGES > 0) {
+            cuda_t *const ring = reinterpret_cast<cuda_t *>(smem) + warp * pipelined_rows_ring_elems(STAGES, kRows, p.D);
+            NeighborCache<index_t, NoPayloadLoad> ids(edges, share.y, NoPayloadLoad{});
+            pipelined_rows_loop<STAGES, kRows>(
+                lane, share.y - share.x, p.D, ring,
+                [&](uint32_t it, cuda_t const *(&srcs)[kRows]) {
+                    NoPayload unused;
+                    const index_t j = ids.get(share.x + it, lane, unused);
+                    srcs[0]         = q_row(j);
+                    srcs[1]         = v_row(j);
+                },
+                [&](uint32_t, cuda_t const *const(&rows)[kRows]) {
+                    Frag qf, vf;
+                    RG::load(qf, rows[0], r, p.nvec);
+                    RG::load(vf, rows[1], r, p.nvec);
+                    edge(true, qf, vf);
                 }
-                const typename Tile::vec_t vv = Tile::read(v_base, vi);
-                vv.template weighted_accum_<accum_t>(&o_acc[t * TW], w);
+            );
+        } else {
+            for_each_neighbor<G>(edges, share.x, share.y, lane, NoPayloadLoad{}, [&](uint32_t, bool active, index_t j, NoPayload) {
+                Frag qf, vf;
+                RG::load(qf, q_row(j), r, p.nvec, active);
+                RG::load(vf, v_row(j), r, p.nvec, active);
+                edge(active, qf, vf);
+            });
+        }
+
+        // Groups -> warp: an online-softmax merge with each xor partner.
+        if constexpr (G < kWarpSize) {
+#pragma unroll
+            for (uint32_t off = G; off < kWarpSize; off <<= 1) {
+                const float2 c = st.merge(__shfl_xor_sync(FULL_WARP_MASK, st.max_val, off), __shfl_xor_sync(FULL_WARP_MASK, st.sum_exp, off));
+#pragma unroll
+                for (size_t e = 0; e < kAccs; ++e) {
+                    const accum_t other = __shfl_xor_sync(FULL_WARP_MASK, acc[e], off);
+                    acc[e]              = AdOps<accum_t>::fma(acc[e], c.x, other * c.y);
+                }
+            }
+        }
+
+        // Warps -> warp 0. The barrier in merge_block_softmax also retires every warp's use of the
+        // ring, which the merge buffer aliases.
+        if constexpr (W > 1) {
+            RG::scale(acc, merge_block_softmax<W>(st, reinterpret_cast<accum_t *>(smem + stats_offset(p.D)), warp, lane));
+            team_sum<W, G, kAccs>(acc, reinterpret_cast<accum_t *>(smem), warp, lane, W);
+        }
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+// Chunked path, for rows too long to keep in registers.
+//
+//   pass 1  warps split the edges; each warp computes full-row scores one edge at a time (lanes
+//           stride over the row), writes them to the score scratch and keeps an online
+//           (max, sum). The block's states are merged; the barrier also publishes the scores.
+//   pass 2  the row is cut into chunks of 32 * VEC features, one vector per lane. The block's
+//           warps form teams of T, one chunk per team at a time; a team's warps split the edges,
+//           accumulate exp(score - max) * V[j] for their chunk in registers and sum within the
+//           team. With at least as many chunks as warps T == 1 and no shared memory is touched;
+//           with fewer, the edges are still spread over all warps.
+//
+// Traffic matches the fused path -- Q and V once per edge -- plus a 4-byte score written and read
+// per chunk round, against rows of more than 1 KiB in the wide layout. K[i] is read once per edge
+// in pass 1, from L1: the Q gathers bypass L1 so they do not evict it.
+// ------------------------------------------------------------------------------------------------
+template <size_t W, bool WIDE, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t>
+struct ForwardChunked {
+    static constexpr size_t VEC   = WIDE ? 16 / sizeof(cuda_t) : 1;
+    using RG                      = RowGroup<kWarpSize, 1, VEC, cuda_t, accum_t>;
+    using Tile                    = typename RG::Tile;
+    using Frag                    = typename RG::Frag;
+    using Params                  = ForwardParams<cuda_t, index_t, accum_t>;
+    using AccumOps                = AdOps<accum_t>;
+    static constexpr size_t kAccs = RG::kAccs;
+
+    // [ team-sum buffer | 2 * W softmax stats ]
+    static constexpr size_t kStatsOffset = ceil_div(kTeamSumBufferElems<W, kWarpSize, kAccs, accum_t> * sizeof(accum_t), size_t{16}) * 16;
+    static __host__ __device__ size_t smem_bytes(uint32_t) { return kStatsOffset + 2 * W * sizeof(accum_t); }
+
+    // `scores` is this row's slice of the scratch. flush(coff, cnvec, acc) is called by one warp per
+    // chunk with that chunk's un-normalised accumulator (lane = vector index within the chunk,
+    // cnvec vectors valid, coff the chunk's first element); on return `st` holds the row's softmax
+    // state in every thread.
+    template <typename Flush>
+    static __device__ __forceinline__ void run(
+        Params const& p, int64_t node, int64_t head, index_t const *const __restrict__ edges, uint32_t n, accum_t *const __restrict__ scores,
+        uint8_t *smem, OnlineSoftmaxState& st, Flush&& flush
+    ) {
+        const uint32_t lane = threadIdx.x % kWarpSize;
+        const uint32_t warp = threadIdx.x / kWarpSize;
+
+        // ---- pass 1: scores
+        cuda_t const *const k_row  = p.K + node * p.stride_k_n + head * p.stride_k_h;
+        st                         = OnlineSoftmaxState{};
+        const uint2 share          = warp_share(n, warp, W, 1);
+        cuda_t const *const q_head = p.Q + head * p.stride_q_h;
+        for_each_neighbor<kWarpSize>(edges, share.x, share.y, lane, NoPayloadLoad{}, [&](uint32_t slot, bool, index_t j, NoPayload) {
+            cuda_t const *const q_row = q_head + static_cast<int64_t>(j) * p.stride_q_n;
+            accum_t part{};
+#pragma unroll 4
+            for (uint32_t v = lane; v < p.nvec; v += kWarpSize) {
+                Tile::read(k_row, v).dot_product_(&part, Tile::template read<Tile::MemoryHint::L2Only>(q_row, v));
+            }
+            const accum_t score = warp_reduce_sum(part) * p.scale;
+            if (lane == 0) {
+                scores[slot] = score;
+            }
+            accum_t w;
+            st.update(score, w);
+        });
+
+        merge_block_softmax<W>(st, reinterpret_cast<accum_t *>(smem + kStatsOffset), warp, lane);
+        if constexpr (W == 1) {
+            __syncwarp();  // publishes lane 0's scores to the warp
+        }
+
+        // ---- pass 2: chunked accumulation
+        const uint32_t nchunks = ceil_div(p.nvec, static_cast<uint32_t>(kWarpSize));
+        // Teams: a power of two no larger than the chunk count (rounded up) or the warp count.
+        uint32_t teams = 1;
+        while (teams < W && teams < nchunks) {
+            teams <<= 1;
+        }
+        const uint32_t T      = static_cast<uint32_t>(W) / teams;
+        const uint32_t team   = warp / T;
+        const uint32_t member = warp % T;
+        const uint2 my_edges  = warp_share(n, member, T, kWarpSize);
+
+        // Weight of a slot, computed once per slot by the lane that fetches its id.
+        auto weight = [&](index_t, uint32_t slot) -> accum_t { return AccumOps::exp(scores[slot] - st.max_val); };
+
+        for (uint32_t c0 = 0; c0 < nchunks; c0 += teams) {
+            const uint32_t c     = c0 + team;
+            const bool has_chunk = c < nchunks;
+            const int64_t coff   = static_cast<int64_t>(c) * kWarpSize * VEC;
+            const uint32_t cnvec = has_chunk ? min(p.nvec - c * static_cast<uint32_t>(kWarpSize), static_cast<uint32_t>(kWarpSize)) : 0;
+
+            alignas(16) accum_t acc[kAccs];
+            RG::zero(acc);
+            if (has_chunk) {
+                cuda_t const *const v_chunk = p.V + head * p.stride_v_h + coff;
+                for_each_neighbor<kWarpSize, 4>(edges, my_edges.x, my_edges.y, lane, weight, [&](uint32_t, bool, index_t j, accum_t w) {
+                    Frag vf;
+                    RG::load(vf, v_chunk + static_cast<int64_t>(j) * p.stride_v_n, lane, cnvec);
+                    RG::fma(acc, vf, w);
+                });
+            }
+            team_sum<W, kWarpSize, kAccs, /*TRAILING_SYNC=*/true>(acc, reinterpret_cast<accum_t *>(smem), warp, lane, T);
+            if (has_chunk && member == 0) {
+                flush(coff, cnvec, acc);
+            }
+        }
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+// Kernel. SLICED selects the split-K heavy path: one block per slice of a heavy node's edge list,
+// writing an un-normalised partial (accumulator, max, sum) that gt_forward_merge_slices_kernel
+// folds into the node's row. Otherwise one block per node, through the node scheduler.
+// ------------------------------------------------------------------------------------------------
+template <
+    sched::ScheduleKind SK, size_t W, int SHAPE, int STAGES, bool SLICED, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float
+>
+__global__ void __launch_bounds__(W *kWarpSize, kForwardMinBlocksPerSM<W>) gt_forward_kernel(
+    ForwardParams<cuda_t, index_t, accum_t> const p, sched::SchedulerParams<index_t> sched_params
+) {
+    using Sh                    = Shape<SHAPE>;
+    static constexpr size_t VEC = Sh::template vec<cuda_t>;
+    using AccumOps              = AdOps<accum_t>;
+
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+
+    const int64_t head = blockIdx.y;
+    if (head >= p.H) [[unlikely]] {
+        return;
+    }
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+
+    // One row: node `node`, edges [edge_begin, edge_begin + n); `out` is the node (in place) or the
+    // slice (SLICED) the result is written for.
+    auto process_row = [&](int64_t node, index_t edge_begin, uint32_t n, int64_t out) {
+        cuda_t *const o_row     = SLICED ? nullptr : p.O + node * p.stride_o_n + head * p.stride_o_h;
+        accum_t *const part_row = SLICED ? p.part_o + dense_row(out, head, p.H, p.D) : nullptr;
+        accum_t *const lse      = SLICED ? p.part_ml + 2 * (out * p.H + head) : p.logsumexp + node * p.H + head;
+
+        auto write_stats = [&](OnlineSoftmaxState const& st) {
+            if constexpr (SLICED) {
+                lse[0] = st.max_val;
+                lse[1] = st.sum_exp;
+            } else {
+                lse[0] = st.sum_exp > accum_t{} ? st.max_val + AccumOps::log(st.sum_exp) : -INFINITY;
+            }
+        };
+
+        if (n == 0) [[unlikely]] {
+            // No edges: zero output and -inf logsumexp; for a slice, the identity partial.
+            if constexpr (SLICED) {
+                zero_row<1>(part_row, p.D, threadIdx.x, blockDim.x);
+            } else {
+                zero_row<VEC>(o_row, p.nvec, threadIdx.x, blockDim.x);
+            }
+            if (threadIdx.x == 0) {
+                write_stats(OnlineSoftmaxState{});
+            }
+            return;
+        }
+
+        index_t const *const edges = p.col_idx + edge_begin;
+        if constexpr (Sh::kChunked) {
+            using C = ForwardChunked<W, Sh::kWide, cuda_t, index_t, accum_t>;
+            OnlineSoftmaxState st;
+            accum_t *const scores = p.scores + head * p.num_edges + static_cast<int64_t>(edge_begin);
+            C::run(p, node, head, edges, n, scores, sh_raw, st, [&](int64_t coff, uint32_t cnvec, accum_t(&acc)[C::kAccs]) {
+                if constexpr (SLICED) {
+                    C::RG::store_accum(part_row + coff, acc, lane, cnvec);
+                } else {
+                    C::RG::store(o_row + coff, acc, accum_t{1} / st.sum_exp, lane, cnvec);
+                }
+            });
+            if (threadIdx.x == 0) {
+                write_stats(st);
+            }
+        } else {
+            using F = ForwardFused<W, SHAPE, STAGES, cuda_t, index_t, accum_t>;
+            OnlineSoftmaxState st;
+            alignas(16) accum_t acc[F::kAccs];
+            F::run(p, node, head, edges, n, sh_raw, st, acc);
+            if (warp == 0) {
+                if (lane < F::G) {
+                    if constexpr (SLICED) {
+                        F::RG::store_accum(part_row, acc, lane, p.nvec);
+                    } else {
+                        F::RG::store(o_row, acc, accum_t{1} / st.sum_exp, lane, p.nvec);
+                    }
+                }
+                if (lane == 0) {
+                    write_stats(st);
+                }
             }
         }
     };
 
-    // The slice's own edge range is handed to the driver as a base offset plus a length, so the
-    // helper's warp-strided indexing lands inside [local_start, local_end) without knowing about
-    // slicing at all.
-    const index_t slice_edge_start = edge_start + static_cast<index_t>(local_start);
-    const int slice_len            = static_cast<int>(local_end - local_start);
-
-    if constexpr (USE_PIPELINE) {
-        cuda_t const *const row_bases[NUM_PREFETCH_ROWS] = {Q, V};
-        int64_t const row_stride_n[NUM_PREFETCH_ROWS]    = {stride_q_n, stride_v_n};
-        int64_t const row_stride_h[NUM_PREFETCH_ROWS]    = {stride_q_h, stride_v_h};
-        cuda_t *warp_dbuf                                = qv_dbuf + block_neighbor_id * NUM_PREFETCH_ROWS * NUM_STAGES * D_CONST;
-        pipelined_neighbor_row_loop<static_cast<int>(N_PER_BLOCK), static_cast<int>(D_CONST), NUM_STAGES, NUM_PREFETCH_ROWS, cuda_t, index_t>(
-            static_cast<int>(block_neighbor_id), static_cast<int>(lane_id), slice_len, slice_edge_start, col_idx, row_bases, row_stride_n,
-            row_stride_h, static_cast<int>(head_h), warp_dbuf, consume
-        );
+    if constexpr (SLICED) {
+        const int slice = blockIdx.x;
+        if (slice >= p.num_slices) [[unlikely]] {
+            return;
+        }
+        const int64_t node      = static_cast<int64_t>(p.heavy_nodes[p.chunk_node[slice]]);
+        const index_t row_begin = p.row_ptr[node];
+        const uint32_t degree   = static_cast<uint32_t>(p.row_ptr[node + 1] - row_begin);
+        const uint32_t lo       = static_cast<uint32_t>(p.chunk_start[slice]);
+        const uint32_t hi       = min(lo + static_cast<uint32_t>(p.slice_size), degree);
+        process_row(node, row_begin + static_cast<index_t>(lo), hi > lo ? hi - lo : 0, slice);
     } else {
-        for (int k = static_cast<int>(block_neighbor_id); k < slice_len; k += static_cast<int>(neighbor_block_size)) {
-            const index_t j                             = col_idx[slice_edge_start + static_cast<index_t>(k)];
-            cuda_t const *const rows[NUM_PREFETCH_ROWS] = {
-                Q + j * stride_q_n + head_h * stride_q_h,
-                V + j * stride_v_n + head_h * stride_v_h,
-            };
-            consume(j, rows);
-        }
-    }
-
-    __syncthreads();
-
-#pragma unroll
-    for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
-        const size_t vi = lane_id + lane_cnt * t;
-        if (vi < TILES) [[likely]] {
-            constexpr size_t compact_N  = std::min(TW, VecFloat<1, cuda_t>::max_vec_size_bytes / std::max(sizeof(cuda_t), sizeof(accum_t)));
-            constexpr size_t repeat_cnt = TW / compact_N;
-            for (size_t i = 0; i < repeat_cnt; ++i) {
-                TileOps<compact_N, accum_t>::write(
-                    my_out, vi * repeat_cnt + i, reinterpret_cast<VecFloat<compact_N, accum_t> const *>(o_acc)[t * repeat_cnt + i]
-                );
+        using Sched = sched::NodeScheduler<SK, index_t, /*SyncBlock=*/true>;
+        __shared__ typename Sched::SharedStorage sched_smem;
+        Sched sched(sched_params, sched_smem);
+        for (auto work = sched.first(); sched.valid(work); work = sched.next(work)) {
+            const int64_t node = static_cast<int64_t>(sched.node(work));
+            if (node >= p.N) [[unlikely]] {
+                continue;
             }
-        }
-    }
-
-    if (lane_id == 0) {
-        neighbor_max[block_neighbor_id] = softmax_state.max_val;
-        neighbor_sum[block_neighbor_id] = softmax_state.sum_exp;
-    }
-    __syncthreads();
-
-    // Cross-warp merge, identical to the in-place kernel's except that the result is left
-    // un-normalised and written to the partial buffers instead of to O.
-    if (block_neighbor_id == 0) {
-        accum_t slice_max = -FLT_MAX;
-        accum_t slice_sum{};
-
-        if (lane_id == 0) {
-            for (size_t w = 0; w < neighbor_block_size; ++w) {
-                slice_max = AccumOps::max(slice_max, neighbor_max[w]);
-            }
-            for (size_t w = 0; w < neighbor_block_size; ++w) {
-                slice_sum = AccumOps::fma(neighbor_sum[w], AccumOps::exp(neighbor_max[w] - slice_max), slice_sum);
-            }
-            for (size_t w = 0; w < neighbor_block_size; ++w) {
-                neighbor_sum[w] = AccumOps::exp(neighbor_max[w] - slice_max);  // per-warp rescale
-            }
-            part_ml[part_base * 2 + 0] = slice_max;
-            part_ml[part_base * 2 + 1] = slice_sum;
-        }
-
-        // Lane 0 rewrote neighbor_sum just above and every lane reads it below; see the
-        // __syncwarp() rationale in the in-place kernel.
-        __syncwarp();
-
-        accum_t *const o_base = part_o + part_base * D_CONST;
-#pragma unroll
-        for (size_t t = 0; t < (TILES + lane_cnt - 1) / lane_cnt; ++t) {
-            const size_t vi = lane_id + t * kWarpSize;
-            if (vi < TILES) [[likely]] {
-                accum_t combined[TW] = {0};
-#pragma unroll
-                for (size_t ep = 0; ep < TW; ++ep) {
-                    const size_t d_idx = vi * TW + ep;
-#pragma unroll
-                    for (size_t w = 0; w < neighbor_block_size; ++w) {
-                        combined[ep] = AccumOps::fma(neighbor_sum[w], neighbor_out[w * D_CONST + d_idx], combined[ep]);
-                    }
-                }
-#pragma unroll
-                for (size_t ep = 0; ep < TW; ++ep) {
-                    o_base[vi * TW + ep] = combined[ep];  // scalar: see the note above
-                }
-            }
+            const index_t row_begin = p.row_ptr[node];
+            process_row(node, row_begin, static_cast<uint32_t>(p.row_ptr[node + 1] - row_begin), node);
         }
     }
 }
 
-/// Merge every slice of one heavy node into its final output row.
-///
-/// Grid is (num_heavy, H), one warp per block. The arithmetic is the same n-way online-softmax
-/// reduction the slice kernel just ran across warps, now across slices, followed by the
-/// normalisation the slice kernel deliberately skipped.
-template <size_t D_CONST, FloatingNum cuda_t, typename index_t, FloatingNum accum_t = float>
-__global__ void __launch_bounds__(kWarpSize) GraphAttentionMergeSlices_D( // no-format
-    size_t H,
-    const index_t *__restrict__ row_ptr, const index_t *__restrict__ heavy_nodes,
-    const int *__restrict__ node_chunk_offset,
-    const accum_t *__restrict__ part_o, const accum_t *__restrict__ part_ml,
-    cuda_t *__restrict__ O, int64_t stride_o_n, int64_t stride_o_h,
-    accum_t *__restrict__ logsumexp, int num_heavy
+// Folds every slice partial of one heavy node into its output row and logsumexp: the same n-way
+// online-softmax merge the slice kernel ran across warps, across slices, followed by the
+// normalisation the slices deliberately skipped. Grid (num_heavy, H, vector blocks), one vector of
+// the row per thread. A node whose slices are all empty comes out as a zero row with -inf
+// logsumexp, as in the in-place kernel.
+
+template <bool WIDE, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
+__global__ void __launch_bounds__(kMergeThreads) gt_forward_merge_slices_kernel(
+    ForwardParams<cuda_t, index_t, accum_t> const p, int const *__restrict__ node_chunk_offset, int num_heavy
 ) {
-    using TW_SELECTOR      = SelectTW<D_CONST, cuda_t>;
-    constexpr size_t TW    = TW_SELECTOR::value;
-    constexpr size_t TILES = D_CONST / TW;
+    static constexpr size_t VEC = WIDE ? 16 / sizeof(cuda_t) : 1;
+    using Tile                  = TileOps<VEC, cuda_t, accum_t>;
+    using AccumOps              = AdOps<accum_t>;
 
-    using AccumOps = AdOps<accum_t>;
-    using Tile     = TileOps<TW, cuda_t, accum_t>;
-
-    const size_t slot   = blockIdx.x;
-    const size_t head_h = blockIdx.y;
-    if (slot >= static_cast<size_t>(num_heavy) || head_h >= H) [[unlikely]] {
+    const int slot     = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    if (slot >= num_heavy || head >= p.H) [[unlikely]] {
         return;
     }
+    const int64_t node = static_cast<int64_t>(p.heavy_nodes[slot]);
+    const int lo       = node_chunk_offset[slot];
+    const int hi       = node_chunk_offset[slot + 1];
 
-    const size_t lane_id   = threadIdx.x;
-    const size_t node_i    = static_cast<size_t>(heavy_nodes[slot]);
-    cuda_t *const out_base = O + node_i * stride_o_n + head_h * stride_o_h;
+    accum_t m = -FLT_MAX;
+    for (int s = lo; s < hi; ++s) {
+        m = AccumOps::max(m, p.part_ml[2 * (s * p.H + head)]);
+    }
+    accum_t l{};
+    for (int s = lo; s < hi; ++s) {
+        l = AccumOps::fma(p.part_ml[2 * (s * p.H + head) + 1], AccumOps::exp(p.part_ml[2 * (s * p.H + head)] - m), l);
+    }
+    if (blockIdx.z == 0 && threadIdx.x == 0) {
+        p.logsumexp[node * p.H + head] = l > accum_t{} ? m + AccumOps::log(l) : -INFINITY;
+    }
 
-    // Isolated nodes take the same path as the in-place kernel: zeroed row, -inf logsumexp.
-    if (row_ptr[node_i + 1] == row_ptr[node_i]) [[unlikely]] {
-        for (size_t vi = lane_id; vi < TILES; vi += kWarpSize) {
-            Tile::write_zero(out_base, vi);
-        }
-        if (lane_id == 0) {
-            logsumexp[node_i * H + head_h] = -INFINITY;
-        }
+    const uint32_t v = blockIdx.z * blockDim.x + threadIdx.x;
+    if (v >= p.nvec) {
         return;
     }
-
-    const size_t lo = static_cast<size_t>(node_chunk_offset[slot]);
-    const size_t hi = static_cast<size_t>(node_chunk_offset[slot + 1]);
-
-    accum_t global_max = -FLT_MAX;
-    for (size_t s = lo; s < hi; ++s) {
-        global_max = AccumOps::max(global_max, part_ml[(s * H + head_h) * 2 + 0]);
-    }
-    accum_t global_sum{};
-    for (size_t s = lo; s < hi; ++s) {
-        const size_t b = (s * H + head_h) * 2;
-        global_sum     = AccumOps::fma(part_ml[b + 1], AccumOps::exp(part_ml[b + 0] - global_max), global_sum);
-    }
-    const accum_t inv_sum = AccumOps::max(accum_t{1} / global_sum, accum_t{});
-
-    if (lane_id == 0) {
-        logsumexp[node_i * H + head_h] = AccumOps::max(global_max + AccumOps::log(global_sum), -INFINITY);
-    }
-
-    for (size_t vi = lane_id; vi < TILES; vi += kWarpSize) {
-        accum_t combined[TW] = {0};
-        for (size_t s = lo; s < hi; ++s) {
-            const accum_t sc         = AccumOps::exp(part_ml[(s * H + head_h) * 2 + 0] - global_max);
-            const accum_t *const o_s = part_o + (s * H + head_h) * D_CONST;
+    alignas(16) accum_t acc[VEC] = {};
+    for (int s = lo; s < hi; ++s) {
+        const accum_t c          = AccumOps::exp(p.part_ml[2 * (s * p.H + head)] - m);
+        accum_t const *const row = p.part_o + dense_row(s, head, p.H, p.D) + static_cast<int64_t>(v) * VEC;
 #pragma unroll
-            for (size_t ep = 0; ep < TW; ++ep) {
-                combined[ep] = AccumOps::fma(sc, o_s[vi * TW + ep], combined[ep]);
-            }
+        for (size_t e = 0; e < VEC; ++e) {
+            acc[e] = AccumOps::fma(c, row[e], acc[e]);
         }
-#pragma unroll
-        for (size_t ep = 0; ep < TW; ++ep) {
-            combined[ep] *= inv_sum;
-        }
-        Tile::write_convert_from_accum(&out_base[vi * TW], combined);
     }
+    const accum_t inv = l > accum_t{} ? accum_t{1} / l : accum_t{};
+#pragma unroll
+    for (size_t e = 0; e < VEC; ++e) {
+        acc[e] *= inv;
+    }
+    Tile::write(p.O + node * p.stride_o_n + head * p.stride_o_h, v, Tile::convert_from_accum(acc));
 }
+
+}  // namespace turbo_gnn::gt

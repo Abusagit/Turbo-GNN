@@ -746,7 +746,7 @@ class GraphTransformerAggrKernel(TunableKernel):
 
     def __init__(self, **kwargs):
         super().__init__()
-        self.forward_light_warps = kwargs.get("forward_light_warps", 4)
+        self.forward_light_warps = kwargs.get("forward_light_warps", 1)
         self.schedule = kwargs.get("schedule", DEFAULT_SCHEDULE)
         self.blocks_per_sm = kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM)
         self.sched_chunk = kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK)
@@ -821,7 +821,10 @@ class GraphTransformerAggrKernel(TunableKernel):
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
             TunableParam("forward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
-            TunableParam("forward_light_warps", [1, 2, 4], default=4),
+            # One warp per light node: a warp already gathers 32 / G rows at once (lane groups of G
+            # for short rows), so further warps only cut how many nodes an SM holds. Measured best
+            # or tied best at head dims 32-256 on uniform and power-law graphs.
+            TunableParam("forward_light_warps", [1, 2, 4], default=1),
             TunableParam("forward_heavy_warps", [8, 16, 32], default=8),
             # Edge-slice size for the heavy bucket. 0 keeps one block per heavy node, so the old
             # and new decompositions are compared inside a single search axis rather than behind
