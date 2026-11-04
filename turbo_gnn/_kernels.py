@@ -32,6 +32,7 @@ from turbo_gnn._functions import (
     ReductionAggrFunction,
     _FusedGraphAttention,
     gatv2_function,
+    reduction_graph_args,
 )
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
@@ -63,32 +64,18 @@ __all__ = [
 
 
 class ReductionAggrKernel(TunableKernel):
-    """Tunable kernel for min/max neighbor aggregation.
+    """Tunable kernel for min/max/sum neighbor aggregation.
 
     Tunable forward parameters (grid-searched during autotuning):
 
-    - ``forward_warps_per_block``: warps per CUDA block for the light-node
-      atomic kernel. More warps = higher occupancy but diminishing returns
-      when feature dim is small.
-    - ``forward_edges_per_block_heavy_nodes``: edges processed per block in
-      the heavy-node tiled kernel. Larger values amortize launch overhead
-      but increase register pressure.
-    - ``forward_use_2d_kernel``: whether to use the 2-D tiled kernel variant
-      for heavy nodes (tiles over both edges and features).
-    - ``forward_features_per_block``, ``forward_tiles_y``: tile dimensions
-      for the 2-D kernel.
-    - ``forward_pipeline_stages``: async-copy pipeline stage count for the
-      light-node and packed-atomics heavy-node kernels' per-thread neighbor
-      scan (0 disables the pipeline; ignored by the 2-D tiled heavy kernel,
-      which already hides latency via shared-memory tree reduction).
-      MEASURED REGRESSION: as of this writing, stages=1 makes these kernels
-      strictly slower on H100 (0/27 and 1/27 swept configs improved; see
-      results/bench_min_aggr_forward/, results/bench_max_aggr_forward/,
-      results/ncu_min_aggr/) -- each block here is a single warp copying a
-      tiny (<=16B) per-thread slice, so there's no other warp to hide the
-      async-copy latency behind, and the pipeline's own sync overhead just
-      adds cost. Kept as a tunable (default 0, off) only so autotune can
-      revisit it if the kernel shape changes.
+    - ``forward_warps_per_block``: warps per CUDA block. Every warp works on a row of its own,
+      so this only sets the scheduling granularity; above 8 it acts as 8.
+    - ``forward_edges_per_block_heavy_nodes``: edges per heavy-row slice. Each slice is one
+      warp's work, and the slices' partial results are merged per row. Short slices balance
+      power-law hubs best; long ones save merge traffic when the heavy degrees are close.
+
+    ``use_2d_kernel``, ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` are accepted
+    for compatibility and have no effect; they are not tuned.
 
     Tunable graph parameter:
 
@@ -107,13 +94,16 @@ class ReductionAggrKernel(TunableKernel):
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
 
     def _execute(self, graph, x, **kwargs):
+        fwd_slices, bwd_slices, fwd_light_degree, bwd_light_degree = reduction_graph_args(
+            graph, self.forward_edges_per_block_heavy_nodes, self.reduce
+        )
         return ReductionAggrFunction.apply(
             graph.forward_indptr,
             graph.forward_indices,
             x,
             graph.light_nodes,
             graph.heavy_nodes,
-            graph.max_degree,
+            fwd_light_degree,
             self.forward_warps_per_block,
             self.forward_edges_per_block_heavy_nodes,
             self.forward_use_2d_kernel,
@@ -125,17 +115,15 @@ class ReductionAggrKernel(TunableKernel):
             graph.backward_indices,
             graph.backward_light_nodes,
             graph.backward_heavy_nodes,
-            graph.backward_max_degree,
+            bwd_light_degree,
+            fwd_slices,
+            bwd_slices,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
+            TunableParam("forward_warps_per_block", [2, 4, 8], default=8),
             TunableParam("forward_edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
-            TunableParam("forward_use_2d_kernel", [True, False], default=False),
-            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
-            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
-            TunableParam("forward_pipeline_stages", [0, 1], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -906,9 +894,7 @@ class GSpMMKernel(TunableKernel):
     - ``forward_huge_degree_threshold_quantile``: degree quantile for the
       light/heavy partition (-1 disables bucketing, all nodes go to light).
 
-    Unlike :class:`ReductionAggrKernel` there is no ``use_2d_kernel`` knob: the
-    packed-atomics heavy variant does not generalize past min/max, so the tiled
-    kernel is the only heavy path.
+    There is no ``use_2d_kernel`` knob: the tiled kernel is the only heavy path.
     """
 
     def __init__(self, op: str = "copy_u", reduce: str = "sum", **kwargs):

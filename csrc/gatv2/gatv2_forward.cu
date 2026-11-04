@@ -60,7 +60,12 @@ struct ForwardFused {
         const uint32_t lane = threadIdx.x % kWarpSize;
         const uint32_t warp = threadIdx.x / kWarpSize;
         const uint32_t r    = lane % G;
-        const accum_t ns    = p.negative_slope;
+        // A short row goes to warp 0 alone (see solo_row): the other warps exit before any barrier.
+        const bool solo = solo_row<W, RG::kGroupsPerWarp>(n);
+        if (solo && warp != 0) {
+            return;
+        }
+        const accum_t ns = p.negative_slope;
 
         // Every group owns the same vectors of every row, so each needs the same part of l[i] and a;
         // widened once here rather than on every edge.
@@ -94,7 +99,7 @@ struct ForwardFused {
             }
         };
 
-        const uint2 share = warp_share(n, warp, W, RG::kGroupsPerWarp);
+        const uint2 share = solo ? make_uint2(0, n) : warp_share(n, warp, W, RG::kGroupsPerWarp);
         if constexpr (STAGES > 0) {
             cuda_t *const ring = reinterpret_cast<cuda_t *>(smem) + warp * pipelined_rows_ring_elems(STAGES, kRows, p.D);
             NeighborCache<index_t, NoPayloadLoad> ids(edges, share.y, NoPayloadLoad{});
@@ -126,7 +131,7 @@ struct ForwardFused {
         // Groups -> warp, then warps -> warp 0. The barrier in merge_block_softmax also retires
         // every warp's use of the ring, which the merge buffer aliases.
         merge_groups_softmax<G>(st, acc);
-        if constexpr (W > 1) {
+        if (W > 1 && !solo) {  // block-uniform: a solo row has no other warp to merge with
             RG::scale(acc, merge_block_softmax<W>(st, reinterpret_cast<accum_t *>(smem + stats_offset(p.D)), warp, lane));
             team_sum<W, G, kAccs>(acc, reinterpret_cast<accum_t *>(smem), warp, lane, W);
         }

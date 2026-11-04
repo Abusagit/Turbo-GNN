@@ -265,29 +265,12 @@ _SCHEDULE_PARAMS = (
 )
 
 _REDUCTION_PARAMS = (
-    KernelParam("warps_per_block", int, 8, "Warps per block for the light-node atomic kernel."),
-    KernelParam("edges_per_block_heavy_nodes", int, 128, "Edges per block for the heavy-node tiled kernel."),
-    KernelParam(
-        "forward_heavy_slice_blocks_per_sm",
-        float,
-        0.0,
-        "Heavy slice as min_heavy_degree/divisor; 0 disables. Overridden by forward_heavy_edge_slice.",
-    ),
-    KernelParam(
-        "forward_heavy_edge_slice",
-        int,
-        0,
-        "Flat edge-slice size for the heavy bucket; 0 keeps the rectangular tiled grid.",
-    ),
-    KernelParam("use_2d_kernel", _parse_bool, False, "Use the 2-D tiled heavy-node kernel variant."),
-    KernelParam("features_per_block", int, 32, "Feature tile size (2-D kernel only)."),
-    KernelParam("tiles_y", int, 8, "Row tile count (2-D kernel only)."),
-    KernelParam(
-        "pipeline_stages",
-        int,
-        0,
-        "cp.async pipeline depth for the forward neighbour scan; 0 disables the pipeline.",
-    ),
+    KernelParam("warps_per_block", int, 8, "Warps per block; each takes its own row, so above 8 acts as 8."),
+    KernelParam("edges_per_block_heavy_nodes", int, 128, "Edges per heavy-row slice (one warp each)."),
+    KernelParam("use_2d_kernel", _parse_bool, False, "Accepted for compatibility; no effect."),
+    KernelParam("features_per_block", int, 32, "Accepted for compatibility; no effect."),
+    KernelParam("tiles_y", int, 8, "Accepted for compatibility; no effect."),
+    KernelParam("pipeline_stages", int, 0, "Accepted for compatibility; no effect."),
 ) + _SCHEDULE_PARAMS
 
 _SPMM_PARAMS = (

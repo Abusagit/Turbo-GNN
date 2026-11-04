@@ -36,7 +36,9 @@
 //   kernels row_dot_kernel and the split-K slice merges (common/row_kernels.cuh).
 //
 // Elementwise per-edge ops need no scratch on the chunked path, every chunk being independent; a
-// per-edge reduction over D needs one only when an edge's row is split across warps.
+// per-edge reduction over D needs one only when an edge's row is split across warps. Such kernels
+// can skip the chunked path altogether and sweep a long row in passes of a fused shape instead (see
+// "Sweep shapes" below; reduction/ is the worked example).
 // =============================================================================
 namespace turbo_gnn::rows {
 
@@ -111,6 +113,52 @@ inline void with_shape(int64_t D, size_t elem_size, bool wide, Fn&& fn) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Sweep shapes
+//
+// For kernels whose per-edge work is elementwise over the row -- a min, max or sum of neighbour
+// rows -- every span of a row is independent of the others. A row longer than one pass of a group
+// then needs no chunked path: it is swept in passes of a whole-warp shape, each pass a work item of
+// its own. One vector a lane up to 256 vectors (8 passes), two beyond: measured on the reduction
+// kernels, the narrower passes are 2-11% faster at D = 256-1024 (fp32) or 512-2048 (fp16) -- twice
+// the items, at the occupancy of a 32-register kernel -- and 1-3% slower at 4096, where the ids
+// re-read per pass begin to count.
+//
+// Short rows go the other way: with nothing to combine across a row's edges but the reduction
+// itself, a lane group can be a worker of its own, one row per group and kWarpSize / G rows per
+// warp. The group is then sized to the row alone -- down to one lane -- since it no longer has to
+// share the warp's edges out.
+// ------------------------------------------------------------------------------------------------
+
+inline int plan_sweep_shape(int64_t D, size_t elem_size, bool wide) {
+    const int64_t nvec = D / (wide ? static_cast<int64_t>(16 / elem_size) : 1);
+    for (size_t g = 1; g <= kWarpSize; g <<= 1) {
+        if (nvec <= static_cast<int64_t>(g)) {
+            return shape_code(wide, g, 1);
+        }
+    }
+    return shape_code(wide, kWarpSize, nvec <= 8 * static_cast<int64_t>(kWarpSize) ? 1 : 2);
+}
+
+inline auto make_sweep_shape_variant(int code) {
+    return MakeIntVariant<1011, 1021, 1041, 1081, 1161, 1321, 1322, 11, 21, 41, 81, 161, 321, 322>(code);
+}
+
+// Runs fn(shape_c) for the sweep shape of a head dim, shape_c an integral_constant.
+template <typename Fn>
+inline void with_sweep_shape(int64_t D, size_t elem_size, bool wide, Fn&& fn) {
+    std::visit(std::forward<Fn>(fn), make_sweep_shape_variant(plan_sweep_shape(D, elem_size, wide)));
+}
+
+// Vectors one pass of a shape covers, and the passes a row of nvec vectors takes.
+template <int SHAPE>
+inline constexpr uint32_t kPassVecs = static_cast<uint32_t>(Shape<SHAPE>::G * Shape<SHAPE>::S);
+
+inline uint32_t sweep_passes(int code, uint32_t nvec) {
+    const uint32_t span = static_cast<uint32_t>(((code % 1000) / 10) * (code % 10));
+    return std::max(ceil_div(nvec, span), 1u);
+}
+
+// ------------------------------------------------------------------------------------------------
 // Launch bounds
 //
 // Light buckets run 1-4 warps per block and are latency bound: they live on occupancy. Asking for
@@ -133,14 +181,20 @@ inline void check_head_dim(int64_t D, char const *what) {
 // Unit stride over the head dim of an [N, H, D] tensor; a size-1 dim may carry any stride.
 inline bool features_contiguous(at::Tensor const& t) { return t.size(2) == 1 || t.stride(2) == 1; }
 
-// Whether every row of t ([N, H, D], unit stride over D) starts on a 16-byte boundary and spans a
-// whole number of 16-byte vectors -- the precondition of the wide shapes.
+// Whether every row of t (rows along the last dim, unit stride over it: [N, H, D] or [N, D])
+// starts on a 16-byte boundary and spans a whole number of 16-byte vectors -- the precondition of
+// the wide shapes.
 inline bool rows_16b_aligned(at::Tensor const& t) {
     const int64_t elem = static_cast<int64_t>(t.element_size());
-    if ((t.size(2) * elem) % 16 != 0 || reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 != 0) {
+    if ((t.size(-1) * elem) % 16 != 0 || reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 != 0) {
         return false;
     }
-    return (t.size(0) <= 1 || (t.stride(0) * elem) % 16 == 0) && (t.size(1) <= 1 || (t.stride(1) * elem) % 16 == 0);
+    for (int64_t d = 0; d + 1 < t.dim(); ++d) {
+        if (t.size(d) > 1 && (t.stride(d) * elem) % 16 != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Offset of row (node, head) in a contiguous [N, H, D] tensor.

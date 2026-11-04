@@ -21,10 +21,12 @@ the input dtype before fp32 accumulation.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 
-from turbo_gnn import graph_transformer_aggr
+from turbo_gnn import _functions, graph_transformer_aggr
 from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as Adjacency
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -285,6 +287,118 @@ def test_index_dtypes(index_dtype, dim, symmetric):
     ei = _edge_index(n=300, hub_deg=150, symmetric=symmetric, seed=2)
     graph = _graph(ei, 300, index_dtype=index_dtype)
     _check(ei, 300, graph, 3, dim, torch.float32, forward_heavy_edge_slice=32, backward_heavy_edge_slice=32)
+
+
+# ---------------------------------------------------------------------------
+# Rows padded to whole 16-byte vectors (_functions._pad_attention_rows)
+# ---------------------------------------------------------------------------
+
+# Odd sizes in every dtype, and sizes that are whole vectors in fp32 only (12, 100), on both sides
+# of the single-pass limits.
+PADDED_DIMS = [1, 3, 7, 12, 33, 100, 257, 1001]
+
+
+@pytest.fixture
+def always_pad(monkeypatch):
+    """Pad every call whose rows are not whole 16-byte vectors (and at least 16 bytes), whatever its
+    size. With the default thresholds this module's small graphs stay on the element-wise kernels,
+    which the tests above cover."""
+    monkeypatch.setattr(_functions, "_PAD_MIN_GATHER_BYTES", 0)
+    monkeypatch.setattr(_functions, "_PAD_MIN_GATHER_BYTES_SHORT_ROWS", 0)
+
+
+def _launched_shapes(fn, family):
+    """Row-shape codes (csrc/common/row_shape.cuh) of the forward and backward kernels of `family`
+    ("gt" or "gatv2") that fn launches: 1000 and up read rows in 16-byte vectors, below 1000 element
+    by element."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    names = [
+        e.name for e in prof.events() if f"{family}_forward_kernel<" in e.name or f"{family}_backward_kernel<" in e.name
+    ]
+    assert names, f"no {family} kernels launched"
+    return {int(re.search(r"ul, (\d+), \d+, (?:true|false),", name).group(1)) for name in names}
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dim", PADDED_DIMS)
+@pytest.mark.parametrize("directed", [True, False], ids=["directed", "undirected"])
+def test_padded_rows_match_reference(directed_graph, undirected_graph, always_pad, directed, dim, dtype):
+    ei, n, graph = directed_graph if directed else undirected_graph
+    _check(ei, n, graph, 2, dim, dtype)
+
+
+@pytest.mark.parametrize("dim", [7, 100])
+def test_padding_keeps_the_scale_of_the_given_head_dim(directed_graph, always_pad, dim):
+    """scale=None means 1/sqrt(D) of the caller's D, not of the padded one."""
+    ei, n, graph = directed_graph
+    q, k, v = _qkv(n, 2, dim, torch.float16)
+    grad_out = torch.randn(n, 2, dim, device="cuda").to(torch.float16)
+    got = _run(graph, q, k, v, None, grad_out)
+    _assert_matches(got, _reference(ei, n, q, k, v, dim**-0.5, grad_out), torch.float16, f"D={dim} default scale")
+
+
+def test_padding_copies_offset_views(directed_graph, always_pad):
+    """A whole number of vectors but offset by one element: copied, not padded, then vector rows."""
+    ei, n, graph = directed_graph
+    base = [torch.randn(n, 2, 65, device="cuda") for _ in range(3)]
+    q, k, v = (b[..., 1:] for b in base)
+    _check(ei, n, graph, 2, 64, torch.float32, qkv=(q, k, v))
+
+
+@pytest.mark.parametrize(("dim", "dtype"), [(7, torch.float32), (100, torch.float16), (1001, torch.bfloat16)])
+def test_padding_takes_vector_rows(directed_graph, monkeypatch, dim, dtype):
+    """Padded, every GT kernel reads 16-byte vectors; below the threshold the element-wise ones run."""
+    ei, n, graph = directed_graph
+    q, k, v = (t.requires_grad_(True) for t in _qkv(n, 2, dim, dtype))
+
+    def step():
+        graph_transformer_aggr(graph, q, q, k, v, None).sum().backward()
+
+    monkeypatch.setattr(_functions, "_PAD_MIN_GATHER_BYTES", 0)
+    monkeypatch.setattr(_functions, "_PAD_MIN_GATHER_BYTES_SHORT_ROWS", 0)
+    assert min(_launched_shapes(step, "gt")) >= 1000
+    monkeypatch.setattr(_functions, "_PAD_MIN_GATHER_BYTES", 1 << 62)
+    monkeypatch.setattr(_functions, "_PAD_MIN_GATHER_BYTES_SHORT_ROWS", 1 << 62)
+    assert max(_launched_shapes(step, "gt")) < 1000
+
+
+def test_rows_under_16_bytes_stay_element_wise(directed_graph, always_pad):
+    """fp16 head dim 7: 14-byte rows cost one sector a gather either way, and padding them measured
+    slower on the backward, so even with no size threshold they are not copied."""
+    ei, n, graph = directed_graph
+    q, k, v = (t.requires_grad_(True) for t in _qkv(n, 2, 7, torch.float16))
+
+    def step():
+        graph_transformer_aggr(graph, q, q, k, v, None).sum().backward()
+
+    assert max(_launched_shapes(step, "gt")) < 1000
+
+
+def _road_edge_index(n=400, max_deg=5, symmetric=False, seed=7):
+    """Low-degree graph, every node with 1..max_deg in-edges: a road network's degree profile."""
+    g = torch.Generator().manual_seed(seed)
+    deg = torch.randint(1, max_deg + 1, (n,), generator=g)
+    dst = torch.repeat_interleave(torch.arange(n), deg)
+    src = torch.randint(0, n, (int(deg.sum()),), generator=g)
+    if symmetric:
+        src, dst = torch.cat([src, dst]), torch.cat([dst, src])
+    key = torch.unique(src * n + dst)
+    return torch.stack([key // n, key % n])
+
+
+@pytest.mark.parametrize("dim", [4, 32, 100, 128, 256, 1000])
+@pytest.mark.parametrize("symmetric", [False, True], ids=["directed", "undirected"])
+def test_short_heavy_rows(dim, symmetric):
+    """A heavy bucket of rows with a few edges each, as quantile bucketing gives low-degree graphs:
+    the heavy blocks hand such rows to one warp and skip the cross-warp merge (solo_row), with
+    the default and the widest heavy blocks, and the light path for the rest."""
+    ei = _road_edge_index(symmetric=symmetric)
+    graph = _graph(ei, 400, quantile=0.5)
+    assert graph.forward_heavy_nodes.numel() > 0 and graph.backward_heavy_nodes.numel() > 0
+    for kw in ({}, {"forward_heavy_warps": 32, "backward_heavy_warps": 16}):
+        _check(ei, 400, graph, 2, dim, torch.float32, **kw)
 
 
 def test_all_light_and_all_heavy():

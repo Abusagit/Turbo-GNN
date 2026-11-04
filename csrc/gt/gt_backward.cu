@@ -71,6 +71,11 @@ struct BackwardFused {
         const uint32_t lane = threadIdx.x % kWarpSize;
         const uint32_t warp = threadIdx.x / kWarpSize;
         const uint32_t r    = lane % G;
+        // A short row goes to warp 0 alone (see solo_row): the other warps exit before any barrier.
+        const bool solo = solo_row<W, RG::kGroupsPerWarp>(n);
+        if (solo && warp != 0) {
+            return;
+        }
 
         // The node's own rows: Q[d], V[d] for the reverse half; K[d], dO[d] for the forward one.
         Frag qd, vd, kd, od;
@@ -141,7 +146,7 @@ struct BackwardFused {
             }
         };
 
-        const uint2 share = warp_share(n, warp, W, RG::kGroupsPerWarp);
+        const uint2 share = solo ? make_uint2(0, n) : warp_share(n, warp, W, RG::kGroupsPerWarp);
         if constexpr (STAGES > 0) {
             cuda_t *const ring = reinterpret_cast<cuda_t *>(smem) + warp * pipelined_rows_ring_elems(STAGES, kRows, p.D);
             // Producer and consumer walk the share at different points, so each has its own cache.
@@ -183,7 +188,7 @@ struct BackwardFused {
         for (size_t k = 0; k < kGrads; ++k) {
             RG::sum_groups(grads[k]);
         }
-        if constexpr (W > 1) {
+        if (W > 1 && !solo) {  // block-uniform: a solo row has no other warp to merge with
             if constexpr (STAGES > 0) {
                 __syncthreads();  // every warp is out of its loop: the merge buffer may overwrite the ring
             }

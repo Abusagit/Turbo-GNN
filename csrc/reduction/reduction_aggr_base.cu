@@ -1,45 +1,36 @@
 #include "common.cuh"
 
-void reduction_aggr_backward_cuda(const at::Tensor& grad_out, const at::Tensor& arg_idx, at::Tensor& grad_x, int warps_per_block = 8);
+// The Python-facing entry points, with the argument lists turbo_gnn has always exposed. The
+// implementation (reduction_aggr.cu) takes only what it uses.
 
-void reduction_aggr_forward_partitioned_cuda(
-    const at::Tensor& edge_ptr,
-    const at::Tensor& edge_idx,
-    const at::Tensor& X,
-    const at::Tensor& light_nodes,
-    const at::Tensor& heavy_nodes,
-    int max_degree,
-    at::Tensor& out,
-    at::Tensor& arg_idx,
-    int warps_per_block             = 8,
-    int edges_per_block_heavy_nodes = 128,
-    bool use_2d_kernel              = false,
-    int features_per_block          = 32,
-    int tiles_y                     = 8,
-    const std::string& reduce       = "min",
-    int pipeline_stages             = 0
+std::vector<at::Tensor> reduction_aggr_forward_cuda(
+    at::Tensor const& edge_ptr,
+    at::Tensor const& edge_idx,
+    at::Tensor X,
+    at::Tensor const& light_nodes,
+    at::Tensor const& heavy_nodes,
+    int warps_per_block,
+    int64_t slice_size,
+    std::string const& reduce,
+    at::Tensor const& chunk_node,
+    at::Tensor const& chunk_start,
+    at::Tensor const& node_chunk_offset,
+    int64_t light_degree_bound
 );
 
-at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int warps_per_block = 8) {
-    TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
-    TORCH_CHECK(arg_idx.is_cuda(), "arg_idx must be CUDA");
-    TORCH_CHECK(
-        grad_out.scalar_type() == at::kFloat || grad_out.scalar_type() == at::kHalf || grad_out.scalar_type() == at::kBFloat16,
-        "grad_out must be float32/float16/bfloat16"
-    );
-    TORCH_CHECK(is_supported_index_type(arg_idx.scalar_type()), "arg_idx must be int32, int64, uint32, or uint64");
+at::Tensor reduction_aggr_backward_cuda(at::Tensor grad_out, at::Tensor const& arg_idx, int64_t num_src_nodes);
 
-    TORCH_CHECK(grad_out.dim() == 2, "grad_out must be 2D");
-    TORCH_CHECK(arg_idx.sizes() == grad_out.sizes(), "arg_idx and grad_out shapes must match");
-    const int64_t num_nodes = grad_out.size(0);
-    const int64_t d         = grad_out.size(1);
-
-    auto grad_x = torch::zeros({num_src_nodes, d}, grad_out.options());
-
-    reduction_aggr_backward_cuda(grad_out, arg_idx, grad_x, warps_per_block);
-    return grad_x;
+at::Tensor reduction_aggr_backward_torch(at::Tensor grad_out, at::Tensor arg_idx, int64_t num_src_nodes, int /*warps_per_block*/) {
+    return reduction_aggr_backward_cuda(grad_out, arg_idx, num_src_nodes);
 }
 
+// max_degree bounds the degree of the light rows -- any larger value is correct, -1 means unknown --
+// and picks the forward's build (see reduction_aggr_forward_cuda). edges_per_block_heavy_nodes is
+// the slice size; chunk_node / chunk_start / node_chunk_offset, the heavy bucket's slice table at
+// that size, are built here when not given. Arguments of the earlier kernels that no longer mean
+// anything are accepted and ignored: use_2d_kernel / features_per_block / tiles_y (the tiled heavy
+// kernel; heavy rows are now always edge-sliced) and pipeline_stages (the per-thread cp.async scan,
+// measured slower than none).
 std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     at::Tensor edge_ptr,
     at::Tensor edge_idx,
@@ -47,62 +38,19 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     at::Tensor light_nodes,
     at::Tensor heavy_nodes,
     int max_degree,
-    int warps_per_block             = 8,
-    int edges_per_block_heavy_nodes = 128,
-    bool use_2d_kernel              = false,
-    int features_per_block          = 32,
-    int tiles_y                     = 8,
-    std::string reduce              = "min",
-    int pipeline_stages             = 0
+    int warps_per_block,
+    int edges_per_block_heavy_nodes,
+    bool /*use_2d_kernel*/,
+    int /*features_per_block*/,
+    int /*tiles_y*/,
+    std::string reduce,
+    int /*pipeline_stages*/,
+    at::Tensor chunk_node,
+    at::Tensor chunk_start,
+    at::Tensor node_chunk_offset
 ) {
-    TORCH_CHECK(edge_ptr.is_cuda() && edge_idx.is_cuda() && X.is_cuda(), "inputs must be CUDA");
-    TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node lists must be CUDA");
-
-    auto idx_dtype = edge_ptr.scalar_type();
-    TORCH_CHECK(is_supported_index_type(idx_dtype), "index tensors must be int32, int64, uint32, or uint64");
-    TORCH_CHECK(edge_idx.scalar_type() == idx_dtype, "edge_idx must have same dtype as edge_ptr");
-    TORCH_CHECK(light_nodes.scalar_type() == idx_dtype, "light_nodes must have same dtype as edge_ptr");
-    TORCH_CHECK(heavy_nodes.scalar_type() == idx_dtype, "heavy_nodes must have same dtype as edge_ptr");
-
-    TORCH_CHECK(
-        X.scalar_type() == at::kFloat || X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16, "X must be float32/float16/bfloat16"
+    return reduction_aggr_forward_cuda(
+        edge_ptr, edge_idx, X, light_nodes, heavy_nodes, warps_per_block, edges_per_block_heavy_nodes, reduce, chunk_node, chunk_start,
+        node_chunk_offset, max_degree
     );
-    TORCH_CHECK(X.dim() == 2, "X must be 2D");
-    const bool tracks_arg      = (reduce != "sum");
-    const bool needs_2d_params = use_2d_kernel || !tracks_arg;
-
-    if (needs_2d_params) {
-        TORCH_CHECK(tiles_y > 0 && tiles_y <= 32, "tiles_y must be in range [1, 32]");
-        TORCH_CHECK((tiles_y & (tiles_y - 1)) == 0, "tiles_y must be power of 2");
-        TORCH_CHECK(features_per_block > 0 && features_per_block <= 1024, "features_per_block must be in range [1, 1024]");
-        TORCH_CHECK(features_per_block * tiles_y <= 1024, "features_per_block * tiles_y must be <= 1024");
-    }
-
-    const auto num_nodes = X.size(0);
-    const auto d         = X.size(1);
-
-    auto out = torch::empty({num_nodes, d}, X.options());
-    // arg_idx uses the same index dtype as edge_ptr.  Accumulating reducers
-    // never write it and their backward does not read it, so skip the
-    // allocation entirely -- at [N, d] it costs as much as the output itself.
-    auto arg_idx = tracks_arg ? torch::empty({num_nodes, d}, edge_ptr.options()) : torch::empty({0}, edge_ptr.options());
-
-    reduction_aggr_forward_partitioned_cuda(
-        edge_ptr,
-        edge_idx,
-        X,
-        light_nodes,
-        heavy_nodes,
-        max_degree,
-        out,
-        arg_idx,
-        warps_per_block,
-        edges_per_block_heavy_nodes,
-        use_2d_kernel,
-        features_per_block,
-        tiles_y,
-        reduce,
-        pipeline_stages
-    );
-    return {out, arg_idx};
 }

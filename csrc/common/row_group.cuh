@@ -340,6 +340,87 @@ __device__ __forceinline__ void for_each_neighbor(
     }
 }
 
+// for_each_neighbor's walk backwards: slots [begin, end) from the last to the first, so that every
+// group meets its own slots in decreasing order. fn(slot, active, nb) as there, called
+// warp-uniformly. For reductions that keep the *first* of equal candidates: walking backwards, an
+// update on `<=` leaves each group the earliest slot attaining its extremum without comparing
+// slots, and an incumbent equal to the starting identity (an input of +-inf) is still replaced.
+//
+// Ids are fetched kWarpSize at a time, the batches aligned to `end`.
+template <size_t G, size_t UNROLL = 1, IntegralNum index_t, typename Fn>
+__device__ __forceinline__ void for_each_neighbor_reverse(
+    index_t const *const __restrict__ ids, uint32_t begin, uint32_t end, uint32_t lane, Fn&& fn
+) {
+    constexpr uint32_t kStep = kWarpSize / G;
+    const uint32_t g         = lane / G;
+
+    // The next batch's ids load while this batch's rows do, so that a long row does not wait on an
+    // id load every 32 edges: measured 1-3% on whole-warp rows of dense graphs.
+    uint32_t top = end;
+    uint32_t cnt = min(static_cast<uint32_t>(kWarpSize), top - begin);
+    uint32_t lo  = top - cnt;
+    index_t held = top > begin && lane < cnt ? ids[lo + lane] : index_t{};
+    while (top > begin) {
+        const uint32_t next_cnt = min(static_cast<uint32_t>(kWarpSize), lo - begin);
+        const uint32_t next_lo  = lo - next_cnt;
+        const index_t next      = lo > begin && lane < next_cnt ? ids[next_lo + lane] : index_t{};
+        const uint32_t steps    = ceil_div(cnt, kStep);
+
+#pragma unroll UNROLL
+        for (uint32_t q = 0; q < steps; ++q) {
+            const uint32_t src = (steps - 1 - q) * kStep + g;
+            const index_t nb   = __shfl_sync(FULL_WARP_MASK, held, src);
+            // Whole-warp groups take one edge a step, so every step has one: src < cnt always.
+            fn(lo + src, G == kWarpSize || src < cnt, nb);
+        }
+        top  = lo;
+        cnt  = next_cnt;
+        lo   = next_lo;
+        held = next;
+    }
+}
+
+// The backward walk of one lane group over slots [begin, end) of a row of its own, for kernels whose
+// groups work independently -- no shuffles, so the groups of a warp may diverge. Every lane loads
+// the slot ids itself (one cache line serves the group). UNROLL slots go at a time, their rows in
+// flight together, and the ids of the next UNROLL slots are fetched while those rows load: one
+// memory latency per UNROLL edges rather than two per edge.
+//
+// load(j, active) issues the load of neighbour j's row -- nothing when !active -- and returns it;
+// use(slot, row) consumes it. Slots reach use() in decreasing order.
+template <size_t UNROLL, IntegralNum index_t, typename LoadFn, typename UseFn>
+__device__ __forceinline__ void for_each_neighbor_reverse_unbatched(
+    index_t const *const __restrict__ ids, uint32_t begin, uint32_t end, LoadFn&& load, UseFn&& use
+) {
+    using row_t = decltype(load(index_t{}, true));
+    auto fetch  = [&](uint32_t top, index_t(&j)[UNROLL]) {
+#pragma unroll
+        for (size_t u = 0; u < UNROLL; ++u) {
+            j[u] = top > begin + static_cast<uint32_t>(u) ? ids[top - 1 - u] : index_t{};
+        }
+    };
+
+    index_t j[UNROLL];
+    fetch(end, j);
+    for (uint32_t top = end; top > begin;) {
+        const uint32_t n = min(static_cast<uint32_t>(UNROLL), top - begin);
+        row_t rows[UNROLL];
+#pragma unroll
+        for (size_t u = 0; u < UNROLL; ++u) {
+            rows[u] = load(j[u], u < n);
+        }
+        const uint32_t next = top - n;
+        fetch(next, j);
+#pragma unroll
+        for (size_t u = 0; u < UNROLL; ++u) {
+            if (u < n) {
+                use(top - 1 - static_cast<uint32_t>(u), rows[u]);
+            }
+        }
+        top = next;
+    }
+}
+
 // Random access to the neighbour ids (and payload) of a CSR row, for a warp that walks it in order
 // from more than one place at once -- the producer and the consumer of a copy pipeline. Ids are
 // fetched kWarpSize at a time and broadcast by shuffle, as in for_each_neighbor. get() must be
@@ -371,6 +452,19 @@ struct NeighborCache {
         return __shfl_sync(FULL_WARP_MASK, held, src);
     }
 };
+
+// Whether a W-warp block should take its row with one warp: a row that warp covers in kSoloSteps
+// steps (of kWarpSize / G edges each). Low-degree graphs put rows of a handful of edges into the
+// heavy bucket -- city-roads-M, whose 99th-percentile degree is 7, sends 4705 rows of degree 7 to
+// 8-warp blocks -- where seven warps find no edges and the block still pays the cross-warp merge:
+// such a block cost about 11 light ones. Must be evaluated identically by every thread of the
+// block; the other warps then exit before any barrier and warp 0 skips the merge.
+inline constexpr uint32_t kSoloSteps = 4;
+
+template <size_t W, size_t GROUPS_PER_WARP>
+__device__ __forceinline__ bool solo_row(uint32_t n) {
+    return W > 1 && n <= kSoloSteps * GROUPS_PER_WARP;
+}
 
 // The contiguous share of slots [0, n) of warp `warp` out of `num_warps`, in whole multiples of
 // `step` slots so that only the last non-empty share ends in a partial step. Contiguous rather

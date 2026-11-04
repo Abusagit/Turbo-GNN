@@ -6,10 +6,11 @@
 #include "common/gspmm_ops.cuh"
 
 // =============================================================================
-// Neighbourhood-reduction kernels, shared by reduction_aggr and g-SpMM.
+// Neighbourhood-reduction kernels of g-SpMM.
 //
-// The kernels moved here out of reduction_aggr.cu unchanged, then grew one axis:
-// the *edge operand*.  What they compute is
+// They were reduction_aggr's kernels until it moved to row shapes of any width
+// (reduction_forward.cuh); g-SpMM grew them one axis: the *edge operand*.  What
+// they compute is
 //
 //     out[v, f] = reduce_{eid in row(v)} op( X[edge_idx[eid], f], rhs[eid, f] )
 //
@@ -150,7 +151,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     index_t *const __restrict__ arg_idx,
     size_t d,
     size_t num_light,
-    cuda_t const *const __restrict__ rhs      = nullptr,
+    cuda_t const *const __restrict__ rhs       = nullptr,
     index_t const *const __restrict__ edge_map = nullptr
 ) {
     using ROps     = ReductionOps<Op>;
@@ -292,190 +293,6 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     }
 }
 
-__device__ __forceinline__ uint32_t float_to_ordered_uint(float x) {
-    uint32_t bits = __float_as_uint(x);
-    if (bits & 0x80000000u) {
-        // negative: invert bits so ordering is preserved
-        return ~bits;
-    } else {
-        // non-negative: set sign bit so they come after all negatives
-        return bits | 0x80000000u;
-    }
-}
-
-__device__ __forceinline__ float ordered_uint_to_float(uint32_t key) {
-    uint32_t bits;
-    if (key & 0x80000000u) {
-        // non-negative branch
-        bits = key & 0x7fffffffu;
-    } else {
-        // negative branch
-        bits = ~key;
-    }
-    return __uint_as_float(bits);
-}
-
-// pack float and int into uint64 for atomic updates (32-bit indices only)
-__device__ __forceinline__ uint64_t pack_val_idx(float val, int idx) {
-    uint32_t key = float_to_ordered_uint(val);
-    return (static_cast<uint64_t>(key) << 32) | static_cast<uint32_t>(idx);
-}
-
-// unpack float and int from uint64
-__device__ __forceinline__ void unpack_val_idx(uint64_t packed, float& val, int& idx) {
-    uint32_t key  = static_cast<uint32_t>(packed >> 32);
-    uint32_t idxu = static_cast<uint32_t>(packed & 0xFFFFFFFFu);
-
-    val = ordered_uint_to_float(key);
-    idx = static_cast<int>(idxu);
-}
-
-// Packed heavy kernel: blockIdx.x = node, blockIdx.y = edge chunk
-// Only for 32-bit index types (packs float32 + int32 into uint64)
-// PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
-template <
-    size_t EDGES_PER_BLOCK, size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float,
-    int PIPELINE_STAGES = 0
->
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_heavy_kernel(
-    index_t const *const __restrict__ heavy_nodes_indices,
-    index_t const *const __restrict__ edge_ptr,
-    index_t const *const __restrict__ edge_idx,
-    cuda_t const *const __restrict__ X,
-    uint64_t *const __restrict__ packed,
-    size_t d
-) {
-    static_assert(sizeof(index_t) <= 4, "Packed heavy kernel only supports 32-bit index types");
-    using ROps     = ReductionOps<Op>;
-    using Sentinel = IndexSentinel<index_t>;
-    // constexpr size_t TW  = (sizeof(cuda_t) <= 2) ? 2 : 1;
-    constexpr size_t TW = VecFloat<1, cuda_t>::max_vec_size_bytes / sizeof(cuda_t);
-    using Tile          = TileOps<TW, cuda_t>;
-
-    const size_t node_idx  = blockIdx.x;
-    const size_t chunk_idx = blockIdx.y;
-    const index_t v        = heavy_nodes_indices[node_idx];
-
-    const index_t row_start = edge_ptr[v];
-    const index_t row_end   = edge_ptr[v + 1];
-
-    const index_t chunk_start         = row_start + static_cast<index_t>(chunk_idx * EDGES_PER_BLOCK);
-    const index_t chunk_end_candidate = chunk_start + static_cast<index_t>(EDGES_PER_BLOCK);
-    const index_t chunk_end           = (chunk_end_candidate < row_end) ? chunk_end_candidate : row_end;
-
-    // exit for chunks beyond this node's edges
-    if (chunk_start >= row_end) [[unlikely]] {
-        return;
-    }
-
-    const size_t tid           = threadIdx.x;
-    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
-    const cuda_t identity_val  = static_cast<cuda_t>(ROps::IDENTITY);
-
-    const size_t d_vec = d / TW;
-
-    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
-    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0;
-    constexpr int NUM_STAGES    = PIPELINE_STAGES;
-
-    extern __shared__ __align__(16) uint8_t sh_raw[];
-    cuda_t *val_dbuf = reinterpret_cast<cuda_t *>(sh_raw);  // only meaningful when USE_PIPELINE
-    cuda_t *my_dbuf  = val_dbuf + tid * NUM_STAGES * TW;
-
-    for (size_t fv = tid; fv < d_vec; fv += BLOCK_DIM) {
-        const size_t base_f = fv * TW;
-
-        cuda_t best_vals[TW];
-        index_t best_srcs[TW];
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            best_vals[e] = identity_val;
-            best_srcs[e] = Sentinel::INVALID;
-        }
-
-        auto visit = [&best_vals, &best_srcs](index_t src, index_t, cuda_t const *val) {
-#pragma unroll
-            for (size_t e = 0; e < TW; ++e) {
-                cuda_t v_e = val[e];
-                bool upgrade_index = false;
-                best_vals[e] = ROps::reduce(v_e, best_vals[e], upgrade_index);
-                if (upgrade_index) {
-                    best_srcs[e] = src;
-                }
-            }
-        };
-
-        if constexpr (USE_PIPELINE) {
-            pipelined_thread_edge_scan<TW, NUM_STAGES, cuda_t, index_t>(chunk_start, chunk_end, edge_idx, X, d, base_f, my_dbuf, visit);
-        } else {
-            for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
-                index_t src                    = edge_idx[eid];
-                const typename Tile::vec_t val = Tile::read(&X[static_cast<size_t>(src) * d], fv);
-                visit(src, eid, val.data);
-            }
-        }
-
-#pragma unroll
-        for (size_t e = 0; e < TW; ++e) {
-            if (Sentinel::is_valid(best_srcs[e])) {
-                uint64_t new_val = pack_val_idx(static_cast<accum_t>(best_vals[e]), static_cast<size_t>(best_srcs[e]));
-                ROps::atomic_reduce(&packed[node_idx * d + base_f + e], new_val);
-            }
-        }
-    }
-
-    // scalar tail for d % TW != 0
-    if (d % TW != 0 && tid == 0) {
-        for (size_t f = d_vec * TW; f < d; ++f) {
-            cuda_t local_best = identity_val;
-            index_t local_arg = Sentinel::INVALID;
-
-            for (index_t eid = chunk_start; eid < chunk_end; ++eid) {
-                const index_t src = edge_idx[eid];
-                const cuda_t val  = X[static_cast<size_t>(src) * d + f];
-                bool upgrade_index = false;
-                local_best = ROps::reduce(val, local_best, upgrade_index);
-                if (upgrade_index) {
-                    local_arg  = src;
-                }
-            }
-
-            if (Sentinel::is_valid(local_arg)) {
-                const uint64_t new_val = pack_val_idx(static_cast<accum_t>(local_best), static_cast<size_t>(local_arg));
-                ROps::atomic_reduce(&packed[node_idx * d + f], new_val);
-            }
-        }
-    }
-}
-
-// unpack results back to separate arrays (32-bit indices only, pairs with heavy kernel)
-template <size_t WARPS_PER_BLOCK, FloatingNum cuda_t, typename index_t>
-__global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) unpack_results_kernel(
-    uint64_t const *const __restrict__ packed,
-    index_t const *const __restrict__ nodes,
-    cuda_t *const __restrict__ out,
-    index_t *const __restrict__ arg_idx,
-    size_t num_nodes,
-    size_t d
-) {
-    static_assert(sizeof(index_t) <= 4, "Unpack kernel only supports 32-bit index types");
-    constexpr size_t BLOCK_DIM = WARPS_PER_BLOCK * kWarpSize;
-    const size_t tid           = blockIdx.x * BLOCK_DIM + threadIdx.x;
-
-    for (size_t i = tid; i < num_nodes * d; i += gridDim.x * BLOCK_DIM) {
-        size_t node_idx = i / d;
-        size_t f        = i % d;
-        index_t v       = nodes[node_idx];
-
-        float val;
-        int idx;
-        unpack_val_idx(packed[node_idx * d + f], val, idx);
-
-        out[static_cast<size_t>(v) * d + f]     = (idx > -1) ? static_cast<cuda_t>(val) : cuda_t{};
-        arg_idx[static_cast<size_t>(v) * d + f] = static_cast<index_t>(idx);
-    }
-}
-
 // Dynamic shared-memory layout of the tiled heavy kernel: `slots` floats,
 // then `slots` index_t.  The float region is rounded up to 16 bytes so that an
 // 8-byte index type stays aligned for any (tiles_y, features_per_block) -- with
@@ -515,7 +332,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     cuda_t *__restrict__ out,
     index_t *__restrict__ arg_idx,
     size_t d,
-    const cuda_t *__restrict__ rhs      = nullptr,
+    const cuda_t *__restrict__ rhs       = nullptr,
     const index_t *__restrict__ edge_map = nullptr
 ) {
     using ROps     = ReductionOps<Op>;
@@ -548,8 +365,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
     constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0 && BOps::USE_LHS;
     constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
-    cuda_t *my_dbuf = reinterpret_cast<cuda_t *>(shared_mem + aggr_heavy_shmem_bytes<index_t>(TILES_Y * SHMEM_STRIDE)) +
-                      (tid * F_BLOCK + fid) * NUM_STAGES * TW;
+    cuda_t *my_dbuf             = reinterpret_cast<cuda_t *>(shared_mem + aggr_heavy_shmem_bytes<index_t>(TILES_Y * SHMEM_STRIDE)) +
+                                  (tid * F_BLOCK + fid) * NUM_STAGES * TW;
 
     const acc_t identity_val = static_cast<acc_t>(ROps::IDENTITY);
     constexpr cuda_t zero_val{};

@@ -7,15 +7,9 @@ passes with AMP support (``custom_fwd`` / ``custom_bwd``).
 
 from __future__ import annotations
 
-import warnings
-from math import ceil
-
 import torch
 
 from turbo_gnn._extension import _C
-
-WARP_SIZE = 32
-FOUR_BYTES_CONSTANT = 4
 
 #: Node -> thread-block scheduling policy, mirroring ``csrc/common/scheduler.cuh``.
 #:
@@ -76,6 +70,92 @@ BUCKET_LAUNCHES = {"sequential": 0, "concurrent": 1}
 DEFAULT_BUCKET_LAUNCH = "sequential"
 
 
+#: Rows that are not whole 16-byte vectors -- odd head dims, or e.g. 100 in fp16 -- are read by the
+#: attention kernels element by element, and those longer than 64 elements also fall to the
+#: two-pass path. The attention functions copy such inputs into zero-padded rows of whole vectors
+#: when the call is large enough to repay the copies, whose cost is mostly fixed: about 100 us of
+#: launches and host time per call. Measured on 14 real graphs (padded / element-wise time, 464
+#: cells; gathered bytes = edges x heads x padded head dim x element size):
+#:
+#:   rows over 64 elements, gathering >= 16 MiB     2.97x geomean, 1 cell of 176 slower (0.90x)
+#:   rows of 16 B to 64 elements, >= 256 MiB        1.41x geomean, 7 of 136 slower (>= 0.76x);
+#:                                                  below 256 MiB padding them lost (0.76x geomean)
+#:   rows under 16 bytes                            0.91x on the backward even at 1-10 GiB: one
+#:                                                  sector a row either way, so never padded
+#:
+#: Thresholds in gathered bytes, for rows longer than _PAD_SHORT_ROW_ELEMENTS and for the others.
+_PAD_MIN_GATHER_BYTES = 1 << 24
+_PAD_MIN_GATHER_BYTES_SHORT_ROWS = 1 << 28
+_PAD_SHORT_ROW_ELEMENTS = 64
+
+
+def _vector_rows(t: torch.Tensor) -> bool:
+    """Whether the kernels read ``t``'s rows (its last dim) in 16-byte vectors.
+
+    Mirrors ``rows::rows_16b_aligned`` in ``csrc/common/row_shape.cuh``: every row starts on a
+    16-byte boundary and spans a whole number of 16-byte vectors.
+
+    Args:
+        t: A tensor with unit stride over its last dim.
+
+    Returns:
+        bool: True when the rows qualify.
+    """
+    elem = t.element_size()
+    if (t.shape[-1] * elem) % 16 or t.data_ptr() % 16:
+        return False
+    return all((stride * elem) % 16 == 0 for size, stride in zip(t.shape[:-1], t.stride()[:-1]) if size > 1)
+
+
+def _pad_rows(t: torch.Tensor, width: int) -> torch.Tensor:
+    """A fresh, contiguous copy of ``t`` with its last dim widened to ``width`` by zeros.
+
+    One op either way (``F.pad`` or ``clone``): host time dominates the cost of the copies on
+    small graphs, and three ops per tensor measured 20 us of it against 13.
+
+    Args:
+        t: Tensor ``[..., D]``.
+        width: New last-dim size, at least ``D``.
+
+    Returns:
+        torch.Tensor: ``[..., width]``; the first ``D`` columns are ``t``, the rest zero.
+    """
+    d = t.shape[-1]
+    if width == d:
+        return t.clone(memory_format=torch.contiguous_format)
+    return torch.nn.functional.pad(t, (0, width - d))
+
+
+def _pad_attention_rows(num_edges: int, heads: int, *tensors: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], int]:
+    """Widen the attention inputs' rows to whole 16-byte vectors when that pays (see
+    ``_PAD_MIN_GATHER_BYTES``).
+
+    The zero columns change nothing the kernels compute: they add 0 to every dot product and
+    LeakyReLU(0) * 0 to every GATv2 score, give zero output columns, and receive gradients that are
+    cut away. Only tensors that need it are copied.
+
+    Args:
+        num_edges: Edges of the forward CSR.
+        heads: Attention heads.
+        *tensors: The inputs, each ``[..., D]`` with the same ``D``.
+
+    Returns:
+        tuple: The tensors to hand to the kernels, and the head dim they have -- ``D`` unless
+        they were padded.
+    """
+    d = tensors[0].shape[-1]
+    elem = tensors[0].element_size()
+    # A non-unit stride over D is the kernels' to reject, whatever the size.
+    if d * elem < 16 or all(_vector_rows(t) for t in tensors) or any(t.stride(-1) != 1 for t in tensors if d > 1):
+        return tensors, d
+    per_vector = 16 // elem
+    width = -(-d // per_vector) * per_vector
+    threshold = _PAD_MIN_GATHER_BYTES if d > _PAD_SHORT_ROW_ELEMENTS else _PAD_MIN_GATHER_BYTES_SHORT_ROWS
+    if num_edges * heads * width * elem < threshold:
+        return tensors, d
+    return tuple(t if width == d and _vector_rows(t) else _pad_rows(t, width) for t in tensors), width
+
+
 def resolve_bucket_launch(bucket_launch) -> int:
     """Accept either a name from :data:`BUCKET_LAUNCHES` or the raw int the kernel takes."""
     if isinstance(bucket_launch, str):
@@ -104,23 +184,66 @@ def resolve_schedule(schedule) -> int:
         raise ValueError(f"unknown schedule {schedule!r}; expected one of {sorted(SCHEDULES)}") from None
 
 
-def _next_power_of_two(x):
-    x -= 1
-    x |= x >> 1
-    x |= x >> 2
-    x |= x >> 4
-    x |= x >> 8
-    x |= x >> 16
-    x += 1
-    return x
+def _slice_kwargs(table) -> dict:
+    """The slice-table keyword arguments of ``_C.reduction_aggr_forward_partitioned``.
+
+    Args:
+        table: An ``EdgeSliceTable`` of the heavy bucket, or None to let the extension build one.
+
+    Returns:
+        The table's tensors by argument name; empty when ``table`` is None.
+    """
+    if table is None:
+        return {}
+    return {
+        "chunk_node": table.chunk_node,
+        "chunk_start": table.chunk_start,
+        "node_chunk_offset": table.node_chunk_offset,
+    }
+
+
+def _light_degree_bound(graph, direction: str) -> int:
+    """Upper bound on the degree of a light row: the smallest heavy degree (cached on the graph), or
+    the largest degree when nothing is heavy."""
+    if getattr(graph, f"{direction}_heavy_nodes").numel() > 0:
+        return graph.min_heavy_degree(direction)
+    return graph.max_degree if direction == "forward" else graph.backward_max_degree
+
+
+def reduction_graph_args(graph, slice_size: int, reduce: str) -> tuple:
+    """Per-graph arguments of ``reduction_aggr`` beyond the CSR, cached on the graph.
+
+    Args:
+        graph: An ``AdjacencyForwardBackwardWithNodeBuckets``.
+        slice_size: Edges per heavy-row slice (``edges_per_block_heavy_nodes``).
+        reduce: The reducer; only ``"sum"`` walks the backward adjacency.
+
+    Returns:
+        ``(fwd_slices, bwd_slices, fwd_light_degree, bwd_light_degree)``: the heavy buckets'
+        ``EdgeSliceTable`` s, and upper bounds on the light rows' degrees, which the kernel weighs
+        against the launch's total work to pick its build. The backward entries are None and -1
+        unless ``reduce`` is ``"sum"``.
+    """
+    fwd = graph.heavy_edge_slices("forward", slice_size)
+    if reduce != "sum":
+        return fwd, None, _light_degree_bound(graph, "forward"), -1
+    return (
+        fwd,
+        graph.heavy_edge_slices("backward", slice_size),
+        _light_degree_bound(graph, "forward"),
+        _light_degree_bound(graph, "backward"),
+    )
 
 
 class ReductionAggrFunction(torch.autograd.Function):
-    """Min/max/sum reduction aggregation over CSR neighbors.
+    """Min/max/sum reduction aggregation over CSR neighbors, for any feature dim.
 
-    Forward: calls ``_C.reduction_aggr_forward_partitioned`` which splits nodes
-    into light (atomic kernel) and heavy (tiled reduction kernel) buckets.
-    For min/max it saves argmin/argmax indices for the backward pass.
+    Forward: calls ``_C.reduction_aggr_forward_partitioned``. Light nodes take one warp each;
+    the heavy bucket is cut into slices of ``edges_per_block_heavy_nodes`` edges, one warp each,
+    whose partial results are merged in edge order. ``fwd_slices`` is that slice table
+    (``graph.heavy_edge_slices("forward", edges_per_block_heavy_nodes)``, cached per graph);
+    without it the extension builds the table on every call, at the cost of a host sync. For
+    min/max the forward also saves the winning source of every output element.
 
     Backward depends on the reducer:
 
@@ -129,8 +252,14 @@ class ReductionAggrFunction(torch.autograd.Function):
       gets gradient).
     - **sum**: every source contributed, so the gradient is itself a sum
       aggregation -- the same forward kernel run over the *transposed* CSR.
-      This needs the backward adjacency, which the ``bwd_*`` arguments carry;
-      without them a ``reduce="sum"`` tensor cannot require grad.
+      This needs the backward adjacency, which the ``bwd_*`` arguments carry
+      (``bwd_slices`` being its slice table); without them a ``reduce="sum"``
+      tensor cannot require grad.
+
+    ``max_degree`` (and ``bwd_max_degree``) bound the degree of the light rows -- see
+    ``reduction_graph_args`` -- and may be any larger value, or -1 if unknown. ``use_2d_kernel``,
+    ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` are accepted for compatibility and
+    have no effect.
     """
 
     @staticmethod
@@ -155,27 +284,11 @@ class ReductionAggrFunction(torch.autograd.Function):
         bwd_light=None,
         bwd_heavy=None,
         bwd_max_degree=-1,
+        fwd_slices=None,
+        bwd_slices=None,
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
-
-        num_of_threads_invoked = WARP_SIZE * warps_per_block
-        num_features_per_thread = FOUR_BYTES_CONSTANT // X.dtype.itemsize
-
-        num_threads_needed = ceil(X.shape[-1] / num_features_per_thread)
-
-        if num_threads_needed < num_of_threads_invoked:
-            warps_per_block_needed = ceil(num_threads_needed / WARP_SIZE)
-            warnings.warn(
-                f"Number of threads involved for ReductionAggr is {num_of_threads_invoked} "
-                f"({warps_per_block} warps per thread block requested). "
-                f"However, number of threads needed is {num_threads_needed} "
-                f"({warps_per_block_needed} warps). Setting this value instead."
-            )
-
-            warps_per_block = warps_per_block_needed
-            if warps_per_block not in {1, 2, 4, 8, 16, 32, 64}:
-                warps_per_block = _next_power_of_two(warps_per_block)
 
         out, arg_idx = _C.reduction_aggr_forward_partitioned(
             edge_ptr,
@@ -191,8 +304,10 @@ class ReductionAggrFunction(torch.autograd.Function):
             tiles_y,
             reduce,
             pipeline_stages,
+            **_slice_kwargs(fwd_slices),
         )
         ctx.save_for_backward(arg_idx, bwd_edge_ptr, bwd_edge_idx, bwd_light, bwd_heavy)
+        ctx.bwd_slices = bwd_slices
         ctx.num_src_nodes = X.size(0)
         ctx.warps_per_block = warps_per_block
         ctx.reduce = reduce
@@ -220,41 +335,23 @@ class ReductionAggrFunction(torch.autograd.Function):
             grad_x, _ = _C.reduction_aggr_forward_partitioned(
                 bwd_edge_ptr,
                 bwd_edge_idx,
-                grad_out.contiguous(),
+                grad_out,
                 bwd_light,
                 bwd_heavy,
                 ctx.bwd_max_degree,
                 ctx.warps_per_block,
                 ctx.edges_per_block_heavy_nodes,
-                True,  # sum has no packed path; the 2-D kernel is the only option
+                False,
                 ctx.features_per_block,
                 ctx.tiles_y,
                 "sum",
                 0,
+                **_slice_kwargs(ctx.bwd_slices),
             )
         else:
             grad_x = _C.reduction_aggr_backward(grad_out, arg_idx, num_src_nodes, ctx.warps_per_block)
 
-        return (
-            None,
-            None,
-            grad_x,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return (None, None, grad_x) + (None,) * 17
 
 
 class gatv2_function(torch.autograd.Function):
@@ -317,6 +414,10 @@ class gatv2_function(torch.autograd.Function):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
         schedule_id = resolve_schedule(schedule)
+        head_dim = x_left.shape[2]
+        (x_left, x_right, attention_weights), width = _pad_attention_rows(
+            indices_forward.numel(), x_left.shape[1], x_left, x_right, attention_weights
+        )
 
         output, logsumexp = _C.gatv2_forward(
             x_left,
@@ -360,8 +461,10 @@ class gatv2_function(torch.autograd.Function):
         ctx.backward_heavy_pipeline_stages = backward_heavy_pipeline_stages
         ctx.is_directed = is_directed
         ctx.heads = x_left.shape[1]
-        ctx.head_dim = x_left.shape[2]
+        ctx.head_dim = head_dim
+        ctx.width = width
 
+        # The padded tensors, output included: the backward runs on the same rows.
         ctx.save_for_backward(
             x_left,
             x_right,
@@ -378,7 +481,7 @@ class gatv2_function(torch.autograd.Function):
             bwd_heavy_nodes,
         )
 
-        return output
+        return output if width == head_dim else output[..., :head_dim].contiguous()
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
@@ -405,7 +508,9 @@ class gatv2_function(torch.autograd.Function):
         # The kernels read the gradient through its row strides but need unit stride over the
         # head dim; autograd may hand over any layout.
         grad_output = grad_output.reshape(-1, num_heads, head_dim)
-        if grad_output.stride(-1) != 1:
+        if ctx.width != head_dim:
+            grad_output = _pad_rows(grad_output, ctx.width)
+        elif grad_output.stride(-1) != 1:
             grad_output = grad_output.contiguous()
 
         grad_x_left, grad_x_right, grad_attention = _C.gatv2_backward(
@@ -439,6 +544,11 @@ class gatv2_function(torch.autograd.Function):
             ctx.backward_pipeline_stages,
             ctx.backward_heavy_pipeline_stages,
         )
+
+        if ctx.width != head_dim:
+            grad_x_left, grad_x_right, grad_attention = (
+                g[..., :head_dim] for g in (grad_x_left, grad_x_right, grad_attention)
+            )
 
         # 16 trailing forward args, the 4 carrying the heavy-node edge-slice table, and
         # backward_pipeline_stages from the async-copy work.
@@ -513,9 +623,12 @@ class _FusedGraphAttention(torch.autograd.Function):
         backward_pipeline_stages=0,
         backward_heavy_pipeline_stages=0,
     ):
+        # Of the head dim as given: padding below must not change the scale.
         scale = scale or 1 / (Q.shape[-1] ** 0.5)
         schedule_id = resolve_schedule(schedule)
         empty = _empty_i32(Q.device)
+        head_dim = Q.shape[2]
+        (Q, K, V), width = _pad_attention_rows(edge_idx.numel(), Q.shape[1], Q, K, V)
         out, logsumexp = _C.gt_forward_csr_mh(
             edge_ptr,
             edge_idx,
@@ -548,7 +661,8 @@ class _FusedGraphAttention(torch.autograd.Function):
         ctx.scale = scale
         ctx.is_directed = is_directed
         ctx.num_heads = Q.shape[1]
-        ctx.head_dim = Q.shape[2]
+        ctx.head_dim = head_dim
+        ctx.width = width
         ctx.backward_light_warps = backward_light_warps
         ctx.backward_heavy_warps = backward_heavy_warps
         # The backward bucket has its own table: it slices the transpose CSR, not the forward one.
@@ -558,11 +672,12 @@ class _FusedGraphAttention(torch.autograd.Function):
         ctx.bwd_node_chunk_offset = bwd_node_chunk_offset if bwd_node_chunk_offset is not None else empty
         ctx.backward_pipeline_stages = backward_pipeline_stages
         ctx.backward_heavy_pipeline_stages = backward_heavy_pipeline_stages
+        # The padded tensors, output included: the backward runs on the same rows.
         ctx.save_for_backward(
             edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp, bwd_light_nodes, bwd_heavy_nodes
         )
 
-        return out
+        return out if width == head_dim else out[..., :head_dim].contiguous()
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
@@ -583,7 +698,8 @@ class _FusedGraphAttention(torch.autograd.Function):
         scale = ctx.scale
         num_heads = ctx.num_heads
         head_dim = ctx.head_dim
-        grad_output = grad_output.reshape(-1, num_heads, head_dim).contiguous()
+        grad_output = grad_output.reshape(-1, num_heads, head_dim)
+        grad_output = _pad_rows(grad_output, ctx.width) if ctx.width != head_dim else grad_output.contiguous()
 
         dQ, dK, dV = _C.gt_backward_csr_mh(
             edge_ptr,
@@ -613,6 +729,9 @@ class _FusedGraphAttention(torch.autograd.Function):
             ctx.backward_pipeline_stages,
             ctx.backward_heavy_pipeline_stages,
         )
+
+        if ctx.width != head_dim:
+            dQ, dK, dV = (g[..., :head_dim] for g in (dQ, dK, dV))
 
         # 15 trailing forward args, plus the 4 forward-table and 4 backward-table arguments.
         return (None,) * 4 + (dQ, dK, dV) + (None,) * 27

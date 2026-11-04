@@ -2,3 +2,4 @@ dataset:
   source: pyg
   name: CoraFull
   root: data
+  allow_random_split: true  # PyG's CoraFull ships no train/val/test masks

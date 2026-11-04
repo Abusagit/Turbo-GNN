@@ -23,7 +23,10 @@ std::vector<at::Tensor> reduction_aggr_forward_partitioned_torch(
     int features_per_block          = 32,
     int tiles_y                     = 8,
     std::string reduce              = "min",
-    int pipeline_stages             = 0
+    int pipeline_stages             = 0,
+    at::Tensor chunk_node           = {},
+    at::Tensor chunk_start          = {},
+    at::Tensor node_chunk_offset    = {}
 );
 
 // ============================================================================

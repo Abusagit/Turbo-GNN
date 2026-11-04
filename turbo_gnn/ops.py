@@ -25,6 +25,7 @@ from turbo_gnn._functions import (
     _FusedGraphAttention,
     csr_SPMM_normalized,
     gatv2_function,
+    reduction_graph_args,
 )
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
@@ -56,7 +57,7 @@ def reduction_aggr(
     reduce: str = "min",
     pipeline_stages: int = 0,
 ) -> torch.Tensor:
-    """Element-wise min, max or sum aggregation over incoming neighbors.
+    """Element-wise min, max or sum aggregation over incoming neighbors, for any feature dim F.
 
     For each destination node *v*, computes::
 
@@ -64,41 +65,45 @@ def reduction_aggr(
 
     With ``reduce="sum"`` this is plain SpMM against the unweighted adjacency
     (DGL's ``copy_u_sum``); the summation is accumulated in fp32 even for
-    fp16/bf16 inputs.
+    fp16/bf16 inputs. Min and max route each output's gradient to the source that
+    attained it -- of equal candidates, the first in edge order. NaN inputs are never
+    selected; +-inf inputs are.
 
-    Uses a partitioned kernel: "light" nodes (low degree) use an atomic-based
-    kernel; "heavy" nodes (high degree) use a tiled reduction kernel for better
-    load balance.
+    Light nodes take one warp each, whose lanes split the row and the edges; the heavy
+    bucket is cut into slices of ``edges_per_block_heavy_nodes`` edges, one warp each,
+    whose partial results are merged in edge order, so heavy rows are deterministic too.
+    Rows are read in 16-byte vectors when every row of ``X`` is 16-byte aligned and
+    element by element otherwise.
 
     Args:
         graph: CSR graph with forward adjacency and light/heavy node buckets.
             ``reduce="sum"`` additionally uses the backward (transposed)
             adjacency for its gradient.
-        X: Node features, shape ``[N, F]``.
-        warps_per_block: Warps per CUDA thread block (light-node kernel).
-        edges_per_block_heavy_nodes: Edges processed per block (heavy-node kernel).
-        use_2d_kernel: Use the 2-D tiled kernel variant for the heavy-node path.
-            Ignored for ``reduce="sum"``, which has no packed-atomics
-            alternative and always takes the 2-D path.
-        features_per_block: Feature-dimension tile size (2-D kernel only).
-        tiles_y: Number of row tiles (2-D kernel only).
+        X: Node features, shape ``[N, F]``; any row stride.
+        warps_per_block: Warps per CUDA thread block. Each warp works on its own
+            row, so this only sets the scheduling granularity; values above 8 act as 8.
+        edges_per_block_heavy_nodes: Edges per heavy-row slice. The slice table is
+            built once per graph and size, which costs one host sync.
+        use_2d_kernel: Accepted for compatibility; no effect.
+        features_per_block: Accepted for compatibility; no effect.
+        tiles_y: Accepted for compatibility; no effect.
         reduce: ``"min"``, ``"max"`` or ``"sum"``.
-        pipeline_stages: Number of async-copy pipeline stages for the light-node
-            and packed-atomics heavy-node kernels' per-thread neighbor scan. 0
-            disables the pipeline. Ignored when ``use_2d_kernel=True``.
+        pipeline_stages: Accepted for compatibility; no effect.
 
     Returns:
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
-        receive zeros -- for min/max the identity (+-inf) is clamped
-        internally, for sum it is already the empty-sum value.
+        receive zeros (for min/max, also those whose every neighbor holds NaN).
     """
+    fwd_slices, bwd_slices, fwd_light_degree, bwd_light_degree = reduction_graph_args(
+        graph, edges_per_block_heavy_nodes, reduce
+    )
     return ReductionAggrFunction.apply(
         graph.forward_indptr,
         graph.forward_indices,
         X,
         graph.light_nodes,
         graph.heavy_nodes,
-        graph.max_degree,
+        fwd_light_degree,
         warps_per_block,
         edges_per_block_heavy_nodes,
         use_2d_kernel,
@@ -110,7 +115,9 @@ def reduction_aggr(
         graph.backward_indices,
         graph.backward_light_nodes,
         graph.backward_heavy_nodes,
-        graph.backward_max_degree,
+        bwd_light_degree,
+        fwd_slices,
+        bwd_slices,
     )
 
 
@@ -156,8 +163,10 @@ def gatv2_aggr(
     (fp16/bf16) features are processed in a single pass with every row in registers;
     longer rows take a two-pass path that stores one or two scalars per edge and head in a
     temporary ``[H, E]`` float32 buffer. Rows that are not whole, 16-byte-aligned vectors --
-    an odd ``D``, or a view offset into a larger tensor -- are read element by element,
-    which is slower.
+    an odd ``D``, ``D = 100`` in fp16, or a view offset into a larger tensor -- are read element
+    by element. When the call is large enough to repay the copies (rows over 64 elements: 16 MiB
+    gathered; shorter rows of at least 16 bytes: 256 MiB), they are copied into rows zero-padded
+    to the next 16 bytes instead, which measured 1.4-3x faster on real graphs.
 
     The backward needs ``<grad_output, output>`` per row and saves the output for it.
 
@@ -280,8 +289,11 @@ def graph_transformer_aggr(
     (fp16/bf16) features are processed in a single pass with every row in registers;
     longer rows take a two-pass path that stores one score per edge and head (and, in the
     backward, two or three scalars) in a temporary ``[H, E]`` float32 buffer. Rows that are
-    not whole, 16-byte-aligned vectors -- an odd ``D``, or a view offset into a larger
-    tensor -- are read element by element, which is slower.
+    not whole, 16-byte-aligned vectors -- an odd ``D``, ``D = 100`` in fp16, or a view offset
+    into a larger tensor -- are read element by element. When the call is large enough to repay
+    the copies (rows over 64 elements: 16 MiB gathered; shorter rows of at least 16 bytes:
+    256 MiB), they are copied into rows zero-padded to the next 16 bytes instead, which measured
+    1.4-3x faster on real graphs. ``scale=None`` is ``1 / sqrt(D)`` of the given ``D``.
 
     Args:
         graph: CSR graph with forward + backward adjacency for fwd/bwd passes.

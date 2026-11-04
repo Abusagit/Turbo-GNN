@@ -374,8 +374,8 @@ def test_forward_block_sizes_vs_fp32_reference(warps, dtype, reduce, use_2d_kern
 @pytest.mark.parametrize("reduce", ["min", "max"])
 @pytest.mark.parametrize("pipeline_stages", [1])
 def test_forward_pipeline_vs_baseline(dtype, reduce, pipeline_stages):
-    """Forward: pipeline (any stage count) must match the pipeline_stages=0 baseline,
-    for both the light (atomic) and packed-atomics heavy kernels."""
+    """Forward: pipeline_stages (accepted for compatibility, no longer a kernel parameter) must not
+    change the result, on light and heavy rows alike."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 

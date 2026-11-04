@@ -113,7 +113,7 @@ permutation), and broadcasts each id with one warp shuffle instead of two. Prefe
 ```python
 from turbo_gnn import reduction_aggr, gatv2_aggr, graph_transformer_aggr, spmm_aggr
 
-# Reduction (min/max) aggregation
+# Reduction (min/max/sum) aggregation, any feature dim F
 out = reduction_aggr(graph, X, reduce="min")       # [N, F]
 
 # GATv2 attention aggregation
@@ -461,8 +461,15 @@ Inputs are synthesized already-projected, in whatever shape the aggregation expe
 
 `gat_v2` treating `--feature-dim` as the *per-head* width is the convention `create_aggr` already
 uses across all backends; it is not a typo. `gat_v2` and `gt` on the cuda backend take any head dim
-from 1 to 65536; widths whose rows are not whole 16-byte vectors (e.g. an odd head dim) run a slower
-element-wise path.
+from 1 to 65536, and `min_aggr` / `max_aggr` (`reduction_aggr`) any feature dim. Rows that are not
+whole 16-byte vectors (e.g. an odd head dim, or 100 in fp16) are read element by element, measured at
+3-6x the time per element of vector rows on real graphs. `gat_v2` and `gt` therefore copy such inputs
+into rows zero-padded to the next 16 bytes when the call is large enough to repay the copies: rows over
+64 elements from 16 MiB gathered (edges x heads x head dim x element size), 2.97x faster on geomean
+over 176 measured cells; shorter rows from 256 MiB, 1.41x; rows under 16 bytes never. The copies cost
+memory for the call's lifetime.
+`min_aggr` / `max_aggr` do not: their backward is layout-independent, and cutting the forward's
+outputs back to width costs about what the vector rows save on sparse graphs.
 
 #### Measurement
 
@@ -500,7 +507,7 @@ The JSON says which mode ran, and populates only the matching pair:
 
 ```bash
 # under ncu: 1 + 5 + 20 = 26 launches, every time
-ncu --kernel-name regex:reduction_aggr_forward .venv/bin/python scripts/benchmark_kernels.py \
+ncu --kernel-name regex:reduction_forward_kernel .venv/bin/python scripts/benchmark_kernels.py \
     --backend cuda --conv min_aggr --launch-ncu-override-iters 20 --launch-ncu-override-warmup 5
 ```
 
