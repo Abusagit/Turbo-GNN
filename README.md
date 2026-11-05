@@ -132,9 +132,12 @@ out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
 ### GSDDMM: per-edge binary ops
 
 `gsddmm` applies a binary op per edge, taking each operand's row from the source node
-(`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). D must be one of
-32, 64, 128, 256; dtypes are fp32/fp16/bf16. Differentiable in both operands — the
-backward's two kernels are picked by `backward_variant` (see below).
+(`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). Any feature dim D
+from 1 to 65536 is supported, in fp32/fp16/bf16, with any row stride (column slices and
+expanded rows are read in place); index dtypes int32/int64/uint32/uint64. Rows that are not
+whole 16-byte vectors on 16-byte boundaries (an odd D, D = 100 in fp16, an offset view) are
+read element by element, which is slower. Differentiable in both operands — the backward's
+two kernels are picked by `backward_variant` (see below).
 
 ```python
 from turbo_gnn import gsddmm, u_add_v, copy_u
@@ -194,10 +197,14 @@ out.backward(grad)
   target row — usually exactly one — and the warp sums each run in registers, so it issues
   one set of atomics per run rather than per edge, and reads the reduced node's own row
   once per run rather than once or twice per edge. The atomics are staged through shared
-  memory so each is one contiguous 128-byte request instead of 32 scattered sectors. Its
-  result is deterministic only up to fp32 atomic ordering.
-  `pipeline_stages` applies here too: it prefetches each edge's `d_out` and other-operand
-  rows that many edges ahead with `cp.async`, as the forward edge kernel does.
+  memory so each is one contiguous request instead of scattered sectors. Its result is
+  deterministic only up to fp32 atomic ordering. On an undirected graph the source-side
+  pass walks a source-grouped list too (the shared CSR read with its rows as sources), so
+  its runs are as long as the destination side's.
+
+`pipeline_stages` is accepted by both kernels for compatibility but has no effect: the
+former fixed-D kernels' `cp.async` ring won at most 4–9% in a few cells and lost up to 2x in
+most, and the kernels now hold each lane's row addresses in registers instead.
 
 `add`, `sub` and `copy` have constant partials, so their backward saves **no** feature
 tensors — the difference between keeping one and two `[E, D]` activations alive per op.

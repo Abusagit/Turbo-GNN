@@ -523,7 +523,10 @@ def gsddmm(
     Args:
         graph: CSR graph with forward adjacency and light/heavy node buckets.
         lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
-            ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
+            ``[E, D]`` for ``"edge"``; any D in [1, 65536] and any row stride.
+            Rows that are not whole 16-byte vectors on 16-byte boundaries (an
+            odd D, D = 100 in fp16, or a view offset into a larger tensor) are
+            read element by element, which is slower.
         rhs: Right operand, same layout rules as ``lhs``. Ignored (and may be
             omitted) for ``op="copy"``, which never reads it.
         op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
@@ -539,14 +542,10 @@ def gsddmm(
             balanced (one warp per edge chunk) but accumulates atomically into an
             fp32 buffer, so its result depends on atomic ordering and is only
             deterministic up to fp32 rounding.
-        pipeline_stages: Async-copy prefetch depth for the per-edge operand
-            rows, 0-3 (0 disables the pipeline); read by both kernels. Stage
-            ``i + stages`` is prefetched while stage ``i`` is consumed, costing
-            ``stages + 1`` shared-memory row slots per warp. A deep pipeline on
-            a wide D with two per-edge operands can exceed the GPU's opt-in
-            shared memory per block (e.g. D=256, 32 heavy warps and both
-            operands gathered per edge needs 192 KiB at stages=2); the kernel
-            raises with the exact figures when it does.
+        pipeline_stages: Accepted for compatibility, 0-3; no effect. The
+            kernels have no cp.async pipeline: on the former fixed-D kernels it
+            won at most 4% (node) and 9% (edge, one op at D=64) and lost up to
+            2x elsewhere.
         light_warps_per_block: *(node kernel)* Warps per block for the
             light-node bucket. Only counts the binding instantiates are
             accepted (currently 4).
@@ -563,7 +562,10 @@ def gsddmm(
             CUDA stream concurrently with the heavy bucket on the current
             stream. The side stream is forked from and joined back to the
             current stream with events, so ordering for the caller is unchanged.
-        edges_per_warp: *(edge kernel)* Contiguous edges each warp walks, 1-32.
+        edges_per_warp: *(edge kernel)* Contiguous edges each lane group walks,
+            1-32. Rows of up to 16 16-byte vectors take a group of 4-16 lanes
+            per edge, and a warp then walks ``edges_per_warp * 32 / G`` edges,
+            at most 32.
         warps_per_block: *(edge kernel)* Independent warps packed per thread
             block, 1-8.
 
@@ -637,22 +639,18 @@ def gsddmm_edge(
         graph: CSR graph; its forward (dst-grouped) or backward (src-grouped)
             adjacency is read to build the cached edge list.
         lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
-            ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
+            ``[E, D]`` for ``"edge"``; any D in [1, 65536] and any row stride.
         rhs: Right operand, same layout rules as ``lhs``. May be omitted for
             ``op="copy"`` (it is never read by the kernel).
         op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
         lhs_target: ``"src"``, ``"dst"``, or ``"edge"``.
         rhs_target: ``"src"``, ``"dst"``, or ``"edge"``. Forced to ``"edge"``
             for ``op="copy"`` (the value is irrelevant since rhs is unread).
-        pipeline_stages: cp.async prefetch depth of the operand rows, in
-            {0, 2, 3}. 0 gathers rows with direct loads; ``s >= 1`` copies
-            the rows of the next ``s`` edges of the warp's chunk into shared
-            memory while the current edge is computed. Only useful with
-            ``edges_per_warp > 1``.
-        edges_per_warp: contiguous edges each warp processes, in [1, 32].
-            The default 1 is the original one-edge-per-warp layout.
+        pipeline_stages: Accepted for compatibility, 0-3; no effect.
+        edges_per_warp: contiguous edges each lane group processes, in
+            [1, 32]; a warp of ``32 / G`` groups takes up to 32 (see
+            :func:`gsddmm`).
         warps_per_block: independent warps per thread block, in [1, 8].
-            The default 1 is the original 32-thread block.
 
     Returns:
         ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"``. Edge order: CSR

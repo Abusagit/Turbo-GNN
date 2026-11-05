@@ -117,9 +117,9 @@ __device__ __forceinline__ void pipelined_neighbor_row_loop(
 //
 // The loop above takes the row width as a template parameter. The graph transformer kernels take
 // any head dim, so their row width is known only at launch and these variants take it as an
-// argument. They follow the hold convention of gsddmm_pipeline.cuh rather than the loop above:
-// the copy for iteration it + NUM_STAGES is issued *before* iteration it is consumed, into a
-// spare slot, so NUM_STAGES copies overlap every consume() at the cost of one extra ring slot.
+// argument. They follow a different convention from the loop above ("hold"): the copy for
+// iteration it + NUM_STAGES is issued *before* iteration it is consumed, into a spare slot, so
+// NUM_STAGES copies overlap every consume() at the cost of one extra ring slot.
 // The loop above issues its next copy only after consuming, leaving NUM_STAGES - 1 in flight.
 //
 // Rows must be 16-byte aligned and row_elems * sizeof(cuda_t) a multiple of 16.
@@ -156,7 +156,8 @@ __device__ __forceinline__ void async_copy_rows_warp_rt(
 //
 // dbuf: this warp's private ring, pipelined_rows_ring_elems(NUM_STAGES, NUM_ROWS, row_elems)
 // elements. Slots are walked with pointer cursors rather than indexed: a register array indexed by
-// a runtime slot is demoted to local memory (see gsddmm_pipeline.cuh).
+// a runtime slot is demoted to local memory (measured on the former g-SDDMM ring: 19M local loads
+// and 4x the instructions for three slots).
 template <size_t NUM_STAGES, size_t NUM_ROWS, FloatingNum cuda_t, typename AddrFn, typename ConsumeFn>
 __device__ __forceinline__ void pipelined_rows_loop(
     uint32_t lane, uint32_t loop_iters, uint32_t row_elems, cuda_t *__restrict__ dbuf, AddrFn&& addr, ConsumeFn&& consume

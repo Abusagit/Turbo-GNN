@@ -312,10 +312,6 @@ class GSDDMMKernel(TunableKernel):
       the light/heavy node buckets. Only the counts the binding instantiates
       are searchable (see ``csrc/gsddmm/gsddmm_dispatch.cuh``); any other value
       raises from the dispatch.
-    - ``forward_pipeline_stages``: async-copy pipeline depth for the per-edge
-      Src/Edge row prefetch, in {0, 1, 2, 3} (0 disables the pipeline). Deeper
-      pipelines buy more overlap but cost ``stages + 1`` shared-memory row
-      slots per warp, so the whole range is searched.
     - ``forward_heavy_edges_per_block``: split each heavy node into chunks of
       this many edges, one block per chunk (0 = one block per node). Bounds
       the heavy launch's tail by the chunk instead of the maximum degree; the
@@ -326,16 +322,17 @@ class GSDDMMKernel(TunableKernel):
 
     Tunable forward parameters, edge variant:
 
-    - ``forward_edges_per_warp``: contiguous edges each warp walks, in [1, 32].
-      1 is the original one-edge-per-warp layout; larger chunks amortize the
-      edge-list load (one coalesced load per chunk) and are what gives the
-      pipeline something to prefetch.
-    - ``forward_pipeline_stages``: cp.async prefetch depth of the operand rows,
-      in {0, 2, 3}. Costs ``stages + 1`` shared row slots per operand per warp;
-      pointless with ``edges_per_warp == 1``.
+    - ``forward_edges_per_warp``: contiguous edges each lane group walks, in
+      [1, 32]. A row of up to 16 16-byte vectors takes a group of 4-16 lanes
+      per edge, so a warp then walks ``edges_per_warp * 32 / G`` edges (at most
+      32); larger chunks amortize the edge-list load (one coalesced load per
+      chunk) and the chunk-shared operand row.
     - ``forward_warps_per_block``: independent warps packed per thread block,
       in {1, 2, 4, 8}. 32-thread blocks cap residency at 32 blocks/SM (half the
       warp slots on sm_80); packing warps lifts that cap.
+
+    ``pipeline_stages`` is accepted and passed through for compatibility but has
+    no effect -- the kernels have no cp.async pipeline -- so it is not searched.
 
     Tunable graph parameter (node variant only -- the edge kernel ignores the
     node buckets):
@@ -565,12 +562,10 @@ class GSDDMMKernel(TunableKernel):
             return [
                 TunableParam("forward_light_warps", [4], default=4),
                 TunableParam("forward_heavy_warps", [32], default=32),
-                TunableParam("forward_pipeline_stages", [0, 1, 2, 3], default=0),
                 TunableParam("forward_heavy_edges_per_block", [0, 512, 1024, 2048, 4096], default=0),
                 TunableParam("forward_overlap_buckets", [False, True], default=False),
             ]
         return [
-            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
             TunableParam("forward_edges_per_warp", [1, 4, 8, 16, 32], default=4),
             TunableParam("forward_warps_per_block", [1, 2, 4, 8], default=4),
         ]
@@ -586,9 +581,9 @@ class GSDDMMKernel(TunableKernel):
     def _merge_params(params: list[TunableParam]) -> list[TunableParam]:
         """Union two variants' axes, merging the values of shared names.
 
-        Both kernels take ``forward_pipeline_stages``, so a plain concatenation
-        would declare it twice -- and a duplicated name collapses in the grid's
-        config dict and would be registered twice by the Optuna driver.
+        A name both kernels declared would otherwise appear twice -- and a
+        duplicated name collapses in the grid's config dict and would be
+        registered twice by the Optuna driver.
         """
         merged: dict[str, TunableParam] = {}
         for param in params:
