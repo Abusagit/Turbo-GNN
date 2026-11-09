@@ -16,6 +16,7 @@ what is being fitted and why.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -38,13 +39,37 @@ def collect(args: argparse.Namespace) -> tuple[list[Measurement], str]:
         measurements += measurements_from_kernel_benchmark_summary(path)
         sources.append(str(path))
     if args.from_json:
-        paths = [p for entry in args.from_json for p in (sorted(entry.glob("*.json")) if entry.is_dir() else [entry])]
+        paths = [
+            p
+            for entry in args.from_json
+            for p in (sorted([*entry.glob("*.json"), *entry.glob("*.jsonl")]) if entry.is_dir() else [entry])
+        ]
         measurements += measurements_from_benchmark_json(paths)
         sources.append(f"{len(paths)} benchmark json record(s)")
     for path in args.from_csv:
         measurements += measurements_from_csv(path)
         sources.append(str(path))
     return measurements, ", ".join(sources)
+
+
+def measurement_metadata(paths: list[Path]) -> dict[str, object]:
+    """Keep device/config provenance and refuse to fit incompatible measurements together."""
+    records: list[dict[str, object]] = []
+    for entry in paths:
+        for path in sorted([*entry.glob("*.json"), *entry.glob("*.jsonl")]) if entry.is_dir() else [entry]:
+            if path.suffix == ".jsonl":
+                records.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
+            else:
+                data = json.loads(path.read_text())
+                records.extend(data if isinstance(data, list) else [data])
+    metadata = {}
+    for field in ("gpu", "sms", "heads", "dtype", "quantile"):
+        values = {record[field] for record in records if field in record}
+        if len(values) > 1:
+            raise ValueError(f"mixed {field} in measurements: {values}; calibrate each configuration separately")
+        if values and all(field in record for record in records):
+            metadata[field] = next(iter(values))
+    return metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +92,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    metadata = measurement_metadata(args.from_json)
     measurements, source = collect(args)
+    if args.from_summary or args.from_csv:
+        metadata = {}  # These legacy formats do not carry device/config provenance.
     if not measurements:
         print("no measurements found", file=sys.stderr)
         return 1
@@ -94,7 +122,12 @@ def main() -> int:
     for key, reason in sorted(skipped.items()):
         print(f"skipped {key}: {reason}")
 
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     save_cost_models(args.out, fits, source, args.weighting)
+    payload = json.loads(args.out.read_text())
+    payload["measurement_metadata"] = metadata
+    payload["measurement_files"] = [str(path) for path in args.from_json]
+    args.out.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"\nwrote {args.out}")
     return 0
 
