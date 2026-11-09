@@ -112,7 +112,7 @@ def main() -> int:
     # from the surrounding nn.Linear projections?
     # =========================================================================
     with torch.no_grad():
-        x_left, x_right = conv.left_right_projection(x).split(conv.heads * conv.head_dim, -1)
+        x_left, x_right = conv.fc_dst(x), conv.fc_src(x)
         x_left = x_left.view(-1, conv.heads, conv.head_dim)
         x_right = x_right.view(-1, conv.heads, conv.head_dim)
 

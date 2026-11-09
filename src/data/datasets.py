@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Dict, Literal, Mapping, Optional, Tuple
 
+import os
 import torch
 import torch_geometric.datasets as pyg_datasets
 from ogb.nodeproppred import NodePropPredDataset
@@ -622,6 +623,7 @@ def load_ogbn(
     graph_backend: GraphBackendOption,
     root: str = "data",
     kernel_related_kwargs: dict[str, Any] = {},
+    native_targets: bool = False,
 ) -> GraphSample:
     """Load an ogbn-* node property prediction dataset as a single-graph sample.
 
@@ -629,6 +631,9 @@ def load_ogbn(
         name (str): OGBN dataset name (e.g., 'ogbn-arxiv', 'ogbn-products').
         graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
         root (str): Download/cache directory.
+        native_targets (bool): keep the dataset's own target layout (e.g. ogbn-proteins' [N, 112]
+            binary labels) and, for a graph without node features, use the mean of each node's
+            incoming edge features as its features (the usual ogbn-proteins recipe).
 
     Returns:
         GraphSample: Canonical sample (x, y, edge_index, masks).
@@ -661,7 +666,13 @@ def load_ogbn(
     graph, labels = dset[0]
 
     edge_index = torch.as_tensor(graph["edge_index"], dtype=torch.long)
-    if graph["node_feat"] is None:
+    if graph["node_feat"] is None and native_targets and graph.get("edge_feat") is not None:
+        # ogbn-proteins: node features = mean of the incoming edge features (OGB's examples).
+        ef = torch.as_tensor(graph["edge_feat"], dtype=torch.float32)
+        dst = edge_index[1]
+        x = torch.zeros(graph["num_nodes"], ef.shape[1], dtype=torch.float32).index_add_(0, dst, ef)
+        x /= torch.bincount(dst, minlength=graph["num_nodes"]).clamp(min=1).unsqueeze(1).float()
+    elif graph["node_feat"] is None:
         # Some OGB graphs carry no node features at all -- ogbn-proteins puts its features on
         # edges. Represent that as a zero-width matrix rather than fabricating values: the
         # node count stays correct for masks and graph construction, and anything that
@@ -698,8 +709,13 @@ def load_pyg_single_graph(
     root: str = "data",
     allow_random_split: bool = False,
     kernel_related_kwargs: dict[str, Any] = {},
+    native_targets: bool = False,
 ) -> GraphSample:
     """Load a single-graph dataset from PyTorch Geometric.
+
+    ``native_targets=True`` keeps GraphLand regression targets as standardized floats instead of
+    binning them into 5 classes (GraphLand's own regression setting), and returns float targets
+    unchanged rather than casting every target to long.
 
     Supported (common) names:
         - 'Cora', 'CiteSeer', 'PubMed'  -> Planetoid datasets
@@ -726,7 +742,9 @@ def load_pyg_single_graph(
             dset = Planetoid(root=root, name=name)
             data: Data = dset[0]
         elif name in ("reddit",):
-            dset = Reddit(root=root)
+            # PyG's Reddit keeps raw/ and processed/ directly under its root: give it its own
+            # directory (data/Reddit), else it reads data/processed of another dataset or downloads.
+            dset = Reddit(root=os.path.join(root, "Reddit"))
             data = dset[0]
         elif name in (
             "hm-categories",
@@ -744,7 +762,16 @@ def load_pyg_single_graph(
             "artnet-views",
             "web-traffic",
         ):
-            dset = GraphLandDataset(root=root, name=name, split="RL")
+            dset = GraphLandDataset(
+                root=root,
+                name=name,
+                split="RL",
+                # Only regression datasets change: the flag is part of GraphLand's processed-cache
+                # key, so classification datasets keep reading their existing cache.
+                convert_regression_to_classification=not (
+                    native_targets and GraphLandDataset.GRAPHLAND_DATASETS[name] == "regression"
+                ),
+            )
             data = dset[0]
         elif name in ("amazon-photo", "amazon-computers"):
             dset = Amazon(root=root, name=name.split("-")[1])
@@ -803,7 +830,7 @@ def load_pyg_single_graph(
 
     return GraphSample(
         x=x,
-        y=y.long(),
+        y=y if (native_targets and y.is_floating_point()) else y.long(),
         edge_index=edge_index,
         edge_weight=edge_weight,
         train_mask=train_mask.bool(),
@@ -920,6 +947,7 @@ class DatasetConfig:
     root: str = "data"
     allow_random_split: bool = False
     kernel_related_kwargs: dict[str, Any] = field(default_factory=lambda: {})
+    native_targets: bool = False  # see load_pyg_single_graph / load_ogbn
 
 
 def load_single_graph(cfg: DatasetConfig) -> GraphSample:
@@ -942,7 +970,11 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
     s = cfg.source.lower()
     if s == "ogbn":
         return load_ogbn(
-            cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+            cfg.name,
+            root=cfg.root,
+            graph_backend=graph_backend,
+            kernel_related_kwargs=kernel_related_kwargs,
+            native_targets=cfg.native_targets,
         )
     if s == "pyg":
         return load_pyg_single_graph(
@@ -951,6 +983,7 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
             graph_backend=graph_backend,
             allow_random_split=getattr(cfg, "allow_random_split", False),
             kernel_related_kwargs=kernel_related_kwargs,
+            native_targets=cfg.native_targets,
         )
     if s == "dgl":
         return load_dgl_single_graph(

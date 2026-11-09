@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from ..base import activation_factory, norm_factory
 from .conv_dispatcher import create_conv_layer
+from .prefix_grad import dst_src_project, num_dst_of
 
 
 class ResidualBlock(torch.nn.Module):
@@ -63,6 +64,9 @@ class ResidualBlock(torch.nn.Module):
         self.norm = norm_factory(norm, self.out_channels)
         self.drop = nn.Dropout(p=dropout) if dropout and dropout > 0.0 else nn.Identity()
         self.use_residual = residual
+        # How the destination-prefix slices are differentiated on sampled blocks; see
+        # prefix_grad.py. Set per run (e.g. by scripts/train_sampled.py).
+        self.prefix_grad = "autograd"
 
     def forward(
         self,
@@ -82,9 +86,16 @@ class ResidualBlock(torch.nn.Module):
             torch.Tensor: Output features [N, Fout].
         """
         projected = self.act(self.projection(x))
-        out = self.conv(projected, graph)
+        # Sampled block: x has num_src rows, the output num_dst (the destination prefix).
+        num_dst = num_dst_of(graph)
+        if num_dst is not None and self.prefix_grad == "inplace" and hasattr(self.conv, "forward_projected"):
+            x_left, x_right, skip = dst_src_project(projected, self.conv.fc_dst, self.conv.fc_src, num_dst)
+            out = self.conv.forward_projected(x_left, x_right, graph)
+        else:
+            out = self.conv(projected, graph)
+            skip = projected if num_dst is None else projected[:num_dst]
         out = self.norm(out)
         out = self.drop(out)
         if self.use_residual:
-            out = out + projected
+            out = out + skip
         return out

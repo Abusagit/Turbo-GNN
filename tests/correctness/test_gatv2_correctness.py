@@ -121,20 +121,17 @@ def share_gatv2_weights(cuda_layer, ref_layer):
     """Copy weights from torch_native GATv2 layer to CUDA GATv2 layer.
 
     Weight mapping:
-      cuda.left_right_projection.weight[:H*D] = ref.fc_dst.weight  (left = dst)
-      cuda.left_right_projection.weight[H*D:] = ref.fc_src.weight  (right = src)
+      cuda.fc_dst = ref.fc_dst  (left = dst)
+      cuda.fc_src = ref.fc_src  (right = src)
       cuda.attn_weights = ref.attn.squeeze(0)  ([1,H,D] -> [H,D])
       cuda._outer_proj.weight = ref._outer_proj.weight
     """
-    H = cuda_layer.heads
-    D = cuda_layer.head_dim
-
     with torch.no_grad():
-        cuda_layer.left_right_projection.weight.data[: H * D].copy_(ref_layer.fc_dst.weight.data)
-        cuda_layer.left_right_projection.weight.data[H * D :].copy_(ref_layer.fc_src.weight.data)
-        if cuda_layer.left_right_projection.bias is not None:
-            cuda_layer.left_right_projection.bias.data[: H * D].copy_(ref_layer.fc_dst.bias.data)
-            cuda_layer.left_right_projection.bias.data[H * D :].copy_(ref_layer.fc_src.bias.data)
+        for name in ("fc_dst", "fc_src"):
+            dst_lin, src_lin = getattr(cuda_layer, name), getattr(ref_layer, name)
+            dst_lin.weight.data.copy_(src_lin.weight.data)
+            if dst_lin.bias is not None:
+                dst_lin.bias.data.copy_(src_lin.bias.data)
 
         cuda_layer.attn_weights.data.copy_(ref_layer.attn.data.squeeze(0))
 

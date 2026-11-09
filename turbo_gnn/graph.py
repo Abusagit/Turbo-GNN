@@ -126,6 +126,18 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     # COO->CSR edge permutation, recorded only by from_edge_list; lets callers
     # reorder edge data that is aligned to the original edge_index.
     forward_edge_perm: torch.Tensor | None = None
+    # Out-degree bound over the transposed CSR; -1 = compute it (one host sync).
+    backward_max_degree: int = -1
+
+    @property
+    def num_dst(self) -> int:
+        """Rows of the forward CSR: destination nodes (equals num_src for square graphs)."""
+        return self.forward_indptr.numel() - 1
+
+    @property
+    def num_src(self) -> int:
+        """Rows of the transposed CSR: source nodes (>= num_dst for sampled blocks)."""
+        return self.backward_indptr.numel() - 1
 
     def __post_init__(self):
         self._device = self.forward_indptr.device
@@ -145,10 +157,12 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         self._min_heavy_degree_cache: dict[str, int] = {}
         self._heavy_edge_count_cache: dict[str, int] = {}
 
-        indptr = self._to_signed_view(self.forward_indptr)
-        degrees = indptr[1:] - indptr[:-1]
-        self.max_degree = degrees.max().item()
-        assert self.max_degree != -1
+        # A caller that already knows the bound (e.g. a sampled block, whose in-degree is capped
+        # by the fanout) passes it and skips the host sync.
+        if self.max_degree == -1:
+            indptr = self._to_signed_view(self.forward_indptr)
+            degrees = indptr[1:] - indptr[:-1]
+            self.max_degree = degrees.max().item() if degrees.numel() else 0
 
         # Auto-detect directedness if not explicitly set
         if self.is_directed is None:
@@ -164,10 +178,12 @@ class AdjacencyForwardBackwardWithNodeBuckets:
 
         # Out-degree bound, needed to size the heavy-node grid when a kernel
         # runs an aggregation over the transposed CSR (e.g. the sum backward).
-        if self.is_directed:
+        if self.backward_max_degree != -1:
+            pass
+        elif self.is_directed:
             bwd_indptr = self._to_signed_view(self.backward_indptr)
             bwd_degrees = bwd_indptr[1:] - bwd_indptr[:-1]
-            self.backward_max_degree = int(bwd_degrees.max().item())
+            self.backward_max_degree = int(bwd_degrees.max().item()) if bwd_degrees.numel() else 0
         else:
             self.backward_max_degree = int(self.max_degree)
 
@@ -658,6 +674,91 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             backward_light_nodes=bwd_light,
             backward_heavy_nodes=bwd_heavy,
             is_directed=is_directed,
+        )
+
+    @classmethod
+    def from_block_csr(
+        cls,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        num_src: int,
+        *,
+        max_in_degree: int | None = None,
+        forward_heavy_threshold: int | None = None,
+        backward_heavy_threshold: int | None = None,
+        quantile: float | None = None,
+    ) -> AdjacencyForwardBackwardWithNodeBuckets:
+        """Build a bipartite (sampled mini-batch) block from its destination-row CSR.
+
+        ``indptr`` is ``[num_dst + 1]`` and ``indices`` holds *local* source ids in
+        ``[0, num_src)``; destination nodes are by convention the first ``num_dst``
+        source nodes, so ``x_dst = x_src[:num_dst]``. The transposed CSR (one row per
+        source node) is built on the indices' device with one stable sort.
+
+        Built for the per-batch path, so it avoids host syncs where it can:
+        ``repeat_interleave`` gets an explicit ``output_size``, out-degrees come from
+        ``scatter_add_`` rather than ``bincount``, and directedness is fixed (a block is
+        always directed). Bucketing:
+
+        - ``*_heavy_threshold=None`` (default): every node light, built with ``arange``,
+          no sync. Under fixed-fanout sampling no in-degree exceeds the fanout, so the
+          forward heavy bucket would be empty anyway.
+        - an int threshold: nodes with degree >= threshold are heavy (``nonzero``, one sync
+          on the current stream).
+        - ``quantile``: the full-graph rule (``_bucket_nodes_by_degree``) on both
+          directions, for ablations; overrides the thresholds.
+
+        ``max_in_degree`` (e.g. the fanout) skips the forward max-degree sync; the
+        backward bound is set to ``num_dst``, which caps any source's out-degree in a
+        simple block.
+        """
+        idx_dt = indptr.dtype
+        assert indices.dtype == idx_dt, "indptr and indices must share a dtype"
+        device = indptr.device
+        num_dst = indptr.numel() - 1
+        num_edges = indices.numel()
+
+        fwd_counts = (indptr[1:] - indptr[:-1]).to(torch.int64)
+        dst = torch.repeat_interleave(
+            torch.arange(num_dst, device=device, dtype=torch.int64), fwd_counts, output_size=num_edges
+        )
+        src = indices.to(torch.int64)
+        # Rows are already grouped by dst, so a stable sort on src yields (src, dst) order,
+        # the same order from_edge_list produces for the transposed CSR.
+        src_sorted, perm = torch.sort(src, stable=True)
+        bwd_indices = dst[perm].to(idx_dt)
+        bwd_counts = torch.zeros(num_src, device=device, dtype=torch.int64)
+        bwd_counts.scatter_add_(0, src_sorted, torch.ones_like(src_sorted))
+        bwd_indptr = torch.cat([bwd_counts.new_zeros(1), bwd_counts.cumsum(0)]).to(idx_dt)
+
+        def bucket(counts: torch.Tensor, n: int, threshold: int | None):
+            if threshold is None:
+                return torch.arange(n, device=device, dtype=idx_dt), torch.empty(0, device=device, dtype=idx_dt)
+            heavy_mask = counts >= threshold
+            return (
+                (~heavy_mask).nonzero(as_tuple=False).view(-1).to(idx_dt),
+                heavy_mask.nonzero(as_tuple=False).view(-1).to(idx_dt),
+            )
+
+        if quantile is not None:
+            fwd_light, fwd_heavy = _bucket_nodes_by_degree(fwd_counts, quantile, index_dtype=idx_dt)
+            bwd_light, bwd_heavy = _bucket_nodes_by_degree(bwd_counts, quantile, index_dtype=idx_dt)
+        else:
+            fwd_light, fwd_heavy = bucket(fwd_counts, num_dst, forward_heavy_threshold)
+            bwd_light, bwd_heavy = bucket(bwd_counts, num_src, backward_heavy_threshold)
+
+        return cls(
+            forward_indptr=indptr,
+            forward_indices=indices,
+            backward_indptr=bwd_indptr,
+            backward_indices=bwd_indices,
+            forward_light_nodes=fwd_light,
+            forward_heavy_nodes=fwd_heavy,
+            backward_light_nodes=bwd_light,
+            backward_heavy_nodes=bwd_heavy,
+            max_degree=max_in_degree if max_in_degree is not None else -1,
+            backward_max_degree=num_dst,
+            is_directed=True,
         )
 
     @classmethod
