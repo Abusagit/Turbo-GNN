@@ -96,13 +96,13 @@ graph = AdjacencyForwardBackwardWithNodeBuckets.from_csr(
 # From DGL graph
 graph = AdjacencyForwardBackwardWithNodeBuckets.from_dgl(dgl_graph).to("cuda")
 
-# For cuSPARSE ops (require int32 indices)
+# 32-bit indices (see below); cuSPARSE also takes int64, uint32 and uint64
 graph_i32 = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
     edge_index, num_nodes=N, index_dtype=torch.int32
 ).to("cuda")
 ```
 
-`index_dtype` is not only a cuSPARSE constraint: the edge-parallel `gsddmm` kernels are
+`index_dtype` matters for speed: the edge-parallel `gsddmm` kernels are
 templated on it and derive their `(src, dst)` pair type from it, so a 32-bit graph moves
 8 bytes per edge of index traffic instead of 16 (and 4 instead of 8 for the canonical-id
 permutation), and broadcasts each id with one warp shuffle instead of two. Prefer
@@ -111,7 +111,7 @@ permutation), and broadcasts each id with one warp shuffle instead of two. Prefe
 ### Kernel calls
 
 ```python
-from turbo_gnn import reduction_aggr, gatv2_aggr, graph_transformer_aggr, spmm_aggr
+from turbo_gnn import reduction_aggr, gatv2_aggr, graph_transformer_aggr, spmm_aggr, gspmm
 
 # Reduction (min/max/sum) aggregation, any feature dim F
 out = reduction_aggr(graph, X, reduce="min")       # [N, F]
@@ -124,10 +124,26 @@ out = gatv2_aggr(graph, x, x_neighbors=x_nb,
 out = graph_transformer_aggr(graph, x, Q=Q, K=K, V=V,
                               scale=1.0/D**0.5)    # [N, H, D]
 
-# cuSPARSE SpMM (fp32 only, requires int32 indices)
+# cuSPARSE SpMM, any feature dim; float32, float16 or bfloat16
 out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
                 norm_type="none", cu_sparse_algorithm_id=-1, block_dim=256)
+
+# Generalized SpMM (the dgl.ops.gspmm family), any feature dim
+out = gspmm(graph, x, e, op="mul", reduce="sum")   # e: [E, F], or [E] / [E, 1] to broadcast
 ```
+
+`gspmm` takes any feature dim and every op x reducer, with int32, int64, uint32 or uint64
+indices and node operands of any row stride. A row is laid across a group of 1-32 lanes or, past 32
+vectors, a warp in passes, in 16-byte vectors when every row the walk reads is 16-byte aligned and
+a whole number of them -- element by element otherwise (e.g. an odd dim, or 100 in fp16). Rows of
+more edges than a slice (16-128, growing with the graph's edges per resident warp) are cut into
+slices whose results are merged in a fixed order, so sums and their gradients are deterministic.
+
+`spmm_aggr` / `csr_SPMM_normalized` cache the normalized edge values and the cuSPARSE descriptor per
+graph tensors (held weakly; modifying them in place or freeing them invalidates the entry; tensors
+created in inference mode are not cached). Calls with edge weights normalize them on every call.
+Products with A^T (the backward) use an explicit transposed CSR for 16-bit values, which cuSPARSE
+requires, and for cached fp32 products of 32 or more columns, where it measured 1.3-3.1x faster.
 
 ### GSDDMM: per-edge binary ops
 

@@ -68,10 +68,11 @@ class ReductionAggrKernel(TunableKernel):
 
     Tunable forward parameters (grid-searched during autotuning):
 
-    - ``forward_warps_per_block``: warps per CUDA block. Every warp works on a row of its own,
-      so this only sets the scheduling granularity; above 8 it acts as 8.
-    - ``forward_edges_per_block_heavy_nodes``: edges per heavy-row slice. Each slice is one
-      warp's work, and the slices' partial results are merged per row. Short slices balance
+    - ``forward_warps_per_block``: warps per CUDA block. Every lane group or warp works on a row
+      of its own, so this only sets the scheduling granularity; above 8 it acts as 8.
+    - ``forward_edges_per_block_heavy_nodes``: edges per slice. Every row of more edges, heavy or
+      not, is cut into slices, each one worker's work, and the slices' partial results are merged
+      per row. Short slices balance
       power-law hubs best; long ones save merge traffic when the heavy degrees are close.
 
     ``use_2d_kernel``, ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` are accepted
@@ -94,16 +95,14 @@ class ReductionAggrKernel(TunableKernel):
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
 
     def _execute(self, graph, x, **kwargs):
-        fwd_slices, bwd_slices, fwd_light_degree, bwd_light_degree = reduction_graph_args(
-            graph, self.forward_edges_per_block_heavy_nodes, self.reduce
-        )
+        fwd, bwd = reduction_graph_args(graph, self.forward_edges_per_block_heavy_nodes, self.reduce)
         return ReductionAggrFunction.apply(
             graph.forward_indptr,
             graph.forward_indices,
             x,
-            graph.light_nodes,
-            graph.heavy_nodes,
-            fwd_light_degree,
+            fwd.light,
+            fwd.heavy,
+            fwd.light_degree,
             self.forward_warps_per_block,
             self.forward_edges_per_block_heavy_nodes,
             self.forward_use_2d_kernel,
@@ -113,11 +112,11 @@ class ReductionAggrKernel(TunableKernel):
             self.forward_pipeline_stages,
             graph.backward_indptr,
             graph.backward_indices,
-            graph.backward_light_nodes,
-            graph.backward_heavy_nodes,
-            bwd_light_degree,
-            fwd_slices,
-            bwd_slices,
+            bwd.light if bwd is not None else None,
+            bwd.heavy if bwd is not None else None,
+            bwd.light_degree if bwd is not None else -1,
+            fwd.slices,
+            bwd.slices if bwd is not None else None,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
@@ -875,21 +874,20 @@ class GSpMMKernel(TunableKernel):
     different optimal launch shapes, and the autotune cache is keyed on the
     kernel instance.
 
-    Tunable forward parameters:
+    Tunable forward parameter:
 
-    - ``forward_warps_per_block``: block size for the light-node kernel, as
-      warps. Features are spread across threadIdx.x and nodes across
-      threadIdx.y, so this trades feature parallelism against node parallelism.
-    - ``forward_features_per_block``, ``forward_tiles_y``: tile shape of the
-      heavy-node kernel. ``tiles_y`` is how many edge chunks are reduced in
-      parallel through shared memory and must be a power of two.
+    - ``forward_warps_per_block``: warps per block of the forward walk. Every lane group or warp
+      works on an item of its own, so this only sets the scheduling granularity; above 8 it acts
+      as 8.
 
     Tunable graph parameter:
 
     - ``forward_huge_degree_threshold_quantile``: degree quantile for the
-      light/heavy partition (-1 disables bucketing, all nodes go to light).
+      light/heavy partition (-1 disables bucketing, all nodes go to light). Rows of more edges
+      than a slice are sliced whichever bucket they are in (``graph.walk_partition``).
 
-    There is no ``use_2d_kernel`` knob: the tiled kernel is the only heavy path.
+    ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` shape the min/max backward only,
+    which the forward benchmark does not run, so they are not searched.
     """
 
     def __init__(self, op: str = "copy_u", reduce: str = "sum", **kwargs):
@@ -918,10 +916,7 @@ class GSpMMKernel(TunableKernel):
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
-            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
-            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=8),
-            TunableParam("forward_pipeline_stages", [0, 1], default=0),
+            TunableParam("forward_warps_per_block", [2, 4, 8], default=8),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:

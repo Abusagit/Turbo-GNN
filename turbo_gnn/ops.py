@@ -25,6 +25,7 @@ from turbo_gnn._functions import (
     _FusedGraphAttention,
     csr_SPMM_normalized,
     gatv2_function,
+    gspmm_slice_size,
     reduction_graph_args,
 )
 from turbo_gnn._gsddmm import (
@@ -69,9 +70,10 @@ def reduction_aggr(
     attained it -- of equal candidates, the first in edge order. NaN inputs are never
     selected; +-inf inputs are.
 
-    Light nodes take one warp each, whose lanes split the row and the edges; the heavy
-    bucket is cut into slices of ``edges_per_block_heavy_nodes`` edges, one warp each,
-    whose partial results are merged in edge order, so heavy rows are deterministic too.
+    A row is the work of a lane group (short rows) or a warp, in passes for long rows; every row
+    of more than ``edges_per_block_heavy_nodes`` edges -- heavy-bucket or not -- is cut into
+    slices of that many edges, one worker each, whose partial results are merged in edge order,
+    so those rows are deterministic too.
     Rows are read in 16-byte vectors when every row of ``X`` is 16-byte aligned and
     element by element otherwise.
 
@@ -94,16 +96,14 @@ def reduction_aggr(
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
         receive zeros (for min/max, also those whose every neighbor holds NaN).
     """
-    fwd_slices, bwd_slices, fwd_light_degree, bwd_light_degree = reduction_graph_args(
-        graph, edges_per_block_heavy_nodes, reduce
-    )
+    fwd, bwd = reduction_graph_args(graph, edges_per_block_heavy_nodes, reduce)
     return ReductionAggrFunction.apply(
         graph.forward_indptr,
         graph.forward_indices,
         X,
-        graph.light_nodes,
-        graph.heavy_nodes,
-        fwd_light_degree,
+        fwd.light,
+        fwd.heavy,
+        fwd.light_degree,
         warps_per_block,
         edges_per_block_heavy_nodes,
         use_2d_kernel,
@@ -113,11 +113,11 @@ def reduction_aggr(
         pipeline_stages,
         graph.backward_indptr,
         graph.backward_indices,
-        graph.backward_light_nodes,
-        graph.backward_heavy_nodes,
-        bwd_light_degree,
-        fwd_slices,
-        bwd_slices,
+        bwd.light if bwd is not None else None,
+        bwd.heavy if bwd is not None else None,
+        bwd.light_degree if bwd is not None else -1,
+        fwd.slices,
+        bwd.slices if bwd is not None else None,
     )
 
 
@@ -780,6 +780,9 @@ def _gspmm_apply(
     # node gradient reads the edge value.
     needs_edge_map = reduce in ("min", "max") or (op in ("mul", "div") and reduce == "sum")
     edge_map = graph.backward_edge_map if needs_edge_map else None
+    # The walks' rows -- whole, or cut into slices -- cached on the graph; the backward adjacency's
+    # only for sum, whose node gradient walks it.
+    fwd_walk, bwd_walk = reduction_graph_args(graph, gspmm_slice_size(graph), reduce)
 
     return GSpMMFunction.apply(
         lhs,
@@ -801,6 +804,8 @@ def _gspmm_apply(
         pipeline_stages,
         graph.max_degree,
         graph.backward_max_degree,
+        fwd_walk,
+        bwd_walk,
     )
 
 
@@ -829,23 +834,28 @@ def gspmm(
     Args:
         graph: CSR graph with forward and backward adjacency plus light/heavy
             node buckets.
-        lhs: Node data, shape ``[N, d]``. Pass ``None`` for ``op="copy_e"``.
+        lhs: Node data, shape ``[N, d]`` with any ``d`` and any row stride. Pass ``None`` for
+            ``op="copy_e"``.
         rhs: Edge data, shape ``[E, d]`` (element-wise) or ``[E]`` / ``[E, 1]``
             (broadcast over the feature dimension). Pass ``None`` for
             ``op="copy_u"``.
         op: One of ``"copy_u"``, ``"copy_e"``, ``"add"``, ``"sub"``, ``"mul"``,
             ``"div"``.
         reduce: One of ``"sum"``, ``"min"``, ``"max"``.
-        warps_per_block: Block size (in warps) of the light-node kernel.
-        features_per_block: Feature tile width of the heavy-node kernel.
-        tiles_y: Edge tiles reduced in parallel by the heavy-node kernel; must
+        warps_per_block: Warps per block of the forward and sum-backward kernels, where every lane
+            group or warp works on a row (or a slice of one) of its own, so this only sets the
+            scheduling granularity; values above 8 act as 8. Also the light-node block size of the
+            min/max backward.
+        features_per_block: Feature tile width of the min/max backward's heavy-node kernel.
+        tiles_y: Edge tiles reduced in parallel by the min/max backward's heavy-node kernel; must
             be a power of two.
+        pipeline_stages: cp.async prefetch depth of the min/max backward's gather; 0 disables it.
 
     Returns:
         Aggregated features, shape ``[N, d]``. Nodes with no incoming edges get
-        zeros: for ``sum`` that is the empty sum, for ``min``/``max`` the
-        identity (+-inf) is clamped, which differs from DGL -- it returns the
-        raw infinity there.
+        zeros: for ``sum`` that is the empty sum; ``min``/``max`` return 0 there (and for
+        elements whose every message is NaN, which is never selected) where DGL returns the
+        raw infinity. Of equal messages, ``min``/``max`` pick the first in CSR edge order.
 
     Note:
         **Edge data must be in CSR order.** ``rhs[i]`` is the data of the edge

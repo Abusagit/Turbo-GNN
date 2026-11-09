@@ -18,6 +18,23 @@ class EdgeSliceTable:
     num_slices: int
 
 
+@dataclass(frozen=True)
+class WalkPartition:
+    """The rows of a reduction walk (``reduction_aggr``, ``gspmm``) over one adjacency.
+
+    ``light`` rows are walked whole, each by one lane group or warp; ``heavy`` rows -- every row of
+    more edges than one slice, heavy-bucket or not -- are cut into the slices of ``slices``, each a
+    work item of its own, and merged. ``light_degree`` bounds the light rows' degrees. See
+    :meth:`AdjacencyForwardBackwardWithNodeBuckets.walk_partition`.
+    """
+
+    light: torch.Tensor
+    heavy: torch.Tensor
+    slices: EdgeSliceTable
+    light_degree: int
+    slice_size: int
+
+
 def _bucket_nodes_by_degree(
     degree_counts: torch.Tensor,
     quantile: float,
@@ -352,19 +369,75 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         cached = self._edge_slice_cache.get(key)
         if cached is not None:
             return cached
+        table = self._slice_table(direction, getattr(self, f"{direction}_heavy_nodes"), slice_size)
+        self._edge_slice_cache[key] = table
+        return table
+
+    def walk_partition(self, direction: str, slice_size: int) -> WalkPartition:
+        """The rows of the reduction walk of ``reduction_aggr`` and ``gspmm``: rows of up to
+        ``slice_size`` edges are walked whole, every longer one is cut into slices.
+
+        A walked row goes to one lane group or warp, so a row of thousands of edges -- light by the
+        degree quantile, on a dense graph -- is a walk thousands of edges long that the whole launch
+        waits for. Measured on tolokers-2, whose light rows reach 827 edges (58% of all edges sit in
+        light rows of more than 128): slicing every row of more than 128 edges ran g-SpMM 1.7-2.5x
+        faster, and it no longer depends on the quantile the graph was built with.
+
+        Cached per (direction, slice_size); building the slice table costs a host sync.
+        """
+        key = (f"walk-{direction}", int(slice_size))
+        cached = self._edge_slice_cache.get(key)
+        if cached is not None:
+            return cached
+        indptr = self._to_signed_view(getattr(self, f"{direction}_indptr"))
+        light_raw = getattr(self, f"{direction}_light_nodes")
+        heavy_raw = getattr(self, f"{direction}_heavy_nodes")
+        # Signed views: unsigned index tensors support few torch ops. Viewed back below, so that the
+        # kernels get node lists of the CSR's own dtype.
+        light, heavy = self._to_signed_view(light_raw), self._to_signed_view(heavy_raw)
+        long_light = (indptr[1:] - indptr[:-1]).index_select(0, light.to(torch.int64)) > slice_size
+        if not bool(long_light.any()):
+            # No light row is longer than a slice: the graph's own buckets, as they are.
+            partition = WalkPartition(
+                light=light_raw,
+                heavy=heavy_raw,
+                slices=self.heavy_edge_slices(direction, slice_size),
+                light_degree=min(int(slice_size), self._light_degree_upper_bound(direction)),
+                slice_size=int(slice_size),
+            )
+            self._edge_slice_cache[key] = partition
+            return partition
+        # The heavy bucket's own order (see sorted_by_degree), then the long light rows.
+        sliced = torch.cat([heavy, light[long_light]])
+        short = light[~long_light].contiguous()
+        partition = WalkPartition(
+            light=short.view(light_raw.dtype),
+            heavy=sliced.contiguous().view(heavy_raw.dtype),
+            slices=self._slice_table(direction, sliced, slice_size),
+            light_degree=min(int(slice_size), self._light_degree_upper_bound(direction)),
+            slice_size=int(slice_size),
+        )
+        self._edge_slice_cache[key] = partition
+        return partition
+
+    def _light_degree_upper_bound(self, direction: str) -> int:
+        """The smallest heavy degree (cached), or the largest degree when nothing is heavy."""
+        if getattr(self, f"{direction}_heavy_nodes").numel() > 0:
+            return self.min_heavy_degree(direction)
+        return self.max_degree if direction == "forward" else self.backward_max_degree
+
+    def _slice_table(self, direction: str, heavy: torch.Tensor, slice_size: int) -> EdgeSliceTable:
+        """The slices of `slice_size` edges of the rows in `heavy` (see `heavy_edge_slices`)."""
         if slice_size <= 0:
             raise ValueError(f"slice_size must be positive, got {slice_size}")
 
         indptr = self._to_signed_view(getattr(self, f"{direction}_indptr"))
-        heavy = getattr(self, f"{direction}_heavy_nodes")
         dev = indptr.device
         num_heavy = int(heavy.numel())
 
         if num_heavy == 0:
             empty = torch.empty(0, dtype=torch.int32, device=dev)
-            table = EdgeSliceTable(empty, empty, torch.zeros(1, dtype=torch.int32, device=dev), 0)
-            self._edge_slice_cache[key] = table
-            return table
+            return EdgeSliceTable(empty, empty, torch.zeros(1, dtype=torch.int32, device=dev), 0)
 
         deg = (indptr[1:] - indptr[:-1]).index_select(0, heavy.to(torch.int64))
         # clamp so a degree-0 heavy node still gets one empty slice rather than vanishing
@@ -377,14 +450,12 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         chunk_node = torch.repeat_interleave(torch.arange(num_heavy, dtype=torch.int64, device=dev), counts)
         chunk_start = (torch.arange(num_slices, dtype=torch.int64, device=dev) - offset[chunk_node]) * slice_size
 
-        table = EdgeSliceTable(
+        return EdgeSliceTable(
             chunk_node.to(torch.int32).contiguous(),
             chunk_start.to(torch.int32).contiguous(),
             offset.to(torch.int32).contiguous(),
             num_slices,
         )
-        self._edge_slice_cache[key] = table
-        return table
 
     def sorted_by_degree(self, descending: bool = True) -> "AdjacencyForwardBackwardWithNodeBuckets":
         """New instance whose light/heavy buckets are ordered by descending degree.

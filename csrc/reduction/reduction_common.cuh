@@ -5,6 +5,7 @@
 #include <type_traits>
 
 #include "common.cuh"
+#include "common/gspmm_ops.cuh"
 #include "common/row_shape.cuh"
 
 // ================================================================================================
@@ -42,6 +43,43 @@ struct Extremum {
 
 template <ReductionOp OP>
 inline constexpr bool kTracksArg = OP != ReductionOp::SUM;
+
+// ------------------------------------------------------------------------------------------------
+// Messages. What the walk folds per edge: reduction_aggr folds the neighbour's row itself; g-SpMM
+// (csrc/spmm/) folds a binary op of it with the edge's own data,
+//
+//     msg[e, f] = op(X[col_idx[e], f], E[e', f])     e' = e, or edge_map[e] on a transposed walk
+//
+// where E is [E, D] or, broadcast over the features, one scalar per edge. g-SpMM records the edge
+// position e as the arg of a min/max rather than the source node: its gradients have to reach E[e],
+// and the source is recoverable from e while e is not from the source.
+//
+// Every axis is `if constexpr` in the kernels, so Message<> -- reduction_aggr -- compiles to the code
+// it did before messages existed.
+// ------------------------------------------------------------------------------------------------
+template <BinaryOp BOP = BinaryOp::COPY_U, bool BCAST = false, bool EMAP = false, bool ARG_IS_EDGE = false>
+struct Message {
+    using Ops                        = BinaryOps<BOP>;
+    static constexpr BinaryOp kOp    = BOP;
+    static constexpr bool kNode      = Ops::USE_LHS;    // gathers X[col_idx[e]]
+    static constexpr bool kEdge      = Ops::USE_RHS;    // reads the edge operand
+    static constexpr bool kBcast     = kEdge && BCAST;  // ... one scalar per edge
+    static constexpr bool kMapped    = kEdge && EMAP;   // ... at row edge_map[e]
+    static constexpr bool kArgIsEdge = ARG_IS_EDGE;     // min/max record e, not col_idx[e]
+    static constexpr bool kCombines  = kNode && kEdge;  // a binary op of two values
+    static_assert(kNode || kEdge, "a message reads node or edge data");
+    static_assert(!(BCAST && !kEdge) && !(EMAP && !kEdge), "broadcast and edge-map axes only apply to ops that read edge data");
+
+    // A combined message is formed in fp32; min/max then compare it rounded to the operand dtype --
+    // g-SpMM's documented semantics, which in fp16 decides many ties among the fp32 values. Rounding
+    // being monotone, the extremum itself is the same either way; only which of equal-after-rounding
+    // edges wins depends on it. Copies are values of the operand dtype already.
+    template <ReductionOp OP, FloatingNum cuda_t>
+    static constexpr bool kRounds = kCombines && OP != ReductionOp::SUM && sizeof(cuda_t) < sizeof(float);
+};
+
+// reduction_aggr's message.
+using NodeRows = Message<>;
 
 // ------------------------------------------------------------------------------------------------
 // Packed candidates. The slices of a heavy row fold their min/max into it with one 64-bit
@@ -154,6 +192,10 @@ struct ForwardParams {
     index_t *arg;                // [N_dst, D], light rows; min/max only
     float *part;                 // [num_slices, D]: per-slice sums; sum only
     unsigned long long *packed;  // [num_heavy, D]: the heavy rows' packed candidates; min/max only
+
+    // The edge operand of a g-SpMM message (see Message): [E, D] rows at stride D, or [E] scalars.
+    cuda_t const *E         = nullptr;
+    index_t const *edge_map = nullptr;  // [E]: the row of E edge e reads, on a transposed walk
 };
 
 }  // namespace turbo_gnn::reduction

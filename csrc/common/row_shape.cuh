@@ -123,6 +123,14 @@ inline void with_shape(int64_t D, size_t elem_size, bool wide, Fn&& fn) {
 // the items, at the occupancy of a 32-register kernel -- and 1-3% slower at 4096, where the ids
 // re-read per pass begin to count.
 //
+// Rows of single elements (not 16-byte aligned) are the exception: a pass of one element a lane is
+// 64 or 128 bytes of a row, so every pass is a whole walk of the row's edges -- ids, addresses, loop
+// -- for very little data, and a row of D = 100 fp16 elements took four. They go two elements a lane
+// from 33 elements on: measured on g-SpMM over five real graphs, 1.13-1.21x faster at D = 33 fp32,
+// 1.16-1.39x at D = 100 fp16 and 1.09-1.18x at D = 255 fp32; 0.97x for fp16 max at D = 65. On
+// reduction_aggr over six graphs, 1.14x geomean (sums 1.10-1.47x), but 0.88-0.95x for fp32 min/max
+// at D = 130-255 on the two densest graphs (reddit, twitch-views), where it gains 1.09-1.22x elsewhere.
+//
 // Short rows go the other way: with nothing to combine across a row's edges but the reduction
 // itself, a lane group can be a worker of its own, one row per group and kWarpSize / G rows per
 // warp. The group is then sized to the row alone -- down to one lane -- since it no longer has to
@@ -136,7 +144,7 @@ inline int plan_sweep_shape(int64_t D, size_t elem_size, bool wide) {
             return shape_code(wide, g, 1);
         }
     }
-    return shape_code(wide, kWarpSize, nvec <= 8 * static_cast<int64_t>(kWarpSize) ? 1 : 2);
+    return shape_code(wide, kWarpSize, !wide || nvec > 8 * static_cast<int64_t>(kWarpSize) ? 2 : 1);
 }
 
 inline auto make_sweep_shape_variant(int code) {
