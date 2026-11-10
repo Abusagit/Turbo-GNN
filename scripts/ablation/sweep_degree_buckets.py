@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DRDo: compare multiple degree buckets with ordering disabled (plus ordered controls)."""
+"""Compare multiple degree buckets with ordering disabled (plus ordered controls)."""
 
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ def plot_rows(rows, out):
             ax.axhline(1, color="gray", linestyle="--")
             ax.set(title=mode, xlabel="Requested buckets", ylabel="Predicted speedup vs 2 natural")
             ax.legend(fontsize=7)
-        fig.suptitle(f"{graph}: DRDo simulation, degree ordering OFF")
+        fig.suptitle(f"{graph}: Bucket simulation, degree ordering OFF")
         fig.savefig(out / f"{graph}-speedup.png", dpi=160)
         plt.close(fig)
 

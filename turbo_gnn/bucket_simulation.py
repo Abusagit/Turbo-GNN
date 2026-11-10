@@ -1,4 +1,4 @@
-"""Degree buckets for the DRDo experiment; no changes to the CUDA graph ABI."""
+"""Degree buckets for scheduling experiments; no changes to the CUDA graph ABI."""
 
 from __future__ import annotations
 

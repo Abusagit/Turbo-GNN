@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: CUDA_VISIBLE_DEVICES=0 bash scripts/ablation/calibrate_device.sh a100 reports/drdo-a100
+# Usage: CUDA_VISIBLE_DEVICES=0 bash scripts/ablation/calibrate_device.sh a100 reports/simulation-a100
 # Extra arguments are passed to measure_kernel_times.py (e.g. --graphs cora pubmed ...).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
