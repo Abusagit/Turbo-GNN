@@ -55,6 +55,7 @@ dev = [
     "ogb>=1.3.0",
     "python-dotenv",
     "tabulate",
+    "optuna>=3.0.0",
     # pyg (core only; C++ extensions like torch-scatter not needed)
     "torch-geometric",
     # lint
@@ -71,6 +72,14 @@ dev = [
     "pytest-xdist>=3.0.0",
     # triton / cutlass
     "nvidia-cutlass-dsl==4.3.0.dev0",
+]
+
+# ---------------------------------------------------------------------------
+# Optuna-based autotuning (AutotuneConfig(strategy="optuna"))
+# Usage: pip install -e ".[optuna]"
+# ---------------------------------------------------------------------------
+optuna = [
+    "optuna>=3.0.0",
 ]
 
 # ---------------------------------------------------------------------------
