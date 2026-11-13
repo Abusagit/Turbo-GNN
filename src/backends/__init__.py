@@ -22,6 +22,7 @@ _backend_modules = [
     "cusparse_backend",
     "dfgnn_backend",
     "dgl_backend",
+    "dgl_ops_backend",
     "fusegnn_backend",
     "pyg_backend",
     "tcgnn_backend",
