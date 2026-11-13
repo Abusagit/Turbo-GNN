@@ -369,6 +369,11 @@ def simulate(
         blocker = config.depends_on.get(name)
         if blocker is not None and blocker in queues and has_pending(blocker):
             return False
+        # One stream serialises every launch, including arbitrary bucket names.
+        # The heavy/merge priority above preserves the original two-bucket schedule.
+        if config.launch_mode == "sequential":
+            if any(has_pending(previous) for previous in kernel_names[: kernel_names.index(name)]):
+                return False
         if config.launch_mode == "concurrent" and name not in ("heavy", "merge"):
             return time >= config.light_launch_latency
         if config.launch_mode == "sequential" and name not in ("heavy", "merge") and "heavy" in workloads:
