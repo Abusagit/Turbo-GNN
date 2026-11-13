@@ -1,4 +1,6 @@
 dataset:
   source: pyg
   name: FacebookPagePage
-  root: data
+  # Own root: shares <root>/processed/data.pt with Reddit/Flickr/LastFMAsia otherwise.
+  root: data/FacebookPagePage
+  allow_random_split: true  # PyG's FacebookPagePage ships no train/val/test masks

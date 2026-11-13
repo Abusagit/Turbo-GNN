@@ -7,15 +7,9 @@ passes with AMP support (``custom_fwd`` / ``custom_bwd``).
 
 from __future__ import annotations
 
-import warnings
-from math import ceil
-
 import torch
 
 from turbo_gnn._extension import _C
-
-WARP_SIZE = 32
-FOUR_BYTES_CONSTANT = 4
 
 #: Node -> thread-block scheduling policy, mirroring ``csrc/common/scheduler.cuh``.
 #:
@@ -76,6 +70,92 @@ BUCKET_LAUNCHES = {"sequential": 0, "concurrent": 1}
 DEFAULT_BUCKET_LAUNCH = "sequential"
 
 
+#: Rows that are not whole 16-byte vectors -- odd head dims, or e.g. 100 in fp16 -- are read by the
+#: attention kernels element by element, and those longer than 64 elements also fall to the
+#: two-pass path. The attention functions copy such inputs into zero-padded rows of whole vectors
+#: when the call is large enough to repay the copies, whose cost is mostly fixed: about 100 us of
+#: launches and host time per call. Measured on 14 real graphs (padded / element-wise time, 464
+#: cells; gathered bytes = edges x heads x padded head dim x element size):
+#:
+#:   rows over 64 elements, gathering >= 16 MiB     2.97x geomean, 1 cell of 176 slower (0.90x)
+#:   rows of 16 B to 64 elements, >= 256 MiB        1.41x geomean, 7 of 136 slower (>= 0.76x);
+#:                                                  below 256 MiB padding them lost (0.76x geomean)
+#:   rows under 16 bytes                            0.91x on the backward even at 1-10 GiB: one
+#:                                                  sector a row either way, so never padded
+#:
+#: Thresholds in gathered bytes, for rows longer than _PAD_SHORT_ROW_ELEMENTS and for the others.
+_PAD_MIN_GATHER_BYTES = 1 << 24
+_PAD_MIN_GATHER_BYTES_SHORT_ROWS = 1 << 28
+_PAD_SHORT_ROW_ELEMENTS = 64
+
+
+def _vector_rows(t: torch.Tensor) -> bool:
+    """Whether the kernels read ``t``'s rows (its last dim) in 16-byte vectors.
+
+    Mirrors ``rows::rows_16b_aligned`` in ``csrc/common/row_shape.cuh``: every row starts on a
+    16-byte boundary and spans a whole number of 16-byte vectors.
+
+    Args:
+        t: A tensor with unit stride over its last dim.
+
+    Returns:
+        bool: True when the rows qualify.
+    """
+    elem = t.element_size()
+    if (t.shape[-1] * elem) % 16 or t.data_ptr() % 16:
+        return False
+    return all((stride * elem) % 16 == 0 for size, stride in zip(t.shape[:-1], t.stride()[:-1]) if size > 1)
+
+
+def _pad_rows(t: torch.Tensor, width: int) -> torch.Tensor:
+    """A fresh, contiguous copy of ``t`` with its last dim widened to ``width`` by zeros.
+
+    One op either way (``F.pad`` or ``clone``): host time dominates the cost of the copies on
+    small graphs, and three ops per tensor measured 20 us of it against 13.
+
+    Args:
+        t: Tensor ``[..., D]``.
+        width: New last-dim size, at least ``D``.
+
+    Returns:
+        torch.Tensor: ``[..., width]``; the first ``D`` columns are ``t``, the rest zero.
+    """
+    d = t.shape[-1]
+    if width == d:
+        return t.clone(memory_format=torch.contiguous_format)
+    return torch.nn.functional.pad(t, (0, width - d))
+
+
+def _pad_attention_rows(num_edges: int, heads: int, *tensors: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], int]:
+    """Widen the attention inputs' rows to whole 16-byte vectors when that pays (see
+    ``_PAD_MIN_GATHER_BYTES``).
+
+    The zero columns change nothing the kernels compute: they add 0 to every dot product and
+    LeakyReLU(0) * 0 to every GATv2 score, give zero output columns, and receive gradients that are
+    cut away. Only tensors that need it are copied.
+
+    Args:
+        num_edges: Edges of the forward CSR.
+        heads: Attention heads.
+        *tensors: The inputs, each ``[..., D]`` with the same ``D``.
+
+    Returns:
+        tuple: The tensors to hand to the kernels, and the head dim they have -- ``D`` unless
+        they were padded.
+    """
+    d = tensors[0].shape[-1]
+    elem = tensors[0].element_size()
+    # A non-unit stride over D is the kernels' to reject, whatever the size.
+    if d * elem < 16 or all(_vector_rows(t) for t in tensors) or any(t.stride(-1) != 1 for t in tensors if d > 1):
+        return tensors, d
+    per_vector = 16 // elem
+    width = -(-d // per_vector) * per_vector
+    threshold = _PAD_MIN_GATHER_BYTES if d > _PAD_SHORT_ROW_ELEMENTS else _PAD_MIN_GATHER_BYTES_SHORT_ROWS
+    if num_edges * heads * width * elem < threshold:
+        return tensors, d
+    return tuple(t if width == d and _vector_rows(t) else _pad_rows(t, width) for t in tensors), width
+
+
 def resolve_bucket_launch(bucket_launch) -> int:
     """Accept either a name from :data:`BUCKET_LAUNCHES` or the raw int the kernel takes."""
     if isinstance(bucket_launch, str):
@@ -104,23 +184,63 @@ def resolve_schedule(schedule) -> int:
         raise ValueError(f"unknown schedule {schedule!r}; expected one of {sorted(SCHEDULES)}") from None
 
 
-def _next_power_of_two(x):
-    x -= 1
-    x |= x >> 1
-    x |= x >> 2
-    x |= x >> 4
-    x |= x >> 8
-    x |= x >> 16
-    x += 1
-    return x
+def _slice_kwargs(table) -> dict:
+    """The slice-table keyword arguments of ``_C.reduction_aggr_forward_partitioned``.
+
+    Args:
+        table: An ``EdgeSliceTable`` of the heavy bucket, or None to let the extension build one.
+
+    Returns:
+        The table's tensors by argument name; empty when ``table`` is None.
+    """
+    if table is None:
+        return {}
+    return {
+        "chunk_node": table.chunk_node,
+        "chunk_start": table.chunk_start,
+        "node_chunk_offset": table.node_chunk_offset,
+    }
+
+
+def _walk_kwargs(walk) -> dict:
+    """The slice table and light-degree bound of a ``WalkPartition`` as ``_C.gspmm_forward``
+    keyword arguments; empty when ``walk`` is None."""
+    if walk is None:
+        return {}
+    return {**_slice_kwargs(walk.slices), "light_degree_bound": walk.light_degree}
+
+
+def reduction_graph_args(graph, slice_size: int, reduce: str) -> tuple:
+    """The rows of the reduction walk of ``reduction_aggr`` and ``gspmm``, cached on the graph.
+
+    Args:
+        graph: An ``AdjacencyForwardBackwardWithNodeBuckets``.
+        slice_size: Edges per slice (``edges_per_block_heavy_nodes``): rows of more edges are cut
+            into slices.
+        reduce: The reducer; only ``"sum"`` walks the backward adjacency.
+
+    Returns:
+        ``(fwd, bwd)``: the forward and backward adjacencies' ``WalkPartition`` s -- the rows walked
+        whole, the rows cut into slices and their ``EdgeSliceTable``, and a bound on the whole rows'
+        degrees, which the kernel weighs against the launch's total work to pick its build. ``bwd``
+        is None unless ``reduce`` is ``"sum"``.
+    """
+    fwd = graph.walk_partition("forward", slice_size)
+    if reduce != "sum":
+        return fwd, None
+    return fwd, graph.walk_partition("backward", slice_size)
 
 
 class ReductionAggrFunction(torch.autograd.Function):
-    """Min/max/sum reduction aggregation over CSR neighbors.
+    """Min/max/sum reduction aggregation over CSR neighbors, for any feature dim.
 
-    Forward: calls ``_C.reduction_aggr_forward_partitioned`` which splits nodes
-    into light (atomic kernel) and heavy (tiled reduction kernel) buckets.
-    For min/max it saves argmin/argmax indices for the backward pass.
+    Forward: calls ``_C.reduction_aggr_forward_partitioned``. ``light`` rows take one lane group or
+    warp each; ``heavy`` rows are cut into slices of ``edges_per_block_heavy_nodes`` edges, one
+    worker each, whose partial results are merged in edge order. ``fwd_slices`` is that slice table;
+    ``reduction_graph_args`` gives the partition (every row of more edges than a slice is cut, see
+    ``graph.walk_partition``) cached per graph. Without a table the extension builds one on every
+    call, at the cost of a host sync. For min/max the forward also saves the winning source of every
+    output element.
 
     Backward depends on the reducer:
 
@@ -129,8 +249,14 @@ class ReductionAggrFunction(torch.autograd.Function):
       gets gradient).
     - **sum**: every source contributed, so the gradient is itself a sum
       aggregation -- the same forward kernel run over the *transposed* CSR.
-      This needs the backward adjacency, which the ``bwd_*`` arguments carry;
-      without them a ``reduce="sum"`` tensor cannot require grad.
+      This needs the backward adjacency, which the ``bwd_*`` arguments carry
+      (``bwd_slices`` being its slice table); without them a ``reduce="sum"``
+      tensor cannot require grad.
+
+    ``max_degree`` (and ``bwd_max_degree``) bound the degree of the light rows -- see
+    ``reduction_graph_args`` -- and may be any larger value, or -1 if unknown. ``use_2d_kernel``,
+    ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` are accepted for compatibility and
+    have no effect.
     """
 
     @staticmethod
@@ -155,27 +281,11 @@ class ReductionAggrFunction(torch.autograd.Function):
         bwd_light=None,
         bwd_heavy=None,
         bwd_max_degree=-1,
+        fwd_slices=None,
+        bwd_slices=None,
     ):
         if torch.is_autocast_enabled():
             X = X.to(torch.get_autocast_gpu_dtype())
-
-        num_of_threads_invoked = WARP_SIZE * warps_per_block
-        num_features_per_thread = FOUR_BYTES_CONSTANT // X.dtype.itemsize
-
-        num_threads_needed = ceil(X.shape[-1] / num_features_per_thread)
-
-        if num_threads_needed < num_of_threads_invoked:
-            warps_per_block_needed = ceil(num_threads_needed / WARP_SIZE)
-            warnings.warn(
-                f"Number of threads involved for ReductionAggr is {num_of_threads_invoked} "
-                f"({warps_per_block} warps per thread block requested). "
-                f"However, number of threads needed is {num_threads_needed} "
-                f"({warps_per_block_needed} warps). Setting this value instead."
-            )
-
-            warps_per_block = warps_per_block_needed
-            if warps_per_block not in {1, 2, 4, 8, 16, 32, 64}:
-                warps_per_block = _next_power_of_two(warps_per_block)
 
         out, arg_idx = _C.reduction_aggr_forward_partitioned(
             edge_ptr,
@@ -191,8 +301,10 @@ class ReductionAggrFunction(torch.autograd.Function):
             tiles_y,
             reduce,
             pipeline_stages,
+            **_slice_kwargs(fwd_slices),
         )
         ctx.save_for_backward(arg_idx, bwd_edge_ptr, bwd_edge_idx, bwd_light, bwd_heavy)
+        ctx.bwd_slices = bwd_slices
         ctx.num_src_nodes = X.size(0)
         ctx.warps_per_block = warps_per_block
         ctx.reduce = reduce
@@ -220,41 +332,23 @@ class ReductionAggrFunction(torch.autograd.Function):
             grad_x, _ = _C.reduction_aggr_forward_partitioned(
                 bwd_edge_ptr,
                 bwd_edge_idx,
-                grad_out.contiguous(),
+                grad_out,
                 bwd_light,
                 bwd_heavy,
                 ctx.bwd_max_degree,
                 ctx.warps_per_block,
                 ctx.edges_per_block_heavy_nodes,
-                True,  # sum has no packed path; the 2-D kernel is the only option
+                False,
                 ctx.features_per_block,
                 ctx.tiles_y,
                 "sum",
                 0,
+                **_slice_kwargs(ctx.bwd_slices),
             )
         else:
             grad_x = _C.reduction_aggr_backward(grad_out, arg_idx, num_src_nodes, ctx.warps_per_block)
 
-        return (
-            None,
-            None,
-            grad_x,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return (None, None, grad_x) + (None,) * 17
 
 
 class gatv2_function(torch.autograd.Function):
@@ -266,10 +360,12 @@ class gatv2_function(torch.autograd.Function):
     ``out[v] = sum alpha_{uv} * x_right[u]``.
 
     Backward (``_C.gatv2_backward``): computes gradients for x_left, x_right,
-    and attention weights. The backward kernel walks the *transposed* CSR
-    (backward adjacency) to scatter gradients to source nodes. The
-    ``grad_A_reduce_row_chunk_size`` parameter controls shared-memory usage
-    in the attention-gradient reduction kernel.
+    and attention weights. On a directed graph the x_right gradient is gathered
+    over the *transposed* CSR (backward adjacency); an undirected graph needs
+    only the forward one. The softmax term uses ``<grad_output, output>`` per
+    row, so the output is saved for the backward. ``grad_A_reduce_row_chunk_size``
+    is accepted for compatibility and unused: the attention-weight gradient is
+    reduced inside the backward kernels.
     """
 
     @staticmethod
@@ -315,6 +411,10 @@ class gatv2_function(torch.autograd.Function):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
         schedule_id = resolve_schedule(schedule)
+        head_dim = x_left.shape[2]
+        (x_left, x_right, attention_weights), width = _pad_attention_rows(
+            indices_forward.numel(), x_left.shape[1], x_left, x_right, attention_weights
+        )
 
         output, logsumexp = _C.gatv2_forward(
             x_left,
@@ -358,8 +458,10 @@ class gatv2_function(torch.autograd.Function):
         ctx.backward_heavy_pipeline_stages = backward_heavy_pipeline_stages
         ctx.is_directed = is_directed
         ctx.heads = x_left.shape[1]
-        ctx.head_dim = x_left.shape[2]
+        ctx.head_dim = head_dim
+        ctx.width = width
 
+        # The padded tensors, output included: the backward runs on the same rows.
         ctx.save_for_backward(
             x_left,
             x_right,
@@ -369,13 +471,14 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            output,
             fwd_light_nodes,
             fwd_heavy_nodes,
             bwd_light_nodes,
             bwd_heavy_nodes,
         )
 
-        return output
+        return output if width == head_dim else output[..., :head_dim].contiguous()
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
@@ -389,6 +492,7 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            output,
             fwd_light_nodes,
             fwd_heavy_nodes,
             bwd_light_nodes,
@@ -398,7 +502,13 @@ class gatv2_function(torch.autograd.Function):
         num_heads = ctx.heads
         head_dim = ctx.head_dim
 
-        grad_output = grad_output.view(-1, num_heads, head_dim)
+        # The kernels read the gradient through its row strides but need unit stride over the
+        # head dim; autograd may hand over any layout.
+        grad_output = grad_output.reshape(-1, num_heads, head_dim)
+        if ctx.width != head_dim:
+            grad_output = _pad_rows(grad_output, ctx.width)
+        elif grad_output.stride(-1) != 1:
+            grad_output = grad_output.contiguous()
 
         grad_x_left, grad_x_right, grad_attention = _C.gatv2_backward(
             grad_output,
@@ -410,6 +520,7 @@ class gatv2_function(torch.autograd.Function):
             indices_backward,
             attention_weights,
             logsumexp,
+            output,
             ctx.negative_slope,
             ctx.grad_A_reduce_row_chunk_size,
             fwd_light_nodes,
@@ -430,6 +541,11 @@ class gatv2_function(torch.autograd.Function):
             ctx.backward_pipeline_stages,
             ctx.backward_heavy_pipeline_stages,
         )
+
+        if ctx.width != head_dim:
+            grad_x_left, grad_x_right, grad_attention = (
+                g[..., :head_dim] for g in (grad_x_left, grad_x_right, grad_attention)
+            )
 
         # 16 trailing forward args, the 4 carrying the heavy-node edge-slice table, and
         # backward_pipeline_stages from the async-copy work.
@@ -504,9 +620,12 @@ class _FusedGraphAttention(torch.autograd.Function):
         backward_pipeline_stages=0,
         backward_heavy_pipeline_stages=0,
     ):
+        # Of the head dim as given: padding below must not change the scale.
         scale = scale or 1 / (Q.shape[-1] ** 0.5)
         schedule_id = resolve_schedule(schedule)
         empty = _empty_i32(Q.device)
+        head_dim = Q.shape[2]
+        (Q, K, V), width = _pad_attention_rows(edge_idx.numel(), Q.shape[1], Q, K, V)
         out, logsumexp = _C.gt_forward_csr_mh(
             edge_ptr,
             edge_idx,
@@ -539,7 +658,8 @@ class _FusedGraphAttention(torch.autograd.Function):
         ctx.scale = scale
         ctx.is_directed = is_directed
         ctx.num_heads = Q.shape[1]
-        ctx.head_dim = Q.shape[2]
+        ctx.head_dim = head_dim
+        ctx.width = width
         ctx.backward_light_warps = backward_light_warps
         ctx.backward_heavy_warps = backward_heavy_warps
         # The backward bucket has its own table: it slices the transpose CSR, not the forward one.
@@ -549,11 +669,12 @@ class _FusedGraphAttention(torch.autograd.Function):
         ctx.bwd_node_chunk_offset = bwd_node_chunk_offset if bwd_node_chunk_offset is not None else empty
         ctx.backward_pipeline_stages = backward_pipeline_stages
         ctx.backward_heavy_pipeline_stages = backward_heavy_pipeline_stages
+        # The padded tensors, output included: the backward runs on the same rows.
         ctx.save_for_backward(
             edge_ptr, edge_idx, edge_ptr_T, edge_idx_T, Q, K, V, out, logsumexp, bwd_light_nodes, bwd_heavy_nodes
         )
 
-        return out
+        return out if width == head_dim else out[..., :head_dim].contiguous()
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
@@ -574,7 +695,8 @@ class _FusedGraphAttention(torch.autograd.Function):
         scale = ctx.scale
         num_heads = ctx.num_heads
         head_dim = ctx.head_dim
-        grad_output = grad_output.reshape(-1, num_heads, head_dim).contiguous()
+        grad_output = grad_output.reshape(-1, num_heads, head_dim)
+        grad_output = _pad_rows(grad_output, ctx.width) if ctx.width != head_dim else grad_output.contiguous()
 
         dQ, dK, dV = _C.gt_backward_csr_mh(
             edge_ptr,
@@ -604,6 +726,9 @@ class _FusedGraphAttention(torch.autograd.Function):
             ctx.backward_pipeline_stages,
             ctx.backward_heavy_pipeline_stages,
         )
+
+        if ctx.width != head_dim:
+            dQ, dK, dV = (g[..., :head_dim] for g in (dQ, dK, dV))
 
         # 15 trailing forward args, plus the 4 forward-table and 4 backward-table arguments.
         return (None,) * 4 + (dQ, dK, dV) + (None,) * 27
@@ -726,18 +851,49 @@ class GsddmmFunction(torch.autograd.Function):
         return None, None, (d_lhs if needs_lhs else None), (d_rhs if needs_rhs else None)
 
 
+#: Bounds of the edges per slice of g-SpMM's walk (see ``gspmm_slice_size``).
+GSPMM_MIN_SLICE = 16
+GSPMM_SLICE_SIZE = 128
+
+
+def gspmm_slice_size(graph) -> int:
+    """Edges per slice of g-SpMM's walk on ``graph``: rows of more edges are cut into slices.
+
+    A launch is over once its longest work item is, and a slice is a walk of its edges by one lane
+    group or warp. On a graph with few edges per resident warp the whole launch is a fraction of a
+    wave and that walk is all that is left: measured on H100, cora (1.6 edges per resident warp) ran
+    1.6-2.3x faster at 16-edge slices than at 128. With many edges per warp, short slices only add
+    items, merges and re-read ids: ogbn-arxiv and twitch-views (160-1600 per warp) ran 3-28% faster
+    at 128 than at 32. In between, amazon-ratings (25 per warp) was best at 16-32 and tolokers-2
+    (124) at 64. Hence the power of two at or below the edges per resident warp, within [16, 128].
+
+    Args:
+        graph: An ``AdjacencyForwardBackwardWithNodeBuckets`` on a CUDA device.
+
+    Returns:
+        The slice size.
+    """
+    props = torch.cuda.get_device_properties(graph.forward_indptr.device)
+    resident_warps = props.multi_processor_count * (props.max_threads_per_multi_processor // 32)
+    per_warp = graph.forward_indices.numel() // max(resident_warps, 1)
+    return min(GSPMM_SLICE_SIZE, max(GSPMM_MIN_SLICE, 1 << max(per_warp.bit_length() - 1, 0)))
+
+
 class GSpMMFunction(torch.autograd.Function):
     """Generalized SpMM: ``out[v] = reduce_{(u,e) in in(v)} op(lhs[u], rhs[e])``.
 
     Covers the ``dgl.ops.gspmm`` operator family -- ``op`` in
-    {copy_u, copy_e, add, sub, mul, div} times ``reduce`` in {sum, min, max}.
+    {copy_u, copy_e, add, sub, mul, div} times ``reduce`` in {sum, min, max} -- for any feature
+    width.
 
-    Forward calls ``_C.gspmm_forward``, which splits nodes into light/heavy
-    buckets and, for min/max, records the winning CSR edge position per output
-    element.
+    Forward calls ``_C.gspmm_forward``: the rows walked whole and the slices of the longer ones
+    (``fwd_walk``, the forward adjacency's ``WalkPartition`` at ``gspmm_slice_size(graph)``, see
+    ``reduction_graph_args``) are work items of a lane group or a warp, which gathers 16-byte vectors
+    where every row allows them. For min/max it records the winning CSR edge position per output
+    element. Without a partition (None) the extension walks the graph's own light/heavy buckets and
+    builds their slice table on every call.
 
-    Backward has two shapes, and both walk a CSR with the same light/heavy
-    node buckets (on two streams) as the forward:
+    Backward has two shapes:
 
     - **min/max**: only the winning edge of each output element contributed.
       On a sparse graph ``_C.gspmm_backward_arg`` walks the *transposed* CSR:
@@ -748,11 +904,15 @@ class GSpMMFunction(torch.autograd.Function):
       walk tests too many edges and the launcher scatters over the winning
       edges instead (one block per destination, atomics on the node gradient).
     - **sum**: every edge contributed, and the two gradients decouple. The node
-      gradient is this same g-SpMM re-run on the *transposed* CSR; the edge
-      gradient is ``_C.gspmm_backward_edge`` over the forward CSR. For ``mul``
+      gradient is this same g-SpMM re-run on the *transposed* CSR (``bwd_walk``); the edge
+      gradient is ``_C.gspmm_backward_edge`` over the forward walk's items. For ``mul``
       and ``div`` the transposed run still needs the edge values, which live in
       forward-CSR order, so ``graph.backward_edge_map`` goes to the kernel and
       the read is redirected there.
+
+    ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` shape the min/max backward only;
+    ``bwd_max_degree`` gates its heavy-row slicing. ``max_degree`` is accepted for compatibility and
+    unused.
     """
 
     # Operations whose node gradient depends on the edge value; their sum
@@ -782,6 +942,8 @@ class GSpMMFunction(torch.autograd.Function):
         pipeline_stages=0,
         max_degree=-1,
         bwd_max_degree=-1,
+        fwd_walk=None,
+        bwd_walk=None,
     ):
         if torch.is_autocast_enabled():
             target = torch.get_autocast_gpu_dtype()
@@ -799,21 +961,19 @@ class GSpMMFunction(torch.autograd.Function):
         lhs_t = empty if lhs is None else lhs.contiguous()
         rhs_t = empty if rhs is None else rhs.contiguous()
 
+        walk_light, walk_heavy = (fwd_walk.light, fwd_walk.heavy) if fwd_walk is not None else (light, heavy)
         out, arg_eid = _C.gspmm_forward(
             edge_ptr,
             edge_idx,
             lhs_t,
             rhs_t,
-            light,
-            heavy,
+            walk_light,
+            walk_heavy,
             op,
             reduce,
             warps_per_block,
-            features_per_block,
-            tiles_y,
-            pipeline_stages,
-            edge_ptr[:0],  # no edge map on a forward pass
-            max_degree,
+            fwd_walk.slice_size if fwd_walk is not None else GSPMM_SLICE_SIZE,
+            **_walk_kwargs(fwd_walk),
         )
 
         ctx.save_for_backward(
@@ -838,6 +998,8 @@ class GSpMMFunction(torch.autograd.Function):
         ctx.pipeline_stages = pipeline_stages
         ctx.max_degree = max_degree
         ctx.bwd_max_degree = bwd_max_degree
+        ctx.fwd_walk = fwd_walk
+        ctx.bwd_walk = bwd_walk
         return out
 
     @staticmethod
@@ -911,20 +1073,19 @@ class GSpMMFunction(torch.autograd.Function):
             if rhs_needs_grad:
                 # Already in the operand dtype: this kernel writes every slot
                 # exactly once, so it has no float staging buffer to cast back.
+                walk = ctx.fwd_walk
                 grad_rhs = _C.gspmm_backward_edge(
                     edge_ptr,
                     edge_idx,
                     grad_out,
                     lhs_t,
                     rhs_t,
-                    light,
-                    heavy,
+                    walk.light if walk is not None else light,
+                    walk.heavy if walk is not None else heavy,
                     op,
                     ctx.warps_per_block,
-                    ctx.features_per_block,
-                    ctx.tiles_y,
-                    ctx.max_degree,
-                    ctx.pipeline_stages,
+                    walk.slice_size if walk is not None else GSPMM_SLICE_SIZE,
+                    **_slice_kwargs(walk.slices if walk is not None else None),
                 )
 
             if lhs_needs_grad:
@@ -956,21 +1117,20 @@ class GSpMMFunction(torch.autograd.Function):
                     edge_map = bwd_edge_ptr[:0]
                     bwd_op = "copy_u"
 
+                walk = ctx.bwd_walk
                 grad_lhs, _ = _C.gspmm_forward(
                     bwd_edge_ptr,
                     bwd_edge_idx,
                     grad_out,
                     rhs_bwd,
-                    bwd_light,
-                    bwd_heavy,
+                    walk.light if walk is not None else bwd_light,
+                    walk.heavy if walk is not None else bwd_heavy,
                     bwd_op,
                     "sum",
                     ctx.warps_per_block,
-                    ctx.features_per_block,
-                    ctx.tiles_y,
-                    ctx.pipeline_stages,
-                    edge_map,
-                    ctx.bwd_max_degree,
+                    walk.slice_size if walk is not None else GSPMM_SLICE_SIZE,
+                    edge_map=edge_map,
+                    **_walk_kwargs(walk),
                 )
 
         return (
@@ -993,4 +1153,6 @@ class GSpMMFunction(torch.autograd.Function):
             None,  # pipeline_stages
             None,  # max_degree
             None,  # bwd_max_degree
+            None,  # fwd_walk
+            None,  # bwd_walk
         )

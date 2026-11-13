@@ -32,6 +32,7 @@ from turbo_gnn._functions import (
     ReductionAggrFunction,
     _FusedGraphAttention,
     gatv2_function,
+    reduction_graph_args,
 )
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
@@ -63,32 +64,19 @@ __all__ = [
 
 
 class ReductionAggrKernel(TunableKernel):
-    """Tunable kernel for min/max neighbor aggregation.
+    """Tunable kernel for min/max/sum neighbor aggregation.
 
     Tunable forward parameters (grid-searched during autotuning):
 
-    - ``forward_warps_per_block``: warps per CUDA block for the light-node
-      atomic kernel. More warps = higher occupancy but diminishing returns
-      when feature dim is small.
-    - ``forward_edges_per_block_heavy_nodes``: edges processed per block in
-      the heavy-node tiled kernel. Larger values amortize launch overhead
-      but increase register pressure.
-    - ``forward_use_2d_kernel``: whether to use the 2-D tiled kernel variant
-      for heavy nodes (tiles over both edges and features).
-    - ``forward_features_per_block``, ``forward_tiles_y``: tile dimensions
-      for the 2-D kernel.
-    - ``forward_pipeline_stages``: async-copy pipeline stage count for the
-      light-node and packed-atomics heavy-node kernels' per-thread neighbor
-      scan (0 disables the pipeline; ignored by the 2-D tiled heavy kernel,
-      which already hides latency via shared-memory tree reduction).
-      MEASURED REGRESSION: as of this writing, stages=1 makes these kernels
-      strictly slower on H100 (0/27 and 1/27 swept configs improved; see
-      results/bench_min_aggr_forward/, results/bench_max_aggr_forward/,
-      results/ncu_min_aggr/) -- each block here is a single warp copying a
-      tiny (<=16B) per-thread slice, so there's no other warp to hide the
-      async-copy latency behind, and the pipeline's own sync overhead just
-      adds cost. Kept as a tunable (default 0, off) only so autotune can
-      revisit it if the kernel shape changes.
+    - ``forward_warps_per_block``: warps per CUDA block. Every lane group or warp works on a row
+      of its own, so this only sets the scheduling granularity; above 8 it acts as 8.
+    - ``forward_edges_per_block_heavy_nodes``: edges per slice. Every row of more edges, heavy or
+      not, is cut into slices, each one worker's work, and the slices' partial results are merged
+      per row. Short slices balance
+      power-law hubs best; long ones save merge traffic when the heavy degrees are close.
+
+    ``use_2d_kernel``, ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` are accepted
+    for compatibility and have no effect; they are not tuned.
 
     Tunable graph parameter:
 
@@ -107,13 +95,14 @@ class ReductionAggrKernel(TunableKernel):
         self.forward_pipeline_stages = kwargs.get("pipeline_stages", 0)
 
     def _execute(self, graph, x, **kwargs):
+        fwd, bwd = reduction_graph_args(graph, self.forward_edges_per_block_heavy_nodes, self.reduce)
         return ReductionAggrFunction.apply(
             graph.forward_indptr,
             graph.forward_indices,
             x,
-            graph.light_nodes,
-            graph.heavy_nodes,
-            graph.max_degree,
+            fwd.light,
+            fwd.heavy,
+            fwd.light_degree,
             self.forward_warps_per_block,
             self.forward_edges_per_block_heavy_nodes,
             self.forward_use_2d_kernel,
@@ -123,19 +112,17 @@ class ReductionAggrKernel(TunableKernel):
             self.forward_pipeline_stages,
             graph.backward_indptr,
             graph.backward_indices,
-            graph.backward_light_nodes,
-            graph.backward_heavy_nodes,
-            graph.backward_max_degree,
+            bwd.light if bwd is not None else None,
+            bwd.heavy if bwd is not None else None,
+            bwd.light_degree if bwd is not None else -1,
+            fwd.slices,
+            bwd.slices if bwd is not None else None,
         )
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
+            TunableParam("forward_warps_per_block", [2, 4, 8], default=8),
             TunableParam("forward_edges_per_block_heavy_nodes", [32, 64, 128, 256, 512, 1024, 2048], default=128),
-            TunableParam("forward_use_2d_kernel", [True, False], default=False),
-            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
-            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=128),
-            TunableParam("forward_pipeline_stages", [0, 1], default=0),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:
@@ -149,12 +136,12 @@ class GATv2AggrKernel(TunableKernel):
 
     Tunable backward parameter:
 
-    - ``backward_grad_A_reduce_row_chunk_size``: number of destination-node
-      rows reduced per shared-memory pass when computing attention gradients.
-      Larger chunks reduce kernel launches but increase shared memory usage.
     - ``backward_pipeline_stages``: async-copy pipeline stage count for the
-      backward AL/R (directed) and G/ALR (undirected) kernels, mirroring
-      ``forward_pipeline_stages`` (0 disables the pipeline).
+      backward kernels, mirroring ``forward_pipeline_stages`` (0 disables the
+      pipeline).
+
+    ``grad_A_reduce_row_chunk_size`` is still accepted and passed through, but the
+    kernels no longer use it: the attention-vector gradient is reduced in-kernel.
 
     Tunable graph parameters (forward and backward):
 
@@ -259,14 +246,14 @@ class GATv2AggrKernel(TunableKernel):
 
     def get_tunable_backward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("backward_grad_A_reduce_row_chunk_size", [512, 1024], default=512),
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
             TunableParam("backward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
             TunableParam("backward_light_warps", [1, 2, 4], default=1),
             TunableParam("backward_heavy_warps", [8, 16, 32], default=8),
-            # The undirected backward's heavy bucket is ~81% of that pass at ~7% occupancy;
-            # slicing it is the point of this axis. 0 keeps one block per heavy node.
+            # Slices the heavy bucket of the backward kernels that walk the forward CSR (the
+            # x_left / attention-vector gradient, and on an undirected graph the x_right one).
+            # 0 keeps one block per heavy node.
             TunableParam("backward_heavy_slice_blocks_per_sm", [0, 8, 16, 32, 64], default=0),
             TunableParam("backward_pipeline_stages", [0, 2, 6, 12], default=0),
             # Separate from the light depth: the heavy bucket runs 8-32 warps per block, so
@@ -324,10 +311,6 @@ class GSDDMMKernel(TunableKernel):
       the light/heavy node buckets. Only the counts the binding instantiates
       are searchable (see ``csrc/gsddmm/gsddmm_dispatch.cuh``); any other value
       raises from the dispatch.
-    - ``forward_pipeline_stages``: async-copy pipeline depth for the per-edge
-      Src/Edge row prefetch, in {0, 1, 2, 3} (0 disables the pipeline). Deeper
-      pipelines buy more overlap but cost ``stages + 1`` shared-memory row
-      slots per warp, so the whole range is searched.
     - ``forward_heavy_edges_per_block``: split each heavy node into chunks of
       this many edges, one block per chunk (0 = one block per node). Bounds
       the heavy launch's tail by the chunk instead of the maximum degree; the
@@ -338,16 +321,17 @@ class GSDDMMKernel(TunableKernel):
 
     Tunable forward parameters, edge variant:
 
-    - ``forward_edges_per_warp``: contiguous edges each warp walks, in [1, 32].
-      1 is the original one-edge-per-warp layout; larger chunks amortize the
-      edge-list load (one coalesced load per chunk) and are what gives the
-      pipeline something to prefetch.
-    - ``forward_pipeline_stages``: cp.async prefetch depth of the operand rows,
-      in {0, 2, 3}. Costs ``stages + 1`` shared row slots per operand per warp;
-      pointless with ``edges_per_warp == 1``.
+    - ``forward_edges_per_warp``: contiguous edges each lane group walks, in
+      [1, 32]. A row of up to 16 16-byte vectors takes a group of 4-16 lanes
+      per edge, so a warp then walks ``edges_per_warp * 32 / G`` edges (at most
+      32); larger chunks amortize the edge-list load (one coalesced load per
+      chunk) and the chunk-shared operand row.
     - ``forward_warps_per_block``: independent warps packed per thread block,
       in {1, 2, 4, 8}. 32-thread blocks cap residency at 32 blocks/SM (half the
       warp slots on sm_80); packing warps lifts that cap.
+
+    ``pipeline_stages`` is accepted and passed through for compatibility but has
+    no effect -- the kernels have no cp.async pipeline -- so it is not searched.
 
     Tunable graph parameter (node variant only -- the edge kernel ignores the
     node buckets):
@@ -577,12 +561,10 @@ class GSDDMMKernel(TunableKernel):
             return [
                 TunableParam("forward_light_warps", [4], default=4),
                 TunableParam("forward_heavy_warps", [32], default=32),
-                TunableParam("forward_pipeline_stages", [0, 1, 2, 3], default=0),
                 TunableParam("forward_heavy_edges_per_block", [0, 512, 1024, 2048, 4096], default=0),
                 TunableParam("forward_overlap_buckets", [False, True], default=False),
             ]
         return [
-            TunableParam("forward_pipeline_stages", [0, 2, 3], default=0),
             TunableParam("forward_edges_per_warp", [1, 4, 8, 16, 32], default=4),
             TunableParam("forward_warps_per_block", [1, 2, 4, 8], default=4),
         ]
@@ -598,9 +580,9 @@ class GSDDMMKernel(TunableKernel):
     def _merge_params(params: list[TunableParam]) -> list[TunableParam]:
         """Union two variants' axes, merging the values of shared names.
 
-        Both kernels take ``forward_pipeline_stages``, so a plain concatenation
-        would declare it twice -- and a duplicated name collapses in the grid's
-        config dict and would be registered twice by the Optuna driver.
+        A name both kernels declared would otherwise appear twice -- and a
+        duplicated name collapses in the grid's config dict and would be
+        registered twice by the Optuna driver.
         """
         merged: dict[str, TunableParam] = {}
         for param in params:
@@ -746,7 +728,7 @@ class GraphTransformerAggrKernel(TunableKernel):
 
     def __init__(self, **kwargs):
         super().__init__()
-        self.forward_light_warps = kwargs.get("forward_light_warps", 4)
+        self.forward_light_warps = kwargs.get("forward_light_warps", 1)
         self.schedule = kwargs.get("schedule", DEFAULT_SCHEDULE)
         self.blocks_per_sm = kwargs.get("blocks_per_sm", DEFAULT_BLOCKS_PER_SM)
         self.sched_chunk = kwargs.get("sched_chunk", DEFAULT_SCHED_CHUNK)
@@ -821,7 +803,10 @@ class GraphTransformerAggrKernel(TunableKernel):
             # Concurrency helps the forward buckets (1.11-1.14x) and hurts the backward ones
             # (0.92-0.99), so the two are searched independently rather than tied together.
             TunableParam("forward_bucket_launch", ["sequential", "concurrent"], default="sequential"),
-            TunableParam("forward_light_warps", [1, 2, 4], default=4),
+            # One warp per light node: a warp already gathers 32 / G rows at once (lane groups of G
+            # for short rows), so further warps only cut how many nodes an SM holds. Measured best
+            # or tied best at head dims 32-256 on uniform and power-law graphs.
+            TunableParam("forward_light_warps", [1, 2, 4], default=1),
             TunableParam("forward_heavy_warps", [8, 16, 32], default=8),
             # Edge-slice size for the heavy bucket. 0 keeps one block per heavy node, so the old
             # and new decompositions are compared inside a single search axis rather than behind
@@ -889,23 +874,20 @@ class GSpMMKernel(TunableKernel):
     different optimal launch shapes, and the autotune cache is keyed on the
     kernel instance.
 
-    Tunable forward parameters:
+    Tunable forward parameter:
 
-    - ``forward_warps_per_block``: block size for the light-node kernel, as
-      warps. Features are spread across threadIdx.x and nodes across
-      threadIdx.y, so this trades feature parallelism against node parallelism.
-    - ``forward_features_per_block``, ``forward_tiles_y``: tile shape of the
-      heavy-node kernel. ``tiles_y`` is how many edge chunks are reduced in
-      parallel through shared memory and must be a power of two.
+    - ``forward_warps_per_block``: warps per block of the forward walk. Every lane group or warp
+      works on an item of its own, so this only sets the scheduling granularity; above 8 it acts
+      as 8.
 
     Tunable graph parameter:
 
     - ``forward_huge_degree_threshold_quantile``: degree quantile for the
-      light/heavy partition (-1 disables bucketing, all nodes go to light).
+      light/heavy partition (-1 disables bucketing, all nodes go to light). Rows of more edges
+      than a slice are sliced whichever bucket they are in (``graph.walk_partition``).
 
-    Unlike :class:`ReductionAggrKernel` there is no ``use_2d_kernel`` knob: the
-    packed-atomics heavy variant does not generalize past min/max, so the tiled
-    kernel is the only heavy path.
+    ``features_per_block``, ``tiles_y`` and ``pipeline_stages`` shape the min/max backward only,
+    which the forward benchmark does not run, so they are not searched.
     """
 
     def __init__(self, op: str = "copy_u", reduce: str = "sum", **kwargs):
@@ -934,10 +916,7 @@ class GSpMMKernel(TunableKernel):
 
     def get_tunable_forward_kernel_params(self) -> list[TunableParam]:
         return [
-            TunableParam("forward_warps_per_block", [1, 2, 4, 8, 16, 32], default=8),
-            TunableParam("forward_features_per_block", [32, 64, 128, 256], default=32),
-            TunableParam("forward_tiles_y", [2, 4, 8, 16], default=8),
-            TunableParam("forward_pipeline_stages", [0, 1], default=0),
+            TunableParam("forward_warps_per_block", [2, 4, 8], default=8),
         ]
 
     def get_tunable_forward_graph_params(self) -> list[TunableParam]:

@@ -4,10 +4,12 @@
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
 
+#include "common/row_shape.cuh"
 #include "gsddmm/gsddmm_launch.cuh"
 
 // =============================================================================
@@ -24,6 +26,8 @@
 namespace gsddmm {
 
 namespace {
+
+namespace rows = turbo_gnn::rows;
 
 GSDDMM_OP parse_op(const std::string& op) {
 #define XX(ENUM, name) \
@@ -78,6 +82,46 @@ void check_canonical_idx(const torch::Tensor& t, at::ScalarType expected, int64_
     TORCH_CHECK(t.numel() == E, ctx, ": canonical_edge_idx must have E=", E, " entries, got ", t.numel());
 }
 
+// The kernels address row k of an operand as base + k * stride(0) with the stride in bytes held in
+// 32 bits, and read the features at unit stride, so an operand that breaks either -- a column slice
+// of a wider tensor is fine, a transposed one is not -- is copied once here. Any row stride that fits
+// is taken as is, 0 included (an expanded row), so views need no copy. A contiguous row always fits:
+// D <= 65536 elements of at most 4 bytes.
+torch::Tensor as_kernel_rows(torch::Tensor t) {
+    const bool unit_features = t.size(1) <= 1 || t.stride(1) == 1;
+    const bool narrow_stride = t.stride(0) >= 0 && t.stride(0) * t.element_size() <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+    return unit_features && narrow_stride ? t : t.contiguous();
+}
+
+// Feature dim checks shared by every entry point.
+void check_feature_dim(const torch::Tensor& L, const torch::Tensor& R, const char *what) {
+    TORCH_CHECK(L.dim() == 2 && R.dim() == 2, what, ": L and R must be [*, D]");
+    TORCH_CHECK(R.size(1) == L.size(1), what, ": L and R must have the same feature dim D");
+    rows::check_head_dim(L.size(1), what);
+}
+
+// The node kernels read the CSR and its node lists through the index type of its width (see
+// MakeIndexWidthVariant): uint32 as int32, which is exact for graphs of fewer than 2^31 nodes and
+// edges.
+void check_csr_index(const torch::Tensor& row_ptr, const torch::Tensor& col_idx, const char *what) {
+    const auto idx_dtype = row_ptr.scalar_type();
+    TORCH_CHECK(is_supported_index_type(idx_dtype), what, ": row_ptr must be int32, int64, uint32 or uint64");
+    TORCH_CHECK(col_idx.scalar_type() == idx_dtype, what, ": col_idx must have the dtype of row_ptr");
+    TORCH_CHECK(row_ptr.is_contiguous() && col_idx.is_contiguous(), what, ": the CSR must be contiguous");
+    rows::check_index_range(row_ptr, col_idx, what);
+}
+
+// The edge kernels carry ids and the warp-chunk arithmetic in the edge list's unsigned width: for a
+// 32-bit list, the last block's chunk offsets must stay below 2^32.
+void check_edge_count(uint64_t E, at::ScalarType idx_dtype, const char *what) {
+    if (c10::elementSize(idx_dtype) == 4) {
+        TORCH_CHECK(
+            E <= std::numeric_limits<uint32_t>::max() - kGsddmmEdgeMaxWarpsPerBlock * kGsddmmEdgeMaxEdgesPerWarp, what,
+            ": a 32-bit edge list supports fewer than 2^32 - 256 edges; use int64 indices"
+        );
+    }
+}
+
 }  // namespace
 
 // =============================================================================
@@ -86,11 +130,13 @@ void check_canonical_idx(const torch::Tensor& t, at::ScalarType expected, int64_
 //
 // op:          "add" | "sub" | "mul" | "div" | "dot" | "copy"
 // lhs_target / rhs_target: "src" | "dst" | "edge"
-// L, R:        CUDA fp32/fp16/bf16, [N, D] for src/dst targets, [E, D] for edge
-//              targets; D in {32, 64, 128, 256}, feature dim contiguous.
+// L, R:        CUDA fp32/fp16/bf16, [N, D] for src/dst targets, [E, D] for edge targets; any D in
+//              [1, 65536] and any row stride. Rows that are not whole 16-byte vectors, or not 16-byte
+//              aligned, are read element by element.
 //              For op == "copy" R is never read (pass Edge) and L can not be Edge, it must be either Src_V or Dst_V.
-// pipeline_stages: cp.async prefetch depth for the per-edge rows, in {0, 1, 2, 3}
-//              (0 disables the pipeline).
+// pipeline_stages: accepted for compatibility, in {0, 1, 2, 3}; no effect (the kernels have no
+//              cp.async pipeline -- measured to win at most 4% on the old fixed-D kernels, and to lose
+//              up to 1.5x in most cells).
 // heavy_block_parts / heavy_edges_per_block: heavy-node chunking. When given,
 //              heavy_nodes lists the node of every heavy BLOCK (a node repeated
 //              once per chunk) and heavy_block_parts[b] the chunk index of block
@@ -129,44 +175,35 @@ torch::Tensor gsddmm_forward_cuda(
     TORCH_CHECK(L.is_cuda() && R.is_cuda(), "L and R must be CUDA");
     TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(), "CSR indices must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node buckets must be CUDA");
-    TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
     );
     TORCH_CHECK(R.dtype() == L.dtype(), "L and R must have the same dtype");
-    TORCH_CHECK(L.stride(1) == 1 && R.stride(1) == 1, "Feature dim (D) must be contiguous for L and R");
+    check_feature_dim(L, R, "GSDDMM forward");
+    TORCH_CHECK(pipeline_stages <= 3, "GSDDMM forward: pipeline_stages must be in [0, 3], got ", pipeline_stages);
+    L = as_kernel_rows(std::move(L));
+    R = as_kernel_rows(std::move(R));
 
+    check_csr_index(row_ptr, col_idx, "GSDDMM forward");
+    rows::check_node_list(light_nodes, row_ptr, "GSDDMM forward: light_nodes");
+    rows::check_node_list(heavy_nodes, row_ptr, "GSDDMM forward: heavy_nodes");
     const auto idx_dtype = row_ptr.scalar_type();
-    TORCH_CHECK(is_supported_index_type(idx_dtype), "row_ptr must be int32, int64, uint32, or uint64");
-    // Only the index types listed in the dispatch (gsddmm_dispatch.cuh) are
-    // instantiated; extend MakeIndexVariant there (at the cost of compile time)
-    // to support more.
-    TORCH_CHECK(
-        idx_dtype == at::kInt || idx_dtype == at::kLong, "GSDDMM forward: row_ptr must be int32 or int64 (the instantiated index types)"
-    );
-    TORCH_CHECK(col_idx.scalar_type() == idx_dtype, "col_idx must have same dtype as row_ptr");
-    TORCH_CHECK(
-        light_nodes.scalar_type() == idx_dtype && heavy_nodes.scalar_type() == idx_dtype, "node buckets must have same dtype as row_ptr"
-    );
 
     const int64_t N = row_ptr.size(0) - 1;
     const int64_t E = col_idx.size(0);
     const int64_t D = L.size(1);
-    TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
 
     check_rows(N, E, L, lhs_member, "L");
     check_rows(N, E, R, rhs_member, "R");
 
     torch::Tensor O = is_dot ? torch::empty({E}, L.options()) : torch::empty({E, D}, L.options());
 
-    TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
-
     const bool chunked = heavy_block_parts.has_value() && heavy_block_parts->numel() > 0;
     if (chunked) {
         TORCH_CHECK(heavy_edges_per_block > 0, "GSDDMM forward: heavy_edges_per_block must be > 0 when heavy_block_parts is given");
         TORCH_CHECK(
-            heavy_block_parts->is_cuda() && heavy_block_parts->scalar_type() == idx_dtype,
-            "heavy_block_parts must be CUDA with the CSR index dtype"
+            heavy_block_parts->is_cuda() && heavy_block_parts->element_size() == row_ptr.element_size() && heavy_block_parts->is_contiguous(),
+            "heavy_block_parts must be a contiguous CUDA tensor with the width of the CSR index dtype (", idx_dtype, ")"
         );
         TORCH_CHECK(
             heavy_block_parts->numel() == heavy_nodes.numel(), "GSDDMM forward: heavy_block_parts (", heavy_block_parts->numel(),
@@ -188,7 +225,8 @@ torch::Tensor gsddmm_forward_cuda(
         .key                   = LRO{lhs_member, rhs_member, op_enum},
         .light_warps_per_block = static_cast<uint16_t>(light_warps_per_block),
         .heavy_warps_per_block = static_cast<uint16_t>(heavy_warps_per_block),
-        .pipeline_stages       = static_cast<uint8_t>(pipeline_stages),
+        // O is a fresh contiguous [E, D], whose rows are aligned exactly when L's length allows it.
+        .wide                  = rows::rows_16b_aligned(L) && (op_enum == GSDDMM_OP::Copy || rows::rows_16b_aligned(R)),
         .heavy_block_parts     = chunked ? &*heavy_block_parts : nullptr,
         .heavy_edges_per_block = chunked ? heavy_edges_per_block : 0u,
         .overlap_buckets       = overlap_buckets,
@@ -211,13 +249,13 @@ torch::Tensor gsddmm_forward_cuda(
     return O;
 }
 
-// op / targets / L / R / D: as for gsddmm_forward_cuda. edge_list: [E, 2] uint64
-//              (src, dst) node-id pairs, contiguous, reinterpreted as ulonglong2.
-// pipeline_stages: cp.async prefetch depth of the per-edge operand rows, in
-//              {0, 1, 2, 3} (0 = direct loads). Only meaningful with edges_per_warp > 1.
-// edges_per_warp: contiguous edges each warp walks, in [1, kGsddmmEdgeMaxEdgesPerWarp].
+// op / targets / L / R / D: as for gsddmm_forward_cuda. edge_list: [E, 2] (src, dst) node-id pairs
+//              in any supported index dtype, contiguous, reinterpreted as uint2 / ulonglong2.
+// pipeline_stages: accepted for compatibility, in {0, 1, 2, 3}; no effect.
+// edges_per_warp: contiguous edges each lane group walks, in [1, kGsddmmEdgeMaxEdgesPerWarp]; a warp
+//              of 32 / G groups walks up to 32 of them (see edge_chunk in gsddmm.cuh).
 // warps_per_block: independent warps packed per thread block, in [1, kGsddmmEdgeMaxWarpsPerBlock].
-// canonical_edge_idx: optional [E] uint64 canonical edge id of every entry of
+// canonical_edge_idx: optional [E] canonical edge id of every entry of
 //              edge_list. Applied to the Edge operand rows and to the output row,
 //              so a source-grouped edge_list (L2-friendly: consecutive warps share
 //              the Src_V row) can still produce output numbered by forward-CSR
@@ -249,27 +287,23 @@ torch::Tensor gsddmm_forward_edge_blocks(
     TORCH_CHECK(is_supported_index_type(edge_list.scalar_type()), "edge_list must be int32, uint32, int64 or uint64");
     const at::ScalarType edge_idx_dtype = edge_list.scalar_type();
     check_edge_list(edge_list, edge_idx_dtype, "edge_list");
-    TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
     );
     TORCH_CHECK(R.dtype() == L.dtype(), "L and R must have the same dtype");
-    TORCH_CHECK(L.stride(1) == 1 && R.stride(1) == 1, "Feature dim (D) must be contiguous for L and R");
+    check_feature_dim(L, R, "GSDDMM forward (edge blocks)");
+    L = as_kernel_rows(std::move(L));
+    R = as_kernel_rows(std::move(R));
 
     const uint64_t E = edge_list.size(0);
-    TORCH_CHECK(E <= (1ull << 63ull) - 1ull, "Too many edges. This kernel supports only up to 2^63 - 1 edges.");
+    check_edge_count(E, edge_idx_dtype, "GSDDMM forward (edge blocks)");
     const uint64_t D = L.size(1);
-    TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
 
     check_rows(static_cast<int64_t>(N), static_cast<int64_t>(E), L, lhs_member, "L");
     check_rows(static_cast<int64_t>(N), static_cast<int64_t>(E), R, rhs_member, "R");
 
     torch::Tensor O = is_dot ? torch::empty({static_cast<int64_t>(E)}, L.options())
                              : torch::empty({static_cast<int64_t>(E), static_cast<int64_t>(D)}, L.options());
-
-    TORCH_CHECK(
-        D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward (edge blocks): unsupported feature dim D=", D, "; supported: 32, 64, 128, 256"
-    );
 
     TORCH_CHECK(pipeline_stages <= 3, "GSDDMM forward (edge blocks): pipeline_stages must be in [0, 3], got ", pipeline_stages);
     TORCH_CHECK(
@@ -299,9 +333,9 @@ torch::Tensor gsddmm_forward_edge_blocks(
         .E                  = E,
         .D                  = D,
         .key                = LRO{lhs_member, rhs_member, op_enum},
-        .pipeline_stages    = static_cast<uint8_t>(pipeline_stages),
         .edges_per_warp     = static_cast<uint8_t>(edges_per_warp),
         .warps_per_block    = static_cast<uint8_t>(warps_per_block),
+        .wide               = rows::rows_16b_aligned(L) && (op_enum == GSDDMM_OP::Copy || rows::rows_16b_aligned(R)),
     };
 
     // One call per op, each resolved in its own translation unit.
@@ -336,22 +370,22 @@ BackwardPasses backward_passes(GSDDMM_OP op, GSDDMM_MEMBER lhs, GSDDMM_MEMBER rh
     return {reads(GSDDMM_MEMBER::Dst_V), reads(GSDDMM_MEMBER::Src_V), uses_rhs && reads(GSDDMM_MEMBER::Edge)};
 }
 
-// Shared validation for both backward entry points. Returns the feature dim.
+// Shared validation for both backward entry points; L and R are made kernel-addressable in place.
+// Returns the feature dim.
 int64_t check_backward_operands(
-    const torch::Tensor& L, const torch::Tensor& R, const torch::Tensor& dO, GSDDMM_OP op_enum, GSDDMM_MEMBER lhs_member,
-    GSDDMM_MEMBER rhs_member, int64_t N, int64_t E
+    torch::Tensor& L, torch::Tensor& R, const torch::Tensor& dO, GSDDMM_OP op_enum, GSDDMM_MEMBER lhs_member, GSDDMM_MEMBER rhs_member,
+    int64_t N, int64_t E
 ) {
     TORCH_CHECK(L.is_cuda() && R.is_cuda() && dO.is_cuda(), "L, R and dO must be CUDA");
-    TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
     );
     TORCH_CHECK(R.dtype() == L.dtype() && dO.dtype() == L.dtype(), "L, R and dO must share a dtype");
-    TORCH_CHECK(L.stride(1) == 1 && R.stride(1) == 1, "Feature dim (D) must be contiguous for L and R");
+    check_feature_dim(L, R, "GSDDMM backward");
+    L = as_kernel_rows(std::move(L));
+    R = as_kernel_rows(std::move(R));
 
     const int64_t D = L.size(1);
-    TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
-    TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM backward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
 
     check_rows(N, E, L, lhs_member, "L");
     check_rows(N, E, R, rhs_member, "R");
@@ -368,6 +402,13 @@ int64_t check_backward_operands(
     return D;
 }
 
+// Whether every row the backward reads -- of L, R and dO -- is whole 16-byte vectors on 16-byte
+// boundaries; its outputs are fresh contiguous tensors, aligned exactly when L's rows can be.
+bool backward_rows_wide(const torch::Tensor& L, const torch::Tensor& R, const torch::Tensor& dO, GSDDMM_OP op_enum) {
+    return rows::rows_16b_aligned(L) && (op_enum == GSDDMM_OP::Copy || rows::rows_16b_aligned(R)) &&
+           (op_enum == GSDDMM_OP::Dot || rows::rows_16b_aligned(dO));
+}
+
 }  // namespace
 
 // Node-parallel backward. Reduces each node operand's gradient in fp32 registers
@@ -379,7 +420,7 @@ int64_t check_backward_operands(
 //              used by the destination-side pass.
 // row_ptr_T / col_idx_T + light_nodes_T / heavy_nodes_T: the backward
 //              (source-grouped) CSR and its buckets, used by the source-side pass.
-// canonical_edge_idx: [E] uint64 mapping a backward-CSR slot to its forward-CSR
+// canonical_edge_idx: [E] (the CSR index dtype) mapping a backward-CSR slot to its forward-CSR
 //              edge id, so the source pass can read dO and the edge operand in
 //              their own numbering. Required whenever a source-side pass runs and
 //              the two CSRs are distinct buffers.
@@ -413,11 +454,12 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(L.device().index());
 
     TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(), "CSR indices must be CUDA");
+    check_csr_index(row_ptr, col_idx, "GSDDMM backward");
     const auto idx_dtype = row_ptr.scalar_type();
-    TORCH_CHECK(
-        idx_dtype == at::kInt || idx_dtype == at::kLong, "GSDDMM backward: row_ptr must be int32 or int64 (the instantiated index types)"
-    );
-    TORCH_CHECK(col_idx.scalar_type() == idx_dtype, "col_idx must have same dtype as row_ptr");
+    if (passes.dst) {
+        rows::check_node_list(light_nodes, row_ptr, "GSDDMM backward: light_nodes");
+        rows::check_node_list(heavy_nodes, row_ptr, "GSDDMM backward: heavy_nodes");
+    }
 
     const int64_t N = row_ptr.size(0) - 1;
     const int64_t E = col_idx.size(0);
@@ -429,6 +471,9 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
         TORCH_CHECK(
             row_ptr_T.scalar_type() == idx_dtype && col_idx_T.scalar_type() == idx_dtype, "GSDDMM backward: both CSRs must share an index dtype"
         );
+        check_csr_index(row_ptr_T, col_idx_T, "GSDDMM backward (backward CSR)");
+        rows::check_node_list(light_nodes_T, row_ptr, "GSDDMM backward: light_nodes_T");
+        rows::check_node_list(heavy_nodes_T, row_ptr, "GSDDMM backward: heavy_nodes_T");
     }
 
     void const *canonical_ptr = nullptr;
@@ -475,6 +520,7 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
         .key                   = LRO{lhs_member, rhs_member, op_enum},
         .light_warps_per_block = static_cast<uint16_t>(light_warps_per_block),
         .heavy_warps_per_block = static_cast<uint16_t>(heavy_warps_per_block),
+        .wide                  = backward_rows_wide(L, R, dO, op_enum),
     };
 
     switch (op_enum) {
@@ -505,8 +551,8 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
 //              Required only when a source-side gradient is needed; pass the
 //              dst-grouped list (and no permutation) for a graph whose orders
 //              coincide.
-// pipeline_stages: cp.async prefetch depth of the per-edge rows, in {0, 1, 2, 3}
-//              (0 = direct loads). Only meaningful with edges_per_warp > 1.
+// pipeline_stages: accepted for compatibility, in {0, 1, 2, 3}; no effect (measured within 1% at
+//              every depth on the old fixed-D kernel).
 // Returns:     {dL, dR}, as for gsddmm_backward_cuda.
 std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     torch::Tensor L,
@@ -538,6 +584,7 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     check_edge_list(edge_list_dst, edge_idx_dtype, "edge_list_dst");
 
     const int64_t E = edge_list_dst.size(0);
+    check_edge_count(static_cast<uint64_t>(E), edge_idx_dtype, "GSDDMM backward (edge blocks)");
     const int64_t D = check_backward_operands(L, R, dO, op_enum, lhs_member, rhs_member, static_cast<int64_t>(N), E);
 
     TORCH_CHECK(
@@ -600,9 +647,9 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
         .E                  = static_cast<uint64_t>(E),
         .D                  = static_cast<uint64_t>(D),
         .key                = LRO{lhs_member, rhs_member, op_enum},
-        .pipeline_stages    = static_cast<uint8_t>(pipeline_stages),
         .edges_per_warp     = static_cast<uint8_t>(edges_per_warp),
         .warps_per_block    = static_cast<uint8_t>(warps_per_block),
+        .wide               = backward_rows_wide(L, R, dO, op_enum),
     };
 
     switch (op_enum) {
@@ -670,7 +717,8 @@ torch::Tensor gsddmm_forward_edge_blocks(
     uint32_t pipeline_stages,
     uint32_t edges_per_warp,
     uint32_t warps_per_block,
-    std::optional<torch::Tensor> canonical_edge_idx
+    std::optional<torch::Tensor>
+        canonical_edge_idx
 ) {
     return gsddmm::gsddmm_forward_edge_blocks(
         std::move(L), std::move(R), std::move(edge_list), std::move(op), std::move(lhs_target), std::move(rhs_target), N, pipeline_stages,
@@ -693,7 +741,8 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
     torch::Tensor heavy_nodes,
     torch::Tensor light_nodes_T,
     torch::Tensor heavy_nodes_T,
-    std::optional<torch::Tensor> canonical_edge_idx,
+    std::optional<torch::Tensor>
+        canonical_edge_idx,
     uint32_t light_warps_per_block,
     uint32_t heavy_warps_per_block
 ) {
@@ -709,8 +758,10 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     torch::Tensor R,
     torch::Tensor dO,
     torch::Tensor edge_list_dst,
-    std::optional<torch::Tensor> edge_list_src,
-    std::optional<torch::Tensor> canonical_edge_idx,
+    std::optional<torch::Tensor>
+        edge_list_src,
+    std::optional<torch::Tensor>
+        canonical_edge_idx,
     std::string op,
     std::string lhs_target,
     std::string rhs_target,

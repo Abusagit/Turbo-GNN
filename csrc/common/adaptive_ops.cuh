@@ -212,6 +212,10 @@ constexpr __device__ auto broadcast_scalar_to_packed(SrcType val) {
             return __float2half2_rn(static_cast<float>(val));
         } else if constexpr (std::is_same_v<std::remove_cvref_t<DstType>, nv_bfloat16>) {
             return __float2bfloat162_rn(static_cast<float>(val));
+        } else if constexpr (std::is_same_v<std::remove_cvref_t<DstType>, float>) {
+            // The packed float2 paths of VecFloat, live from sm_100 (see can_be_packed_new_b):
+            // without this case scalar_add_/scalar_mul_ on float vectors returned void there.
+            return make_float2(static_cast<float>(val), static_cast<float>(val));
         } else {
             __builtin_unreachable();
         }

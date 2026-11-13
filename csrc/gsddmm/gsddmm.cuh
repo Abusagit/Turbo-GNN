@@ -1,9 +1,57 @@
 #pragma once
 
+#include <cstdint>
+#include <type_traits>
+
 #include "common.cuh"
-#include "common/gsddmm_pipeline.cuh"
+#include "common/row_group.cuh"
+#include "common/row_shape.cuh"
+
+// =============================================================================
+// g-SDDMM (generalized sampled dense-dense matrix multiplication), forward and backward, for any
+// feature dim D in [1, rows::kMaxHeadDim].
+//
+// The graph is given in CSR (row_ptr/col_idx). Row node i is the *destination* of the edges stored
+// in its row, col node j = col_idx[e] is the *source* -- the same message-passing orientation as
+// the GT/GATv2 kernels (edge e carries the message j -> i). For every edge position e in
+// [row_ptr[i], row_ptr[i+1]):
+//
+//     lhs = L[sel(ll), :],  rhs = R[sel(rr), :]
+//     sel(Src_V) = j   (neighbor node row, L/R are [N, D])
+//     sel(Dst_V) = i   (row node row,       L/R are [N, D])
+//     sel(Edge)  = e   (edge row,           L/R are [E, D])
+//
+//     op in {Add, Sub, Mul, Div}:  O[e, :] = op(lhs, rhs)   (O is [E, D])
+//     op == Copy:                  O[e, :] = lhs            (R is never read)
+//     op == Dot:                   O[e]     = sum_d lhs[d] * rhs[d]
+//                                (products formed in cuda_t, reduced in accum_t, result written
+//                                 as cuda_t;  O is [E])
+//
+// Row layout. A row of D features is laid across a lane group of G lanes as in
+// common/row_group.cuh: 16-byte vectors when every row read is 16-byte aligned and D a whole
+// number of them, single elements otherwise. Short rows take one group per edge -- G = 4, 8 or 16
+// lanes, so a warp works on 32 / G edges at once -- and rows of more than 32 vectors take whole
+// warps with two vectors per lane, swept in passes of 64 vectors when longer than that. Every op is
+// elementwise over the row except Dot's reduction, which a group accumulates over its passes before
+// reducing across its lanes, so no path needs scratch memory or a second kernel.
+//
+// Four kernels implement it:
+//
+//   forward_node   one block per (bucketed) CSR row -- or per chunk of a heavy row -- its warps
+//                  splitting the row's edges in contiguous shares. The Dst_V operand row is the same
+//                  for every edge of the block and is held in registers.
+//   forward_edge   one warp per contiguous chunk of an explicit [E, 2] edge list. A chunk whose
+//                  edges share the grouping node's row (the list is grouped by it) holds that row
+//                  in registers too.
+//   backward_node  one block per node of the pass's CSR; the node's gradient is reduced in fp32
+//                  registers across the block and stored once. No atomics, deterministic.
+//   backward_edge  one warp per edge chunk; the chunk's runs of edges sharing a target node are
+//                  summed in registers and added once per run with fp32 atomics. Load balanced.
+// =============================================================================
 
 namespace gsddmm {
+
+using turbo_gnn::rows::Shape;
 
 // Operation to do over
 enum class GSDDMM_OP : uint8_t {
@@ -22,40 +70,7 @@ enum class GSDDMM_MEMBER : uint8_t {
     Edge,   // Edge
 };
 
-// =============================================================================
-// GSDDMM (Generalized Sampled-Dense-Dense Matrix Multiplication) forward
-// =============================================================================
-//
-// The graph is given in CSR (row_ptr/col_idx). Row node i is the *destination*
-// of the edges stored in its row, col node j = col_idx[e] is the *source* —
-// the same message-passing orientation as the GT/GATv2 kernels (edge e carries
-// the message j -> i). For every edge position e in [row_ptr[i], row_ptr[i+1]):
-//
-//     lhs = L[sel(ll), :],  rhs = R[sel(rr), :]
-//     sel(Src_V) = j   (neighbor node row, L/R are [N, D])
-//     sel(Dst_V) = i   (row node row,       L/R are [N, D])
-//     sel(Edge)  = e   (edge row,           L/R are [E, D])
-//
-//     op in {Add, Sub, Mul, Div}:  O[e, :] = op(lhs, rhs)   (O is [E, D])
-//     op == Copy:                  O[e, :] = lhs            (R is never read)
-//     op == Dot:                   O[e]     = sum_d lhs[d] * rhs[d]
-//                                (products formed in cuda_t, reduced in accum_t,
-//                                 result written as cuda_t;  O is [E])
-//
-// Parallelization (mirrors the GT forward kernel): the grid covers a bucket of
-// nodes through the node_indices indirection (node_i = node_indices[blockIdx.x]),
-// the block is (kWarpSize, N_PER_BLOCK); each warp owns one edge at a time and
-// walks the node's edge list with stride N_PER_BLOCK, lanes splitting the
-// D_CONST features into TW-wide vector tiles.
-//
-// Compile-time routing (GsddmmPlan): Dst_V operand rows are identical for every
-// edge of the CSR row, so they are staged once per block in shared memory with
-// 16-byte copies; Src_V / Edge rows are gathered per edge — either by direct
-// wide global loads (PIPELINE_STAGES == 0) or through a cp.async multi-stage
-// pipeline into shared memory (PIPELINE_STAGES >= 1). All op/member branches
-// are resolved with if constexpr, so unused operands are never loaded.
-
-// Compile-time operand routing for one GSDDMM instantiation.
+// Compile-time operand routing for one forward instantiation.
 template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr>
 struct GsddmmPlan {
     // The right operand is read for every op except Copy (Copy propagates lhs only).
@@ -63,108 +78,21 @@ struct GsddmmPlan {
     static_assert((ll != rr) || !USE_R, "You should use more efficient methods to do ops between the same dense data.");
     static_assert(op != GSDDMM_OP::Copy || ll != GSDDMM_MEMBER::Edge, "We can not copy edge features to the edge.");
 
-    static constexpr bool L_DST = (ll == GSDDMM_MEMBER::Dst_V);
-    static constexpr bool R_DST = USE_R && (rr == GSDDMM_MEMBER::Dst_V);
+    static constexpr bool L_DST     = (ll == GSDDMM_MEMBER::Dst_V);
+    static constexpr bool R_DST     = USE_R && (rr == GSDDMM_MEMBER::Dst_V);
+    static constexpr bool READS_DST = L_DST || R_DST;
+    static constexpr bool IS_DOT    = (op == GSDDMM_OP::Dot);
 
-    // The right operand has a per-edge row only when it is read at all and is
-    // not the staged Dst_V row. Copy's R must not be counted here: the kernel
-    // is handed a 1-row stand-in for it, and a prefetch of R + j * D from that
-    // stand-in is an out-of-bounds read (the direct-load path only ever formed
-    // the pointer, which is why the bug was confined to the pipelined path).
-    static constexpr bool R_EDGE_ROW = USE_R && !R_DST;
-
-    // Dst_V rows are staged once per block in shared memory (they are the same
-    // for every edge of the CSR row); Src_V / Edge rows are gathered per edge.
-    static constexpr size_t NUM_DST_ROWS  = (L_DST ? 1 : 0) + (R_DST ? 1 : 0);
-    static constexpr size_t NUM_EDGE_ROWS = (L_DST ? 0 : 1) + (R_EDGE_ROW ? 1 : 0);
-
-    // Slot of each operand inside the per-edge rows[] array (-1: staged in
-    // shared, or -- for Copy's R -- absent).
-    static constexpr int L_SLOT = L_DST ? -1 : 0;
-    static constexpr int R_SLOT = R_EDGE_ROW ? (L_DST ? 0 : 1) : -1;
-
-    // true: the per-edge row is indexed by edge position e; false: by neighbor node j.
-    static constexpr bool L_EDGE_INDEXED = (ll == GSDDMM_MEMBER::Edge);
-    static constexpr bool R_EDGE_INDEXED = USE_R && (rr == GSDDMM_MEMBER::Edge);
-
-    static constexpr bool R_FIRST = R_DST || (rr == GSDDMM_MEMBER::Src_V && ll == GSDDMM_MEMBER::Edge);
-
-    static constexpr bool IS_DOT = (op == GSDDMM_OP::Dot);
+    // The edge kernel's list is grouped by destination when an operand reads it, by source
+    // otherwise, so that the operand of the grouping member is shared by a chunk's edges.
+    static constexpr GSDDMM_MEMBER GROUPING = READS_DST ? GSDDMM_MEMBER::Dst_V : GSDDMM_MEMBER::Src_V;
+    static constexpr bool L_GROUPED         = (ll == GROUPING);
+    static constexpr bool R_GROUPED         = USE_R && (rr == GROUPING);
+    static_assert(L_GROUPED || R_GROUPED, "every instantiated member pair has a node operand");
 };
 
-// Dynamic shared memory requirement of GSDDMM_forward_normal for one instantiation.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, uint8_t PIPELINE_STAGES>
-inline consteval size_t gsddmm_forward_shmem_bytes() {
-    using Plan = GsddmmPlan<op, ll, rr>;
-    return Plan::NUM_DST_ROWS * D_CONST * sizeof(cuda_t) +
-           N_PER_BLOCK * gsddmm_pipe::pipelined_ring_elems(PIPELINE_STAGES, Plan::NUM_EDGE_ROWS, D_CONST) * sizeof(cuda_t);
-}
-
-// Edge-block kernel launch limits (validated by the binding, baked into __launch_bounds__).
-inline constexpr size_t kGsddmmEdgeMaxWarpsPerBlock = 8;
-inline constexpr size_t kGsddmmEdgeMaxEdgesPerWarp  = kWarpSize;  // lane k caches edge k's (src, dst) pair
-
-// Dynamic shared memory requirement of GSDDMM_forward_edge_block per WARP (the
-// block needs warps_per_block times this). Every operand of the edge kernel is
-// gathered per edge (there is no shared Dst_V row across a warp's edge chunk), so
-// the ring buffer holds one L row and, unless the op is Copy, one R row per slot.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, uint8_t PIPELINE_STAGES>
-inline consteval size_t gsddmm_forward_edge_shmem_bytes_per_warp() {
-    constexpr size_t rows = GsddmmPlan<op, ll, rr>::USE_R ? 2 : 1;
-    return gsddmm_pipe::pipelined_ring_elems(PIPELINE_STAGES, rows, D_CONST) * sizeof(cuda_t);
-}
-
-// forward kernel: one thread block per (bucketed) CSR row node -- or, when
-// block_part != nullptr, per edges_per_block-wide chunk of a node's edge list
-// (node_indices then lists the node of every block, block_part its chunk index;
-// this bounds a block's work by the chunk size instead of the node's degree).
-// Each warp of the block owns one edge at a time, lanes split the D_CONST
-// features into vector tiles.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
-__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal ( // no-format
-    size_t N,
-    cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
-    index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
-    index_t const *__restrict__ node_indices,  // node indirection: node_i = node_indices[blockIdx.x]
-    index_t const *__restrict__ block_part,    // nullptr, or chunk index of block blockIdx.x within its node's edge list
-    uint32_t edges_per_block                   // chunk width when block_part != nullptr
-);
-
-// Edge-block variant: reads an explicit [E, 2] edge list of (src, dst) node-id
-// pairs (reinterpreted as index_pair_t<index_t>) instead of the CSR. Warp w (global
-// index over the grid, blockDim.y warps per block) owns the contiguous edge
-// chunk [w * edges_per_warp, (w + 1) * edges_per_warp), 1 <= edges_per_warp <=
-// kGsddmmEdgeMaxEdgesPerWarp. PIPELINE_STAGES == 0 gathers the operand rows with
-// direct wide loads; PIPELINE_STAGES >= 1 prefetches them that many edges ahead
-// with cp.async into a per-warp shared ring buffer (L and R rows in the same
-// stage). Defaults (stages 0, one edge per warp, one warp per block) reproduce
-// the original one-edge-per-block layout exactly.
-//
-// canonical_edge_idx (nullable, [E]): canonical edge id of each traversal slot,
-// applied to the Edge operand rows AND the output row, so the list may be grouped
-// by source for locality while the output stays numbered by forward-CSR position.
-// nullptr: the traversal order is already the canonical one (slot index == id).
-// REMAP_IDS is the compile-time shadow of that nullness, set by the dispatcher:
-// the no-remap instantiation compiles the remap away entirely, and the remap
-// one is a plain load with no flag branch left in the body.
-//
-// index_t is the graph's own (unsigned) index width -- the same type that bounds
-// the CSR -- and it types the edge list, the canonical ids, E, and every id the
-// kernel derives from them. A 32-bit graph therefore reads 8 bytes per pair
-// instead of 16, 4 bytes per canonical id instead of 8, and broadcasts each id
-// with ONE shuffle instead of two. Only byte offsets are widened to size_t:
-// node_id * D_CONST overflows 32 bits long before a node id does.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false>
-__global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block ( // no-format
-    index_t E,
-    cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
-    index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
-    index_t const *__restrict__ canonical_edge_idx,
-    uint32_t edges_per_warp
-);
-
 // =============================================================================
-// GSDDMM backward
+// Backward
 // =============================================================================
 //
 // With O[e] = op(L[sel(ll)], R[sel(rr)]) and dO given, the per-edge partials are
@@ -176,21 +104,22 @@ __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDM
 //     copy:  dL = dO             (R is never read)
 //     dot:   dL = dO[e] * R,     dR = dO[e] * L        (dO is one scalar per edge)
 //
-// Each partial then lands on the row its operand was read from, which is what
-// makes the backward a *reduction* rather than a map:
+// Each partial then lands on the row its operand was read from, which is what makes the backward a
+// *reduction* rather than a map:
 //
 //   - an Edge operand owns one row per edge, so its gradient is a plain store;
-//   - a Src_V operand's gradient sums over the node's OUTGOING edges, i.e. the
-//     rows of the backward (source-grouped) CSR;
-//   - a Dst_V operand's gradient sums over its INCOMING edges, i.e. the rows of
-//     the forward CSR.
+//   - a Src_V operand's gradient sums over the node's OUTGOING edges, i.e. the rows of the backward
+//     (source-grouped) CSR;
+//   - a Dst_V operand's gradient sums over its INCOMING edges, i.e. the rows of the forward CSR.
 //
-// GSDDMM_REDUCE names which of those two node reductions a launch performs. Every
-// instantiated member pair holds at most one Src_V and one Dst_V operand, so the
-// passes a call needs follow from (ll, rr) alone and never write the same buffer:
-// (Src_V, Dst_V) runs both passes, a pair with an Edge operand runs the single
-// pass for its node operand and writes the edge gradient on the way through, and
-// Copy runs the one pass for its lhs.
+// GSDDMM_REDUCE names which of those two node reductions a launch performs. Every instantiated
+// member pair holds at most one Src_V and one Dst_V operand, so the passes a call needs follow from
+// (ll, rr) alone and never write the same buffer: (Src_V, Dst_V) runs both passes, a pair with an
+// Edge operand runs the single pass for its node operand and writes the edge gradient on the way
+// through, and Copy runs the one pass for its lhs.
+//
+// Every partial is elementwise over the feature dim -- Dot's included, its dO being a scalar per
+// edge -- so a row of any length is reduced pass by pass with nothing to carry between passes.
 enum class GSDDMM_REDUCE : uint8_t {
     Dst,  // walk the forward CSR, reduce per destination node
     Src,  // walk the backward CSR, reduce per source node
@@ -203,8 +132,8 @@ struct GsddmmBackwardPlan {
 
     static constexpr GSDDMM_MEMBER SELF_MEMBER = (reduce == GSDDMM_REDUCE::Dst) ? GSDDMM_MEMBER::Dst_V : GSDDMM_MEMBER::Src_V;
 
-    // Which operand this pass reduces. Exactly one of the two can match, because
-    // the instantiated pairs never repeat a member.
+    // Which operand this pass reduces. Exactly one of the two can match, because the instantiated
+    // pairs never repeat a member.
     static constexpr bool SELF_IS_LHS = (ll == SELF_MEMBER);
     static constexpr bool SELF_IS_RHS = Fwd::USE_R && (rr == SELF_MEMBER);
     static constexpr bool HAS_SELF    = SELF_IS_LHS || SELF_IS_RHS;
@@ -215,137 +144,177 @@ struct GsddmmBackwardPlan {
     static constexpr GSDDMM_MEMBER OTHER = SELF_IS_LHS ? rr : ll;
     static constexpr bool OTHER_IS_EDGE  = HAS_OTHER && (OTHER == GSDDMM_MEMBER::Edge);
 
-    // Mul/Div/Dot multiply by the other operand's row; Add/Sub/Copy have constant
-    // partials, so those passes are pure reductions of dO and read no operands.
+    // Mul/Div/Dot multiply by the other operand's row; Add/Sub/Copy have constant partials, so those
+    // passes are pure reductions of dO and read no operands.
     static constexpr bool NEEDS_OTHER_ROW = HAS_OTHER && (op == GSDDMM_OP::Mul || op == GSDDMM_OP::Div || op == GSDDMM_OP::Dot);
 
-    // Div's denominator gradient is -dO * L / R^2. R is this pass's own row, so
-    // the -1/R^2 factor is constant across the sum and is applied once at the
-    // end instead of per edge -- the own row is read once per node, never per edge.
+    // Div's denominator gradient is -dO * L / R^2. R is this pass's own row, so the -1/R^2 factor is
+    // constant across the sum: the node-parallel kernel applies it once at the end, the edge-parallel
+    // one once per edge from the run's cached row -- the own row is read once per node or run, never
+    // per edge.
     static constexpr bool NEEDS_SELF_ROW = (op == GSDDMM_OP::Div) && SELF_IS_RHS;
     // Negated partials: sub's rhs, and div's rhs (through the factor above).
     static constexpr bool NEGATE_SELF = SELF_IS_RHS && (op == GSDDMM_OP::Sub || op == GSDDMM_OP::Div);
 
-    // The edge operand's gradient is a plain per-edge store, written by this pass
-    // (the only one that runs when a pair has an Edge operand).
+    // The edge operand's gradient is a plain per-edge store, written by this pass (the only one that
+    // runs when a pair has an Edge operand).
     static constexpr bool WRITE_EDGE_GRAD = OTHER_IS_EDGE;
-    // ... and for Div it needs the edge row itself (dR = -dO * L / R^2 with R
-    // edge-indexed), so that row is read per edge even when SELF does not need it.
+    // ... and for Div it needs the edge row itself (dR = -dO * L / R^2 with R edge-indexed), so that
+    // row is read per edge even when SELF does not need it.
     static constexpr bool NEEDS_OTHER_ROW_FOR_EDGE_GRAD = WRITE_EDGE_GRAD && (op == GSDDMM_OP::Div) && (OTHER == rr);
 
     static constexpr bool READS_OTHER = NEEDS_OTHER_ROW || NEEDS_OTHER_ROW_FOR_EDGE_GRAD;
     static constexpr bool IS_DOT      = Fwd::IS_DOT;
 
-    // The reduced operand's own row is needed by Div's -1/self^2 factor and by
-    // the edge operand's gradient (where the node row is its "other" operand).
-    static constexpr bool KEEP_SELF_ROW = NEEDS_SELF_ROW || (WRITE_EDGE_GRAD && (op == GSDDMM_OP::Mul || op == GSDDMM_OP::Div || op == GSDDMM_OP::Dot));
-
-    // Rows the edge-parallel backward gathers PER EDGE, and so the width of its
-    // cp.async ring: the edge's dO row -- Dot's dO is one scalar per edge, not a
-    // row -- plus the other operand's row when the partial reads it. The reduced
-    // node's own row is deliberately NOT here: it is constant over a run of
-    // edges sharing that node, so it is read once per run into registers
-    // (KEEP_SELF_ROW) instead of being prefetched per edge.
-    // Zero only for a pass this pair does not have (HAS_SELF false), which the
-    // dispatch never launches; the kernel asserts it is nonzero for the ones it
-    // does. The assert cannot live here: the dispatch forms this Plan for every
-    // (pair, direction) combination and only then drops the ones without a SELF.
-    static constexpr size_t NUM_EDGE_ROWS = (IS_DOT ? 0 : 1) + (READS_OTHER ? 1 : 0);
-
-    // Slot of each per-edge row inside the rows[] array (-1: not gathered).
-    static constexpr int DO_SLOT    = IS_DOT ? -1 : 0;
-    static constexpr int OTHER_SLOT = READS_OTHER ? (IS_DOT ? 0 : 1) : -1;
+    // The reduced operand's own row is needed by Div's -1/self^2 factor and by the edge operand's
+    // gradient (where the node row is its "other" operand).
+    static constexpr bool KEEP_SELF_ROW =
+        NEEDS_SELF_ROW || (WRITE_EDGE_GRAD && (op == GSDDMM_OP::Mul || op == GSDDMM_OP::Div || op == GSDDMM_OP::Dot));
 };
 
-// Dynamic shared memory for one GSDDMM_backward_normal launch: one fp32 feature
-// row per warp, holding that warp's partial sum so warp 0 can reduce them (the
-// same layout the GT backward uses). A single warp per block needs none.
-template <size_t N_PER_BLOCK, size_t D_CONST, FloatingNum accum_t = float>
-inline consteval size_t gsddmm_backward_shmem_bytes() {
-    return N_PER_BLOCK > 1 ? N_PER_BLOCK * D_CONST * sizeof(accum_t) : 0;
+// =============================================================================
+// Row shapes
+//
+// A shape code as in common/row_shape.cuh: 1000 * WIDE + 10 * G + S. The shapes compiled are
+//
+//   G = 4, 8, 16, 32 with one vector a lane  rows of up to G vectors, one group per edge;
+//   G = 32 with two vectors a lane           rows of more than 32 vectors, in passes of 64.
+//
+// G = 4 is the smallest group, as for the attention kernels: below it the per-edge address math and
+// id shuffles, not idle lanes, bound a row of a few elements. Whole warps sweep long rows rather
+// than take a group per edge, since a row of more than 32 vectors fills a warp on its own.
+// =============================================================================
+
+inline int plan_shape(int64_t D, size_t elem_size, bool wide) {
+    const int64_t nvec = D / (wide ? static_cast<int64_t>(16 / elem_size) : 1);
+    for (size_t g : {size_t{4}, size_t{8}, size_t{16}, kWarpSize}) {
+        if (nvec <= static_cast<int64_t>(g)) {
+            return turbo_gnn::rows::shape_code(wide, g, 1);
+        }
+    }
+    return turbo_gnn::rows::shape_code(wide, kWarpSize, 2);
 }
 
-// Dynamic shared memory of GSDDMM_backward_edge_block per WARP. Two buffers,
-// laid out back to back inside each warp's slice (so a warp finds both from
-// warp_id alone, without needing blockDim.y):
-//
-//   [0, D_CONST * sizeof(accum_t))   flush scratch: one accum_t feature row,
-//       the staging buffer that turns the atomic flush from 32 sectors per
-//       request into 4 (see the kernel).
-//   [.., + ring)                     the cp.async ring for the per-edge rows,
-//       empty when PIPELINE_STAGES == 0.
-//
-// The flush row comes first and is a multiple of 16 bytes (D_CONST >= 32,
-// sizeof(accum_t) >= 4), so the ring stays 16-byte aligned for cp.async and the
-// per-warp stride does too.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
-inline consteval size_t gsddmm_backward_edge_shmem_bytes_per_warp() {
-    using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
-    return D_CONST * sizeof(accum_t) + gsddmm_pipe::pipelined_ring_elems(PIPELINE_STAGES, Plan::NUM_EDGE_ROWS, D_CONST) * sizeof(cuda_t);
+inline auto make_shape_variant(int code) { return MakeIntVariant<1041, 1081, 1161, 1321, 1322, 41, 81, 161, 321, 322>(code); }
+
+// Vectors one pass of a shape covers; the S = 2 whole-warp shape is the only one that may take
+// several passes.
+template <int SHAPE>
+inline constexpr uint32_t kPassVecs = static_cast<uint32_t>(Shape<SHAPE>::G * Shape<SHAPE>::S);
+
+template <int SHAPE>
+inline constexpr bool kMultiPass = Shape<SHAPE>::G == kWarpSize && Shape<SHAPE>::S == 2;
+
+template <int SHAPE>
+inline uint32_t row_passes(uint32_t nvec) {
+    return ceil_div(nvec, kPassVecs<SHAPE>);
 }
 
-// Node-parallel backward: one thread block per (bucketed) node of the CSR that
-// `reduce` selects, warps striding over that node's edges. The node's gradient is
-// accumulated in fp32 registers and written once, so this variant needs NO
-// atomics and no zeroed output -- it is the accurate, load-imbalanced choice.
-//
-// row_ptr/col_idx are the CSR for the pass direction: the forward CSR for
-// GSDDMM_REDUCE::Dst, the backward (source-grouped) CSR for ::Src. In the latter
-// case the slot walked is a CSC position, so canonical_edge_idx (required there,
-// unless the graph aliases its two CSRs) maps it to the forward-CSR edge id that
-// numbers dO and the Edge operand.
-//
-// d_self is the reduced node gradient, [N, D]. d_edge is the edge operand's
-// gradient, [E, D], written only when the pair has an Edge operand; pass nullptr
-// otherwise.
-//
-// Unlike the forward there is no heavy-node chunking here: splitting a node over
-// several blocks would make them all write its row, which is exactly what this
-// variant exists to avoid. Use the edge-parallel backward when the degree
-// distribution makes one-block-per-node the bottleneck.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
-__global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_backward_normal ( // no-format
-    size_t N,
-    cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
-    cuda_t *__restrict__ d_self, cuda_t *__restrict__ d_edge,
-    index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
-    index_t const *__restrict__ node_indices,
-    index_t const *__restrict__ canonical_edge_idx
-);
+// Edge-block kernel launch limits (validated by the binding, baked into __launch_bounds__).
+inline constexpr size_t kGsddmmEdgeMaxWarpsPerBlock = 8;
+inline constexpr size_t kGsddmmEdgeMaxEdgesPerWarp  = kWarpSize;  // lane k caches edge k's (src, dst) pair
 
-// Edge-parallel backward: one warp per contiguous chunk of the explicit edge
-// list, mirroring GSDDMM_forward_edge_block. Perfectly load balanced, at the cost
-// of accumulating the node gradient with atomics -- into an fp32 buffer
-// (d_self_f32, zero-initialized by the caller, cast back on the host), because
-// fp16/bf16 atomics would both contend and lose the reduction's precision.
-//
-// The edge list is grouped by the node being reduced, so a warp's chunk is a
-// short sequence of RUNS of edges sharing a target row -- usually exactly one.
-// The warp walks the chunk in runs, sums each run in fp32 registers, and issues
-// its atomics once per run instead of once per edge. A run's target node being
-// fixed also means that node's own row -- which Div's -1/self^2 factor and the
-// edge operand's gradient both need -- is read once per run into registers
-// rather than once or twice per edge.
-//
-// The atomics go through a per-warp shared staging row so that each one is a
-// 128-byte, 4-sector request: the accumulator is blocked by lane, which is what
-// makes the operand loads 16-byte wide and is simultaneously the worst possible
-// shape for a scalar atomic (32 sectors per request, 4 bytes used of each). See
-// the kernel body.
-//
-// PIPELINE_STAGES prefetches the per-edge rows (the dO row and the other
-// operand's) that many edges ahead with cp.async, exactly as the forward edge
-// kernel does; 0 takes the direct-load path. index_t types the edge list and
-// every id, as in the forward. REMAP_IDS is the compile-time shadow of
-// canonical_edge_idx != nullptr, exactly as in the forward edge kernel.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false>
-__global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block ( // no-format
-    index_t E,
-    cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
-    accum_t *__restrict__ d_self_f32, cuda_t *__restrict__ d_edge,
-    index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
-    index_t const *__restrict__ canonical_edge_idx,
-    uint32_t edges_per_warp
-);
+// Edges a warp of the edge kernels walks for a requested edges_per_warp. The parameter counts the
+// edges each lane GROUP walks: a warp of 32 / G groups takes edges_per_warp * 32 / G of them, at
+// most kGsddmmEdgeMaxEdgesPerWarp, so a short row that puts several groups in a warp does not leave
+// all but edges_per_warp of them idle. For whole-warp rows (G = 32) it is the warp's count.
+template <int SHAPE>
+inline uint32_t edge_chunk(uint32_t edges_per_warp) {
+    const uint32_t groups = static_cast<uint32_t>(kWarpSize / Shape<SHAPE>::G);
+    const uint32_t chunk  = edges_per_warp * groups;
+    return chunk < kGsddmmEdgeMaxEdgesPerWarp ? chunk : static_cast<uint32_t>(kGsddmmEdgeMaxEdgesPerWarp);
+}
+
+// =============================================================================
+// Kernel parameters
+// =============================================================================
+
+// The two operands' rows: row k of L starts stride_l BYTES after row 0 (any value, including 0 for an
+// expanded operand), features contiguous. Strides are in bytes so that a row address is one 32x32-bit
+// wide multiply-add onto a byte pointer; in elements, ptxas re-associates the scaling into four
+// instructions per row. row_bytes = D * sizeof(cuda_t), the stride of the [E, D] outputs and dO.
+// nvec = D / VEC vectors per row; passes = row_passes<SHAPE>(nvec).
+template <FloatingNum cuda_t>
+struct Operands {
+    cuda_t const *L;
+    cuda_t const *R;
+    uint32_t stride_l;
+    uint32_t stride_r;
+    uint32_t D;
+    uint32_t row_bytes;
+    uint32_t nvec;
+    uint32_t passes;
+};
+
+template <FloatingNum cuda_t, IntegralNum index_t>
+struct NodeForwardParams {
+    Operands<cuda_t> x;
+    cuda_t *O;  // [E, D] contiguous, or [E] for Dot
+    index_t const *row_ptr;
+    index_t const *col_idx;
+    index_t const *node_indices;  // node_i = node_indices[blockIdx.x]
+    index_t const *block_part;    // nullptr, or the chunk of block blockIdx.x within its node's edge list
+    uint32_t edges_per_block;     // chunk width when block_part != nullptr
+    int64_t N;
+};
+
+// The edge kernels read an explicit [E, 2] list of (src, dst) node-id pairs, reinterpreted as
+// index_pair_t<index_t>, and carry every id in index_t's unsigned form. canonical (nullable, [E])
+// is the canonical edge id of each traversal slot, applied to the Edge operand rows and the output
+// row, so the list may be grouped by source for locality while the output stays numbered by
+// forward-CSR position. REMAP_IDS is the compile-time shadow of its nullness.
+template <FloatingNum cuda_t, IntegralNum index_t>
+struct EdgeForwardParams {
+    Operands<cuda_t> x;
+    cuda_t *O;
+    index_pair_t<index_t> const *pairs;
+    index_t const *canonical;
+    std::make_unsigned_t<index_t> E;
+    uint32_t chunk;  // edges per warp, edge_chunk<SHAPE>(edges_per_warp)
+};
+
+// dO is [E, D] contiguous ([E] for Dot); d_self the reduced node gradient, [N, D] contiguous;
+// d_edge the edge operand's gradient, [E, D] contiguous, written only when the pair has an Edge
+// operand (nullptr otherwise).
+template <FloatingNum cuda_t, IntegralNum index_t>
+struct NodeBackwardParams {
+    Operands<cuda_t> x;
+    cuda_t const *dO;
+    cuda_t *d_self;
+    cuda_t *d_edge;
+    index_t const *row_ptr;  // the forward CSR for GSDDMM_REDUCE::Dst, the backward one for ::Src
+    index_t const *col_idx;
+    index_t const *node_indices;
+    index_t const *canonical;  // ::Src: maps a backward-CSR slot to its forward-CSR edge id
+    int64_t N;
+};
+
+template <FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t>
+struct EdgeBackwardParams {
+    Operands<cuda_t> x;
+    cuda_t const *dO;
+    accum_t *d_self;  // fp32 accumulation buffer, zeroed by the caller
+    cuda_t *d_edge;
+    index_pair_t<index_t> const *pairs;  // grouped by the node this pass reduces
+    index_t const *canonical;
+    std::make_unsigned_t<index_t> E;
+    uint32_t chunk;
+};
+
+// Shared memory of one backward_node block: the deterministic cross-warp merge (block_merge in
+// gsddmm.cu, sized as team_sum's rounds).
+template <size_t W, int SHAPE, FloatingNum cuda_t, FloatingNum accum_t = float>
+inline constexpr size_t backward_node_smem_bytes() {
+    constexpr size_t G    = Shape<SHAPE>::G;
+    constexpr size_t accs = Shape<SHAPE>::S * Shape<SHAPE>::template vec<cuda_t>;
+    return kTeamSumBufferElems<W, G, accs, accum_t> * sizeof(accum_t);
+}
+
+// Shared memory of one backward_edge warp: the staging row through which a run's sum is flushed,
+// one pass of accum_t elements.
+template <int SHAPE, FloatingNum cuda_t, FloatingNum accum_t = float>
+inline constexpr size_t backward_edge_smem_bytes_per_warp() {
+    return kPassVecs<SHAPE> * Shape<SHAPE>::template vec<cuda_t> * sizeof(accum_t);
+}
 
 };  // namespace gsddmm

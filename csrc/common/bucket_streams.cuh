@@ -41,9 +41,7 @@ enum class BucketLaunch : int {
 inline constexpr int kNumBucketLaunchModes = 2;
 
 inline BucketLaunch bucket_launch_from_int(int value) {
-    TORCH_CHECK(
-        value >= 0 && value < kNumBucketLaunchModes, "bucket_launch must be 0 (sequential) or 1 (concurrent), got ", value
-    );
+    TORCH_CHECK(value >= 0 && value < kNumBucketLaunchModes, "bucket_launch must be 0 (sequential) or 1 (concurrent), got ", value);
     return static_cast<BucketLaunch>(value);
 }
 
@@ -52,9 +50,8 @@ inline BucketLaunch bucket_launch_from_int(int value) {
 /// Joining happens in the destructor as well as in `join()`, so an early return or a thrown
 /// check cannot leave the caller's stream running ahead of work still queued on the side one.
 class BucketStreams {
-  public:
-    BucketStreams(BucketLaunch mode, at::Device device)
-        : mode_(mode), main_(at::cuda::getCurrentCUDAStream(device.index())), side_(main_) {
+   public:
+    BucketStreams(BucketLaunch mode, at::Device device) : mode_(mode), main_(at::cuda::getCurrentCUDAStream(device.index())), side_(main_) {
         if (mode_ != BucketLaunch::Concurrent) {
             return;
         }
@@ -65,8 +62,8 @@ class BucketStreams {
         forked_ = true;
     }
 
-    BucketStreams(BucketStreams const &)            = delete;
-    BucketStreams &operator=(BucketStreams const &) = delete;
+    BucketStreams(BucketStreams const&)            = delete;
+    BucketStreams& operator=(BucketStreams const&) = delete;
 
     ~BucketStreams() { join(); }
 
@@ -91,7 +88,7 @@ class BucketStreams {
     /// Required for every tensor that was allocated on the caller's stream and is touched by
     /// the light kernel: without it the caching allocator may reuse that block as soon as the
     /// caller's stream is done with it, while the side stream is still reading.
-    void record(at::Tensor const &t) const {
+    void record(at::Tensor const& t) const {
         if (!forked_ || !t.defined() || !t.is_cuda()) {
             return;
         }
@@ -99,7 +96,7 @@ class BucketStreams {
     }
 
     template <typename... Tensors>
-    void record_all(Tensors const &...tensors) const {
+    void record_all(Tensors const&...tensors) const {
         (record(tensors), ...);
     }
 
@@ -114,7 +111,7 @@ class BucketStreams {
         forked_ = false;
     }
 
-  private:
+   private:
     BucketLaunch mode_;
     at::cuda::CUDAStream main_;
     at::cuda::CUDAStream side_;
@@ -126,7 +123,7 @@ class BucketStreams {
 /// Each callable receives the stream its bucket should launch on. Keeping the call here rather
 /// than at every site means the ordering rule and the join live in exactly one place.
 template <typename LightFn, typename HeavyFn>
-inline void run_buckets(BucketStreams &b, LightFn &&light, HeavyFn &&heavy) {
+inline void run_buckets(BucketStreams& b, LightFn&& light, HeavyFn&& heavy) {
     if (b.heavy_first()) {
         heavy(b.heavy());
         light(b.light());

@@ -24,6 +24,7 @@ from src.data.converters import (
 )
 
 from .graphland_datasets import GraphLandDataset
+from .heterophilous_datasets import load_heterophilous_graph
 
 GraphBackendOption = Literal[
     "pyg",
@@ -900,6 +901,41 @@ def load_dgl_single_graph(
     )
 
 
+# --------------------------- Heterophilous loaders --------------------------- #
+
+
+def load_heterophilous(
+    name: str,
+    graph_backend: GraphBackendOption,
+    root: str = "data",
+    kernel_related_kwargs: dict[str, Any] = {},
+) -> GraphSample:
+    """Load a heterophilous graph (e.g. 'amazon-ratings') from the authors' npz release, without PyG.
+
+    Uses the first of the release's fixed train/val/test splits, as the PyG loader does.
+
+    Args:
+        name (str): Dataset name (see ``heterophilous_datasets.FILES``).
+        graph_backend (GraphBackendOption): format for storing graph and its weights for different graph convolutions.
+        root (str): Download/cache directory.
+
+    Returns:
+        GraphSample: Canonical sample (x, y, edge_index, masks).
+    """
+    graph = ensure_cpu_device(load_heterophilous_graph)(root=root, name=name)
+    return GraphSample(
+        x=graph["x"],
+        y=graph["y"],
+        edge_index=graph["edge_index"],
+        edge_weight=None,
+        train_mask=graph["train_mask"],
+        val_mask=graph["val_mask"],
+        test_mask=graph["test_mask"],
+        backend=graph_backend,
+        kernel_related_kwargs=kernel_related_kwargs,
+    )
+
+
 # ------------------------------ Public factories ----------------------------- #
 
 
@@ -908,7 +944,7 @@ class DatasetConfig:
     """Configuration for selecting and loading a single-graph dataset.
 
     Attributes:
-        source (str): 'ogbn' | 'pyg' | 'dgl' | 'auto'
+        source (str): 'ogbn' | 'pyg' | 'dgl' | 'heterophilous' | 'auto'
         name (str): Dataset name (e.g., 'ogbn-arxiv', 'Cora', 'reddit').
         conv_backend (str): Conv backend type.
         root (str): Download/cache directory.
@@ -954,6 +990,10 @@ def load_single_graph(cfg: DatasetConfig) -> GraphSample:
         )
     if s == "dgl":
         return load_dgl_single_graph(
+            cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
+        )
+    if s == "heterophilous":
+        return load_heterophilous(
             cfg.name, root=cfg.root, graph_backend=graph_backend, kernel_related_kwargs=kernel_related_kwargs
         )
     if s == "auto":

@@ -96,13 +96,13 @@ graph = AdjacencyForwardBackwardWithNodeBuckets.from_csr(
 # From DGL graph
 graph = AdjacencyForwardBackwardWithNodeBuckets.from_dgl(dgl_graph).to("cuda")
 
-# For cuSPARSE ops (require int32 indices)
+# 32-bit indices (see below); cuSPARSE also takes int64, uint32 and uint64
 graph_i32 = AdjacencyForwardBackwardWithNodeBuckets.from_edge_list(
     edge_index, num_nodes=N, index_dtype=torch.int32
 ).to("cuda")
 ```
 
-`index_dtype` is not only a cuSPARSE constraint: the edge-parallel `gsddmm` kernels are
+`index_dtype` matters for speed: the edge-parallel `gsddmm` kernels are
 templated on it and derive their `(src, dst)` pair type from it, so a 32-bit graph moves
 8 bytes per edge of index traffic instead of 16 (and 4 instead of 8 for the canonical-id
 permutation), and broadcasts each id with one warp shuffle instead of two. Prefer
@@ -111,9 +111,9 @@ permutation), and broadcasts each id with one warp shuffle instead of two. Prefe
 ### Kernel calls
 
 ```python
-from turbo_gnn import reduction_aggr, gatv2_aggr, graph_transformer_aggr, spmm_aggr
+from turbo_gnn import reduction_aggr, gatv2_aggr, graph_transformer_aggr, spmm_aggr, gspmm
 
-# Reduction (min/max) aggregation
+# Reduction (min/max/sum) aggregation, any feature dim F
 out = reduction_aggr(graph, X, reduce="min")       # [N, F]
 
 # GATv2 attention aggregation
@@ -124,17 +124,36 @@ out = gatv2_aggr(graph, x, x_neighbors=x_nb,
 out = graph_transformer_aggr(graph, x, Q=Q, K=K, V=V,
                               scale=1.0/D**0.5)    # [N, H, D]
 
-# cuSPARSE SpMM (fp32 only, requires int32 indices)
+# cuSPARSE SpMM, any feature dim; float32, float16 or bfloat16
 out = spmm_aggr(x, graph_i32.forward_indptr, graph_i32.forward_indices,
                 norm_type="none", cu_sparse_algorithm_id=-1, block_dim=256)
+
+# Generalized SpMM (the dgl.ops.gspmm family), any feature dim
+out = gspmm(graph, x, e, op="mul", reduce="sum")   # e: [E, F], or [E] / [E, 1] to broadcast
 ```
+
+`gspmm` takes any feature dim and every op x reducer, with int32, int64, uint32 or uint64
+indices and node operands of any row stride. A row is laid across a group of 1-32 lanes or, past 32
+vectors, a warp in passes, in 16-byte vectors when every row the walk reads is 16-byte aligned and
+a whole number of them -- element by element otherwise (e.g. an odd dim, or 100 in fp16). Rows of
+more edges than a slice (16-128, growing with the graph's edges per resident warp) are cut into
+slices whose results are merged in a fixed order, so sums and their gradients are deterministic.
+
+`spmm_aggr` / `csr_SPMM_normalized` cache the normalized edge values and the cuSPARSE descriptor per
+graph tensors (held weakly; modifying them in place or freeing them invalidates the entry; tensors
+created in inference mode are not cached). Calls with edge weights normalize them on every call.
+Products with A^T (the backward) use an explicit transposed CSR for 16-bit values, which cuSPARSE
+requires, and for cached fp32 products of 32 or more columns, where it measured 1.3-3.1x faster.
 
 ### GSDDMM: per-edge binary ops
 
 `gsddmm` applies a binary op per edge, taking each operand's row from the source node
-(`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). D must be one of
-32, 64, 128, 256; dtypes are fp32/fp16/bf16. Differentiable in both operands — the
-backward's two kernels are picked by `backward_variant` (see below).
+(`"src"`), the destination node (`"dst"`) or the edge itself (`"edge"`). Any feature dim D
+from 1 to 65536 is supported, in fp32/fp16/bf16, with any row stride (column slices and
+expanded rows are read in place); index dtypes int32/int64/uint32/uint64. Rows that are not
+whole 16-byte vectors on 16-byte boundaries (an odd D, D = 100 in fp16, an offset view) are
+read element by element, which is slower. Differentiable in both operands — the backward's
+two kernels are picked by `backward_variant` (see below).
 
 ```python
 from turbo_gnn import gsddmm, u_add_v, copy_u
@@ -194,10 +213,14 @@ out.backward(grad)
   target row — usually exactly one — and the warp sums each run in registers, so it issues
   one set of atomics per run rather than per edge, and reads the reduced node's own row
   once per run rather than once or twice per edge. The atomics are staged through shared
-  memory so each is one contiguous 128-byte request instead of 32 scattered sectors. Its
-  result is deterministic only up to fp32 atomic ordering.
-  `pipeline_stages` applies here too: it prefetches each edge's `d_out` and other-operand
-  rows that many edges ahead with `cp.async`, as the forward edge kernel does.
+  memory so each is one contiguous request instead of scattered sectors. Its result is
+  deterministic only up to fp32 atomic ordering. On an undirected graph the source-side
+  pass walks a source-grouped list too (the shared CSR read with its rows as sources), so
+  its runs are as long as the destination side's.
+
+`pipeline_stages` is accepted by both kernels for compatibility but has no effect: the
+former fixed-D kernels' `cp.async` ring won at most 4–9% in a few cells and lost up to 2x in
+most, and the kernels now hold each lane's row addresses in registers instead.
 
 `add`, `sub` and `copy` have constant partials, so their backward saves **no** feature
 tensors — the difference between keeping one and two `[E, D]` activations alive per op.
@@ -460,8 +483,16 @@ Inputs are synthesized already-projected, in whatever shape the aggregation expe
 | `gt` | `(Q, K, V, graph)` | `feature_dim // heads` |
 
 `gat_v2` treating `--feature-dim` as the *per-head* width is the convention `create_aggr` already
-uses across all backends; it is not a typo. Note `gt` on the cuda backend only supports head dims of
-32, 64, 128 or 256.
+uses across all backends; it is not a typo. `gat_v2` and `gt` on the cuda backend take any head dim
+from 1 to 65536, and `min_aggr` / `max_aggr` (`reduction_aggr`) any feature dim. Rows that are not
+whole 16-byte vectors (e.g. an odd head dim, or 100 in fp16) are read element by element, measured at
+3-6x the time per element of vector rows on real graphs. `gat_v2` and `gt` therefore copy such inputs
+into rows zero-padded to the next 16 bytes when the call is large enough to repay the copies: rows over
+64 elements from 16 MiB gathered (edges x heads x head dim x element size), 2.97x faster on geomean
+over 176 measured cells; shorter rows from 256 MiB, 1.41x; rows under 16 bytes never. The copies cost
+memory for the call's lifetime.
+`min_aggr` / `max_aggr` do not: their backward is layout-independent, and cutting the forward's
+outputs back to width costs about what the vector rows save on sparse graphs.
 
 #### Measurement
 
@@ -499,7 +530,7 @@ The JSON says which mode ran, and populates only the matching pair:
 
 ```bash
 # under ncu: 1 + 5 + 20 = 26 launches, every time
-ncu --kernel-name regex:reduction_aggr_forward .venv/bin/python scripts/benchmark_kernels.py \
+ncu --kernel-name regex:reduction_forward_kernel .venv/bin/python scripts/benchmark_kernels.py \
     --backend cuda --conv min_aggr --launch-ncu-override-iters 20 --launch-ncu-override-warmup 5
 ```
 

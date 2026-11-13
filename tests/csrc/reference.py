@@ -249,24 +249,33 @@ def make_input(
 
     ``kind="random"`` gives well-conditioned values; ``kind="special"`` tiles the
     boundary pool; ``kind="extreme"`` mixes in inf/-inf/nan.
+
+    The values are drawn on the CPU, where the seeded generator lives -- the inputs stay
+    identical whatever device the test targets. Every tensor is pinned to ``cpu``
+    explicitly, so an ambient ``torch.set_default_device`` cannot move a draw away from
+    its generator. The finished tensor is narrowed on the host and moved to ``device``
+    in a single copy.
     """
-    gen = torch.Generator(device="cpu").manual_seed(seed)
+    host = torch.device("cpu")
+    gen = torch.Generator(device=host).manual_seed(seed)
     dt = TORCH_DTYPE[name]
 
     if kind == "random":
-        x = torch.rand((m, n), generator=gen, dtype=torch.float64) * 3.5 + 0.25
+        x = torch.rand((m, n), generator=gen, dtype=torch.float64, device=host) * 3.5 + 0.25
         if not positive:
-            sign = torch.randint(0, 2, (m, n), generator=gen, dtype=torch.float64) * 2 - 1
+            sign = torch.randint(0, 2, (m, n), generator=gen, dtype=torch.float64, device=host) * 2 - 1
             x = x * sign
     elif kind == "special":
-        pool = torch.tensor(_special_pool(name), dtype=torch.float64)
-        idx = torch.randint(0, pool.numel(), (m, n), generator=gen)
+        pool = torch.tensor(_special_pool(name), dtype=torch.float64, device=host)
+        idx = torch.randint(0, pool.numel(), (m, n), generator=gen, device=host)
         x = pool[idx]
         if positive:
             x = x.abs().clamp(min=torch.finfo(dt).smallest_normal)
     elif kind == "extreme":
-        pool = torch.tensor([*_special_pool(name), float("inf"), float("-inf"), float("nan")], dtype=torch.float64)
-        idx = torch.randint(0, pool.numel(), (m, n), generator=gen)
+        pool = torch.tensor(
+            [*_special_pool(name), float("inf"), float("-inf"), float("nan")], dtype=torch.float64, device=host
+        )
+        idx = torch.randint(0, pool.numel(), (m, n), generator=gen, device=host)
         x = pool[idx]
     else:
         raise ValueError(f"unknown kind {kind!r}")
@@ -284,7 +293,19 @@ def make_input(
         # elementwise mul_/prod tests.
         x = x.clamp(min=-max_abs, max=max_abs)
 
-    return x.to(dt).to(device)
+    # Host-to-device copies from pageable memory are staged by the driver before the call
+    # returns, so non_blocking is safe here and skips the stream sync of a blocking copy.
+    return x.to(dt).to(device, non_blocking=True)
+
+
+def _host_scalar(v: float) -> torch.Tensor:
+    """A 0-dim float64 tensor on the CPU, for rounding a Python scalar through a dtype.
+
+    Kept on the host on purpose: a 0-dim CPU tensor combines with CUDA tensors as a
+    plain kernel argument (no copy, no sync), whereas creating it on the device costs a
+    blocking host-to-device copy and every ``.item()`` on it a device-to-host sync.
+    """
+    return torch.tensor(v, dtype=torch.float64, device="cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +316,7 @@ def make_input(
 def ref_leaky_relu(a: torch.Tensor, ns: float, name: str) -> torch.Tensor:
     """max(a,0) + ns*min(a,0), with the header's rounding at each step."""
 
-    ns_r = rnd(torch.tensor(ns, dtype=torch.float64), name)
+    ns_r = rnd(_host_scalar(ns), name)
     hi = torch.clamp(a, min=0.0)
     lo = torch.clamp(a, max=0.0)
 
@@ -313,12 +334,12 @@ def ref_leaky_relu_backward(a: torch.Tensor, dy: torch.Tensor, ns: float, name: 
       as ``-0.0 >= 0`` and takes the pass-through branch -- while dy is not flushed,
       because passing it through involves no arithmetic.
     """
-    ns_r = rnd(torch.tensor(ns, dtype=torch.float64), name)
+    ns_r = rnd(_host_scalar(ns), name)
     if paths.ftz:
         a = flush_subnormals(a, name)
     if paths.packed:
         mask = (a > 0).double()
-        diff = rnd(rnd(torch.tensor(1.0, dtype=torch.float64), name) - ns_r, name)
+        diff = rnd(rnd(_host_scalar(1.0), name) - ns_r, name)
         factor = rnd(mask * diff + ns_r, name)  # packed_fma -> single rounding
         return rnd(dy * factor, name)
     return torch.where(a >= 0, dy, rnd(dy * ns_r, name))
@@ -329,7 +350,7 @@ def ref_elementwise(
 ) -> torch.Tensor:
     """fp64 reference for one elementwise op. Inputs are float64 views of the dtype."""
 
-    s_r = rnd(torch.tensor(s, dtype=torch.float64), name)
+    s_r = rnd(_host_scalar(s), name)
     if paths.ftz and op in FTZ_ARITH_OPS:
         a, b, c = (flush_subnormals(t, name) for t in (a, b, c))
         return flush_subnormals(_ref_elementwise_body(op, a, b, c, s, s_r, name, paths), name)
@@ -567,8 +588,8 @@ def ref_reduce(
         # -ftz flushes subnormal operands, for the comparisons in min/max just as much as
         # for the arithmetic in sum/prod/dot.
         a, b = flush_subnormals(a, name), flush_subnormals(b, name)
-    init = rnd(torch.tensor(acc_init, dtype=torch.float64), acc_name).item()
-    w_r = rnd(torch.tensor(w, dtype=torch.float64), acc_name)
+    init = rnd(_host_scalar(acc_init), acc_name).item()
+    w_r = rnd(_host_scalar(w), acc_name)
 
     if op in ("sum_acc", "sum_ret"):
         buf = emul_sum(a, paths, acc_name)
