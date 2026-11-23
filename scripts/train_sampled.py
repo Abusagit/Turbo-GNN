@@ -55,6 +55,13 @@ from src.sampling.neighbor_sampler import GPUNeighborSampler, seed_batches  # no
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 INDEX_DTYPES = {"int32": torch.int32, "int64": torch.int64}
+FULL_NEIGHBOR_HEAVY_THRESHOLD = 64  # heavy bucket for full-neighbor (-1) blocks, both directions
+# Full-neighbor runs use the sync-free sampler while its padded edge capacity per batch (summed
+# over layers) stays below this; past it, the padded sampling work (sort/searchsorted over
+# capacity, not real, edges) costs more than the exact sampler's host syncs. 10M: async wins
+# 1.9x on ogbn-arxiv (~1M padded edges), ties on twitch-views (~14M), loses 1.5x on
+# pokec-regions (~32M).
+FULL_NEIGHBOR_ASYNC_MAX_EDGES = 10_000_000
 
 
 # ------------------------------------------------------------------------- data
@@ -94,6 +101,8 @@ def load_data(dataset_yaml: str, device: torch.device, dtype: torch.dtype, task:
     """
     with open(dataset_yaml, encoding="utf-8") as f:
         ds = yaml.safe_load(f)["dataset"]
+    if ds["source"] == "csr_npy":
+        return load_csr_npy(ds, device, dtype)
     native = targets == "native"
     if task == "auto":
         task = dataset_task(ds)
@@ -116,6 +125,28 @@ def load_data(dataset_yaml: str, device: torch.device, dtype: torch.dtype, task:
     x = sample.x.to(device=device, dtype=dtype)
     splits = {k: getattr(sample, f"{k}_mask").to(device).nonzero().view(-1) for k in ("train", "val", "test")}
     return ds["name"], edge_index, x, Task(task, sample.y.to(device)), splits
+
+
+def load_csr_npy(ds: dict, device: torch.device, dtype: torch.dtype):
+    """A graph too large for the PyG/OGB loaders (ogbn-papers100M), preprocessed once into .npy files.
+
+    ``<root>/<dir>/`` holds the in-neighbor CSR with self-loops (indptr int64 [N+1], indices int32 [E],
+    row v lists the sources u of edges u -> v), node features (fp16 [N, F]), labels (int64 [N], -1 where
+    unlabeled) and split ids (int64). The edge list is returned as ``("csr", indptr, indices)`` instead
+    of an edge_index, so neither side has to materialize a [2, E] tensor.
+    """
+    import numpy as np
+
+    d = Path(os.environ.get("TURBO_GNN_DATA_ROOT") or ds.get("root", "data")) / ds["dir"]
+    t0 = time.perf_counter()
+    indptr = torch.from_numpy(np.load(d / "indptr.npy")).to(device)
+    indices = torch.from_numpy(np.load(d / "indices.npy")).to(device=device, dtype=torch.int64)
+    x = torch.from_numpy(np.load(d / "feat.npy")).to(device=device, dtype=dtype)
+    y = torch.from_numpy(np.load(d / "label.npy")).to(device)
+    y = torch.where(y < 0, torch.zeros_like(y), y)  # unlabeled nodes never enter a loss or a metric
+    splits = {k: torch.from_numpy(np.load(d / f"{k}_idx.npy")).to(device) for k in ("train", "val", "test")}
+    print(f"[{ds['name']}] loaded CSR ({indices.numel():,} edges) in {time.perf_counter() - t0:.0f}s", flush=True)
+    return ds["name"], ("csr", indptr, indices), x, Task("multiclass", y), splits
 
 
 class Task:
@@ -216,7 +247,7 @@ class OursBatchMaker:
         if self.backend == "cuda":
             from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
 
-            return G.from_block_csr(
+            g = G.from_block_csr(
                 b.indptr,
                 b.indices,
                 b.num_src,
@@ -225,6 +256,15 @@ class OursBatchMaker:
                 backward_heavy_threshold=self.args.bwd_heavy_threshold,
                 quantile=self.args.quantile,
             )
+            # Heavy edge-slice tables need a device->host read (the slice count). Build them
+            # here, in the producer thread, so the kernel launch finds them cached and the
+            # training thread never blocks on it.
+            kw = json.loads(self.args.kernel_kwargs)
+            for direction in ("forward", "backward"):
+                size = kw.get(f"{direction}_heavy_edge_slice", 0)
+                if size > 0:
+                    g.heavy_edge_slices(direction, size)
+            return g
         import dgl
 
         return dgl.create_block(
@@ -295,8 +335,10 @@ class AsyncBatchMaker:
         return {"x": x, "y": y, "graphs": graphs, "stats": stats, "_parts": fb.blocks}
 
 
-def ours_epoch(maker, idx, args, device, shuffle=True, prefetch=None):
+def ours_epoch(maker, idx, args, device, shuffle=True, prefetch=None, max_steps=0):
     seeds = seed_batches(idx, args.batch_size, shuffle=shuffle)
+    if max_steps > 0:
+        seeds = seeds[:max_steps]
     loader = PrefetchLoader(
         maker, seeds, prefetch=args.prefetch == "on" if prefetch is None else prefetch, depth=args.prefetch_depth, device=device
     )
@@ -315,9 +357,11 @@ def dgl_native_loader(graph, idx, args, device, shuffle=True):
     return dgl.dataloading.DataLoader(graph, idx, sampler, **kw)
 
 
-def dgl_native_epoch(loader):
+def dgl_native_epoch(loader, max_steps=0):
     it = iter(loader)
-    while True:
+    step = 0
+    while max_steps <= 0 or step < max_steps:
+        step += 1
         t0 = time.perf_counter()
         try:
             input_nodes, output_nodes, blocks = next(it)
@@ -333,6 +377,69 @@ def dgl_native_epoch(loader):
         yield batch, {"wait_host_ms": wait_ms}
 
 
+# ------------------------------------------------------------------------- profiling
+PROFILE_CATEGORIES = [
+    ("gSDDMM", r"(?i)sddmm"),
+    ("gSpMM", r"(?i)spmm|reduction_aggr"),
+    ("fused-GATv2", r"(?i)gatv2"),
+    ("GEMM", r"(?i)gemm|cutlass|xmma|cublas|sm\d\d_|ampere_|hopper_|nvjet"),
+    ("norm", r"(?i)layer_?norm"),
+    ("memcpy/memset", r"(?i)memcpy|memset"),
+    ("index/gather/scatter", r"(?i)index|gather|scatter|segment|embedding"),
+    ("sort/scan/unique", r"(?i)sort|scan|unique|radix|cub::"),
+    ("reduce", r"(?i)reduce"),
+    ("cast/copy", r"(?i)copy|cast|convert|to_copy"),
+]
+
+
+def profile_category(name: str) -> str:
+    import re
+
+    for cat, rx in PROFILE_CATEGORIES:
+        if re.search(rx, name):
+            return cat
+    return "elementwise/other"
+
+
+class StepProfiler:
+    """torch.profiler around the forward and the backward of a few training steps, kernel time per category."""
+
+    def __init__(self, n: int, start: int = 20):
+        self.n, self.start, self.seen, self.prof = n, start, 0, None
+        self.acc = {"fwd": {}, "bwd": {}}
+        self.kernels = {"fwd": {}, "bwd": {}}
+
+    def active(self) -> bool:
+        return self.start <= self.seen < self.start + self.n
+
+    def begin(self):
+        torch.cuda.synchronize()
+        self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+        self.prof.__enter__()
+
+    def end(self, phase: str):
+        torch.cuda.synchronize()
+        self.prof.__exit__(None, None, None)
+        for e in self.prof.key_averages():
+            t = getattr(e, "self_device_time_total", None)
+            if t is None:
+                t = getattr(e, "self_cuda_time_total", 0)
+            if not t or e.key.startswith("ProfilerStep"):
+                continue
+            dev = str(getattr(e, "device_type", ""))
+            if "CPU" in dev:
+                continue
+            cat = profile_category(e.key)
+            self.acc[phase][cat] = self.acc[phase].get(cat, 0.0) + t / 1e3
+            self.kernels[phase][e.key] = self.kernels[phase].get(e.key, 0.0) + t / 1e3
+
+    def result(self) -> dict:
+        per = lambda d: {k: round(v / self.n, 3) for k, v in sorted(d.items(), key=lambda kv: -kv[1])}  # noqa: E731
+        top = lambda d: dict(list(per(d).items())[:25])  # noqa: E731
+        return {"steps": self.n, "fwd_ms_by_category": per(self.acc["fwd"]), "bwd_ms_by_category": per(self.acc["bwd"]),
+                "fwd_top_kernels_ms": top(self.kernels["fwd"]), "bwd_top_kernels_ms": top(self.kernels["bwd"])}
+
+
 # ------------------------------------------------------------------------- loop
 def run_epoch(model, optimizer, scaler, batches, args, dtype, task: Task, train=True):
     compute = torch.cuda.current_stream()
@@ -340,14 +447,21 @@ def run_epoch(model, optimizer, scaler, batches, args, dtype, task: Task, train=
     steps = []
     outs, ys = [], []
     loss_sum = 0.0
+    prof = getattr(args, "_profiler", None) if train else None
     for batch, timing in batches:
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         t_host = time.perf_counter()
+        profiling = prof is not None and prof.active()
+        if profiling:
+            prof.begin()
         ev[0].record(compute)
         with torch.set_grad_enabled(train), autocast:
             logits = model(batch["x"], batch["graphs"])
             loss = task.loss(logits, batch["y"])
         ev[1].record(compute)
+        if profiling:
+            prof.end("fwd")
+            prof.begin()
         if train:
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
@@ -359,6 +473,10 @@ def run_epoch(model, optimizer, scaler, batches, args, dtype, task: Task, train=
                 loss.backward()
                 ev[2].record(compute)
                 optimizer.step()
+            if profiling:
+                prof.end("bwd")
+        if prof is not None:
+            prof.seen += 1
         else:
             ev[2].record(compute)
             outs.append(logits.float())
@@ -447,6 +565,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fanouts", default="15,10,5", help="outermost layer first; -1 = all neighbors")
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--max-steps", type=int, default=0,
+                   help="train only the first N batches of each epoch (0 = all); the record keeps the full "
+                   "epoch's step count and a projected epoch time (wall per step x steps)")
     p.add_argument("--warmup-epochs", type=int, default=1)
     p.add_argument("--dtype", choices=list(DTYPES), default="bf16")
     p.add_argument("--index-dtype", choices=list(INDEX_DTYPES), default="int32")
@@ -463,16 +584,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefix-grad", choices=PREFIX_GRAD_MODES, default="autograd")
     p.add_argument(
         "--sampler-impl",
-        choices=["async", "exact"],
-        default="async",
-        help="async: no host syncs while training (padded static shapes); exact: data-dependent sizes, syncs",
+        choices=["auto", "async", "exact"],
+        default="auto",
+        help="async: no host syncs while training (padded static shapes); exact: data-dependent sizes, syncs; "
+        "auto: async, except full-neighbor (-1) runs whose padded edge capacity exceeds "
+        "FULL_NEIGHBOR_ASYNC_MAX_EDGES",
     )
     p.add_argument("--sampler-graphs", choices=["on", "off"], default="on", help="capture the async sampler in CUDA graphs")
     p.add_argument("--prefetch", choices=["on", "off"], default="on")
     p.add_argument("--prefetch-depth", type=int, default=2)
     p.add_argument("--fwd-heavy-threshold", type=int, default=None, help="in-degree >= T is heavy (default: all light)")
     p.add_argument("--bwd-heavy-threshold", type=int, default=None, help="out-degree >= T is heavy (default: all light)")
+    p.add_argument("--fwd-order", choices=["natural", "degree"], default="natural",
+                   help="async sampler: order forward rows by sampled in-degree (desc) inside each bucket")
+    p.add_argument("--bwd-order", choices=["natural", "degree"], default="natural",
+                   help="async sampler: order backward (transposed) rows by sampled out-degree (desc) inside each bucket")
     p.add_argument("--quantile", type=float, default=None, help="full-graph bucketing rule instead of thresholds")
+    p.add_argument("--full-neighbor-buckets", choices=["on", "off"], default="on",
+                   help=f"fanouts with -1: default both heavy thresholds to {FULL_NEIGHBOR_HEAVY_THRESHOLD} (explicit thresholds win)")
+    p.add_argument("--profile-steps", type=int, default=0,
+                   help="profile fwd/bwd of N training steps (from step 20 of the first timed epoch) with torch.profiler")
     p.add_argument("--kernel-kwargs", default="{}", help="JSON forwarded to GATv2AggrKernel (warps, bucket launch, ...)")
     # dgl native
     p.add_argument("--dgl-sampling", choices=["gpu", "uva", "cpu"], default="gpu")
@@ -491,6 +622,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tag", default="")
     args = p.parse_args()
     args.fanout_list = [int(f) for f in args.fanouts.split(",")]
+    # Full-neighbor layers (-1): the sync-free sampler resolves -1 to the max in-degree (static
+    # edge bound = sum of the largest degrees); `--sampler-impl auto` (the default) keeps it while
+    # that padded bound is small, see FULL_NEIGHBOR_ASYNC_MAX_EDGES.
+    # Unlike fixed fanouts, full-neighbor blocks keep the graph's degree skew in BOTH
+    # directions, so degree bucketing is on by default (threshold 64 on both directions: 1.4-3.2x
+    # per epoch over no bucketing on ogbn-arxiv / twitch-views / pokec-regions).
+    # --full-neighbor-buckets off reproduces the unbucketed run.
+    args.full_neighbor = any(f < 0 for f in args.fanout_list)
+    if args.full_neighbor and args.sampler == "ours":
+        if args.full_neighbor_buckets == "on" and args.quantile is None:
+            if args.fwd_heavy_threshold is None:
+                args.fwd_heavy_threshold = FULL_NEIGHBOR_HEAVY_THRESHOLD
+            if args.bwd_heavy_threshold is None:
+                args.bwd_heavy_threshold = FULL_NEIGHBOR_HEAVY_THRESHOLD
     return args
 
 
@@ -515,10 +660,20 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler() if dtype == torch.float16 else None
 
+    csr = edge_index if isinstance(edge_index, tuple) else None  # ("csr", indptr, indices) from load_csr_npy
+    num_edges = int(csr[2].numel()) if csr else int(edge_index.shape[1])
     if args.sampler == "ours":
-        indptr, indices = in_csr(edge_index, num_nodes)
+        indptr, indices = (csr[1], csr[2]) if csr else in_csr(edge_index, num_nodes)
         sampler = GPUNeighborSampler(indptr, indices, args.fanout_list, index_dtype=INDEX_DTYPES[args.index_dtype])
         maker = OursBatchMaker(sampler, x, y, args.backend, args)
+        if args.sampler_impl == "auto":
+            args.sampler_impl = "async"
+            if args.full_neighbor:
+                cap = AsyncNeighborSampler(indptr, indices, args.fanout_list).padded_edge_capacity(args.batch_size)
+                args.padded_edge_capacity = cap
+                if cap > FULL_NEIGHBOR_ASYNC_MAX_EDGES:
+                    args.sampler_impl = "exact"
+                print(f"full-neighbor: padded edge capacity {cap:,} per batch -> {args.sampler_impl} sampler", flush=True)
         if args.sampler_impl == "async":
             assert args.quantile is None, "--quantile needs --sampler-impl exact (a quantile is a host-side value)"
             async_sampler = AsyncNeighborSampler(
@@ -528,6 +683,8 @@ def main() -> None:
                 index_dtype=INDEX_DTYPES[args.index_dtype],
                 fwd_heavy_threshold=args.fwd_heavy_threshold,
                 bwd_heavy_threshold=args.bwd_heavy_threshold,
+                fwd_order=args.fwd_order,
+                bwd_order=args.bwd_order,
             )
             if args.sampler_graphs == "on":
                 # stage 1 replayed from CUDA graphs: ~0.7 ms of CPU per batch instead of ~9 ms
@@ -535,17 +692,25 @@ def main() -> None:
             train_maker = AsyncBatchMaker(async_sampler, x, y, args.backend)
         else:
             train_maker = maker
-        train_batches = lambda: ours_epoch(train_maker, splits["train"], args, device)  # noqa: E731
+        train_batches = lambda: ours_epoch(train_maker, splits["train"], args, device, max_steps=args.max_steps)  # noqa: E731
         eval_batches = lambda split: ours_epoch(train_maker, splits[split], args, device, shuffle=False, prefetch=False)  # noqa: E731
     else:
         assert args.backend == "dgl", "--sampler dgl needs --backend dgl"
         import dgl
 
-        g = dgl.graph(
-            (edge_index[0].contiguous(), edge_index[1].contiguous()),
-            num_nodes=num_nodes,
-            idtype=INDEX_DTYPES[args.index_dtype],
-        )
+        if csr:  # in-neighbor CSR == the CSC of the graph; edge ids are implicit (empty eids)
+            idt = INDEX_DTYPES[args.index_dtype]
+            gdev = csr[1].device if args.dgl_sampling == "gpu" else torch.device("cpu")  # UVA/CPU: never build on the GPU
+            ip, ix = csr[1].to(gdev, idt), csr[2].to(gdev, idt)
+            g = dgl.graph(("csc", (ip, ix, torch.tensor([], dtype=idt, device=gdev))), num_nodes=num_nodes, idtype=idt)
+            del ip, ix
+            del csr, edge_index
+        else:
+            g = dgl.graph(
+                (edge_index[0].contiguous(), edge_index[1].contiguous()),
+                num_nodes=num_nodes,
+                idtype=INDEX_DTYPES[args.index_dtype],
+            )
         if args.dgl_sampling in ("uva", "cpu"):
             g = g.to("cpu")
             # contiguous: DGL pins in place (UVA) and shares with workers only contiguous storage
@@ -557,20 +722,27 @@ def main() -> None:
             g.ndata["feat"], g.ndata["label"] = x, y
             idx = splits
         train_loader = dgl_native_loader(g, idx["train"].to(g.idtype), args, device)
-        train_batches = lambda: dgl_native_epoch(train_loader)  # noqa: E731
+        train_batches = lambda: dgl_native_epoch(train_loader, args.max_steps)  # noqa: E731
         eval_batches = lambda split: dgl_native_epoch(  # noqa: E731
             dgl_native_loader(g, idx[split].to(g.idtype), args, device, shuffle=False)
         )
 
+    full_steps = -(-splits["train"].numel() // args.batch_size)
     epochs = []
     for epoch in range(args.warmup_epochs + args.epochs):
         model.train()
+        args._profiler = StepProfiler(args.profile_steps) if args.profile_steps and epoch == args.warmup_epochs else None
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         rows, loss, _ = run_epoch(model, optimizer, scaler, train_batches(), args, dtype, task, train=True)
         wall = time.perf_counter() - t0
         rec = {"epoch": epoch, "warmup": epoch < args.warmup_epochs, "wall_s": wall, "steps": len(rows), "loss": loss}
+        rec["full_epoch_steps"] = full_steps
+        rec["projected_epoch_s"] = wall / max(len(rows), 1) * full_steps
         rec.update(summarize(rows))
+        if args._profiler is not None:
+            rec["profile"] = args._profiler.result()
+            print(json.dumps(rec["profile"]["fwd_ms_by_category"]), json.dumps(rec["profile"]["bwd_ms_by_category"]), flush=True)
         epochs.append(rec)
         print(
             f"[{name} {args.backend}/{args.sampler}] epoch {epoch} wall {wall:.3f}s loss {loss:.4f} "
@@ -583,16 +755,18 @@ def main() -> None:
         "dataset": name,
         "task": task.kind,
         "metric": task.metric,
-        "args": {k: v for k, v in vars(args).items()},
+        "args": {k: v for k, v in vars(args).items() if not k.startswith("_")},
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(),
         "num_nodes": num_nodes,
-        "num_edges": int(edge_index.shape[1]),
+        "num_edges": num_edges,
         "epochs": epochs,
         "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30,
     }
     timed = [e["wall_s"] for e in epochs if not e["warmup"]]
     result["epoch_wall_s_median"] = statistics.median(timed) if timed else None
+    proj = [e["projected_epoch_s"] for e in epochs if not e["warmup"]]
+    result["projected_epoch_s_median"] = statistics.median(proj) if proj else None
     if args.eval != "none":
         model.eval()
         for split in ("val", "test") if args.eval == "end" else ("val",):

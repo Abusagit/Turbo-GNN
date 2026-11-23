@@ -21,7 +21,7 @@ ITERS="${ITERS:-30}"
 REPEATS="${REPEATS:-7}"
 GRAPHS="${GRAPHS:-random skewed ogbn-arxiv ogbn-products}"
 GRAPH_CACHE="${GRAPH_CACHE:-data/graph_cache}"
-RESULTS="$HERE/results"
+RESULTS="${RESULTS_DIR:-$HERE/results}"
 
 bwd_flag=""
 kinds="fwd"
@@ -129,5 +129,5 @@ for kind in $kinds; do
     "$PYTHON_PLOT" "$HERE/plot.py" "$RESULTS"/results_*_"$TAG".json --dim 64 --kind "$kind" \
         --title "g-SpMM: turbo_gnn против DGL по конфигурациям (d=64, $DTYPE, $label)" \
         --xlabel "Ускорение: dgl / turbo_gnn ($label, медиана из $REPEATS прогонов по $ITERS запусков)" \
-        -o "$RESULTS/speedup_d64_${TAG}_${kind}.png"
+        -o "$RESULTS/speedup_d64_${TAG}_${kind}.png" || echo "plot failed (non-fatal)"
 done

@@ -106,9 +106,21 @@ __device__ __forceinline__ index_t aggr_edge_data_pos(index_t eid, index_t const
     }
 }
 
-template <BinaryOp BOp, bool RHS_BROADCAST, size_t TW, FloatingNum cuda_t, typename index_t, FloatingNum accum_t>
+// Broadcast edge data with one column per head (DGL's per-head attention weight):
+// rhs is [E, cols] and feature f of the [N, cols * 2^shift] node row reads column
+// f >> shift.  A plain [E] broadcast is cols = 1 with shift = 31, which selects
+// column 0 for every feature the kernels can index.  Every feature tile the
+// kernels read (TW <= 8 elements, or one 32-wide warp step) is aligned inside one
+// head, because the per-head width 2^shift is a multiple of 32 whenever cols > 1.
+struct RhsGroup {
+    uint32_t cols  = 1;
+    uint32_t shift = 31;
+};
+
+template <BinaryOp BOp, bool RHS_BROADCAST, size_t TW, FloatingNum cuda_t, typename index_t, FloatingNum accum_t, bool RHS_GROUPED = false>
 __device__ __forceinline__ void aggr_edge_message(
-    cuda_t const *const __restrict__ uslice, cuda_t const *const __restrict__ rhs, index_t eid, size_t fv, size_t d, accum_t (&msg)[TW]
+    cuda_t const *const __restrict__ uslice, cuda_t const *const __restrict__ rhs, index_t eid, size_t fv, size_t d, accum_t (&msg)[TW],
+    RhsGroup grp = {}
 ) {
     using BOps = BinaryOps<BOp>;
     using Tile = TileOps<TW, cuda_t>;
@@ -117,7 +129,12 @@ __device__ __forceinline__ void aggr_edge_message(
     typename Tile::vec_t e_slice{};
     if constexpr (BOps::USE_RHS) {
         if constexpr (RHS_BROADCAST) {
-            e_scalar = static_cast<accum_t>(rhs[static_cast<size_t>(eid)]);
+            if constexpr (RHS_GROUPED) {
+                // Per-head scalar; fv is a tile index, the tile starts at feature fv * TW.
+                e_scalar = static_cast<accum_t>(rhs[static_cast<size_t>(eid) * grp.cols + ((fv * TW) >> grp.shift)]);
+            } else {
+                e_scalar = static_cast<accum_t>(rhs[static_cast<size_t>(eid)]);
+            }
         } else {
             e_slice = Tile::read(&rhs[static_cast<size_t>(eid) * d], fv);
         }
@@ -139,7 +156,8 @@ __device__ __forceinline__ void aggr_edge_message(
 // PIPELINE_STAGES>0 regresses this kernel, see pipelined_thread_edge_scan.
 template <
     size_t WARPS_PER_BLOCK, FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, int PIPELINE_STAGES = 0,
-    BinaryOp BOp = BinaryOp::COPY_U, bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false
+    BinaryOp BOp = BinaryOp::COPY_U, bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false,
+    bool RHS_GROUPED = false  // per-head broadcast edge operand (RhsGroup); false keeps the plain [E] broadcast code
 >
 __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_forward_light_kernel_1d(
     index_t const *const __restrict__ light_nodes_indices,
@@ -151,7 +169,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
     size_t d,
     size_t num_light,
     cuda_t const *const __restrict__ rhs      = nullptr,
-    index_t const *const __restrict__ edge_map = nullptr
+    index_t const *const __restrict__ edge_map = nullptr,
+    RhsGroup rhs_group                         = {}
 ) {
     using ROps     = ReductionOps<Op>;
     using BOps     = BinaryOps<BOp>;
@@ -206,7 +225,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
         auto visit = [&](index_t src, index_t eid, cuda_t const *uslice) {
             accum_t msg[TW];
             const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
-            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t>(uslice, rhs, e_pos, fv, d, msg);
+            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t, RHS_GROUPED>(uslice, rhs, e_pos, fv, d, msg, rhs_group);
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 const acc_t v_e    = static_cast<acc_t>(msg[e]);
@@ -272,7 +291,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK *kWarpSize) reduction_aggr_for
                     }
                     accum_t msg[1];
                     const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
-                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(&u_val, rhs, e_pos, f, d, msg);
+                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t, RHS_GROUPED>(&u_val, rhs, e_pos, f, d, msg, rhs_group);
                     bool upgrade_index = false;
                     best_val           = ROps::reduce(static_cast<acc_t>(msg[0]), best_val, upgrade_index);
                     if constexpr (ROps::TRACKS_ARG) {
@@ -505,7 +524,8 @@ __host__ __device__ inline size_t aggr_pipeline_bytes(size_t slots, int stages) 
 // Works with all index sizes (no packing constraint)
 template <
     FloatingNum cuda_t, ReductionOp Op, typename index_t, FloatingNum accum_t = float, BinaryOp BOp = BinaryOp::COPY_U,
-    bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false, int PIPELINE_STAGES = 0
+    bool RHS_BROADCAST = false, bool ARG_IS_EDGE = false, bool VECTORIZE = true, bool EDGE_MAP = false, int PIPELINE_STAGES = 0,
+    bool RHS_GROUPED = false
 >
 __global__ void reduction_aggr_forward_heavy_kernel_2d(
     const index_t *__restrict__ nodes,
@@ -516,7 +536,8 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
     index_t *__restrict__ arg_idx,
     size_t d,
     const cuda_t *__restrict__ rhs      = nullptr,
-    const index_t *__restrict__ edge_map = nullptr
+    const index_t *__restrict__ edge_map = nullptr,
+    RhsGroup rhs_group                   = {}
 ) {
     using ROps     = ReductionOps<Op>;
     using BOps     = BinaryOps<BOp>;
@@ -576,7 +597,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
         auto visit = [&](index_t src, index_t eid, cuda_t const *uslice) {
             accum_t msg[TW];
             const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
-            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t>(uslice, rhs, e_pos, fv, d, msg);
+            aggr_edge_message<BOp, RHS_BROADCAST, TW, cuda_t, index_t, accum_t, RHS_GROUPED>(uslice, rhs, e_pos, fv, d, msg, rhs_group);
 #pragma unroll
             for (size_t e = 0; e < TW; ++e) {
                 const acc_t v_e    = static_cast<acc_t>(msg[e]);
@@ -688,7 +709,7 @@ __global__ void reduction_aggr_forward_heavy_kernel_2d(
                     }
                     accum_t msg[1];
                     const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
-                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(&u_val, rhs, e_pos, tail_f, d, msg);
+                    aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t, RHS_GROUPED>(&u_val, rhs, e_pos, tail_f, d, msg, rhs_group);
                     bool upgrade_index = false;
                     local_best         = ROps::reduce(static_cast<float>(msg[0]), local_best, upgrade_index);
                     if constexpr (ROps::TRACKS_ARG) {

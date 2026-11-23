@@ -20,12 +20,16 @@ def random_graph(num_nodes=1500, num_edges=40000, seed=0):
     return indptr.cuda(), src.cuda(), adj
 
 
+@pytest.mark.parametrize("order", ["natural", "degree"])
 @pytest.mark.parametrize("graphed", [False, True])
-@pytest.mark.parametrize("fanouts", [[5, 10], [3, 7, 4], [25]])
+@pytest.mark.parametrize("fanouts", [[5, 10], [3, 7, 4], [25], [-1], [-1, 4], [-1, -1]])
 @pytest.mark.parametrize("thresholds", [(None, None), (4, 3)])
-def test_blocks_are_valid(fanouts, thresholds, graphed):
+def test_blocks_are_valid(fanouts, thresholds, graphed, order):
     indptr, indices, adj = random_graph()
-    sampler = AsyncNeighborSampler(indptr, indices, fanouts, fwd_heavy_threshold=thresholds[0], bwd_heavy_threshold=thresholds[1])
+    sampler = AsyncNeighborSampler(
+        indptr, indices, fanouts, fwd_heavy_threshold=thresholds[0], bwd_heavy_threshold=thresholds[1],
+        fwd_order=order, bwd_order=order,
+    )
     if graphed:  # captured for 100 seeds, run with 64: exercises the padded-seed path
         sampler = GraphedNeighborSampler(sampler, batch_size=100)
         for _ in range(4):  # cycle through every graph instance
@@ -72,6 +76,12 @@ def test_blocks_are_valid(fanouts, thresholds, graphed):
                 assert hv.numel() == 0
             else:
                 assert bool((deg[hv] >= t).all()) and bool((deg[lt] < t).all())
+            if order == "degree":  # inside each bucket: degree descending, ties in id order
+                for rows in (lt, hv):
+                    d = deg[rows]
+                    assert bool((d[:-1] >= d[1:]).all())
+                    same = d[:-1] == d[1:]
+                    assert bool((rows[:-1][same] < rows[1:][same]).all())
 
 
 def test_sampling_is_uniform():
@@ -127,3 +137,47 @@ def test_graphed_sampler_leaves_default_generator_alone():
     a = sampler.finalize(sampler.launch(seeds)).blocks[-1].indices.clone()
     b = sampler.finalize(sampler.launch(seeds)).blocks[-1].indices.clone()
     assert not torch.equal(a, b)
+
+
+@pytest.mark.parametrize("thresholds", [(None, None), (4, 3)])
+def test_degree_order_only_permutes_rows(thresholds):
+    """Degree ordering changes the order rows are listed in, nothing else: same CSR pair and
+    the same bucket membership as natural order for the same random draws."""
+    indptr, indices, _ = random_graph()
+    seeds = torch.randperm(indptr.numel() - 1)[:64].cuda()
+    out = {}
+    for order in ("natural", "degree"):
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        s = AsyncNeighborSampler(indptr, indices, [6, 4], fwd_heavy_threshold=thresholds[0],
+                                 bwd_heavy_threshold=thresholds[1], generator=gen, fwd_order=order, bwd_order=order)
+        out[order] = s.finalize(s.launch(seeds))
+    for a, b in zip(out["natural"].blocks, out["degree"].blocks):
+        for name in ("indptr", "indices", "bwd_indptr", "bwd_indices"):
+            assert torch.equal(getattr(a, name), getattr(b, name)), name
+        for name in ("fwd_light", "fwd_heavy", "bwd_light", "bwd_heavy"):
+            assert sorted(getattr(a, name).tolist()) == sorted(getattr(b, name).tolist()), name
+
+
+def test_bad_order_rejected():
+    indptr, indices, _ = random_graph(num_nodes=50, num_edges=300)
+    with pytest.raises(ValueError):
+        AsyncNeighborSampler(indptr, indices, [3], bwd_order="random")
+
+
+def test_full_neighbor_matches_exact_sampler():
+    """fanout -1: the async sampler returns every in-edge, the same blocks as GPUNeighborSampler."""
+    from src.sampling.neighbor_sampler import GPUNeighborSampler
+
+    indptr, indices, _ = random_graph()
+    seeds = torch.randperm(indptr.numel() - 1)[:64].cuda()
+    a = AsyncNeighborSampler(indptr, indices, [-1, -1])
+    got = a.finalize(a.launch(seeds))
+    ref = GPUNeighborSampler(indptr, indices, [-1, -1]).sample(seeds)
+    assert torch.equal(got.input_nodes, ref.input_nodes)
+    for g, r in zip(got.blocks, ref.blocks):
+        assert g.num_src == r.num_src
+        assert torch.equal(g.indptr.long(), r.indptr.long())
+        # rows list the same neighbors (in-row order may differ)
+        for v in range(r.num_dst):
+            s, e = int(r.indptr[v]), int(r.indptr[v + 1])
+            assert sorted(g.indices[s:e].tolist()) == sorted(r.indices[s:e].tolist())

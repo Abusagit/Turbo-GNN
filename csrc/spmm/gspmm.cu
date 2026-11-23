@@ -22,13 +22,38 @@ bool op_uses_rhs(BinaryOp op) { return op != BinaryOp::COPY_U; }
 struct FeatureLayout {
     int64_t d;
     bool rhs_broadcast;
+    RhsGroup grp;  // per-head broadcast columns ({1, 31}: a plain [E] / [E, 1] broadcast)
 };
+
+// Per-head broadcast (DGL's multi-head layout): node rows are [N, H * Dh] (the
+// [N, H, Dh] features flattened) and the edge operand is [E, H], one scalar per
+// edge and head, applied to that head's Dh features. Recognised by its shape
+// alone: 1 < H < d columns that divide d into power-of-two heads of >= 32
+// features (the alignment that keeps every kernel tile inside one head).
+RhsGroup deduce_rhs_group(BinaryOp op, const torch::Tensor& rhs, int64_t d) {
+    if (!op_uses_rhs(op) || rhs.dim() != 2) {
+        return {};
+    }
+    const int64_t cols = rhs.size(1);
+    if (cols <= 1 || cols >= d) {
+        return {};
+    }
+    const int64_t per_head = d / cols;
+    TORCH_CHECK(
+        d % cols == 0 && per_head >= 32 && (per_head & (per_head - 1)) == 0, "rhs [E, ", cols, "] does not match node features of width d = ", d,
+        ": an edge operand is [E] / [E, 1] (broadcast), [E, d] (elementwise), or [E, heads] with d = heads * Dh and Dh a power of two >= 32 ",
+        "(per-head broadcast, i.e. node data [N, heads, Dh])"
+    );
+    return {static_cast<uint32_t>(cols), static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(per_head)))};
+}
+
+bool is_per_head(const RhsGroup& g) { return g.cols > 1; }
 
 bool deduce_rhs_broadcast(BinaryOp op, const torch::Tensor& rhs, int64_t d) {
     if (!op_uses_rhs(op) || d <= 1) {
         return false;
     }
-    return (rhs.dim() == 1) || (rhs.size(1) == 1);
+    return (rhs.dim() == 1) || (rhs.size(1) == 1) || is_per_head(deduce_rhs_group(op, rhs, d));
 }
 
 FeatureLayout deduce_feature_layout(BinaryOp op, const torch::Tensor& lhs, const torch::Tensor& rhs) {
@@ -41,7 +66,7 @@ FeatureLayout deduce_feature_layout(BinaryOp op, const torch::Tensor& lhs, const
         d = (rhs.dim() > 1) ? rhs.size(1) : 1;
     }
 
-    return {d, deduce_rhs_broadcast(op, rhs, d)};
+    return {d, deduce_rhs_broadcast(op, rhs, d), deduce_rhs_group(op, rhs, d)};
 }
 
 void check_common_inputs(
@@ -258,6 +283,12 @@ std::vector<torch::Tensor> gspmm_forward(
     const auto layout     = deduce_feature_layout(bop, lhs, rhs);
 
     check_common_inputs(edge_ptr, edge_idx, lhs, rhs, bop, layout);
+    // The min/max backward (the arg kernels) has no per-head path; refuse up front
+    // rather than return a forward whose gradient would be wrong.
+    TORCH_CHECK(
+        !is_per_head(layout.grp) || rop == ReductionOp::SUM,
+        "gspmm: a per-head edge operand ([E, heads]) is supported with reduce='sum' only (got '", reduce, "')"
+    );
 
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node buckets must be CUDA");
     TORCH_CHECK(
@@ -346,7 +377,12 @@ std::vector<torch::Tensor> gspmm_forward(
 
             constexpr BinaryOp BOP    = static_cast<BinaryOp>(decltype(op_c)::value);
             constexpr ReductionOp ROP = static_cast<ReductionOp>(decltype(rop_c)::value);
-            constexpr bool BCAST      = decltype(bcast_c)::value;
+            // 0: elementwise edge operand, 1: one scalar per edge, 2: one scalar per edge and
+            // head (RhsGroup); the per-head kernels are their own instantiations, so the
+            // plain broadcast compiles exactly as before.
+            constexpr int BMODE       = decltype(bcast_c)::value;
+            constexpr bool BCAST      = BMODE != 0;
+            constexpr bool GRP        = BMODE == 2;
             constexpr int STAGES      = decltype(stages_c)::value;
             constexpr bool EMAP       = decltype(emap_c)::value;
             using BOps                = BinaryOps<BOP>;
@@ -359,6 +395,8 @@ std::vector<torch::Tensor> gspmm_forward(
             // table for a path only mul/div sum backward takes.
             if constexpr (BCAST && !BOps::USE_RHS) {
                 return;
+            } else if constexpr (GRP && ROP != ReductionOp::SUM) {
+                return;  // rejected by the binding (per-head edge data is sum-only)
             } else if constexpr (EMAP && !(BOps::GRAD_USES_OPERANDS && ROP == ReductionOp::SUM)) {
                 return;
             } else {
@@ -391,14 +429,14 @@ std::vector<torch::Tensor> gspmm_forward(
                     if constexpr (STAGES > 0) {
                         ensure_dynamic_shmem(
                             reduction_aggr_forward_light_kernel_1d<
-                                kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, true, kGSpMMVectorize, EMAP>,
+                                kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, true, kGSpMMVectorize, EMAP, GRP>,
                             shmem_l, "gspmm light"
                         );
                     }
 
                     reduction_aggr_forward_light_kernel_1d<
                         kGSpMMWarpsPerBlock, cuda_t, ROP, index_t, float, STAGES, BOP, BCAST, /*ARG_IS_EDGE=*/true,
-                        kGSpMMVectorize, EMAP
+                        kGSpMMVectorize, EMAP, GRP
                     ><<<blocks_l, block_l, shmem_l, main_stream>>>(
                         index_ptr<index_t>(light_nodes),
                         index_ptr<index_t>(edge_ptr),
@@ -409,7 +447,8 @@ std::vector<torch::Tensor> gspmm_forward(
                         d,
                         static_cast<size_t>(num_light),
                         rhs_ptr,
-                        emap_ptr
+                        emap_ptr,
+                        layout.grp
                     );
                 }
 
@@ -427,12 +466,12 @@ std::vector<torch::Tensor> gspmm_forward(
 
                     ensure_dynamic_shmem(
                         gspmm_heavy_sliced_kernel<
-                            cuda_t, index_t, ROP, BOP, BCAST, EMAP, static_cast<size_t>(kGSpMMHeavySliceEdges), STAGES>,
+                            cuda_t, index_t, ROP, BOP, BCAST, EMAP, static_cast<size_t>(kGSpMMHeavySliceEdges), STAGES, float, GRP>,
                         shmem_s, "gspmm heavy sliced"
                     );
 
                     gspmm_heavy_sliced_kernel<
-                        cuda_t, index_t, ROP, BOP, BCAST, EMAP, static_cast<size_t>(kGSpMMHeavySliceEdges), STAGES
+                        cuda_t, index_t, ROP, BOP, BCAST, EMAP, static_cast<size_t>(kGSpMMHeavySliceEdges), STAGES, float, GRP
                     ><<<blocks_s, block_h, shmem_s, heavy_stream>>>(
                         index_ptr<index_t>(heavy_nodes),
                         index_ptr<index_t>(slice_offsets),
@@ -444,7 +483,8 @@ std::vector<torch::Tensor> gspmm_forward(
                         slice_partials.data_ptr<float>(),
                         slice_args.defined() ? index_ptr_mut<index_t>(slice_args) : nullptr,
                         static_cast<size_t>(num_heavy),
-                        d
+                        d,
+                        layout.grp
                     );
 
                     const unsigned reduce_threads = 256;
@@ -472,12 +512,12 @@ std::vector<torch::Tensor> gspmm_forward(
 
                     ensure_dynamic_shmem(
                         reduction_aggr_forward_heavy_kernel_2d<
-                            cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize, EMAP, STAGES>,
+                            cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize, EMAP, STAGES, GRP>,
                         shmem, "gspmm heavy"
                     );
 
                     reduction_aggr_forward_heavy_kernel_2d<
-                        cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize, EMAP, STAGES>
+                        cuda_t, ROP, index_t, float, BOP, BCAST, /*ARG_IS_EDGE=*/true, kGSpMMVectorize, EMAP, STAGES, GRP>
                         <<<grid_h, block_h, shmem, heavy_stream>>>(
                             index_ptr<index_t>(heavy_nodes),
                             index_ptr<index_t>(edge_ptr),
@@ -487,7 +527,8 @@ std::vector<torch::Tensor> gspmm_forward(
                             index_ptr_mut<index_t>(arg_eid),
                             d,
                             rhs_ptr,
-                            emap_ptr
+                            emap_ptr,
+                            layout.grp
                         );
                 }
             }
@@ -496,7 +537,7 @@ std::vector<torch::Tensor> gspmm_forward(
         MakeTypeVariant<float, at::Half, at::BFloat16>(value_dtype(bop, lhs, rhs)),
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
         MakeIntVariant<0, 1, 2>(static_cast<int>(rop)),
-        MakeBoolVariant<false, true>(layout.rhs_broadcast),
+        MakeIntVariant<0, 1, 2>(!layout.rhs_broadcast ? 0 : (is_per_head(layout.grp) ? 2 : 1)),
         MakeIntVariant<0, 1, 2, 4>(pipeline_stages),
         MakeBoolVariant<false, true>(use_edge_map)
     );
@@ -637,6 +678,7 @@ std::vector<torch::Tensor> gspmm_backward_arg(
     const bool uses_lhs = op_uses_lhs(bop);
     const bool uses_rhs = op_uses_rhs(bop);
     const bool bcast    = deduce_rhs_broadcast(bop, rhs, d);
+    TORCH_CHECK(!is_per_head(deduce_rhs_group(bop, rhs, d)), "gspmm backward: a per-head edge operand is supported with reduce='sum' only");
     if (uses_rhs) {
         TORCH_CHECK(rhs.size(0) == num_edges, "rhs must have one row per edge (", rhs.size(0), " vs ", num_edges, ")");
     }
@@ -869,6 +911,7 @@ torch::Tensor gspmm_backward_edge(
     const int64_t num_edges = edge_idx.numel();
     const int64_t d         = grad_out.size(1);
     TORCH_CHECK(rhs.size(0) == num_edges, "rhs must have one row per edge (", rhs.size(0), " vs ", num_edges, ")");
+    const RhsGroup grp = deduce_rhs_group(bop, rhs, d);
 
     const int64_t num_light = light_nodes.numel();
     const int64_t num_heavy = heavy_nodes.numel();
@@ -904,7 +947,9 @@ torch::Tensor gspmm_backward_edge(
             using cuda_t  = typename decltype(typeInfo)::CudaType;
 
             constexpr BinaryOp BOP = static_cast<BinaryOp>(decltype(op_c)::value);
-            constexpr bool BCAST   = decltype(bcast_c)::value;
+            constexpr int BMODE    = decltype(bcast_c)::value;  // 0 elementwise, 1 broadcast, 2 per-head broadcast
+            constexpr bool BCAST   = BMODE != 0;
+            constexpr bool GRP     = BMODE == 2;
             constexpr int STAGES   = decltype(stages_c)::value;
             using BOps             = BinaryOps<BOP>;
 
@@ -935,11 +980,11 @@ torch::Tensor gspmm_backward_edge(
                     );
                     if constexpr (EFF_STAGES > 0) {
                         ensure_dynamic_shmem(
-                            gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t, cuda_t, float, EFF_STAGES>, shmem_l,
+                            gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t, cuda_t, float, EFF_STAGES, GRP>, shmem_l,
                             "gspmm backward edge light"
                         );
                     }
-                    gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t, cuda_t, float, EFF_STAGES>
+                    gspmm_backward_edge_light_kernel<BOP, BCAST, cuda_t, index_t, cuda_t, float, EFF_STAGES, GRP>
                         <<<shape.blocks, shape.block, shmem_l, streams.main>>>(
                             index_ptr<index_t>(light_nodes),
                             index_ptr<index_t>(edge_ptr),
@@ -949,7 +994,8 @@ torch::Tensor gspmm_backward_edge(
                             rhs_ptr,
                             grad_rhs_ptr,
                             static_cast<size_t>(num_light),
-                            static_cast<size_t>(d)
+                            static_cast<size_t>(d),
+                            grp
                         );
                 }
 
@@ -962,12 +1008,12 @@ torch::Tensor gspmm_backward_edge(
                     if constexpr (EFF_STAGES > 0) {
                         ensure_dynamic_shmem(
                             gspmm_backward_edge_heavy_kernel<
-                                BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), cuda_t, float, EFF_STAGES>,
+                                BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), cuda_t, float, EFF_STAGES, GRP>,
                             shmem_h, "gspmm backward edge heavy"
                         );
                     }
                     gspmm_backward_edge_heavy_kernel<
-                        BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), cuda_t, float, EFF_STAGES>
+                        BOP, BCAST, cuda_t, index_t, static_cast<size_t>(kGSpMMHeavySliceEdges), cuda_t, float, EFF_STAGES, GRP>
                         <<<grid_h, block_h, shmem_h, streams.heavy>>>(
                             index_ptr<index_t>(heavy_nodes),
                             slice_offsets.defined() ? index_ptr<index_t>(slice_offsets) : nullptr,
@@ -978,7 +1024,8 @@ torch::Tensor gspmm_backward_edge(
                             rhs_ptr,
                             grad_rhs_ptr,
                             static_cast<size_t>(num_heavy),
-                            static_cast<size_t>(d)
+                            static_cast<size_t>(d),
+                            grp
                         );
                 }
             }
@@ -986,7 +1033,7 @@ torch::Tensor gspmm_backward_edge(
         MakeIndexVariant<int32_t, int64_t>(edge_ptr.scalar_type()),
         MakeTypeVariant<float, at::Half, at::BFloat16>(grad_out.scalar_type()),
         MakeIntVariant<0, 1, 2, 3, 4, 5>(static_cast<int>(bop)),
-        MakeBoolVariant<false, true>(deduce_rhs_broadcast(bop, rhs, d)),
+        MakeIntVariant<0, 1, 2>(!deduce_rhs_broadcast(bop, rhs, d) ? 0 : (is_per_head(grp) ? 2 : 1)),
         MakeIntVariant<0, 1, 2, 4>(pipeline_stages)
     );
 

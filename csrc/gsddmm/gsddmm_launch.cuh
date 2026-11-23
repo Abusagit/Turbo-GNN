@@ -57,7 +57,9 @@ struct GsddmmLaunchArgs {
     uint32_t heavy_edges_per_block;
     // Run the light bucket on a pool stream forked from / joined back to `stream`
     // while the heavy bucket runs on `stream` itself (see gsddmm_dispatch).
-    bool overlap_buckets;
+    bool overlap_buckets;    // Multi-head operands [rows, heads, D] (heads contiguous; D is the per-head
+    // width): one launch covers every head. 1 is the plain [rows, D] layout.
+    uint32_t heads = 1;
 };
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>_<dtype>.cu). Each
@@ -89,7 +91,9 @@ struct GsddmmLaunchArgsEdge {
     LRO key;
     uint8_t pipeline_stages;  // cp.async prefetch depth per warp, 0 = direct loads
     uint8_t edges_per_warp;   // contiguous edges per warp, 1..kGsddmmEdgeMaxEdgesPerWarp
-    uint8_t warps_per_block;  // independent warps packed per block, 1..kGsddmmEdgeMaxWarpsPerBlock
+    uint8_t warps_per_block;  // independent warps packed per block, 1..kGsddmmEdgeMaxWarpsPerBlock    // Multi-head operands [rows, heads, D] (heads contiguous; D is the per-head
+    // width): one launch covers every head. 1 is the plain [rows, D] layout.
+    uint32_t heads = 1;
 };
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>_<dtype>.cu). Each
@@ -134,7 +138,9 @@ struct GsddmmBackwardLaunchArgs {
     uint64_t D;
     LRO key;
     uint16_t light_warps_per_block;
-    uint16_t heavy_warps_per_block;
+    uint16_t heavy_warps_per_block;    // Multi-head operands [rows, heads, D] (heads contiguous; D is the per-head
+    // width): one launch covers every head. 1 is the plain [rows, D] layout.
+    uint32_t heads = 1;
 };
 
 #define XX(ENUM, name) void gsddmm_backward_launch_##name(const GsddmmBackwardLaunchArgs& args);
@@ -169,7 +175,9 @@ struct GsddmmBackwardLaunchArgsEdge {
     LRO key;
     uint8_t pipeline_stages;  // cp.async prefetch depth of the per-edge rows, 0 = direct loads
     uint8_t edges_per_warp;
-    uint8_t warps_per_block;
+    uint8_t warps_per_block;    // Multi-head operands [rows, heads, D] (heads contiguous; D is the per-head
+    // width): one launch covers every head. 1 is the plain [rows, D] layout.
+    uint32_t heads = 1;
 };
 
 #define XX(ENUM, name) void gsddmm_backward_edge_launch_##name(const GsddmmBackwardLaunchArgsEdge& args);

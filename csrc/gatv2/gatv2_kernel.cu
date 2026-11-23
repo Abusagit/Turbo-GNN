@@ -285,15 +285,17 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_forward_cuda)(
     int pipeline_stages,
     int heavy_pipeline_stages
 ) {
+    // Rectangular (bipartite) graphs are supported: `l` holds one row per CSR row (destination
+    // node, N_dst = row_ptr.numel() - 1) and `r` one row per column id (source node, N_src).
+    // Sampled mini-batch blocks have N_src >= N_dst; full graphs have N_src == N_dst.
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
-    TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
-    TORCH_CHECK(l.sizes() == r.sizes(), "l, r sizes must match");
+    TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l must be [N_dst, H, D] and r [N_src, H, D]");
 
     TORCH_CHECK(row_ptr.is_cuda(), "row_ptr must be a CUDA tensor");
     TORCH_CHECK(col_idx.is_cuda(), "col_idx must be a CUDA tensor");
     TORCH_CHECK(attn_vec.is_cuda(), "attn_vec must be a CUDA tensor");
 
-    TORCH_CHECK(l.size(0) == r.size(0), "l and r must have same number of nodes");
+    TORCH_CHECK(row_ptr.numel() == l.size(0) + 1, "row_ptr must be [N_dst + 1] with N_dst = l.size(0)");
     TORCH_CHECK(l.size(1) == r.size(1), "l and r must have same head dimension");
     TORCH_CHECK(l.size(2) == r.size(2), "l and r must have same feature dimension");
     TORCH_CHECK(l.size(2) == attn_vec.size(1), "attn_vec dimension must match features");
@@ -544,17 +546,24 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_backward_cuda)(
     TORCH_CHECK(row_ptr_T.is_contiguous(), "row_ptr_T must be contiguous");
     TORCH_CHECK(col_idx_T.is_contiguous(), "col_idx_T must be contiguous");
 
-    TORCH_CHECK(grad_h.dim() == 3 && l.dim() == 3 && r.dim() == 3, "grad_h, l, r must be [N, H, D]");
-    TORCH_CHECK(grad_h.sizes() == l.sizes() && l.sizes() == r.sizes(), "grad_h, l, r sizes must match");
+    // Rectangular graphs: grad_h, l, logsumexp and the per-row scratch (grad_a, G) are indexed by
+    // destination node (forward CSR rows, N_dst); r and grad_r by source node (CSR^T rows, N_src).
+    TORCH_CHECK(grad_h.dim() == 3 && l.dim() == 3 && r.dim() == 3, "grad_h, l must be [N_dst, H, D] and r [N_src, H, D]");
+    TORCH_CHECK(grad_h.sizes() == l.sizes(), "grad_h and l sizes must match");
+    TORCH_CHECK(l.size(1) == r.size(1) && l.size(2) == r.size(2), "l and r must have the same H and D");
     TORCH_CHECK(attn_vec.dim() == 2, "attn_vec must be [H, D]");
-    TORCH_CHECK(logsumexp.dim() == 2, "logsumexp must be [N, H]");
+    TORCH_CHECK(logsumexp.dim() == 2, "logsumexp must be [N_dst, H]");
 
-    const int64_t N = l.size(0);
-    const int64_t H = l.size(1);
-    const int64_t D = l.size(2);
+    const int64_t N     = l.size(0);  // N_dst
+    const int64_t N_src = r.size(0);
+    const int64_t H     = l.size(1);
+    const int64_t D     = l.size(2);
 
+    TORCH_CHECK(row_ptr.numel() == N + 1, "row_ptr must be [N_dst + 1]");
+    TORCH_CHECK(row_ptr_T.numel() == N_src + 1, "row_ptr_T must be [N_src + 1]");
+    TORCH_CHECK(is_directed || N_src == N, "the undirected backward needs a square graph; pass is_directed=True for bipartite blocks");
     TORCH_CHECK(attn_vec.size(0) == H && attn_vec.size(1) == D, "attn_vec must be [H, D]");
-    TORCH_CHECK(logsumexp.size(0) == N && logsumexp.size(1) == H, "logsumexp must be [N, H]");
+    TORCH_CHECK(logsumexp.size(0) == N && logsumexp.size(1) == H, "logsumexp must be [N_dst, H]");
     TORCH_CHECK(D % 4 == 0, "head_dim (D) must be divisible by 4");
 
     auto gh_strides = grad_h.strides();
@@ -583,7 +592,7 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_backward_cuda)(
 
     // grad_l, grad_r: match input dtype
     torch::Tensor grad_l = torch::empty({N, H, D}, typed_options);
-    torch::Tensor grad_r = torch::empty({N, H, D}, typed_options);
+    torch::Tensor grad_r = torch::empty({N_src, H, D}, typed_options);
     // grad_a: always float32 (internal)
     torch::Tensor grad_a = torch::empty({N, H, D}, f32_options);
     // grad_a_reduced: accumulate in float32 to avoid bf16/fp16 atomicAdd contention
@@ -703,8 +712,9 @@ std::vector<torch::Tensor> ATTN_SHARD_FN(gatv2_backward_cuda)(
                         SK_KIND, index_ptr<index_t>(node_indices), num_nodes_bucket, sched_counters, static_cast<int>(H), this_bucket, offs, sched_chunk
                     );
 
+                    // Bound by N_src: the R kernel walks CSR^T rows, one per source node.
                     GATv2Backward_R<SK, W, DC, cuda_t, index_t, float, STAGES><<<blocks, threads, sh_r, stream>>>(
-                        N, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
+                        N_src, H, D, grad_h_ptr, stride_gh_n, stride_gh_h, l_ptr, stride_l_n, stride_l_h, r_ptr, stride_r_n, stride_r_h,
                         index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T), sp, attn_ptr, d_logsumexp,
                         d_G, negative_slope, grad_r_ptr
                     );

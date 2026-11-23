@@ -19,8 +19,9 @@ device, and ships them to pinned host memory with one non-blocking copy at the e
   the two: launch batch i+1, then finalize batch i (see `PrefetchLoader`).
 
 Block layout matches `GPUNeighborSampler`: outermost block first, destinations are the first
-``num_dst`` sources, CSR rows are destinations with local source ids. Fanouts must be positive;
-full-neighbor blocks (-1) have no static edge bound and stay on `GPUNeighborSampler`.
+``num_dst`` sources, CSR rows are destinations with local source ids. A fanout of -1 takes the
+full neighborhood: it is resolved to the graph's maximum in-degree, so no row is subsampled and
+the edge capacity is the sum of the ``n_cap`` largest degrees (still static, still capturable).
 """
 
 from __future__ import annotations
@@ -93,6 +94,12 @@ class AsyncNeighborSampler:
         index_dtype: dtype of the emitted CSR / bucket lists.
         fwd_heavy_threshold / bwd_heavy_threshold: rows with in-degree (forward) or source
             out-degree (backward) >= threshold go to the heavy bucket; None = all light.
+        fwd_order / bwd_order: ``"natural"`` keeps rows in id order inside each bucket;
+            ``"degree"`` sorts them by sampled degree, largest first, so the warps packed into
+            one thread block get similar work (the paper's degree ordering, applied per block).
+            Sampling caps forward in-degrees at the fanout, so the skew that is left is on the
+            backward (transposed) side, where a hub sampled by many destinations becomes one
+            long row -- ``bwd_order="degree"`` targets exactly that.
         generator: optional CUDA ``torch.Generator``.
     """
 
@@ -105,24 +112,36 @@ class AsyncNeighborSampler:
         fwd_heavy_threshold: int | None = None,
         bwd_heavy_threshold: int | None = None,
         generator: torch.Generator | None = None,
+        fwd_order: str = "natural",
+        bwd_order: str = "natural",
     ) -> None:
-        if any(f <= 0 for f in fanouts):
-            raise ValueError("AsyncNeighborSampler needs positive fanouts; use GPUNeighborSampler for -1")
+        for name, v in (("fwd_order", fwd_order), ("bwd_order", bwd_order)):
+            if v not in ("natural", "degree"):
+                raise ValueError(f"{name} must be 'natural' or 'degree', got {v!r}")
+        if any(f == 0 or f < -1 for f in fanouts):
+            raise ValueError(f"fanouts must be positive or -1 (all neighbors), got {fanouts}")
         self.indptr = indptr.to(torch.int64)
         self.indices = indices.to(torch.int64)
-        self.fanouts = list(fanouts)
+        # -1 (full neighborhood) = fanout max in-degree: every row then has deg <= fanout, so it
+        # keeps all its in-edges, Floyd never runs (no row is over-full), and the static edge
+        # bound is the sum of the n_cap largest degrees. One host read, here, before training.
+        max_deg = max(1, int((self.indptr[1:] - self.indptr[:-1]).max())) if indptr.numel() > 1 else 1
+        self.fanouts = [max_deg if f == -1 else int(f) for f in fanouts]
         self.index_dtype = index_dtype
         self.fwd_t = fwd_heavy_threshold
         self.bwd_t = bwd_heavy_threshold
+        self.fwd_order_mode = fwd_order
+        self.bwd_order_mode = bwd_order
         self.generator = generator
         self.num_nodes = indptr.numel() - 1
         self.num_edges = indices.numel()
         dev = indptr.device
         n = self.num_nodes
-        # Node-indexed scratch with one extra dummy slot (id N) that padding entries point at.
-        self._local = torch.full((n + 1,), -1, dtype=torch.int64, device=dev)
+        # Node-indexed scratch with one extra dummy slot (id N) that padding entries point at,
+        # followed by private write slots for the frontier scatter (grown in stage 1 to E_cap).
+        self._e_slots = torch.arange(1, device=dev)
+        self._local = torch.full((n + 2,), -1, dtype=torch.int64, device=dev)
         self._mark = torch.zeros(n + 1, dtype=torch.bool, device=dev)
-        self._all_nodes = torch.arange(n, device=dev)
         # Static capacity bounds per fanout, computed here (before training: these few host
         # reads are the only syncs the sampler ever makes). For any n destination rows the
         # sampled edges are at most the sum of the n largest min(deg, f) over the whole graph,
@@ -134,6 +153,15 @@ class AsyncNeighborSampler:
             top = torch.sort(deg.clamp(max=f), descending=True).values
             self._edge_bound[f] = torch.cat([top.new_zeros(1), torch.cumsum(top, 0)]).cpu()
             self._big_bound[f] = int((deg > f).sum())
+
+    def padded_edge_capacity(self, batch_size: int) -> int:
+        """Edge slots one batch of `batch_size` seeds is padded to, summed over layers (host-side)."""
+        total, n_cap = 0, batch_size
+        for f in reversed(self.fanouts):
+            e = self.edge_cap(f, n_cap)
+            total += e
+            n_cap = min(n_cap + e, self.num_nodes)
+        return total
 
     def edge_cap(self, f: int, n_cap: int) -> int:
         """Static bound on the edges n_cap destination rows can sample at fanout f (host-side)."""
@@ -159,14 +187,25 @@ class AsyncNeighborSampler:
             picks[:, it] = t
         return torch.where((deg > f)[:, None], picks, k[None, :].expand(n_cap, f))
 
-    def _bucket_order(self, counts: torch.Tensor, valid: torch.Tensor, threshold: int | None):
-        """Row order heavy | light | padding, and the heavy count (both on the device)."""
-        if threshold is None:
+    def _bucket_order(self, counts: torch.Tensor, valid: torch.Tensor, threshold: int | None, mode: str = "natural"):
+        """Row order heavy | light | padding, and the heavy count (both on the device).
+
+        ``mode="degree"`` additionally sorts rows by degree, descending, inside each bucket.
+        One device sort either way: no host sync, so it stays CUDA-graph capturable."""
+        zero = torch.zeros((), dtype=torch.int64, device=self.device)
+        if threshold is None and mode == "natural":
             # All light; valid rows are already a prefix, so the identity order works.
-            return torch.arange(counts.numel(), device=self.device), torch.zeros((), dtype=torch.int64, device=self.device)
-        heavy = valid & (counts >= threshold)
-        key = torch.where(heavy, 0, torch.where(valid, 1, 2))
-        return torch.sort(key, stable=True).indices, heavy.sum()
+            return torch.arange(counts.numel(), device=self.device), zero
+        heavy = valid & (counts >= threshold) if threshold is not None else torch.zeros_like(valid)
+        bucket = torch.where(heavy, 0, torch.where(valid, 1, 2))
+        if mode == "degree":
+            # bucket in the high bits, (2^40 - 1 - degree) in the low bits: ascending sort =
+            # bucket order, then degree descending; ties keep id order (stable sort).
+            big = 1 << 40
+            key = bucket * big + (big - 1 - counts.clamp(min=0, max=big - 1))
+        else:
+            key = bucket
+        return torch.sort(key, stable=True).indices, (heavy.sum() if threshold is not None else zero)
 
     def launch(self, seeds: torch.Tensor) -> PendingBatch:
         """Issue every GPU op for one batch on the current stream; no host sync."""
@@ -198,6 +237,10 @@ class AsyncNeighborSampler:
             # bound, far below n_cap * f when most rows have deg < f). Slot e belongs to the row
             # whose cumulative count first exceeds e; slots past the real total are padding.
             E_cap = self.edge_cap(f, n_cap)
+            if self._e_slots.numel() < E_cap:  # host-side ints: runs in the eager warm-up, never in a capture
+                self._e_slots = torch.arange(E_cap, device=dev)
+                self._local = torch.full((N + 1 + E_cap,), -1, dtype=torch.int64, device=dev)
+                local = self._local
             row_end = torch.cumsum(counts, 0)
             row_start = row_end - counts
             num_e = row_end[-1]
@@ -223,27 +266,33 @@ class AsyncNeighborSampler:
             edge_pos = (start[erow] + inrow).clamp(0, self.num_edges - 1)
             src = torch.where(evalid, self.indices[edge_pos], N)  # padding -> N
 
-            # ---- frontier: destinations first, then new sources in id order
-            mark.index_fill_(0, src, True)
+            # ---- frontier: destinations first, then new sources in id order. Sort-based, so the
+            # work is O(E_cap log E_cap) in the sampled edges, not O(N) in the graph: on a 111M-node
+            # graph the dense node-mask/cumsum version cost ~47 ms of GPU time per batch.
+            mark.index_fill_(0, dst, True)  # dst ids are not new
+            mark[N:].fill_(True)  # nor is the padding dummy
+            s_sorted, _ = torch.sort(src, stable=True)  # padding (id N) sorts last; stable = no sync
+            first = torch.ones_like(s_sorted, dtype=torch.bool)
+            first[1:] = s_sorted[1:] != s_sorted[:-1]
+            isnew = first & ~mark[s_sorted]  # mark[N] is set, so padding is never new
+            nrank = torch.cumsum(isnew, 0) - 1  # duplicates of a new node share its rank
+            num_new = nrank[-1] + 1
+            ingroup = ~mark[s_sorted]  # entries whose value is a new node (first or duplicate)
             mark.index_fill_(0, dst, False)
             mark[N:].fill_(False)
-            m = mark[:N]
-            cums = torch.cumsum(m, 0)
-            num_new = cums[-1]
             local.index_copy_(0, dst, rows)  # padding all lands on the dummy slot
-            new_local = n + cums - 1
-            local[:N].copy_(torch.where(m, new_local, local[:N]))
+            # New nodes get n + rank; every other entry writes to a private slot past N + 1 (one
+            # each), never to one shared dump address: many writes to one address serialise.
+            local.scatter_(0, torch.where(ingroup, s_sorted, N + 1 + self._e_slots[:E_cap]), n + nrank)
             col = local[src]  # padding slots read the dummy; masked below
             src_cap = min(n_cap + E_cap, N)
-            # Non-new nodes are scattered to private slots past src_cap (one each), never to one
-            # shared dump address: millions of writes to a single address serialise on the GPU.
-            src_nodes = torch.full((src_cap + N,), N, dtype=torch.int64, device=dev)
+            src_nodes = torch.full((src_cap + E_cap,), N, dtype=torch.int64, device=dev)
             src_nodes[:n_cap] = dst
-            src_nodes.scatter_(0, torch.where(m, new_local, src_cap + self._all_nodes), self._all_nodes)
+            src_nodes.scatter_(0, torch.where(isnew, n + nrank, src_cap + self._e_slots[:E_cap]), s_sorted)
             src_nodes = src_nodes[:src_cap]
             num_src = n + num_new
             local.index_fill_(0, src_nodes, -1)
-            mark.index_fill_(0, src_nodes, False)
+            local[N : N + 1].fill_(-1)
 
             # ---- forward CSR (rows = destinations): slots are already row-major, so the column
             # ids need no compaction; the valid prefix has length num_e.
@@ -260,9 +309,9 @@ class AsyncNeighborSampler:
             bwd_counts = bwd_indptr[1:] - bwd_indptr[:-1]
 
             # ---- light/heavy order per direction
-            fwd_order, h_f = self._bucket_order(counts, valid_row, self.fwd_t)
+            fwd_order, h_f = self._bucket_order(counts, valid_row, self.fwd_t, self.fwd_order_mode)
             src_valid = torch.arange(src_cap, device=dev) < num_src
-            bwd_order, h_b = self._bucket_order(bwd_counts, src_valid, self.bwd_t)
+            bwd_order, h_b = self._bucket_order(bwd_counts, src_valid, self.bwd_t, self.bwd_order_mode)
 
             layers.append(
                 _PaddedLayer(

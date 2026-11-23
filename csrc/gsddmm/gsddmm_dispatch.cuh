@@ -57,28 +57,33 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
                 using cuda_t               = typename decltype(typeInfo)::CudaType;
                 constexpr size_t DC        = decltype(d_c)::value;
                 constexpr size_t W         = decltype(warp_c)::value;
-                constexpr int STAGES       = decltype(stages_c)::value;
+                // Stage axis value 4 = multi-head operands, which run unpipelined: the multi-head
+                // instantiations stay a +1/4 of the grid instead of doubling it.
+                constexpr int STAGES_V       = decltype(stages_c)::value;
+                constexpr bool MH       = STAGES_V == 4;
+                constexpr int STAGES       = MH ? 0 : STAGES_V;
 
                 cuda_t const *L_ptr = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
                 cuda_t const *R_ptr = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
                 cuda_t *O_ptr       = reinterpret_cast<cuda_t *>(args.O.data_ptr<torch_t>());
 
-                auto kernel = GSDDMM_forward_normal<OP, LL, RR, W, DC, cuda_t, index_t, float, STAGES>;
+                auto kernel = GSDDMM_forward_normal<OP, LL, RR, W, DC, cuda_t, index_t, float, STAGES, MH>;
 
-                constexpr size_t shmem = gsddmm_forward_shmem_bytes<OP, LL, RR, W, DC, cuda_t, STAGES>();
+                constexpr size_t shmem = gsddmm_forward_shmem_bytes<OP, LL, RR, W, DC, cuda_t, static_cast<uint8_t>(STAGES)>();
                 ensure_dynamic_shmem(kernel, shmem, "GSDDMM forward");
 
-                dim3 blocks(static_cast<unsigned>(num_blocks));
+                TORCH_CHECK(args.heads >= 1 && args.heads <= 65535, "GSDDMM forward: heads must be in [1, 65535], got ", args.heads);
+                dim3 blocks(static_cast<unsigned>(num_blocks), args.heads);  // y: one slice per head
                 dim3 threads(kWarpSize, W);
 
                 kernel<<<blocks, threads, shmem, stream>>>(
                     static_cast<size_t>(args.N), L_ptr, R_ptr, O_ptr, index_ptr<index_t>(args.row_ptr), index_ptr<index_t>(args.col_idx),
-                    index_ptr<index_t>(node_indices), block_parts ? index_ptr<index_t>(*block_parts) : nullptr, edges_per_block
+                    index_ptr<index_t>(node_indices), block_parts ? index_ptr<index_t>(*block_parts) : nullptr, edges_per_block, args.heads
                 );
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
             MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-            warp_variant, MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages)
+            warp_variant, MakeIntVariant<0, 1, 2, 3, 4>(args.heads > 1 ? 4 : args.pipeline_stages)
         );
     };
 
@@ -138,7 +143,11 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             using torch_t              = typename decltype(typeInfo)::TorchType;
             using cuda_t               = typename decltype(typeInfo)::CudaType;
             constexpr size_t DC        = decltype(d_c)::value;
-            constexpr int STAGES       = decltype(stages_c)::value;
+            // Stage axis value 4 = multi-head operands, which run unpipelined: the multi-head
+                // instantiations stay a +1/4 of the grid instead of doubling it.
+                constexpr int STAGES_V       = decltype(stages_c)::value;
+                constexpr bool MH       = STAGES_V == 4;
+                constexpr int STAGES       = MH ? 0 : STAGES_V;
             // The remap flag as a template parameter: the no-remap instantiation
             // compiles the canonical-id select away entirely. See the kernel body
             // for why a runtime flag here cost 20%+ of the whole kernel.
@@ -148,7 +157,7 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             cuda_t const *R_ptr = reinterpret_cast<const cuda_t *>(args.R.data_ptr<torch_t>());
             cuda_t *O_ptr       = reinterpret_cast<cuda_t *>(args.O.data_ptr<torch_t>());
 
-            auto kernel = GSDDMM_forward_edge_block<OP, LL, RR, DC, cuda_t, index_t, float, STAGES, REMAP_IDS>;
+            auto kernel = GSDDMM_forward_edge_block<OP, LL, RR, DC, cuda_t, index_t, float, STAGES, REMAP_IDS, MH>;
 
             const size_t shmem = args.warps_per_block * gsddmm_forward_edge_shmem_bytes_per_warp<OP, LL, RR, DC, cuda_t, STAGES>();
             ensure_dynamic_shmem(kernel, shmem, "GSDDMM forward (edge blocks)");
@@ -157,7 +166,8 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             // linear block count is folded into (x, y, z) to stay within the
             // per-dimension grid limits for very large edge lists.
             const uint64_t num_warps  = ceil_div<uint64_t>(args.E, args.edges_per_warp);
-            const uint64_t num_blocks = ceil_div<uint64_t>(num_warps, args.warps_per_block);
+            // heads blocks per edge block; the kernel splits the linear index back.
+            const uint64_t num_blocks = ceil_div<uint64_t>(num_warps, args.warps_per_block) * args.heads;
 
             constexpr uint64_t kMaxGridX  = (1ull << 31) - 1ull;
             constexpr uint64_t kMaxGridYZ = 65535ull;
@@ -173,12 +183,12 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
 
             kernel<<<blocks, threads, shmem, args.stream>>>(
                 static_cast<index_t>(args.E), L_ptr, R_ptr, O_ptr, reinterpret_cast<pair_t const *>(args.edge_nodes_idx),
-                reinterpret_cast<index_t const *>(args.canonical_edge_idx), static_cast<uint32_t>(args.edges_per_warp)
+                reinterpret_cast<index_t const *>(args.canonical_edge_idx), static_cast<uint32_t>(args.edges_per_warp), args.heads
             );
         },
         lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
         MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-        MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
+        MakeIntVariant<0, 1, 2, 3, 4>(args.heads > 1 ? 4 : args.pipeline_stages),
         MakeIntVariant<0, 1>(args.canonical_edge_idx != nullptr ? 1 : 0)
     );
 }
@@ -204,7 +214,8 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
         }
 
         std::visit(
-            [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto warp_c) {
+            [&](auto lro_c, auto idxInfo, auto typeInfo, auto d_c, auto warp_c, auto mh_c) {
+                constexpr bool MH              = decltype(mh_c)::value;  // multi-head operands
                 constexpr GSDDMM_OP OP         = decltype(lro_c)::value.op;
                 constexpr GSDDMM_MEMBER LL     = decltype(lro_c)::value.l;
                 constexpr GSDDMM_MEMBER RR     = decltype(lro_c)::value.r;
@@ -231,24 +242,25 @@ void gsddmm_backward_dispatch(const GsddmmBackwardLaunchArgs& args) {
                     cuda_t *self_ptr        = reinterpret_cast<cuda_t *>(self_out.data_ptr<torch_t>());
                     cuda_t *edge_ptr        = Plan::WRITE_EDGE_GRAD ? reinterpret_cast<cuda_t *>(edge_out.data_ptr<torch_t>()) : nullptr;
 
-                    auto kernel = GSDDMM_backward_normal<OP, LL, RR, REDUCE, W, DC, cuda_t, index_t, float>;
+                    auto kernel = GSDDMM_backward_normal<OP, LL, RR, REDUCE, W, DC, cuda_t, index_t, float, MH>;
 
                     constexpr size_t shmem = gsddmm_backward_shmem_bytes<W, DC, float>();
                     ensure_dynamic_shmem(kernel, shmem, "GSDDMM backward");
 
-                    dim3 blocks(static_cast<unsigned>(num_blocks));
+                    TORCH_CHECK(args.heads >= 1 && args.heads <= 65535, "GSDDMM backward: heads must be in [1, 65535], got ", args.heads);
+                    dim3 blocks(static_cast<unsigned>(num_blocks), args.heads);  // y: one slice per head
                     dim3 threads(kWarpSize, W);
 
                     kernel<<<blocks, threads, shmem, args.stream>>>(
                         static_cast<size_t>(args.N), L_ptr, R_ptr, dO_ptr, self_ptr, edge_ptr,
                         index_ptr<index_t>(IS_SRC ? args.row_ptr_T : args.row_ptr), index_ptr<index_t>(IS_SRC ? args.col_idx_T : args.col_idx),
-                        index_ptr<index_t>(node_indices), IS_SRC ? reinterpret_cast<index_t const *>(args.canonical_edge_idx) : nullptr
+                        index_ptr<index_t>(node_indices), IS_SRC ? reinterpret_cast<index_t const *>(args.canonical_edge_idx) : nullptr, args.heads
                     );
                 }
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.row_ptr.scalar_type()),
             MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-            warp_variant
+            warp_variant, MakeBoolVariant<false, true>(args.heads > 1)
         );
     };
 
@@ -294,7 +306,11 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     using torch_t         = typename decltype(typeInfo)::TorchType;
                     using cuda_t          = typename decltype(typeInfo)::CudaType;
                     constexpr size_t DC   = decltype(d_c)::value;
-                    constexpr int STAGES  = decltype(stages_c)::value;
+                    // Stage axis value 4 = multi-head operands, which run unpipelined: the multi-head
+                // instantiations stay a +1/4 of the grid instead of doubling it.
+                constexpr int STAGES_V  = decltype(stages_c)::value;
+                constexpr bool MH  = STAGES_V == 4;
+                constexpr int STAGES  = MH ? 0 : STAGES_V;
                     // The remap flag as a template parameter; see the forward dispatch.
                     constexpr bool REMAP_IDS = decltype(remap_c)::value != 0;
 
@@ -306,7 +322,7 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     float *self_ptr         = self_f32.data_ptr<float>();
                     cuda_t *edge_ptr        = Plan::WRITE_EDGE_GRAD ? reinterpret_cast<cuda_t *>(edge_out.data_ptr<torch_t>()) : nullptr;
 
-                    auto kernel = GSDDMM_backward_edge_block<OP, LL, RR, REDUCE_, DC, cuda_t, index_t, float, STAGES, REMAP_IDS>;
+                    auto kernel = GSDDMM_backward_edge_block<OP, LL, RR, REDUCE_, DC, cuda_t, index_t, float, STAGES, REMAP_IDS, MH>;
 
                     // Per-warp shared memory: the atomic-flush staging row plus,
                     // when pipelined, the cp.async ring (gsddmm.cuh).
@@ -316,7 +332,8 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     ensure_dynamic_shmem(kernel, shmem, "GSDDMM backward (edge blocks)");
 
                     const uint64_t num_warps  = ceil_div<uint64_t>(args.E, args.edges_per_warp);
-                    const uint64_t num_blocks = ceil_div<uint64_t>(num_warps, args.warps_per_block);
+                    // heads blocks per edge block; the kernel splits the linear index back.
+                    const uint64_t num_blocks = ceil_div<uint64_t>(num_warps, args.warps_per_block) * args.heads;
 
                     constexpr uint64_t kMaxGridX  = (1ull << 31) - 1ull;
                     constexpr uint64_t kMaxGridYZ = 65535ull;
@@ -332,13 +349,13 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
 
                     kernel<<<blocks, threads, shmem, args.stream>>>(
                         static_cast<index_t>(args.E), L_ptr, R_ptr, dO_ptr, self_ptr, edge_ptr, reinterpret_cast<pair_t const *>(edges),
-                        reinterpret_cast<index_t const *>(canonical), static_cast<uint32_t>(args.edges_per_warp)
+                        reinterpret_cast<index_t const *>(canonical), static_cast<uint32_t>(args.edges_per_warp), args.heads
                     );
                 }
             },
             lro_variant, MakeIndexVariant<int32_t, uint32_t, int64_t, uint64_t>(args.edge_index_dtype),
             MakeTypeVariant<GSDDMM_SHARD_TYPE>(args.L.scalar_type()), MakeIntVariant<32, 64, 128, 256>(static_cast<int>(args.D)),
-            MakeIntVariant<0, 1, 2, 3>(args.pipeline_stages),
+            MakeIntVariant<0, 1, 2, 3, 4>(args.heads > 1 ? 4 : args.pipeline_stages),
             MakeIntVariant<0, 1>(canonical != nullptr ? 1 : 0)
         );
     };

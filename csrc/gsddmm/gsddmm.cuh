@@ -120,14 +120,15 @@ inline consteval size_t gsddmm_forward_edge_shmem_bytes_per_warp() {
 // this bounds a block's work by the chunk size instead of the node's degree).
 // Each warp of the block owns one edge at a time, lanes split the D_CONST
 // features into vector tiles.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool MULTI_HEAD = false>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal ( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
     index_t const *__restrict__ node_indices,  // node indirection: node_i = node_indices[blockIdx.x]
     index_t const *__restrict__ block_part,    // nullptr, or chunk index of block blockIdx.x within its node's edge list
-    uint32_t edges_per_block                   // chunk width when block_part != nullptr
+    uint32_t edges_per_block,                  // chunk width when block_part != nullptr
+    uint32_t heads                             // operands are [rows, heads, D_CONST]; head = blockIdx.y (1: [rows, D_CONST])
 );
 
 // Edge-block variant: reads an explicit [E, 2] edge list of (src, dst) node-id
@@ -154,13 +155,14 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_forward_normal
 // instead of 16, 4 bytes per canonical id instead of 8, and broadcasts each id
 // with ONE shuffle instead of two. Only byte offsets are widened to size_t:
 // node_id * D_CONST overflows 32 bits long before a node id does.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false, bool MULTI_HEAD = false>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block ( // no-format
     index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
     index_t const *__restrict__ canonical_edge_idx,
-    uint32_t edges_per_warp
+    uint32_t edges_per_warp,
+    uint32_t heads  // operands are [rows, heads, D_CONST]; head = low digit of the linear block index
 );
 
 // =============================================================================
@@ -303,14 +305,15 @@ inline consteval size_t gsddmm_backward_edge_shmem_bytes_per_warp() {
 // several blocks would make them all write its row, which is exactly what this
 // variant exists to avoid. Use the edge-parallel backward when the degree
 // distribution makes one-block-per-node the bottleneck.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, bool MULTI_HEAD = false>
 __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_backward_normal ( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
     cuda_t *__restrict__ d_self, cuda_t *__restrict__ d_edge,
     index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
     index_t const *__restrict__ node_indices,
-    index_t const *__restrict__ canonical_edge_idx
+    index_t const *__restrict__ canonical_edge_idx,
+    uint32_t heads  // operands are [rows, heads, D_CONST]; head = blockIdx.y
 );
 
 // Edge-parallel backward: one warp per contiguous chunk of the explicit edge
@@ -338,14 +341,15 @@ __global__ void __launch_bounds__(N_PER_BLOCK * kWarpSize) GSDDMM_backward_norma
 // kernel does; 0 takes the direct-load path. index_t types the edge list and
 // every id, as in the forward. REMAP_IDS is the compile-time shadow of
 // canonical_edge_idx != nullptr, exactly as in the forward edge kernel.
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t = float, uint8_t PIPELINE_STAGES = 0, bool REMAP_IDS = false, bool MULTI_HEAD = false>
 __global__ void __launch_bounds__(kWarpSize * kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block ( // no-format
     index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
     accum_t *__restrict__ d_self_f32, cuda_t *__restrict__ d_edge,
     index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
     index_t const *__restrict__ canonical_edge_idx,
-    uint32_t edges_per_warp
+    uint32_t edges_per_warp,
+    uint32_t heads  // operands are [rows, heads, D_CONST]; head = low digit of the linear block index
 );
 
 };  // namespace gsddmm
