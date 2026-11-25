@@ -53,6 +53,7 @@ MODEL_BACKEND_TO_GRAPH_REPR: Mapping[str, GraphBackendOption] = {  # NOTE this d
     # representation for each convolution backend
     "pyg": "pyg",
     "dgl": "dgl",
+    "dgl_ops": "dgl",
     "torch_native_gcn": "normalized_adj_mat_gcn",
     "torch_native_mean_aggr": "adj_mat_in_degree_normalized_transposed",
     "torch_native_sum_aggr": "adj_mat_transposed",
