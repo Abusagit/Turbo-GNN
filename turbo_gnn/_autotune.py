@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import inspect
 import itertools
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -49,6 +50,12 @@ class AutotuneConfig:
             ~30x cheaper warmup across an op family, at the cost of making a
             per-op measurement depend on which op ran first, so it is off by
             default for reproducible benchmarking.
+        strategy: Search strategy: ``"grid"`` (exhaustive) or ``"optuna"``
+            (TPE sampling, requires the ``optuna`` package).
+        n_trials: Trial budget for ``"optuna"``. When the full grid is not
+            larger than this budget, an exhaustive grid search is run instead.
+        timeout: Optional wall-clock limit in seconds for ``"optuna"``.
+        seed: Optional sampler seed for ``"optuna"``.
     """
 
     warmup: int = 10
@@ -62,6 +69,14 @@ class AutotuneConfig:
     use_cache: bool = True
     measure_variant: bool = True
     share_variant_probe: bool = False
+    strategy: str = "grid"
+    n_trials: int = 50
+    timeout: float | None = None
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.strategy not in ("grid", "optuna"):
+            raise ValueError(f"Unknown autotune strategy {self.strategy!r}, expected 'grid' or 'optuna'")
 
 
 def _build_combinations(
@@ -88,6 +103,113 @@ def _build_combinations(
         canon = canonicalise(combo)
         seen.setdefault(tuple(sorted(canon.items())), canon)
     return list(seen.values())
+
+
+# evaluate(graph_cfg, kernel_cfg) -> ms per iteration, or None for an invalid config
+EvaluateFn = Callable[[dict[str, Any], dict[str, Any]], "float | None"]
+
+
+def _search(
+    kernel_params: list[TunableParam],
+    graph_params: list[TunableParam],
+    evaluate: EvaluateFn,
+    config: AutotuneConfig,
+    canonicalise: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], float]:
+    """Find the fastest (graph_cfg, kernel_cfg) pair using ``config.strategy``.
+
+    Returns:
+        (best_graph_cfg, best_kernel_cfg, best_ms). Both configs are empty and
+        ``best_ms`` is ``inf`` if every evaluated config was invalid.
+    """
+    strategy = getattr(config, "strategy", "grid")
+    n_trials = getattr(config, "n_trials", 50)
+    total = len(_build_combinations(graph_params)) * len(_build_combinations(kernel_params, canonicalise))
+
+    if strategy == "optuna" and total > n_trials:
+        return _optuna_search(kernel_params, graph_params, evaluate, config, canonicalise)
+    if strategy == "optuna":
+        logger.info("Search space has %d configs <= n_trials=%d, using grid search", total, n_trials)
+    return _grid_search(kernel_params, graph_params, evaluate, canonicalise)
+
+
+def _grid_search(
+    kernel_params: list[TunableParam],
+    graph_params: list[TunableParam],
+    evaluate: EvaluateFn,
+    canonicalise: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], float]:
+    """Exhaustive search: outer loop over graph combos (expensive to rebuild), inner over kernel combos."""
+    best_ms, best_graph, best_kernel = float("inf"), {}, {}
+    n_trials, best_trial = 0, 0
+    kernel_combos = _build_combinations(kernel_params, canonicalise)
+    for graph_cfg in _build_combinations(graph_params):
+        for kernel_cfg in kernel_combos:
+            n_trials += 1
+            ms = evaluate(graph_cfg, kernel_cfg)
+            if ms is not None and ms < best_ms:
+                best_ms, best_graph, best_kernel = ms, graph_cfg, kernel_cfg
+                best_trial = n_trials
+    logger.info("Grid search: best %.3f ms found at trial %d/%d", best_ms, best_trial, n_trials)
+    return best_graph, best_kernel, best_ms
+
+
+def _suggest(trial, param: TunableParam) -> Any:
+    """Suggest a value from ``param.values``; non-primitive values are sampled by index."""
+    if all(v is None or isinstance(v, (bool, int, float, str)) for v in param.values):
+        return trial.suggest_categorical(param.name, list(param.values))
+    return param.values[trial.suggest_categorical(param.name, list(range(len(param.values))))]
+
+
+def _optuna_search(
+    kernel_params: list[TunableParam],
+    graph_params: list[TunableParam],
+    evaluate: EvaluateFn,
+    config: AutotuneConfig,
+    canonicalise: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], float]:
+    import optuna  # optional dependency, only needed for strategy="optuna"
+
+    graph_names = {p.name for p in graph_params}
+    params = graph_params + kernel_params
+    seen: dict[str, float | None] = {}
+    # [ms, graph_cfg, kernel_cfg, trial number (1-based), unique configs timed so far]
+    best: list = [float("inf"), {}, {}, 0, 0]
+
+    def objective(trial) -> float:
+        cfg = {p.name: _suggest(trial, p) for p in params}
+        graph_cfg = {k: v for k, v in cfg.items() if k in graph_names}
+        kernel_cfg = {k: v for k, v in cfg.items() if k not in graph_names}
+        # collapse behaviourally identical configs so they are timed once, as in the grid
+        if canonicalise is not None:
+            kernel_cfg = canonicalise(kernel_cfg)
+        key = json.dumps({**graph_cfg, **kernel_cfg}, sort_keys=True, default=repr)
+        if key not in seen:
+            seen[key] = evaluate(graph_cfg, kernel_cfg)
+        ms = seen[key]
+        if ms is None:
+            raise optuna.TrialPruned()
+        if ms < best[0]:
+            best[:] = [ms, graph_cfg, kernel_cfg, trial.number + 1, len(seen)]
+        return ms
+
+    verbosity = optuna.logging.get_verbosity()
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    try:
+        sampler = optuna.samplers.TPESampler(seed=config.seed, multivariate=True)
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        study.optimize(objective, n_trials=config.n_trials, timeout=config.timeout)
+    finally:
+        optuna.logging.set_verbosity(verbosity)
+    logger.info(
+        "Optuna search: best %.3f ms found at trial %d/%d (unique config %d/%d timed)",
+        best[0],
+        best[3],
+        len(study.trials),
+        best[4],
+        len(seen),
+    )
+    return best[1], best[2], best[0]
 
 
 class _InlineAutotuneCache:
@@ -260,7 +382,7 @@ class TunableKernel(ABC):
     # ------ inline autotuning ------
 
     def _inline_autotune(self, x, graph_repr, config=None, **kwargs):
-        """Full grid search over this kernel's declared params for the pass being tuned."""
+        """Search (``config.strategy``) over this kernel's declared params for the pass being tuned."""
         config = config or self._autotune_config
         if bool(getattr(config, "tune_backward", False)):
             kernel_params = self.get_tunable_backward_kernel_params()
@@ -277,7 +399,7 @@ class TunableKernel(ABC):
         return self._grid_search(x, graph_repr, config, kernel_params, graph_params, **kwargs)
 
     def _grid_search(self, x, graph_repr, config, kernel_params, graph_params, **kwargs):
-        """Time every (graph config, kernel config) pair and keep the fastest.
+        """Search (graph config, kernel config) pairs with ``config.strategy`` and keep the fastest.
 
         Split out of :meth:`_inline_autotune` so a kernel whose parameter space
         depends on an earlier decision (GSDDMM picks its kernel variant first,
@@ -321,39 +443,41 @@ class TunableKernel(ABC):
         if not kernel_params and not graph_params:
             return {"kernel_config": {}, "graph_config": {}, "graph_repr": graph_repr, "ms_per_iter": None}
 
-        graph_combos = _build_combinations(graph_params)
-        kernel_combos = _build_combinations(kernel_params, self.canonicalise_config)
-        best_ms = float("inf")
-        best_result = {"kernel_config": {}, "graph_config": {}, "graph_repr": graph_repr, "ms_per_iter": None}
+        # graph repartitioning is expensive; reuse the last one while graph_cfg is unchanged
+        last_graph: list = [None, None]
+
+        def evaluate(graph_cfg, kernel_cfg):
+            if last_graph[0] != graph_cfg or last_graph[1] is None:
+                last_graph[:] = [graph_cfg, graph_repr.repartition(**graph_cfg) if graph_cfg else graph_repr]
+            if kernel_cfg:
+                self.configure(**kernel_cfg)
+            try:
+                bench_fn = make_bench(x, last_graph[1], **kwargs)
+                return time_callable(bench_fn, warmup=config.warmup, iters=config.iters).ms_per_iter
+            except RuntimeError:
+                logger.debug("Skipping invalid config: graph=%s kernel=%s", graph_cfg, kernel_cfg)
+                return None
+
         self._is_autotuning = True
         try:
-            for graph_cfg in graph_combos:
-                current_graph = graph_repr.repartition(**graph_cfg) if graph_cfg else graph_repr
-                for kernel_cfg in kernel_combos:
-                    if kernel_cfg:
-                        self.configure(**kernel_cfg)
-                    try:
-                        bench_fn = make_bench(x, current_graph, **kwargs)
-                        ms = time_callable(
-                            bench_fn,
-                            warmup=config.warmup,
-                            iters=config.iters,
-                        ).ms_per_iter
-                    except RuntimeError:
-                        logger.debug("Skipping invalid config: graph=%s kernel=%s", graph_cfg, kernel_cfg)
-                        continue
-                    if ms < best_ms:
-                        best_ms = ms
-                        # graph_config records which partitioning won; the caller
-                        # cannot recover it from graph_repr alone.
-                        best_result = {
-                            "kernel_config": kernel_cfg,
-                            "graph_config": graph_cfg,
-                            "graph_repr": current_graph,
-                            "ms_per_iter": ms,
-                        }
+            best_graph_cfg, best_kernel_cfg, best_ms = _search(
+                kernel_params, graph_params, evaluate, config, self.canonicalise_config
+            )
         finally:
             self._is_autotuning = False
+        if not best_graph_cfg:
+            best_graph = graph_repr
+        elif last_graph[0] == best_graph_cfg:
+            best_graph = last_graph[1]
+        else:
+            best_graph = graph_repr.repartition(**best_graph_cfg)
+        # graph_config records which partitioning won; the caller cannot recover it from graph_repr alone.
+        best_result = {
+            "kernel_config": best_kernel_cfg,
+            "graph_config": best_graph_cfg,
+            "graph_repr": best_graph,
+            "ms_per_iter": best_ms if best_ms != float("inf") else None,
+        }
         if best_result["kernel_config"]:
             self.configure(**best_result["kernel_config"])
         return best_result

@@ -1,16 +1,17 @@
 """
 Autotuning engine for CUDA backend kernel and graph parameters.
 
-Performs grid search grouped by graph params (outer) then kernel params (inner)
-to minimize expensive graph rebuilds. Results are cached to JSON on disk.
+Searches graph + kernel params either exhaustively (grid search grouped by graph
+params (outer) then kernel params (inner) to minimize expensive graph rebuilds) or
+with Optuna TPE sampling (``AutotuneConfig.strategy``). Results are cached to JSON on disk.
 """
 
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import logging
+import math
 import shutil
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ import torch
 import src.benchmarking.microbench as _microbench
 from src.backends.base import AutotuneConfig, BaseConvolution, TunableKernel, TunableParam
 from src.data.datasets import GraphSample
+from turbo_gnn._autotune import _build_combinations, _search  # noqa: F401  (re-exported for tests)
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +107,6 @@ class AutotuneCache:
         return count
 
 
-def _build_combinations(params: list[TunableParam]) -> list[dict[str, Any]]:
-    """Build all combinations from a list of TunableParam."""
-    if not params:
-        return [{}]
-    names = [p.name for p in params]
-    value_lists = [p.values for p in params]
-    return [dict(zip(names, combo)) for combo in itertools.product(*value_lists)]
-
-
 def _apply_best_config(
     target,
     graph_sample: GraphSample,
@@ -139,7 +132,7 @@ def _apply_best_config(
         target.configure(**kernel_cfg)
 
 
-def _grid_search(
+def _tune(
     target,
     x: torch.Tensor,
     graph_sample: GraphSample,
@@ -152,11 +145,11 @@ def _grid_search(
     feature_dim: int,
     gpu_name: str,
 ) -> tuple[dict[str, Any], float]:
-    """Run grid search: outer loop over graph combos, inner over kernel combos.
+    """Search graph + kernel params with ``config.strategy`` (grid or optuna).
 
     Individual trial results are cached per-trial when ``config.cache_dir``
     is set, so previously-timed configurations are reused even if the
-    parameter space changes.
+    parameter space or the search strategy changes.
 
     Args:
         target: The convolution or kernel callable to tune (anything with
@@ -176,86 +169,59 @@ def _grid_search(
     """
     time_callable = _microbench.time_callable
 
-    graph_combos = _build_combinations(graph_params)
-    kernel_combos = _build_combinations(kernel_params)
-
-    total_trials = len(graph_combos) * len(kernel_combos)
-    logger.info(
-        "Grid search %s: %d graph combos x %d kernel combos = %d total trials",
-        target_name,
-        len(graph_combos),
-        len(kernel_combos),
-        total_trials,
-    )
+    total_trials = math.prod(len(p.values) for p in graph_params + kernel_params)
+    logger.info("%s search %s: %d configs in search space", config.strategy, target_name, total_trials)
 
     use_cache = config.cache_dir is not None and config.use_cache
     save_cache = config.cache_dir is not None
 
-    best_ms = float("inf")
-    best_config: dict[str, Any] = {}
+    # graph rebuilds are expensive (CSR, node partitions); only redo them when graph_cfg changes
+    current_graph_cfg: list = [None]
     trial = 0
 
-    for graph_cfg in graph_combos:
-        # apply graph params (expensive: rebuilds CSR, partitions nodes)
-        if graph_cfg:
+    def evaluate(graph_cfg: dict[str, Any], kernel_cfg: dict[str, Any]) -> float | None:
+        nonlocal trial
+        trial += 1
+        if graph_cfg and graph_cfg != current_graph_cfg[0]:
             current_kwargs = dict(graph_sample.kernel_related_kwargs)
             current_kwargs.update(graph_cfg)
             graph_sample.update_graph_repr_with_new_hyperparameters(current_kwargs)
+        current_graph_cfg[0] = graph_cfg
 
-        graph_repr = graph_sample.graph_repr
+        if kernel_cfg:
+            target.configure(**kernel_cfg)
 
-        for kernel_cfg in kernel_combos:
-            trial += 1
-            combined_cfg = {**graph_cfg, **kernel_cfg}
+        combined_cfg = {**graph_cfg, **kernel_cfg}
+        trial_key = None
+        if save_cache:
+            trial_key = AutotuneCache.compute_trial_key(
+                target_name,
+                feature_dim,
+                graph_sample.num_nodes,
+                graph_sample.num_edges,
+                gpu_name,
+                combined_cfg,
+            )
+        if use_cache:
+            ms = AutotuneCache.load_trial(config.cache_dir, target_name, trial_key)  # type: ignore
+            if ms is not None:
+                logger.debug("Trial %d: %s -> %.3f ms (cached)", trial, combined_cfg, ms)
+                return ms
 
-            # apply kernel params
-            if kernel_cfg:
-                target.configure(**kernel_cfg)
+        try:
+            bench_fn = make_bench_fn(target, x, graph_sample.graph_repr)
+            result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
+        except RuntimeError as exc:
+            logger.debug("Trial %d: %s -> invalid config (%s)", trial, combined_cfg, exc)
+            return None
+        ms = result.ms_per_iter
+        logger.debug("Trial %d: %s -> %.3f ms", trial, combined_cfg, ms)
+        if save_cache:
+            AutotuneCache.save_trial(config.cache_dir, target_name, trial_key, ms)  # type: ignore
+        return ms
 
-            # per-trial cache lookup
-            trial_key = None
-            ms = None
-            if use_cache:
-                trial_key = AutotuneCache.compute_trial_key(
-                    target_name,
-                    feature_dim,
-                    graph_sample.num_nodes,
-                    graph_sample.num_edges,
-                    gpu_name,
-                    combined_cfg,
-                )
-                ms = AutotuneCache.load_trial(config.cache_dir, target_name, trial_key)  # type: ignore
-                if ms is not None:
-                    logger.debug("Trial %d/%d: %s -> %.3f ms (cached)", trial, total_trials, combined_cfg, ms)
-
-            if ms is None:
-                try:
-                    bench_fn = make_bench_fn(target, x, graph_repr)
-                    result = time_callable(bench_fn, warmup=config.warmup, iters=config.iters, do_memory_profile=False)
-                except RuntimeError as exc:
-                    logger.debug("Trial %d/%d: %s -> invalid config (%s)", trial, total_trials, combined_cfg, exc)
-                    continue
-                ms = result.ms_per_iter
-                logger.debug("Trial %d/%d: %s -> %.3f ms", trial, total_trials, combined_cfg, ms)
-
-                # save this trial
-                if save_cache:
-                    if trial_key is None:
-                        trial_key = AutotuneCache.compute_trial_key(
-                            target_name,
-                            feature_dim,
-                            graph_sample.num_nodes,
-                            graph_sample.num_edges,
-                            gpu_name,
-                            combined_cfg,
-                        )
-                    AutotuneCache.save_trial(config.cache_dir, target_name, trial_key, ms)  # type: ignore
-
-            if ms < best_ms:
-                best_ms = ms
-                best_config = combined_cfg
-
-    return best_config, best_ms
+    best_graph_cfg, best_kernel_cfg, best_ms = _search(kernel_params, graph_params, evaluate, config)
+    return {**best_graph_cfg, **best_kernel_cfg}, best_ms
 
 
 def run_autotune(
@@ -266,7 +232,7 @@ def run_autotune(
 ) -> dict:
     """Core autotuning search with separate forward/backward parameter spaces.
 
-    Runs independent grid searches for forward and backward passes, then
+    Runs independent searches for forward and backward passes, then
     merges results. Forward uses get_tunable_forward_kernel_params() and
     get_tunable_forward_graph_params(); backward uses get_tunable_backward_kernel_params()
     and get_tunable_backward_graph_params().
@@ -298,7 +264,7 @@ def run_autotune(
     best_fwd: dict[str, Any] = {}
     best_bwd: dict[str, Any] = {}
 
-    # --- fwd grid search ---
+    # --- fwd search ---
     fwd_params = fwd_kernel_params + fwd_graph_params
     if fwd_params:
 
@@ -309,7 +275,7 @@ def run_autotune(
             return _bench
 
         logger.info("Autotuning %s forward pass:", target_name)
-        best_fwd, fwd_ms = _grid_search(
+        best_fwd, fwd_ms = _tune(
             conv,
             x,
             graph_sample,
@@ -323,7 +289,7 @@ def run_autotune(
         )
         logger.info("Forward best: %s (%.3f ms)", best_fwd, fwd_ms)
 
-    # --- bwd grid search ---
+    # --- bwd search ---
     bwd_params = bwd_kernel_params + bwd_graph_params
     if config.tune_backward and bwd_params:
 
@@ -337,7 +303,7 @@ def run_autotune(
             return _bench
 
         logger.info("Autotuning %s backward pass:", target_name)
-        best_bwd, bwd_ms = _grid_search(
+        best_bwd, bwd_ms = _tune(
             conv,
             x,
             graph_sample,
@@ -401,7 +367,7 @@ def run_autotune_kernel(
     best_fwd: dict[str, Any] = {}
     best_bwd: dict[str, Any] = {}
 
-    # --- fwd grid search ---
+    # --- fwd search ---
     fwd_params = fwd_kernel_params + fwd_graph_params
     if fwd_params:
 
@@ -409,7 +375,7 @@ def run_autotune_kernel(
             return k.make_forward_bench_fn(xi, g)
 
         logger.info("Autotuning %s forward pass:", target_name)
-        best_fwd, fwd_ms = _grid_search(
+        best_fwd, fwd_ms = _tune(
             kernel,
             x,
             graph_sample,
@@ -423,7 +389,7 @@ def run_autotune_kernel(
         )
         logger.info("Forward best: %s (%.3f ms)", best_fwd, fwd_ms)
 
-    # --- bwd grid search ---
+    # --- bwd search ---
     bwd_params = bwd_kernel_params + bwd_graph_params
     if config.tune_backward and bwd_params:
 
@@ -431,7 +397,7 @@ def run_autotune_kernel(
             return k.make_backward_bench_fn(xi, g)
 
         logger.info("Autotuning %s backward pass:", target_name)
-        best_bwd, bwd_ms = _grid_search(
+        best_bwd, bwd_ms = _tune(
             kernel,
             x,
             graph_sample,
