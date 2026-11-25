@@ -412,7 +412,7 @@ def measure_train_step_peak_cuda_memory(
     """
     kwargs = kwargs or {}
 
-    scaler = torch.cuda.amp.GradScaler(
+    scaler = torch.amp.GradScaler(device_type="cuda",
         enabled=bool(amp_dtype is not None and use_grad_scaler and torch.cuda.is_available())
     )
 

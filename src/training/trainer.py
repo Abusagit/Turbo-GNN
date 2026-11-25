@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from tqdm import tqdm
@@ -120,9 +120,9 @@ class GNNTrainer:
         self.hooks: list[Any] = []
 
         # Setup AMP if enabled
-        self.scaler = GradScaler() if config.use_amp else None
+        self.scaler = GradScaler("cuda") if config.use_amp else None
         self.autocast_context = (
-            autocast(enabled=config.use_amp, dtype=torch.bfloat16) if config.use_amp else nullcontext()
+            autocast("cuda", enabled=config.use_amp, dtype=torch.bfloat16) if config.use_amp else nullcontext()
         )
 
         # Training state

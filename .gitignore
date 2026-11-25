@@ -4,6 +4,7 @@ compile_commands.json
 .cache/clangd
 CLAUDE.md
 .claude
+.pi
 
 .venv
 .env
