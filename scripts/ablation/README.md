@@ -1,126 +1,107 @@
-# Load-imbalance simulator: from an empty machine to the figures
+# Load-imbalance simulation
 
-The simulator charges a vertex `alpha + beta * degree` ticks and schedules the resulting
-blocks onto SM slots. `beta` is fixed at 1 by definition -- one tick is the cost of one
-neighbour -- so the whole model rests on two numbers measured from the real kernels: `alpha`,
-the per-vertex prologue and epilogue, and the duration of a tick.
+The simulator assigns each node `alpha + beta * degree` ticks and schedules its
+blocks onto SM slots. GPU measurements calibrate the cost model; the simulation
+runs on CPU. Predicted times describe scheduling effects, not measured speedups
+of new CUDA kernels. Recalibrate after changing the GPU or kernel implementation.
 
-Both belong to the card they were measured on. **Measure and simulate on the same GPU**, or
-the run silently mixes two machines.
+## Run on A100
 
-## The pipeline
-
-| # | step | script | needs a GPU | cost |
-|---|---|---|---|---|
-| 1 | time the real kernels | `measure_kernel_times.py` | **yes** | ~1 min |
-| 2 | fit the cost model | `calibrate_cost_model.py` | no | seconds |
-| 3 | sweep the grid | `sweep_all.py` | no | hours |
-| 4 | draw | `plot_heatmap_grid.py` and friends | no | minutes to hours |
-
-Only step 1 touches the GPU. Everything after it is CPU-bound and can run while the card is
-busy with something else.
-
-### 1. Measure
+Use the [project environment](../../README.md#installation), with CUDA toolkit
+and datasets available. Run from the repository root. Rebuild the extension after
+switching branches so measurements use the current kernels:
 
 ```bash
-python scripts/ablation/measure_kernel_times.py \
-    --graphs cora citeseer pubmed tolokers-2 ogbn-arxiv ... \
-    --warmup 10 --iters 30 --out reports/measurements.jsonl
+TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=4 TURBO_GNN_FORCE_BUILD=TRUE \
+  .venv/bin/python -m pip install -e . --no-build-isolation
+
+# Measure kernels and fit cost_models.json.
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 \
+  bash scripts/ablation/calibrate_device.sh a100 reports/simulation-a100
+
+# Compare bucket counts and scheduling policies on CPU.
+OMP_NUM_THREADS=4 .venv/bin/python scripts/ablation/sweep_degree_buckets.py \
+  --hardware a100 --cost-model reports/simulation-a100/cost_models.json \
+  --graphs tolokers-2 --conv gat_v2 --head-dim 128 \
+  --buckets 2 4 8 --orderings natural --plot \
+  --out reports/simulation-a100/sweep
 ```
 
-Times `gt`, `gat_v2` and `min_aggr`, forward and backward, at head dimensions 128 and 256,
-on every graph given, using CUDA events. One JSON record per (graph, conv, pass, head dim)
-with the graph's node and edge counts, the milliseconds per launch and the device name. A
-graph that will not load is skipped with its reason and the run continues.
+Calibration uses eight real graphs, `gt/gat_v2/min_aggr` forward, one head,
+head dimensions 128/256, fp32 and heavy quantile 0.99. Append
+`--convs gat_v2 --head-dims 128` to the calibration command for a shorter run.
+Set `PY` to use a different Python executable. Check the logs for skipped datasets
+and rejected fits. These settings differ from the paper's fp16 benchmarks.
 
-### 2. Calibrate
+For H100, rebuild with `TORCH_CUDA_ARCH_LIST=9.0`, then use:
 
 ```bash
-python scripts/ablation/calibrate_cost_model.py \
-    --from-json reports/measurements.jsonl --out cost_models.json
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 \
+  bash scripts/ablation/calibrate_device.sh h100 reports/simulation-h100
+
+OMP_NUM_THREADS=4 .venv/bin/python scripts/ablation/sweep_degree_buckets.py \
+  --hardware h100 --cost-model reports/simulation-h100/cost_models.json \
+  --graphs tolokers-2 --orderings natural --plot \
+  --out reports/simulation-h100/sweep
 ```
 
-Regresses `t(N, E) = c + a*N + b*E` per (conv, pass, head dim), under `a, b >= 0`. Since
-`sum(alpha + beta * degree) = alpha*N + beta*E`, normalising `beta` to 1 gives
-`alpha = a/b` and a tick of `b` nanoseconds. Prints a table: `alpha`, ns per tick, launch
-overhead, R2, median error, and what share of the time edges explain.
+The profiles assume SXM 80GB cards: A100 uses 108 SMs / 2039 GB/s;
+H100 uses 132 SMs / 3350 GB/s. Override `--sms` and `--memory-bandwidth-gbps`
+for other variants. GPU, dtype, head count and quantile metadata are checked.
 
-Read the "do not predict wall clock from these cells" list. A cell is flagged when `alpha`
-hits the non-negativity constraint, when edges explain under 20% of its time, or when the
-median error exceeds 35%. Flagged cells are skipped by every later step. One or two flags is
-normal -- min-aggregation's backward pass is O(N), not O(E), so no `alpha + beta * degree`
-model describes it.
+## Bucket experiments
 
-`cost_models.json` is **not** committed: it is only valid for the card it was measured on.
+| Strategy | Partition |
+|---|---|
+| `quantile` | Split light nodes by quantile; keep the heavy bucket intact. |
+| `log` | Split light nodes into logarithmic degree ranges; keep heavy intact. |
+| `tail` | Split both light and heavy nodes with finer ranges in the tail. |
 
-### 3. Sweep
+Defaults: 2/4/8 buckets, all three strategies, sequential/concurrent launches,
+and seeds 42/43/44. `--orderings natural` preserves node order within each bucket;
+a two-bucket descending-order control is always included. Use
+`--orderings natural descending` to compare both orders for every bucket count.
+
+Buckets launch from highest to lowest degree. Each node retains its resource
+class: 8 light or 4 heavy blocks per SM by default. Empty buckets are omitted,
+equal degrees stay together, and `tail` requires an even bucket count.
+Edge slicing is disabled in this experiment.
+
+`--extra-launch-us 0 2 5` adds a sensitivity surcharge per extra nonempty bucket.
+It is an assumed launch cost, not a measured overhead. Preprocessing, cache
+locality and per-bucket kernel tuning are not modelled.
+
+## Datasets and results
+
+Use `--graphs paper` for the 16 graphs in main-text Tables 1–3:
+
+```text
+artnet-exp avazu-ctr citeseer city-reviews city-roads-L city-roads-M
+cora hm-categories ogbn-arxiv ogbn-products ogbn-proteins pokec-regions
+pubmed tolokers-2 twitch-views web-fraud
+```
+
+Start with `tolokers-2 ogbn-arxiv web-fraud city-roads-L pubmed`. Additional options
+include `web-traffic`, `amazon-computers`, `coauthor-physics` and `reddit`.
+Use `synth-N16384` for scheduling stress tests, not cost-model calibration.
+
+Calibration writes `measurements.jsonl`, `cost_models.json` and logs. The bucket
+sweep writes `results.csv`, `manifest.json` and optional plots. CSV rows include
+requested/effective bucket counts, makespan, predicted time, and speedups against
+the two-bucket natural/ordered controls for the same launch mode and seed.
+A speedup greater than 1 is an improvement.
+
+The fit is `t = c + a*N + b*E`, with `alpha=a/b` and `beta=1`. One shared tick
+duration is anchored to the two-bucket sequential baseline; `c` is added once.
+Absolute times depend on fit quality. The new sweep supports forward only:
+the existing measurement script's backward mode times forward and backward together.
+
+## Other experiments and checks
+
+`sweep_all.py` explores launch modes and edge slicing. `simulate_load_imbalance.py`
+exposes individual scheduling parameters. `plot_heatmap_grid.py` and
+`plot_heatmap_pair.py` produce occupancy figures. Each script supports `--help`.
 
 ```bash
-python scripts/ablation/sweep_all.py --cost-model cost_models.json \
-    --sms 108 --memory-bandwidth-gbps 2039 --out reports/sweep.csv
+.venv/bin/python -m pytest tests/unit/test_degree_bucket_simulation.py -q
 ```
-
-One row per (graph, cell, quantile, launch mode, split-K): makespan `T`, the perfect-packing
-time `T*`, which of the three lower bounds attains it, the ratio, the drain tail, mean slot
-occupancy and predicted milliseconds. This is where the conclusions come from; the figures
-only illustrate them.
-
-Resumable -- rows already in the CSV are skipped -- and dominated by the graphs with the
-largest hub, since a run without slicing lasts about as long as the biggest vertex.
-
-### 4. Draw
-
-```bash
-# Five panels per figure, as PDF, for the paper.
-python scripts/ablation/plot_heatmap_grid.py \
-    --setups tolokers-2:gat_v2:forward:128:0.99 ogbn-arxiv:gt:forward:128:0.99 \
-    --cost-model cost_models.json --sms 108 --memory-bandwidth-gbps 2039 \
-    --out-dir reports/figures
-
-# Two panels: the bucketed baseline against concurrent + edge slicing.
-python scripts/ablation/plot_heatmap_pair.py --dataset tolokers-2 \
-    --cost-model cost_models.json --conv gat_v2 --pass forward --head-dim 128 \
-    --sms 108 --memory-bandwidth-gbps 2039 --out pair.png
-```
-
-`plot_heatmap_grid.py` prints the graph's shape and every panel's `T`, `T*` and `T/T*`, which
-is everything a caption needs. Pass `--tex` if you also want that written as LaTeX.
-
-The older figure scripts are still here: `plot_all.py` walks the whole grid into per-cell
-directories of PNGs, `plot_launch_modes.py` draws one such figure, and
-`plot_occupancy_profile.py` collapses the SM axis into a single occupancy curve.
-
-## Exploring a single configuration
-
-`simulate_load_imbalance.py` is the layer underneath all of the above, and runs one point of
-the space with every knob exposed -- assignment order, vertices per block, blocks per SM,
-occupancy, launch mode, slice size. Start here when changing the model rather than using it.
-`dump_timeline.py` prints the resulting schedule block by block.
-
-## Checking that the simulation is sound
-
-Three things are worth re-deriving after any change to the cost model.
-
-**The tick should track memory bandwidth.** It is a per-neighbour cost, and that cost is
-memory-bound, so moving to a card with `k` times less bandwidth should multiply it by `k`.
-Between an H100 and an A100 the measured ratio was 1.62 against a bandwidth ratio of 1.64.
-Nothing in the calibration knows about bandwidth, so this is an independent check.
-
-**`alpha` should be roughly card-independent.** It is a ratio of two fitted coefficients, so
-a uniform slowdown cancels. Large moves in `alpha` between cards mean the fit is unstable,
-not that the hardware changed.
-
-**`T/T*` should never fall below 1.** It is a makespan over a lower bound on the same work;
-a value under 1 means a bound is computed wrong.
-
-Unit tests cover the fit and the launch barrier:
-
-```bash
-python -m pytest tests/unit/test_cost_model_calibration.py \
-                 tests/unit/test_load_imbalance_simulation.py
-```
-
-## Runbooks
-
-`dev/sinfillo/recalibrate.sh` runs steps 1--4 end to end on a new card.
-`dev/sinfillo/paper_figures.sh` runs step 4 for the setups chosen for the paper.

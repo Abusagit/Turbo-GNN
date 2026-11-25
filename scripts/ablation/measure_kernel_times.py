@@ -208,6 +208,12 @@ def main() -> int:
                     "graph": {"num_nodes": num_nodes, "num_edges": num_edges},
                     "ms_per_iter": elapsed,
                     "gpu": gpu,
+                    "sms": torch.cuda.get_device_properties(device).multi_processor_count,
+                    "dtype": "float32",
+                    "quantile": args.quantile,
+                    "timing_scope": "forward+backward" if backward else "forward",
+                    "warmup": args.warmup,
+                    "iters": args.iters,
                 }
             )
             print(f"    {conv:<9} d{head_dim:<4} {pass_name:<9} {elapsed:10.4f} ms")
