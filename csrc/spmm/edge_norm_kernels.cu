@@ -1,12 +1,21 @@
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
 #include "common.cuh"
+
+// Degrees and normalized edge weights of a CSR (rows are destinations) for the cuSPARSE SpMM
+// (cusparse_spmm.cpp). Both launches go to the caller's current stream on the CSR's device, ordered
+// after whatever produced the CSR there. They used to go to the legacy default stream, followed by a
+// cudaDeviceSynchronize: that orders nothing *before* them, so a CSR still being written on a side
+// stream was read unfinished (reproduced: wrong normalization in 5 of 5 trials).
 
 enum class NormType : uint8_t { NONE = 0, RIGHT = 1, LEFT = 2, BOTH = 3 };
 
 template <IntegralNum index_t>
 __global__ void compute_degrees_kernel(
-    const index_t *indptr, const index_t *indices, float *in_degrees, float *out_degrees, int32_t num_nodes
+    const index_t *indptr, const index_t *indices, float *in_degrees, float *out_degrees, int64_t num_nodes
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx < num_nodes) {
         // For TRANSPOSED CSR: indptr gives IN-degrees (incoming edges)
         // IN-degree in TRANSPOSED CSR (row = destination, entries = sources)
@@ -26,14 +35,14 @@ __global__ void compute_degrees_kernel(
 template <IntegralNum index_t>
 __global__ void compute_edge_weights_kernel(
     const index_t *indptr, const index_t *indices, const float *edge_weights, float *normalized_weights, const float *in_degrees,
-    const float *out_degrees, int32_t num_nodes, NormType norm
+    const float *out_degrees, int64_t num_nodes, NormType norm
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx < num_nodes) {
         for (index_t i = indptr[idx]; i < indptr[idx + 1]; i++) {
-            int dst      = idx;
-            index_t src  = indices[i];
-            float weight = edge_weights ? edge_weights[static_cast<size_t>(i)] : 1.0f;
+            const int64_t dst = idx;
+            index_t src       = indices[i];
+            float weight      = edge_weights ? edge_weights[static_cast<size_t>(i)] : 1.0f;
 
             switch (norm) {
                 case NormType::NONE:
@@ -70,28 +79,35 @@ void launch_compute_degrees(
     TORCH_CHECK(in_degrees.scalar_type() == torch::kFloat, "in_degrees must be float32");
     TORCH_CHECK(out_degrees.scalar_type() == torch::kFloat, "out_degrees must be float32");
     TORCH_CHECK(indptr.is_contiguous() && indices.is_contiguous(), "indptr/indices contiguous");
+    TORCH_CHECK(
+        in_degrees.device() == indptr.device() && out_degrees.device() == indptr.device() && indices.device() == indptr.device(),
+        "compute_degrees: all tensors must be on one device"
+    );
+    TORCH_CHECK(block_dim >= 1 && block_dim <= 1024, "compute_degrees: block_dim must be in [1, 1024]");
+    const at::cuda::CUDAGuard device_guard(indptr.device());
 
-    int32_t num_nodes = indptr.size(0) - 1;
+    const int64_t num_nodes = indptr.size(0) - 1;
 
     in_degrees.zero_();
     out_degrees.zero_();
+    if (num_nodes <= 0) {
+        return;
+    }
 
     dim3 block(block_dim);
-    dim3 grid(ceil_div<uint32_t>(num_nodes, block.x));
+    dim3 grid(static_cast<unsigned>(ceil_div<int64_t>(num_nodes, block.x)));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     std::visit(
         [&](auto idxInfo) {
             using index_t = typename decltype(idxInfo)::Type;
-            compute_degrees_kernel<index_t><<<grid, block>>>(
+            compute_degrees_kernel<index_t><<<grid, block, 0, stream>>>(
                 index_ptr<index_t>(indptr), index_ptr<index_t>(indices), in_degrees.data_ptr<float>(), out_degrees.data_ptr<float>(), num_nodes
             );
         },
         MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype)
     );
-
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "compute_degrees_kernel launch failed: ", cudaGetErrorString(err));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void launch_compute_normalized_weights(
@@ -113,10 +129,16 @@ void launch_compute_normalized_weights(
         "edge_weights must be same length as indices or empty"
     );
 
-    int32_t num_nodes = static_cast<int32_t>(indptr.size(0) - 1);
+    TORCH_CHECK(block_dim >= 1 && block_dim <= 1024, "compute_normalized_weights: block_dim must be in [1, 1024]");
+    const at::cuda::CUDAGuard device_guard(indptr.device());
+    const int64_t num_nodes = indptr.size(0) - 1;
+    if (num_nodes <= 0) {
+        return;
+    }
 
     dim3 block(block_dim);
-    dim3 grid(ceil_div<uint32_t>(num_nodes, block.x));
+    dim3 grid(static_cast<unsigned>(ceil_div<int64_t>(num_nodes, block.x)));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     const float *edge_weights_ptr = nullptr;
 
@@ -130,7 +152,7 @@ void launch_compute_normalized_weights(
     std::visit(
         [&](auto idxInfo) {
             using index_t = typename decltype(idxInfo)::Type;
-            compute_edge_weights_kernel<index_t><<<grid, block>>>(
+            compute_edge_weights_kernel<index_t><<<grid, block, 0, stream>>>(
                 index_ptr<index_t>(indptr), index_ptr<index_t>(indices), edge_weights_ptr, normalized_weights.data_ptr<float>(),
                 in_degrees.data_ptr<float>(), out_degrees.data_ptr<float>(), num_nodes, norm
             );
@@ -138,8 +160,5 @@ void launch_compute_normalized_weights(
         MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype)
     );
 
-    cudaDeviceSynchronize();
-
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "compute_edge_weights_kernel launch failed: ", cudaGetErrorString(err));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

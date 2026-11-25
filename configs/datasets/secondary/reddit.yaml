@@ -1,4 +1,7 @@
 dataset:
   source: pyg
   name: reddit
-  root: data
+  # Own root: PyG's Reddit, Flickr, FacebookPagePage and LastFMAsia have no per-name
+  # sub-directory and all write <root>/processed/data.pt, so under a shared root they
+  # silently load each other's graph. data/<ClassName> matches prepare_graph.py.
+  root: data/Reddit

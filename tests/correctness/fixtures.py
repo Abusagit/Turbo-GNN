@@ -21,12 +21,18 @@ def device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def set_default_device(device):
-    """Set the default device for the test session."""
+    """Make ``device`` the default torch device for the duration of one test.
+
+    Function-scoped on purpose: a session-scoped default device leaks into every test
+    that runs afterwards (e.g. tests/csrc, whose CPU-generator draws then fail).
+    """
+    prev = torch.get_default_device()
     torch.set_default_device(device)
     yield device
-    torch.set_default_device("cpu")  # Reset after tests
+    # None removes the global DeviceContext entirely; "cpu" would leave one installed.
+    torch.set_default_device(None if prev.type == "cpu" else prev)
 
 
 @pytest.fixture

@@ -27,6 +27,15 @@ inline constexpr bool is_device_pass = false;
 inline constexpr int kCudaArch       = 0;
 #endif
 
+// Resident blocks per SM of the architecture being compiled (CUDA Programming Guide, compute
+// capability table): 16 on sm_86, 24 on sm_87/89 and sm_12x, 32 elsewhere from sm_80 on. A
+// __launch_bounds__ minimum above it is ignored by ptxas -- register cap included.
+inline constexpr int kMaxResidentBlocksPerSM = kCudaArch == 860 ? 16 : (kCudaArch == 870 || kCudaArch == 890 || kCudaArch >= 1200) ? 24 : 32;
+
+// Resident threads per SM, same table: 1536 on sm_86/87/89 and sm_12x, 2048 elsewhere from sm_80
+// on. A __launch_bounds__ minimum asking for more is ignored by ptxas (with a warning).
+inline constexpr int kMaxThreadsPerSM = (kCudaArch >= 860 && kCudaArch < 900) || kCudaArch >= 1200 ? 1536 : 2048;
+
 #ifdef CUDA_KERNEL_DEBUG
 #define CUDA_KERNEL_CHECK()                                                    \
   do {                                                                         \
@@ -153,6 +162,28 @@ struct OnlineSoftmaxState {
         return correction;
     }
 
+    // update() with the new logit's weight exp(logit - max) handed back instead of recomputed by
+    // the caller: two exponentials per logit rather than three. Returns the rescale factor for
+    // accumulators built against the previous max.
+    __device__ float update(float logit, float& weight) {
+        const float new_max    = fmaxf(max_val, logit);
+        const float correction = __expf(max_val - new_max);
+        weight                 = __expf(logit - new_max);
+        sum_exp                = fmaf(sum_exp, correction, weight);
+        max_val                = new_max;
+        return correction;
+    }
+
+    // Folds another partial state (max, sum) into this one. Returns the factors that rescale this
+    // state's and the other state's accumulators to the merged max.
+    __device__ float2 merge(float other_max, float other_sum) {
+        const float new_max = fmaxf(max_val, other_max);
+        const float2 c      = make_float2(__expf(max_val - new_max), __expf(other_max - new_max));
+        sum_exp             = fmaf(sum_exp, c.x, other_sum * c.y);
+        max_val             = new_max;
+        return c;
+    }
+
     __device__ float get_alpha(float logit) const { return __expf(logit - max_val) / sum_exp; }
 
     // FlashAttention logsumexp trick
@@ -180,10 +211,9 @@ struct OnlineSoftmaxState {
 // TRACKS_ARG
 //     Whether the reducer needs argmin/argmax bookkeeping.  Comparison
 //     reducers (MIN/MAX) do: the backward pass scatters the gradient to the
-//     single winning source, and the heavy-node path packs (value, index) into
-//     a uint64 for atomicMin/Max.  Accumulating reducers (SUM) do not -- the
-//     arg tensor stays empty, the packed path is never instantiated, and the
-//     backward is a reduction over the transposed CSR instead.
+//     single winning source.  Accumulating reducers (SUM) do not -- the arg
+//     tensor stays empty, and the backward is a reduction over the transposed
+//     CSR instead.
 //
 // AccumType<cuda_t, accum_t>
 //     Type of the running accumulator.  MIN/MAX stay in cuda_t (a comparison
@@ -199,9 +229,8 @@ struct ReductionOps;
 
 template <>
 struct ReductionOps<ReductionOp::MIN> {
-    static constexpr bool TRACKS_ARG          = true;
-    static constexpr float IDENTITY           = INFINITY;  // +inf
-    static constexpr uint64_t PACKED_IDENTITY = 0xff800000ffffffffULL;
+    static constexpr bool TRACKS_ARG = true;
+    static constexpr float IDENTITY  = INFINITY;  // +inf
 
     template <typename cuda_t, typename accum_t>
     using AccumType = cuda_t;
@@ -214,17 +243,12 @@ struct ReductionOps<ReductionOp::MIN> {
         }
         return b;
     }
-
-    static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
-        return atomicMin(reinterpret_cast<unsigned long long *>(addr), val);
-    }
 };
 
 template <>
 struct ReductionOps<ReductionOp::MAX> {
-    static constexpr bool TRACKS_ARG          = true;
-    static constexpr float IDENTITY           = -INFINITY;  // -inf
-    static constexpr uint64_t PACKED_IDENTITY = 0x007fffffffffffffULL;
+    static constexpr bool TRACKS_ARG = true;
+    static constexpr float IDENTITY  = -INFINITY;  // -inf
 
     template <typename cuda_t, typename accum_t>
     using AccumType = cuda_t;
@@ -236,10 +260,6 @@ struct ReductionOps<ReductionOp::MAX> {
             return a;
         }
         return b;
-    }
-
-    static __device__ __forceinline__ uint64_t atomic_reduce(uint64_t *addr, uint64_t val) {
-        return atomicMax(reinterpret_cast<unsigned long long *>(addr), val);
     }
 };
 
@@ -255,11 +275,6 @@ struct ReductionOps<ReductionOp::SUM> {
     static __device__ __forceinline__ val_t reduce(val_t a, val_t b, bool& /*upgrade*/) {
         return a + b;
     }
-
-    // No atomic_reduce / PACKED_IDENTITY on purpose: there is no order-
-    // preserving (value, index) packing to atomically add over, so the packed
-    // heavy-node path is not instantiated for this reducer (see the
-    // TRACKS_ARG branch in reduction_aggr_forward_partitioned_cuda_impl).
 };
 
 template <size_t bytes>

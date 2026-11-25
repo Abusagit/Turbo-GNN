@@ -25,6 +25,8 @@ from turbo_gnn._functions import (
     _FusedGraphAttention,
     csr_SPMM_normalized,
     gatv2_function,
+    gspmm_slice_size,
+    reduction_graph_args,
 )
 from turbo_gnn._gsddmm import (
     EdgeBlockParams,
@@ -56,7 +58,7 @@ def reduction_aggr(
     reduce: str = "min",
     pipeline_stages: int = 0,
 ) -> torch.Tensor:
-    """Element-wise min, max or sum aggregation over incoming neighbors.
+    """Element-wise min, max or sum aggregation over incoming neighbors, for any feature dim F.
 
     For each destination node *v*, computes::
 
@@ -64,41 +66,44 @@ def reduction_aggr(
 
     With ``reduce="sum"`` this is plain SpMM against the unweighted adjacency
     (DGL's ``copy_u_sum``); the summation is accumulated in fp32 even for
-    fp16/bf16 inputs.
+    fp16/bf16 inputs. Min and max route each output's gradient to the source that
+    attained it -- of equal candidates, the first in edge order. NaN inputs are never
+    selected; +-inf inputs are.
 
-    Uses a partitioned kernel: "light" nodes (low degree) use an atomic-based
-    kernel; "heavy" nodes (high degree) use a tiled reduction kernel for better
-    load balance.
+    A row is the work of a lane group (short rows) or a warp, in passes for long rows; every row
+    of more than ``edges_per_block_heavy_nodes`` edges -- heavy-bucket or not -- is cut into
+    slices of that many edges, one worker each, whose partial results are merged in edge order,
+    so those rows are deterministic too.
+    Rows are read in 16-byte vectors when every row of ``X`` is 16-byte aligned and
+    element by element otherwise.
 
     Args:
         graph: CSR graph with forward adjacency and light/heavy node buckets.
             ``reduce="sum"`` additionally uses the backward (transposed)
             adjacency for its gradient.
-        X: Node features, shape ``[N, F]``.
-        warps_per_block: Warps per CUDA thread block (light-node kernel).
-        edges_per_block_heavy_nodes: Edges processed per block (heavy-node kernel).
-        use_2d_kernel: Use the 2-D tiled kernel variant for the heavy-node path.
-            Ignored for ``reduce="sum"``, which has no packed-atomics
-            alternative and always takes the 2-D path.
-        features_per_block: Feature-dimension tile size (2-D kernel only).
-        tiles_y: Number of row tiles (2-D kernel only).
+        X: Node features, shape ``[N, F]``; any row stride.
+        warps_per_block: Warps per CUDA thread block. Each warp works on its own
+            row, so this only sets the scheduling granularity; values above 8 act as 8.
+        edges_per_block_heavy_nodes: Edges per heavy-row slice. The slice table is
+            built once per graph and size, which costs one host sync.
+        use_2d_kernel: Accepted for compatibility; no effect.
+        features_per_block: Accepted for compatibility; no effect.
+        tiles_y: Accepted for compatibility; no effect.
         reduce: ``"min"``, ``"max"`` or ``"sum"``.
-        pipeline_stages: Number of async-copy pipeline stages for the light-node
-            and packed-atomics heavy-node kernels' per-thread neighbor scan. 0
-            disables the pipeline. Ignored when ``use_2d_kernel=True``.
+        pipeline_stages: Accepted for compatibility; no effect.
 
     Returns:
         Aggregated features, shape ``[N, F]``. Nodes with no incoming edges
-        receive zeros -- for min/max the identity (+-inf) is clamped
-        internally, for sum it is already the empty-sum value.
+        receive zeros (for min/max, also those whose every neighbor holds NaN).
     """
+    fwd, bwd = reduction_graph_args(graph, edges_per_block_heavy_nodes, reduce)
     return ReductionAggrFunction.apply(
         graph.forward_indptr,
         graph.forward_indices,
         X,
-        graph.light_nodes,
-        graph.heavy_nodes,
-        graph.max_degree,
+        fwd.light,
+        fwd.heavy,
+        fwd.light_degree,
         warps_per_block,
         edges_per_block_heavy_nodes,
         use_2d_kernel,
@@ -108,9 +113,11 @@ def reduction_aggr(
         pipeline_stages,
         graph.backward_indptr,
         graph.backward_indices,
-        graph.backward_light_nodes,
-        graph.backward_heavy_nodes,
-        graph.backward_max_degree,
+        bwd.light if bwd is not None else None,
+        bwd.heavy if bwd is not None else None,
+        bwd.light_degree if bwd is not None else -1,
+        fwd.slices,
+        bwd.slices if bwd is not None else None,
     )
 
 
@@ -149,27 +156,47 @@ def gatv2_aggr(
         out[v] = sum_{u in N(v)} alpha_{uv} * x_neighbors[u]
 
     The forward pass fuses edge score computation, numerically stable softmax
-    (via log-sum-exp), and weighted aggregation into a single kernel.
+    (via log-sum-exp), and weighted aggregation into a single kernel. The score's
+    elementwise part is computed in float32 from inputs of any of the supported dtypes.
+
+    Any head dim ``D`` from 1 to 65536 is supported. Rows of up to 256 (fp32) or 512
+    (fp16/bf16) features are processed in a single pass with every row in registers;
+    longer rows take a two-pass path that stores one or two scalars per edge and head in a
+    temporary ``[H, E]`` float32 buffer. Rows that are not whole, 16-byte-aligned vectors --
+    an odd ``D``, ``D = 100`` in fp16, or a view offset into a larger tensor -- are read element
+    by element. When the call is large enough to repay the copies (rows over 64 elements: 16 MiB
+    gathered; shorter rows of at least 16 bytes: 256 MiB), they are copied into rows zero-padded
+    to the next 16 bytes instead, which measured 1.4-3x faster on real graphs.
+
+    The backward needs ``<grad_output, output>`` per row and saves the output for it.
 
     Args:
         graph: CSR graph with forward + backward adjacency for fwd/bwd passes.
-        x: Destination (left) node features after projection, shape ``[N, H, D]``.
+        x: Destination (left) node features after projection, shape ``[N, H, D]``; the last
+            dim must have unit stride.
         x_neighbors: Source (right) node features after projection, shape ``[N, H, D]``.
         attention_weights: Learnable attention vector per head, shape ``[H, D]``.
         negative_slope: LeakyReLU negative slope (typically 0.2).
-        grad_A_reduce_row_chunk_size: Row chunk size for backward attention gradient
-            reduction. Larger values use more shared memory but fewer kernel launches.
+        grad_A_reduce_row_chunk_size: Unused; kept for signature stability. The
+            attention-vector gradient is reduced inside the backward kernels.
         schedule: Node-to-block scheduling policy. Only ``"one_per_block"`` (one block per
             node) is available.
         blocks_per_sm: Unused by ``"one_per_block"``; kept for signature stability.
+        backward_heavy_edge_slice: Edges per block in the heavy bucket of the backward
+            kernels that walk the forward adjacency: the x / attention-vector gradient
+            kernel, and on an undirected graph the x_neighbors one too. ``0`` keeps one
+            block per heavy node.
         pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
-            r[j] prefetch. 0 disables the pipeline (plain warp-strided loop).
+            x_neighbors[u] prefetch. 0 disables the pipeline. Applies to rows of 16-byte
+            vectors that span at least a warp (and at most the single-pass limit); other
+            rows ignore it. A depth whose staging buffer does not fit the device's shared
+            memory is lowered to the deepest one that does.
         backward_pipeline_stages: Number of async-copy pipeline stages for the backward
-            kernels' neighbor-row prefetch (AL/R when directed, G/ALR when undirected).
-            0 disables the pipeline.
+            kernels' neighbor-row prefetch. 0 disables the pipeline. Same applicability
+            as ``pipeline_stages``.
 
     Returns:
-        Aggregated features, shape ``[N, H*D]`` (heads concatenated).
+        Aggregated features, shape ``[N, H, D]``.
     """
     # An explicit edge count wins; otherwise derive it from the heavy-degree threshold.
     forward_heavy_edge_slice = forward_heavy_edge_slice or graph.heavy_slice_for_blocks_per_sm(
@@ -229,7 +256,7 @@ def graph_transformer_aggr(
     K: torch.Tensor,
     V: torch.Tensor,
     scale: float | None = None,
-    forward_light_warps: int = 4,
+    forward_light_warps: int = 1,
     forward_heavy_warps: int = 8,
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
@@ -258,11 +285,22 @@ def graph_transformer_aggr(
     The entire forward pass (dot-product scores, numerically stable softmax,
     weighted value aggregation) is fused into a single CSR-based CUDA kernel.
 
+    Any head dim ``D`` from 1 to 65536 is supported. Rows of up to 256 (fp32) or 512
+    (fp16/bf16) features are processed in a single pass with every row in registers;
+    longer rows take a two-pass path that stores one score per edge and head (and, in the
+    backward, two or three scalars) in a temporary ``[H, E]`` float32 buffer. Rows that are
+    not whole, 16-byte-aligned vectors -- an odd ``D``, ``D = 100`` in fp16, or a view offset
+    into a larger tensor -- are read element by element. When the call is large enough to repay
+    the copies (rows over 64 elements: 16 MiB gathered; shorter rows of at least 16 bytes:
+    256 MiB), they are copied into rows zero-padded to the next 16 bytes instead, which measured
+    1.4-3x faster on real graphs. ``scale=None`` is ``1 / sqrt(D)`` of the given ``D``.
+
     Args:
         graph: CSR graph with forward + backward adjacency for fwd/bwd passes.
         x: Original node features (unused by the kernel but passed through the
             autotuning wrapper for shape inference), shape ``[N, F]``.
-        Q: Query tensor, shape ``[N, H, D]`` where ``H * D = F``.
+        Q: Query tensor, shape ``[N, H, D]`` where ``H * D = F``; the last dim must
+            have unit stride.
         K: Key tensor, shape ``[N, H, D]``.
         V: Value tensor, shape ``[N, H, D]``.
         scale: Scaling factor, typically ``1 / sqrt(D)``.
@@ -274,9 +312,13 @@ def graph_transformer_aggr(
             into slices of that size, one block each, merged by a second kernel. Balances
             the heavy bucket and sizes its grid by edge count rather than node count.
         pipeline_stages: Number of async-copy pipeline stages for the forward kernel's
-            Q[j]/V[j] prefetch. 0 disables the pipeline.
+            Q[j]/V[j] prefetch. 0 disables the pipeline. Applies to rows of 16-byte
+            vectors that span at least a warp (and at most the single-pass limit); other
+            rows ignore it. A depth whose staging buffer does not fit the device's shared
+            memory is lowered to the deepest one that does.
         backward_pipeline_stages: Number of async-copy pipeline stages for the backward
-            kernels' neighbor-row prefetch. 0 disables the pipeline.
+            kernels' neighbor-row prefetch. 0 disables the pipeline. Same applicability
+            as ``pipeline_stages``.
 
     Returns:
         Attended features, shape ``[N, H, D]``.
@@ -481,7 +523,10 @@ def gsddmm(
     Args:
         graph: CSR graph with forward adjacency and light/heavy node buckets.
         lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
-            ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
+            ``[E, D]`` for ``"edge"``; any D in [1, 65536] and any row stride.
+            Rows that are not whole 16-byte vectors on 16-byte boundaries (an
+            odd D, D = 100 in fp16, or a view offset into a larger tensor) are
+            read element by element, which is slower.
         rhs: Right operand, same layout rules as ``lhs``. Ignored (and may be
             omitted) for ``op="copy"``, which never reads it.
         op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
@@ -497,14 +542,10 @@ def gsddmm(
             balanced (one warp per edge chunk) but accumulates atomically into an
             fp32 buffer, so its result depends on atomic ordering and is only
             deterministic up to fp32 rounding.
-        pipeline_stages: Async-copy prefetch depth for the per-edge operand
-            rows, 0-3 (0 disables the pipeline); read by both kernels. Stage
-            ``i + stages`` is prefetched while stage ``i`` is consumed, costing
-            ``stages + 1`` shared-memory row slots per warp. A deep pipeline on
-            a wide D with two per-edge operands can exceed the GPU's opt-in
-            shared memory per block (e.g. D=256, 32 heavy warps and both
-            operands gathered per edge needs 192 KiB at stages=2); the kernel
-            raises with the exact figures when it does.
+        pipeline_stages: Accepted for compatibility, 0-3; no effect. The
+            kernels have no cp.async pipeline: on the former fixed-D kernels it
+            won at most 4% (node) and 9% (edge, one op at D=64) and lost up to
+            2x elsewhere.
         light_warps_per_block: *(node kernel)* Warps per block for the
             light-node bucket. Only counts the binding instantiates are
             accepted (currently 4).
@@ -521,7 +562,10 @@ def gsddmm(
             CUDA stream concurrently with the heavy bucket on the current
             stream. The side stream is forked from and joined back to the
             current stream with events, so ordering for the caller is unchanged.
-        edges_per_warp: *(edge kernel)* Contiguous edges each warp walks, 1-32.
+        edges_per_warp: *(edge kernel)* Contiguous edges each lane group walks,
+            1-32. Rows of up to 16 16-byte vectors take a group of 4-16 lanes
+            per edge, and a warp then walks ``edges_per_warp * 32 / G`` edges,
+            at most 32.
         warps_per_block: *(edge kernel)* Independent warps packed per thread
             block, 1-8.
 
@@ -595,22 +639,18 @@ def gsddmm_edge(
         graph: CSR graph; its forward (dst-grouped) or backward (src-grouped)
             adjacency is read to build the cached edge list.
         lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
-            ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
+            ``[E, D]`` for ``"edge"``; any D in [1, 65536] and any row stride.
         rhs: Right operand, same layout rules as ``lhs``. May be omitted for
             ``op="copy"`` (it is never read by the kernel).
         op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
         lhs_target: ``"src"``, ``"dst"``, or ``"edge"``.
         rhs_target: ``"src"``, ``"dst"``, or ``"edge"``. Forced to ``"edge"``
             for ``op="copy"`` (the value is irrelevant since rhs is unread).
-        pipeline_stages: cp.async prefetch depth of the operand rows, in
-            {0, 2, 3}. 0 gathers rows with direct loads; ``s >= 1`` copies
-            the rows of the next ``s`` edges of the warp's chunk into shared
-            memory while the current edge is computed. Only useful with
-            ``edges_per_warp > 1``.
-        edges_per_warp: contiguous edges each warp processes, in [1, 32].
-            The default 1 is the original one-edge-per-warp layout.
+        pipeline_stages: Accepted for compatibility, 0-3; no effect.
+        edges_per_warp: contiguous edges each lane group processes, in
+            [1, 32]; a warp of ``32 / G`` groups takes up to 32 (see
+            :func:`gsddmm`).
         warps_per_block: independent warps per thread block, in [1, 8].
-            The default 1 is the original 32-thread block.
 
     Returns:
         ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"``. Edge order: CSR
@@ -740,6 +780,9 @@ def _gspmm_apply(
     # node gradient reads the edge value.
     needs_edge_map = reduce in ("min", "max") or (op in ("mul", "div") and reduce == "sum")
     edge_map = graph.backward_edge_map if needs_edge_map else None
+    # The walks' rows -- whole, or cut into slices -- cached on the graph; the backward adjacency's
+    # only for sum, whose node gradient walks it.
+    fwd_walk, bwd_walk = reduction_graph_args(graph, gspmm_slice_size(graph), reduce)
 
     return GSpMMFunction.apply(
         lhs,
@@ -761,6 +804,8 @@ def _gspmm_apply(
         pipeline_stages,
         graph.max_degree,
         graph.backward_max_degree,
+        fwd_walk,
+        bwd_walk,
     )
 
 
@@ -789,23 +834,28 @@ def gspmm(
     Args:
         graph: CSR graph with forward and backward adjacency plus light/heavy
             node buckets.
-        lhs: Node data, shape ``[N, d]``. Pass ``None`` for ``op="copy_e"``.
+        lhs: Node data, shape ``[N, d]`` with any ``d`` and any row stride. Pass ``None`` for
+            ``op="copy_e"``.
         rhs: Edge data, shape ``[E, d]`` (element-wise) or ``[E]`` / ``[E, 1]``
             (broadcast over the feature dimension). Pass ``None`` for
             ``op="copy_u"``.
         op: One of ``"copy_u"``, ``"copy_e"``, ``"add"``, ``"sub"``, ``"mul"``,
             ``"div"``.
         reduce: One of ``"sum"``, ``"min"``, ``"max"``.
-        warps_per_block: Block size (in warps) of the light-node kernel.
-        features_per_block: Feature tile width of the heavy-node kernel.
-        tiles_y: Edge tiles reduced in parallel by the heavy-node kernel; must
+        warps_per_block: Warps per block of the forward and sum-backward kernels, where every lane
+            group or warp works on a row (or a slice of one) of its own, so this only sets the
+            scheduling granularity; values above 8 act as 8. Also the light-node block size of the
+            min/max backward.
+        features_per_block: Feature tile width of the min/max backward's heavy-node kernel.
+        tiles_y: Edge tiles reduced in parallel by the min/max backward's heavy-node kernel; must
             be a power of two.
+        pipeline_stages: cp.async prefetch depth of the min/max backward's gather; 0 disables it.
 
     Returns:
         Aggregated features, shape ``[N, d]``. Nodes with no incoming edges get
-        zeros: for ``sum`` that is the empty sum, for ``min``/``max`` the
-        identity (+-inf) is clamped, which differs from DGL -- it returns the
-        raw infinity there.
+        zeros: for ``sum`` that is the empty sum; ``min``/``max`` return 0 there (and for
+        elements whose every message is NaN, which is never selected) where DGL returns the
+        raw infinity. Of equal messages, ``min``/``max`` pick the first in CSR edge order.
 
     Note:
         **Edge data must be in CSR order.** ``rhs[i]`` is the data of the edge

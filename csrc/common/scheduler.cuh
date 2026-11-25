@@ -93,16 +93,14 @@ struct SchedulerParams {
 };
 
 struct WorkTile {
-    int idx;   ///< position in the ordered node list
-    bool ok;   ///< false => the loop terminates
+    int idx;  ///< position in the ordered node list
+    bool ok;  ///< false => the loop terminates
 };
 
 namespace detail {
 
 /// True for exactly one thread per block, whatever the block shape.
-__device__ __forceinline__ bool is_block_leader() {
-    return threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0;
-}
+__device__ __forceinline__ bool is_block_leader() { return threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0; }
 
 /// Two slots so the broadcast can be double-buffered; see `DynamicQueue::next`.
 struct SharedSlots {
@@ -111,7 +109,7 @@ struct SharedSlots {
 
 /// Make the leader's value visible to the whole block, and fence the previous iteration's
 /// shared-memory traffic on the way through.
-__device__ __forceinline__ int publish(SharedSlots &st, int v, int buf) {
+__device__ __forceinline__ int publish(SharedSlots& st, int v, int buf) {
     if (is_block_leader()) {
         st.slot[buf] = v;
     }
@@ -135,7 +133,7 @@ __device__ __forceinline__ int publish(SharedSlots &st, int v, int buf) {
 /// a launch shaped identically to `one_per_block` -- `GridStride` still measured 0.93x, and
 /// the rank claim was the only thing left to account for it. One atomic plus one barrier per
 /// block, all blocks hitting a single counter, is not free at 131k blocks.
-__device__ __forceinline__ int claim_rank(int *rank_counter, SharedSlots &st) {
+__device__ __forceinline__ int claim_rank(int *rank_counter, SharedSlots& st) {
     int r = 0;
     if (is_block_leader()) {
         r = atomicAdd(rank_counter, 1);
@@ -157,15 +155,12 @@ struct SchedulerBase {
     index_t const *nodes_;
     int count_;
 
-    __device__ __forceinline__ explicit SchedulerBase(Params const &p)
-        : nodes_(p.nodes), count_(p.count) {}
+    __device__ __forceinline__ explicit SchedulerBase(Params const& p) : nodes_(p.nodes), count_(p.count) {}
 
     __device__ __forceinline__ bool valid(WorkTile w) const { return w.ok; }
 
     /// Node id through the indirection array -- the bucketed kernels.
-    __device__ __forceinline__ index_t node(WorkTile w) const {
-        return nodes_ ? nodes_[w.idx] : static_cast<index_t>(w.idx);
-    }
+    __device__ __forceinline__ index_t node(WorkTile w) const { return nodes_ ? nodes_[w.idx] : static_cast<index_t>(w.idx); }
 
     /// Position within the ordered list, for kernels indexing a compacted output buffer
     /// (the packed-heavy scratch is indexed by compacted position, not by node id).
@@ -180,14 +175,14 @@ struct SchedulerBase {
 // the zero-overhead baseline that proves the conversion cost nothing.
 // ---------------------------------------------------------------------------------------
 template <typename index_t, bool SyncBlock>
-struct NodeScheduler<ScheduleKind::OneNodePerBlock, index_t, SyncBlock> : SchedulerBase<index_t> {
+struct NodeScheduler<ScheduleKind::OneNodePerBlock, index_t, SyncBlock>: SchedulerBase<index_t> {
     using Base          = SchedulerBase<index_t>;
     using SharedStorage = typename Base::SharedStorage;
     using Params        = typename Base::Params;
 
     static constexpr bool kPersistent = false;
 
-    __device__ __forceinline__ NodeScheduler(Params const &p, SharedStorage &) : Base(p) {}
+    __device__ __forceinline__ NodeScheduler(Params const& p, SharedStorage&) : Base(p) {}
 
     __device__ __forceinline__ WorkTile first() const {
         const int i = static_cast<int>(blockIdx.x);
@@ -204,14 +199,14 @@ struct NodeScheduler<ScheduleKind::OneNodePerBlock, index_t, SyncBlock> : Schedu
 // its bytes.
 // ---------------------------------------------------------------------------------------
 template <typename index_t, bool SyncBlock>
-struct NodeScheduler<ScheduleKind::GridStride, index_t, SyncBlock> : SchedulerBase<index_t> {
+struct NodeScheduler<ScheduleKind::GridStride, index_t, SyncBlock>: SchedulerBase<index_t> {
     using Base          = SchedulerBase<index_t>;
     using SharedStorage = typename Base::SharedStorage;
     using Params        = typename Base::Params;
 
     static constexpr bool kPersistent = true;
 
-    __device__ __forceinline__ NodeScheduler(Params const &p, SharedStorage &) : Base(p) {}
+    __device__ __forceinline__ NodeScheduler(Params const& p, SharedStorage&) : Base(p) {}
 
     /// `blockIdx.x`, not an atomically-claimed rank: the stride assignment is the same set of
     /// nodes whichever block walks it, so paying an atomic to permute the ids buys nothing.
@@ -238,7 +233,7 @@ struct NodeScheduler<ScheduleKind::GridStride, index_t, SyncBlock> : SchedulerBa
 // Costs `gridDim.x + 1` ints.
 // ---------------------------------------------------------------------------------------
 template <typename index_t, bool SyncBlock>
-struct NodeScheduler<ScheduleKind::PrecomputedList, index_t, SyncBlock> : SchedulerBase<index_t> {
+struct NodeScheduler<ScheduleKind::PrecomputedList, index_t, SyncBlock>: SchedulerBase<index_t> {
     using Base          = SchedulerBase<index_t>;
     using SharedStorage = typename Base::SharedStorage;
     using Params        = typename Base::Params;
@@ -248,8 +243,7 @@ struct NodeScheduler<ScheduleKind::PrecomputedList, index_t, SyncBlock> : Schedu
     int const *block_offsets_;
     int end_ = 0;  ///< block-uniform: both bounds come from a uniform address
 
-    __device__ __forceinline__ NodeScheduler(Params const &p, SharedStorage &)
-        : Base(p), block_offsets_(p.block_offsets) {}
+    __device__ __forceinline__ NodeScheduler(Params const& p, SharedStorage&) : Base(p), block_offsets_(p.block_offsets) {}
 
     /// `blockIdx.x` indexes the host's assignment directly -- no atomic, no barrier, and no
     /// shared slot, so `first()` is two uniform loads. Both addresses are block-uniform, so
@@ -320,7 +314,7 @@ struct NodeScheduler<ScheduleKind::PrecomputedList, index_t, SyncBlock> : Schedu
 // by construction, which is what the persistent policies needed a rank for in the first place.
 // ---------------------------------------------------------------------------------------
 template <typename index_t, bool SyncBlock>
-struct NodeScheduler<ScheduleKind::DynamicQueue, index_t, SyncBlock> : SchedulerBase<index_t> {
+struct NodeScheduler<ScheduleKind::DynamicQueue, index_t, SyncBlock>: SchedulerBase<index_t> {
     using Base          = SchedulerBase<index_t>;
     using SharedStorage = typename Base::SharedStorage;
     using Params        = typename Base::Params;
@@ -333,10 +327,8 @@ struct NodeScheduler<ScheduleKind::DynamicQueue, index_t, SyncBlock> : Scheduler
     int chunk_end_ = 0;  ///< one past the last item of the chunk this block currently holds
     int buf_       = 0;  ///< block-uniform double-buffer parity
 
-    __device__ __forceinline__ NodeScheduler(Params const &p, SharedStorage &st)
-        : Base(p), st_(&st),
-          work_counter_(p.counters + blockIdx.y * kCounterStride + kWorkSlot),
-          chunk_(p.chunk < 1 ? 1 : p.chunk) {}
+    __device__ __forceinline__ NodeScheduler(Params const& p, SharedStorage& st)
+        : Base(p), st_(&st), work_counter_(p.counters + blockIdx.y * kCounterStride + kWorkSlot), chunk_(p.chunk < 1 ? 1 : p.chunk) {}
 
     /// Draw a chunk from the shared cursor. Block-uniform on return: `publish` broadcasts the
     /// leader's value and carries the barrier that fences the previous iteration's shared
@@ -351,8 +343,7 @@ struct NodeScheduler<ScheduleKind::DynamicQueue, index_t, SyncBlock> : Scheduler
             // end proves every chunk has already been handed out, while a stale-low read just
             // falls through to the atomic and stays correct.
             const int seen = *reinterpret_cast<int volatile *>(work_counter_);
-            claimed = (seen * chunk_ >= this->count_) ? this->count_
-                                                      : atomicAdd(work_counter_, 1) * chunk_;
+            claimed        = (seen * chunk_ >= this->count_) ? this->count_ : atomicAdd(work_counter_, 1) * chunk_;
         }
         const int base = detail::publish(*st_, claimed, buf_);
         chunk_end_     = base + chunk_;
@@ -413,9 +404,7 @@ inline int sm_count() { return at::cuda::getCurrentDeviceProperties()->multiProc
 /// and dynamic shared memory are known), or tune it per bucket.
 ///
 /// Never exceeds `count`: surplus blocks would claim a rank, find nothing and exit.
-inline int persistent_grid_x(
-    ScheduleKind kind, int count, int blocks_per_sm, int grid_y = 1, int chunk = 1
-) {
+inline int persistent_grid_x(ScheduleKind kind, int count, int blocks_per_sm, int grid_y = 1, int chunk = 1) {
     if (kind == ScheduleKind::OneNodePerBlock) {
         return count;
     }
@@ -465,9 +454,7 @@ inline at::Tensor default_block_offsets(int count, int num_blocks, at::Device de
 /// Built with ATen ops on the current stream: a cumsum over the bucket and a searchsorted,
 /// both small. It is still work per launch, which is why it is worth caching on the graph for
 /// a repeated call; for a single measurement it is a few tens of microseconds.
-inline at::Tensor degree_balanced_block_offsets(
-    at::Tensor const &indptr, at::Tensor const &nodes, int count, int num_blocks
-) {
+inline at::Tensor degree_balanced_block_offsets(at::Tensor const& indptr, at::Tensor const& nodes, int count, int num_blocks) {
     const int nb = std::max(1, num_blocks);
     if (count <= 0) {
         return at::zeros({nb + 1}, at::TensorOptions().dtype(at::kInt).device(indptr.device()));
@@ -499,8 +486,8 @@ inline at::Tensor degree_balanced_block_offsets(
 /// same `kind`; `launch_index` selects its row.
 template <typename index_t>
 inline SchedulerParams<index_t> make_params(
-    ScheduleKind kind, index_t const *nodes, int count, at::Tensor const &counters, int heads = 1,
-    int launch_index = 0, at::Tensor const &block_offsets = {}, int chunk = 1
+    ScheduleKind kind, index_t const *nodes, int count, at::Tensor const& counters, int heads = 1, int launch_index = 0,
+    at::Tensor const& block_offsets = {}, int chunk = 1
 ) {
     SchedulerParams<index_t> p;
     p.nodes = nodes;
@@ -509,8 +496,7 @@ inline SchedulerParams<index_t> make_params(
 
     if (needs_counters(kind)) {
         TORCH_CHECK(counters.defined(), "scheduler: persistent policies need a zeroed counter slab");
-        p.counters = counters.data_ptr<int>() +
-                     static_cast<int64_t>(launch_index) * std::max(1, heads) * kCounterStride;
+        p.counters = counters.data_ptr<int>() + static_cast<int64_t>(launch_index) * std::max(1, heads) * kCounterStride;
     }
     if (kind == ScheduleKind::PrecomputedList) {
         TORCH_CHECK(block_offsets.defined(), "scheduler: PrecomputedList needs block_offsets");
@@ -523,19 +509,21 @@ inline SchedulerParams<index_t> make_params(
     return p;
 }
 
-inline ScheduleKind schedule_from_string(std::string const &name) {
+inline ScheduleKind schedule_from_string(std::string const& name) {
     if (name == "one_per_block") return ScheduleKind::OneNodePerBlock;
     if (name == "grid_stride") return ScheduleKind::GridStride;
     if (name == "precomputed") return ScheduleKind::PrecomputedList;
     if (name == "dynamic") return ScheduleKind::DynamicQueue;
-    TORCH_CHECK(false, "scheduler: unknown schedule '", name,
-                "'; expected one_per_block | grid_stride | precomputed | dynamic");
+    TORCH_CHECK(false, "scheduler: unknown schedule '", name, "'; expected one_per_block | grid_stride | precomputed | dynamic");
 }
 
 inline ScheduleKind schedule_from_int(int v) {
-    TORCH_CHECK(v >= 0 && v < kNumScheduleKinds,
-                "scheduler: schedule must be 0..3 (0=one_per_block, 1=grid_stride, "
-                "2=precomputed, 3=dynamic), got ", v);
+    TORCH_CHECK(
+        v >= 0 && v < kNumScheduleKinds,
+        "scheduler: schedule must be 0..3 (0=one_per_block, 1=grid_stride, "
+        "2=precomputed, 3=dynamic), got ",
+        v
+    );
     return static_cast<ScheduleKind>(v);
 }
 

@@ -1,4 +1,6 @@
 dataset:
   source: pyg
   name: LastFMAsia
-  root: data
+  # Own root: shares <root>/processed/data.pt with Reddit/Flickr/FacebookPagePage otherwise.
+  root: data/LastFMAsia
+  allow_random_split: true  # PyG's LastFMAsia ships no train/val/test masks

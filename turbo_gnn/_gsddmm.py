@@ -51,9 +51,6 @@ GsddmmVariantChoice = Literal["auto", "node", "edge"]
 GSDDMM_OPS = ("add", "sub", "mul", "div", "dot", "copy")
 GSDDMM_MEMBERS = ("src", "dst", "edge")
 
-# Feature widths the kernels are instantiated for (see gsddmm_dispatch.cuh).
-GSDDMM_FEATURE_DIMS = (32, 64, 128, 256)
-
 # Timing budget for the variant probe when the caller supplied no AutotuneConfig.
 _PROBE_WARMUP = 3
 _PROBE_ITERS = 10
@@ -68,6 +65,7 @@ _PROBE_REPEATS = 3
 # Keys of the per-graph caches this module owns (all live in ``graph.__dict__``).
 _EDGE_LIST_DST_KEY = "_gsddmm_edge_list_dst"
 _EDGE_LIST_SRC_KEY = "_gsddmm_edge_list_src"
+_EDGE_LIST_SRC_BWD_KEY = "_gsddmm_edge_list_src_backward"
 _CANONICAL_IDX_KEY = "_gsddmm_canonical_edge_idx"
 _COPY_RHS_KEY = "_gsddmm_copy_rhs_stub"
 _CSR_ALIASED_KEY = "_gsddmm_csr_aliased"
@@ -198,7 +196,7 @@ class NodeBlockParams:
     Args:
         light_warps: Warps per block for the light-node bucket.
         heavy_warps: Warps per block for the heavy-node bucket.
-        pipeline_stages: cp.async prefetch depth for the per-edge rows, 0-3.
+        pipeline_stages: Accepted for compatibility, 0-3; no effect.
         heavy_edges_per_block: Split heavy nodes into chunks of this many edges,
             one block per chunk (0 = one block per node).
         overlap_buckets: Run the light bucket on a side stream concurrently with
@@ -220,8 +218,10 @@ class EdgeBlockParams:
     """Launch parameters of ``GSDDMM_forward_edge_block``.
 
     Args:
-        pipeline_stages: cp.async prefetch depth of the operand rows, 0-3.
-        edges_per_warp: Contiguous edges each warp walks, 1-32.
+        pipeline_stages: Accepted for compatibility, 0-3; no effect.
+        edges_per_warp: Contiguous edges each lane group walks, 1-32; a warp of
+            ``32 / G`` groups takes up to 32 (``edge_chunk`` in
+            ``csrc/gsddmm/gsddmm.cuh``).
         warps_per_block: Independent warps packed per block, 1-8.
     """
 
@@ -522,6 +522,29 @@ def _graph_edge_list(graph, by_src: bool = False) -> torch.Tensor:
     return edge_list
 
 
+def _graph_backward_src_edge_list(graph) -> torch.Tensor:
+    """The ``[E, 2]`` list the edge-parallel backward's source pass walks: edges grouped by source.
+
+    For a directed graph that is :func:`_graph_edge_list` ``(by_src=True)``. For an undirected one,
+    whose two CSRs are aliased, ``_graph_edge_list`` hands back the destination-grouped list for both
+    directions -- right for the forward, which only cares about operand locality, but the source
+    pass reduces per source: on that list nearly every edge starts a new run and costs a flush of
+    its own (measured on tolokers-2: one flush per edge, 2.3x the kernel time of a grouped list).
+    The aliased CSR read with its rows as sources IS a source-grouped list, i.e. the destination list
+    with its columns swapped, and :func:`_graph_canonical_edge_idx` -- which reads the backward CSR
+    the same way -- maps its slots to canonical ids.
+    """
+    if not _edge_list_is_canonical(graph, by_src=True):
+        return _graph_edge_list(graph, by_src=True)
+    dst_list = _graph_edge_list(graph, by_src=False)
+    cached = graph.__dict__.get(_EDGE_LIST_SRC_BWD_KEY)
+    if cached is not None and cached[0] is dst_list:
+        return cached[1]
+    src_list = dst_list.flip(1).contiguous()
+    graph.__dict__[_EDGE_LIST_SRC_BWD_KEY] = (dst_list, src_list)
+    return src_list
+
+
 def _graph_canonical_edge_idx(graph) -> torch.Tensor:
     """``[E]`` in the graph's index dtype: forward-CSR edge position of each source-grouped edge.
 
@@ -760,14 +783,13 @@ def _launch_backward_edge(
     usually a single run of edges sharing a target row: the warp then sums the
     whole chunk in registers and flushes it with one set of atomics.
 
-    ``pipeline_stages`` is the same knob as the forward's -- the cp.async prefetch
-    depth of the per-edge rows (the dO row and the other operand's).
+    ``pipeline_stages`` is passed through for compatibility and has no effect.
     """
     edge_list_dst = _graph_edge_list(graph, by_src=False)
     edge_list_src = edge_list_dst
     canonical = None
-    if spec.reads_src and not _edge_list_is_canonical(graph, by_src=True):
-        edge_list_src = _graph_edge_list(graph, by_src=True)
+    if spec.reads_src and graph.forward_indices.numel() > 0:
+        edge_list_src = _graph_backward_src_edge_list(graph)
         canonical = _graph_canonical_edge_idx(graph)
     return _C.gsddmm_backward_edge(
         lhs,
@@ -832,9 +854,8 @@ def _default_traversal(spec: GsddmmSpec, feat_dim: int, canonical_output: bool =
 def _time_plan(plan: GsddmmLaunchPlan, graph, lhs, rhs, warmup: int, iters: int) -> float:
     """Time one candidate in ms/iter; a candidate that cannot launch scores +inf.
 
-    A candidate can legitimately fail to launch (a deep pipeline at ``D=256``
-    over-subscribes shared memory; the edge candidate's edge list may not fit in
-    memory), and the other variant is then simply the answer.
+    A candidate can legitimately fail to launch (the edge candidate's edge list
+    may not fit in memory), and the other variant is then simply the answer.
     """
     try:
         return time_callable(lambda: plan.launch(graph, lhs, rhs), warmup=warmup, iters=iters).ms_per_iter
@@ -863,7 +884,7 @@ def _release_edge_caches(graph, keep: frozenset[str]) -> None:
     winner does not read is worth releasing. Caches that predate the probe are
     left alone -- their owner asked for them.
     """
-    for key in (_EDGE_LIST_DST_KEY, _EDGE_LIST_SRC_KEY, _CANONICAL_IDX_KEY):
+    for key in (_EDGE_LIST_DST_KEY, _EDGE_LIST_SRC_KEY, _EDGE_LIST_SRC_BWD_KEY, _CANONICAL_IDX_KEY):
         if key not in keep:
             graph.__dict__.pop(key, None)
 
@@ -1070,9 +1091,7 @@ def resolve_plan(
             spec,
             "edge",
             edge_params or EdgeBlockParams(),
-            traversal=_default_traversal(
-                spec, lhs.shape[-1] if lhs.ndim > 1 else 1, canonical_output=canonical_output
-            ),
+            traversal=_default_traversal(spec, lhs.shape[-1] if lhs.ndim > 1 else 1, canonical_output=canonical_output),
             canonical_output=canonical_output,
         )
     if variant != "auto":

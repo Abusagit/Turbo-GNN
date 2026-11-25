@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from fixtures import device, set_default_device
 
 from src.backends.registry import BackendRegistry
 from src.data.datasets import MODEL_BACKEND_TO_GRAPH_REPR, DatasetConfig, GraphSample, load_single_graph
@@ -41,7 +42,7 @@ def test_backend_registration():
         pytest.fail(f"Missing backends: {missing}")
 
 
-def test_backend_convolutions():
+def test_backend_convolutions(set_default_device):
     """Test that each backend can create and run convolutions."""
     print("\n" + "=" * 60)
     print("Testing Backend Convolutions")
@@ -52,9 +53,9 @@ def test_backend_convolutions():
     num_edges = 500
     feature_dim = 16
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # The fixture makes this the default device for this test only, and restores it after.
+    device = set_default_device
     print(f"Testing on device: {device}")
-    torch.set_default_device(device)
     # Generate random graph
     edge_index = torch.randint(0, num_nodes, (2, num_edges), device=device)
     x = torch.randn(num_nodes, feature_dim, device=device, requires_grad=True)
@@ -230,7 +231,6 @@ def test_model_building():
         # Test forward pass
         x = torch.randn(100, 128)
         edge_index = torch.randint(0, 100, (2, 500))
-        torch.set_default_device(x.device)
 
         graph = GraphSample(
             backend=MODEL_BACKEND_TO_GRAPH_REPR["pyg"], x=x, y=torch.zeros(len(x)), edge_index=edge_index

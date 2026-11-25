@@ -5,22 +5,15 @@
 
 #include "misc.cuh"
 
-enum class BinaryOp {
-    COPY_U,
-    COPY_E,
-    ADD,
-    SUB,
-    MUL,
-    DIV
-};
+enum class BinaryOp { COPY_U, COPY_E, ADD, SUB, MUL, DIV };
 
 template <BinaryOp Op>
 struct BinaryOps;
 
 template <>
 struct BinaryOps<BinaryOp::COPY_U> {
-    static constexpr bool USE_LHS = true;
-    static constexpr bool USE_RHS = false;
+    static constexpr bool USE_LHS            = true;
+    static constexpr bool USE_RHS            = false;
     static constexpr bool GRAD_USES_OPERANDS = false;
 
     template <typename val_t>
@@ -39,8 +32,8 @@ struct BinaryOps<BinaryOp::COPY_U> {
 
 template <>
 struct BinaryOps<BinaryOp::COPY_E> {
-    static constexpr bool USE_LHS = false;
-    static constexpr bool USE_RHS = true;
+    static constexpr bool USE_LHS            = false;
+    static constexpr bool USE_RHS            = true;
     static constexpr bool GRAD_USES_OPERANDS = false;
 
     template <typename val_t>
@@ -59,8 +52,8 @@ struct BinaryOps<BinaryOp::COPY_E> {
 
 template <>
 struct BinaryOps<BinaryOp::ADD> {
-    static constexpr bool USE_LHS = true;
-    static constexpr bool USE_RHS = true;
+    static constexpr bool USE_LHS            = true;
+    static constexpr bool USE_RHS            = true;
     static constexpr bool GRAD_USES_OPERANDS = false;
 
     template <typename val_t>
@@ -79,8 +72,8 @@ struct BinaryOps<BinaryOp::ADD> {
 
 template <>
 struct BinaryOps<BinaryOp::SUB> {
-    static constexpr bool USE_LHS = true;
-    static constexpr bool USE_RHS = true;
+    static constexpr bool USE_LHS            = true;
+    static constexpr bool USE_RHS            = true;
     static constexpr bool GRAD_USES_OPERANDS = false;
 
     template <typename val_t>
@@ -99,8 +92,8 @@ struct BinaryOps<BinaryOp::SUB> {
 
 template <>
 struct BinaryOps<BinaryOp::MUL> {
-    static constexpr bool USE_LHS = true;
-    static constexpr bool USE_RHS = true;
+    static constexpr bool USE_LHS            = true;
+    static constexpr bool USE_RHS            = true;
     static constexpr bool GRAD_USES_OPERANDS = true;
 
     template <typename val_t>
@@ -119,8 +112,8 @@ struct BinaryOps<BinaryOp::MUL> {
 
 template <>
 struct BinaryOps<BinaryOp::DIV> {
-    static constexpr bool USE_LHS = true;
-    static constexpr bool USE_RHS = true;
+    static constexpr bool USE_LHS            = true;
+    static constexpr bool USE_RHS            = true;
     static constexpr bool GRAD_USES_OPERANDS = true;
 
     template <typename val_t>

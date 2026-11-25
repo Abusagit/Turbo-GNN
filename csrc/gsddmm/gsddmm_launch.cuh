@@ -5,21 +5,19 @@
 #include "gsddmm/gsddmm.cuh"
 
 // =============================================================================
-// GSDDMM forward: host-side launch plumbing shared by the per-op translation
-// units.
+// GSDDMM: host-side launch plumbing shared by the per-op translation units.
 //
-// The kernel is fully templated on (op, lhs member, rhs member, warps/block, D,
-// dtype, index type, pipeline stages), so every combination is a separate
-// instantiation and the size of the dispatch grid alone drives this kernel's
-// compile time. nvcc scales superlinearly in instantiations per translation
-// unit, so the grid is sharded by op: gsddmm_launch_<op>_<dtype>.cu instantiates only
-// its own op's slice of the grid and the six files compile in parallel.
+// The kernels are templated on (op, lhs member, rhs member, row shape, dtype, index width, and
+// warps per block or the edge-id remap), so every combination is a separate instantiation and the
+// size of the dispatch grid alone drives this kernel's compile time. nvcc scales superlinearly in
+// instantiations per translation unit, so the grid is sharded by op and dtype:
+// gsddmm_launch_<op>_<dtype>.cu instantiates only its own slice of the grid and the files compile in
+// parallel.
 //
-// gsddmm_binding.cu keeps the argument checking and output allocation (it
-// instantiates no kernels at all) and routes to one of the entry points below.
-// Adding an op means adding an enumerator, an entry point here, and one more
-// gsddmm_launch_<op>_<dtype>.cu; extending the dtype / index / D / warps / stages axes
-// happens once in gsddmm_dispatch.cuh and costs every shard.
+// gsddmm_binding.cu keeps the argument checking and output allocation (it instantiates no kernels
+// at all) and routes to one of the entry points below. Adding an op means adding an enumerator, an
+// entry point here, and one more gsddmm_launch_<op>_<dtype>.cu; extending the shape / index / warps
+// axes happens once in gsddmm_dispatch.cuh and costs every shard.
 // =============================================================================
 
 namespace gsddmm {
@@ -35,7 +33,9 @@ struct LRO {
 
 // Everything a per-op launcher needs, assembled once by gsddmm_binding.cu after
 // validation. The tensors are borrowed for the duration of the call; O is the
-// (already allocated) output.
+// (already allocated) output. L and R have unit feature stride and row strides that fit 32 bits;
+// wide says every row read starts on a 16-byte boundary and spans whole 16-byte vectors, which
+// selects the 16-byte row layout over the element-wise one (see gsddmm.cuh).
 struct GsddmmLaunchArgs {
     const torch::Tensor& L;
     const torch::Tensor& R;
@@ -50,7 +50,7 @@ struct GsddmmLaunchArgs {
     LRO key;
     uint16_t light_warps_per_block;
     uint16_t heavy_warps_per_block;
-    uint8_t pipeline_stages;
+    bool wide;
     // Heavy-node chunking (nullptr / 0 = one block per heavy node): heavy_nodes
     // then lists the node of every heavy block and heavy_block_parts its chunk index.
     const torch::Tensor *heavy_block_parts;
@@ -87,9 +87,9 @@ struct GsddmmLaunchArgsEdge {
     uint64_t E;
     uint64_t D;
     LRO key;
-    uint8_t pipeline_stages;  // cp.async prefetch depth per warp, 0 = direct loads
-    uint8_t edges_per_warp;   // contiguous edges per warp, 1..kGsddmmEdgeMaxEdgesPerWarp
+    uint8_t edges_per_warp;   // edges per lane group, 1..kGsddmmEdgeMaxEdgesPerWarp (see edge_chunk)
     uint8_t warps_per_block;  // independent warps packed per block, 1..kGsddmmEdgeMaxWarpsPerBlock
+    bool wide;
 };
 
 // Per-op entry points; one translation unit each (gsddmm_launch_<op>_<dtype>.cu). Each
@@ -135,6 +135,7 @@ struct GsddmmBackwardLaunchArgs {
     LRO key;
     uint16_t light_warps_per_block;
     uint16_t heavy_warps_per_block;
+    bool wide;
 };
 
 #define XX(ENUM, name) void gsddmm_backward_launch_##name(const GsddmmBackwardLaunchArgs& args);
@@ -167,9 +168,9 @@ struct GsddmmBackwardLaunchArgsEdge {
     uint64_t E;
     uint64_t D;
     LRO key;
-    uint8_t pipeline_stages;  // cp.async prefetch depth of the per-edge rows, 0 = direct loads
     uint8_t edges_per_warp;
     uint8_t warps_per_block;
+    bool wide;
 };
 
 #define XX(ENUM, name) void gsddmm_backward_edge_launch_##name(const GsddmmBackwardLaunchArgsEdge& args);

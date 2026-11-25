@@ -249,6 +249,19 @@ def test_gatv2_cuda_vs_torch_native_backward(num_nodes, feature_dim, heads):
         msg=lambda m: f"CUDA vs torch_native backward mismatch: {_max_mean_diff(x_cuda.grad, x_ref.grad)}\n{m}",
     )
 
+    # The attention vectors train: the conv used to hand the kernel `attn_weights.data`, which
+    # detached them and left their gradient None.
+    assert cuda_layer.attn_weights.grad is not None, "No CUDA attention-vector gradient"
+    g_attn = cuda_layer.attn_weights.grad
+    g_attn_ref = ref_layer.attn.grad.squeeze(0)
+    assert_close(
+        g_attn,
+        g_attn_ref,
+        rtol=1e-4,
+        atol=1e-4 * g_attn_ref.abs().max().item(),
+        msg=lambda m: f"CUDA vs torch_native attention gradient mismatch: {_max_mean_diff(g_attn, g_attn_ref)}\n{m}",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Low-precision: CUDA (fp16/bf16) vs torch_native (fp32)

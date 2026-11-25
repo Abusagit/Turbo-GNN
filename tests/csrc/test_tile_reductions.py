@@ -158,7 +158,7 @@ def test_minmax_value_form_is_not_clamped_against_zero(bridge, n, dtype_name, wa
     # All strictly positive for min, all strictly negative for max: in both cases the
     # true answer has the same sign as the input, so a zero seed cannot produce it.
     sign = -1.0 if want_max else 1.0
-    a = sign * (torch.arange(1, 8 * n + 1, dtype=torch.float64).reshape(8, n) / 4.0).to(dt).to(device)
+    a = sign * (torch.arange(1, 8 * n + 1, dtype=torch.float64, device=device).reshape(8, n) / 4.0).to(dt)
 
     got = _run(mod, "max_ret" if want_max else "min_ret", n, a, a, acc_init=0.0)
     want = a.double().max(dim=1).values if want_max else a.double().min(dim=1).values
@@ -176,9 +176,9 @@ def test_sum_accumulates_in_accum_t(bridge, dtype_name):
     # 8 x 1024: representable individually, and the exact total (8192) is representable
     # too, but half's 11-bit significand cannot hold the odd partial sums along the way
     # once a +1 term is mixed in.
-    a = torch.full((4, n), 1024.0, dtype=torch.float64)
+    a = torch.full((4, n), 1024.0, dtype=torch.float64, device=device)
     a[:, 0] = 1.0
-    a_t = a.to(dt).to(device)
+    a_t = a.to(dt)
 
     got = _run(mod, "sum_ret", n, a_t, a_t, acc_init=0.0)
     want = a_t.double().sum(dim=1)  # exact in fp64

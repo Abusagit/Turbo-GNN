@@ -61,7 +61,7 @@ def test_read_uses_vector_indexing(bridge, n, dtype_name, start):
     device = torch.device("cuda:0")
 
     total = (start + M) * n
-    arr = (torch.arange(1, total + 1, dtype=torch.float64) / 16.0).to(TORCH_DTYPE[dtype_name]).to(device)
+    arr = (torch.arange(1, total + 1, dtype=torch.float64, device=device) / 16.0).to(TORCH_DTYPE[dtype_name])
 
     got = mod.tile_read(n, arr, start, M)
     want = arr[start * n : (start + M) * n].reshape(M, n)
@@ -106,8 +106,8 @@ def test_gatv2_dot_leaky_relu_closed_form(bridge, n, dtype_name):
     device = torch.device("cuda:0")
     dt = TORCH_DTYPE[dtype_name]
 
-    pattern = torch.tensor([2.0 if k % 2 == 0 else -2.0 for k in range(n)], dtype=torch.float64)
-    lv = pattern.repeat(4, 1).to(dt).to(device)
+    pattern = torch.tensor([2.0 if k % 2 == 0 else -2.0 for k in range(n)], dtype=torch.float64, device=device)
+    lv = pattern.repeat(4, 1).to(dt)
     r = torch.zeros((4, n), dtype=dt, device=device)
     a = torch.ones((4, n), dtype=dt, device=device)
 
@@ -194,7 +194,7 @@ def test_make_ns_broadcasts_the_slope(bridge, n, dtype_name, ns):
     """make_ns must produce the negative slope in ns_t, readable as a num_type scalar."""
     mod = bridge.get("grad", dtype_name)
     got = mod.make_ns(n, ns)
-    want = torch.tensor([ns], dtype=TORCH_DTYPE[dtype_name]).double().item()
+    want = torch.tensor([ns], dtype=TORCH_DTYPE[dtype_name], device="cpu").double().item()
     assert got == pytest.approx(want, rel=2e-2, abs=1e-3)
 
 

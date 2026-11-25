@@ -420,12 +420,14 @@ def test_gsddmm_copy_edge_target_rejected():
         gsddmm(graph, e, None, op="copy", lhs_target="edge")
 
 
-def test_gsddmm_unsupported_dim_rejected():
+@pytest.mark.parametrize("dim", [0, 65537])
+def test_gsddmm_out_of_range_dim_rejected(dim):
+    """Any D in [1, 65536] is supported (see test_gsddmm_any_dim.py); outside it the binding raises."""
     graph = _make_graph()
     num_nodes = graph.forward_indptr.numel() - 1
-    x = torch.randn(num_nodes, 16, device=DEVICE)  # D must be in {32, 64, 128, 256}
-    with pytest.raises(RuntimeError):
-        gsddmm(graph, x, x, op="add", lhs_target="src", rhs_target="dst")
+    x = torch.randn(num_nodes, dim, device=DEVICE)
+    with pytest.raises(RuntimeError, match="out of range"):
+        gsddmm(graph, x, x, op="add", lhs_target="src", rhs_target="dst", variant="node")
 
 
 def test_gsddmm_rhs_required_for_binary_ops():

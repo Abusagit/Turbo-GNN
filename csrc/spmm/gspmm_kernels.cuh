@@ -5,196 +5,22 @@
 #include "reduction/reduction_aggr_kernels.cuh"
 
 // ---------------------------------------------------------------------------
-// Backward kernels.
+// The min/max backward of g-SpMM.
 //
-// Both gradients walk a CSR row per node and split the nodes into the same
-// light/heavy buckets the forward uses: a light node is one warp-row of a
-// 2-D block (features along x, nodes along y), a heavy node owns a whole block
-// whose y-tiles split its edge list.  The two buckets are launched on separate
-// streams by the host, exactly as in gspmm_forward.
+// Only the winning edge of each output element carried gradient. On a sparse graph the gradient
+// walks the *transposed* CSR (rows are sources), so a source's node gradient is a plain sum over its
+// out-edges and needs no atomics; nodes are split into light and heavy buckets launched on separate
+// streams, a light node being one y-row of a 2-D block (features along x), a heavy node a whole block
+// whose y-tiles split its edge list. On a dense graph the launcher scatters over the winning edges
+// instead (reduction_aggr_backward_typed).
 //
-// The edge gradient of a sum walks the *forward* CSR (rows are destinations,
-// every edge of a row carries the row's grad_out), the gradient of an arg
-// reducer walks the *transposed* CSR (rows are sources, so a source's node
-// gradient is a plain sum over its out-edges and needs no atomics).
+// A broadcast edge operand ([E] or [E, 1]) folds the d features of an edge into one slot. The kernels
+// then require blockDim.x == kWarpSize so that a node's (or tile's) feature threads are exactly one
+// warp and the fold is a shuffle reduction: the launcher forces that shape.
 //
-// A broadcast edge operand ([E] or [E, 1]) folds the d features of an edge
-// into one slot.  Both kernels then require blockDim.x == kWarpSize so that a
-// node's (or tile's) feature threads are exactly one warp and the fold is a
-// shuffle reduction: the launcher forces that shape.
+// The forward and the sum backward are the row-shape kernels of reduction/reduction_forward.cuh and
+// gspmm_edge_grad.cuh.
 // ---------------------------------------------------------------------------
-
-// Edge gradient of a sum reduction over edges [e_begin, e_end) of destination
-// v, for the feature threads fid, fid + f_stride, ...  Every (e, f) slot is
-// written exactly once, in grad_t directly.
-//
-// Features outer, edges inner: grad_out[v, f] is loaded once per feature and
-// the stores of one warp land on d consecutive elements of one edge row.
-template <
-    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t, FloatingNum accum_t,
-    int PIPELINE_STAGES = 0
->
-__device__ __forceinline__ void gspmm_edge_grad_span(
-    size_t v,
-    index_t e_begin,
-    index_t e_end,
-    size_t fid,
-    size_t f_stride,
-    index_t const *const __restrict__ edge_idx,
-    cuda_t const *const __restrict__ grad_out,
-    cuda_t const *const __restrict__ lhs,
-    cuda_t const *const __restrict__ rhs,
-    grad_t *const __restrict__ grad_rhs,
-    size_t d,
-    cuda_t *const dbuf = nullptr
-) {
-    using BOps        = BinaryOps<BOp>;
-    const size_t base = v * d;
-
-    static_assert(PIPELINE_STAGES >= 0, "pipeline_stages must be >= 0 (0 disables the pipeline)");
-    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0 && BOps::GRAD_USES_OPERANDS;
-    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
-
-    if constexpr (RHS_BROADCAST) {
-        // f_stride == kWarpSize and the callers are one full warp.
-        for (index_t eid = e_begin; eid < e_end; ++eid) {
-            size_t u_base = 0;
-            if constexpr (BOps::GRAD_USES_OPERANDS) {
-                u_base = static_cast<size_t>(edge_idx[eid]) * d;
-            }
-            accum_t partial{};
-            for (size_t f = fid; f < d; f += kWarpSize) {
-                const accum_t g = static_cast<accum_t>(grad_out[base + f]);
-                accum_t u_val{};
-                accum_t e_val{};
-                if constexpr (BOps::GRAD_USES_OPERANDS) {
-                    u_val = static_cast<accum_t>(lhs[u_base + f]);
-                    e_val = static_cast<accum_t>(rhs[static_cast<size_t>(eid)]);
-                }
-                partial += BOps::grad_rhs(u_val, e_val, g);
-            }
-            partial = warp_reduce_sum(partial);
-            if (fid == 0) {
-                grad_rhs[static_cast<size_t>(eid)] = static_cast<grad_t>(partial);
-            }
-        }
-    } else {
-        for (size_t f = fid; f < d; f += f_stride) {
-            const accum_t g = static_cast<accum_t>(grad_out[base + f]);
-
-            auto emit = [&](index_t eid, accum_t u_val) {
-                const size_t e_off = static_cast<size_t>(eid) * d + f;
-                accum_t e_val{};
-                if constexpr (BOps::GRAD_USES_OPERANDS) {
-                    e_val = static_cast<accum_t>(rhs[e_off]);
-                }
-                grad_rhs[e_off] = static_cast<grad_t>(BOps::grad_rhs(u_val, e_val, g));
-            };
-
-            if constexpr (USE_PIPELINE) {
-                pipelined_thread_edge_scan<1, NUM_STAGES, cuda_t, index_t>(
-                    e_begin, e_end, edge_idx, lhs, d, f, dbuf,
-                    [&](index_t /*src*/, index_t eid, cuda_t const *uslice) { emit(eid, static_cast<accum_t>(uslice[0])); }
-                );
-            } else {
-                for (index_t eid = e_begin; eid < e_end; ++eid) {
-                    accum_t u_val{};
-                    if constexpr (BOps::GRAD_USES_OPERANDS) {
-                        u_val = static_cast<accum_t>(lhs[static_cast<size_t>(edge_idx[eid]) * d + f]);
-                    }
-                    emit(eid, u_val);
-                }
-            }
-        }
-    }
-}
-
-template <FloatingNum cuda_t, int STAGES>
-__host__ __device__ inline size_t gspmm_edge_grad_shmem_bytes(size_t threads) {
-    return (STAGES > 0) ? ((threads * static_cast<size_t>(STAGES) * sizeof(cuda_t) + 15) / 16) * 16 : 0;
-}
-
-template <
-    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t = cuda_t, FloatingNum accum_t = float,
-    int PIPELINE_STAGES = 0
->
-__global__ void gspmm_backward_edge_light_kernel(
-    index_t const *const __restrict__ light_nodes,
-    index_t const *const __restrict__ edge_ptr,
-    index_t const *const __restrict__ edge_idx,
-    cuda_t const *const __restrict__ grad_out,
-    cuda_t const *const __restrict__ lhs,
-    cuda_t const *const __restrict__ rhs,
-    grad_t *const __restrict__ grad_rhs,
-    size_t num_light,
-    size_t d
-) {
-    extern __shared__ __align__(16) uint8_t edge_light_raw[];
-    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
-    cuda_t *const dbuf = reinterpret_cast<cuda_t *>(edge_light_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
-
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
-    if (i >= num_light) {
-        return;  // a whole y-row leaves together, so the broadcast shuffles below stay full-warp
-    }
-    const index_t v = light_nodes[i];
-    gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES>(
-        static_cast<size_t>(v), edge_ptr[v], edge_ptr[v + 1], threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf
-    );
-}
-
-template <
-    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, size_t CHUNK_EDGES, FloatingNum grad_t = cuda_t,
-    FloatingNum accum_t = float, int PIPELINE_STAGES = 0
->
-__global__ void gspmm_backward_edge_heavy_kernel(
-    index_t const *const __restrict__ heavy_nodes,
-    index_t const *const __restrict__ slice_offsets,
-    index_t const *const __restrict__ edge_ptr,
-    index_t const *const __restrict__ edge_idx,
-    cuda_t const *const __restrict__ grad_out,
-    cuda_t const *const __restrict__ lhs,
-    cuda_t const *const __restrict__ rhs,
-    grad_t *const __restrict__ grad_rhs,
-    size_t num_heavy,
-    size_t d
-) {
-    extern __shared__ __align__(16) uint8_t edge_heavy_raw[];
-    constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
-    cuda_t *const dbuf = reinterpret_cast<cuda_t *>(edge_heavy_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
-
-    const size_t tiles = blockDim.y;
-    const size_t tid   = threadIdx.y;
-
-    // Edges [c_begin, c_begin + c_len) of heavy node i, split across the tiles.
-    auto process = [&](size_t i, size_t c_begin, size_t c_len) {
-        const index_t v         = heavy_nodes[i];
-        const index_t row_start = edge_ptr[v];
-        const size_t per_tile   = (c_len + tiles - 1) / tiles;
-        const size_t t_begin    = min(tid * per_tile, c_len);
-        const size_t t_end      = min(t_begin + per_tile, c_len);
-        gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES>(
-            static_cast<size_t>(v), row_start + static_cast<index_t>(c_begin + t_begin), row_start + static_cast<index_t>(c_begin + t_end),
-            threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf
-        );
-    };
-
-    if (slice_offsets == nullptr) {
-        const index_t v = heavy_nodes[blockIdx.x];
-        process(blockIdx.x, 0, static_cast<size_t>(edge_ptr[v + 1] - edge_ptr[v]));
-        return;
-    }
-
-    const size_t total_slices = static_cast<size_t>(slice_offsets[num_heavy]);
-    for (size_t slice = blockIdx.x; slice < total_slices; slice += gridDim.x) {
-        const size_t i       = csr_row_of<index_t>(slice_offsets, num_heavy, slice);
-        const size_t chunk   = slice - static_cast<size_t>(slice_offsets[i]);
-        const index_t v      = heavy_nodes[i];
-        const size_t degree  = static_cast<size_t>(edge_ptr[v + 1] - edge_ptr[v]);
-        const size_t c_begin = chunk * CHUNK_EDGES;
-        process(i, c_begin, min(CHUNK_EDGES, degree - c_begin));
-    }
-}
 
 // Gradients of an arg-tracking reducer (min/max) over the backward-CSR edges
 // [b_begin, b_end) of source u, for one feature f.  Returns this thread's
@@ -223,8 +49,7 @@ __global__ void gspmm_backward_edge_heavy_kernel(
 // lane past d prefetches a clamped, in-bounds address and discards it, so the
 // trip count stays warp-uniform for the broadcast shuffles.
 template <
-    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_rhs_t, FloatingNum accum_t,
-    int PIPELINE_STAGES = 0
+    BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_rhs_t, FloatingNum accum_t, int PIPELINE_STAGES = 0
 >
 __device__ __forceinline__ accum_t gspmm_arg_grad_span(
     size_t u,
@@ -297,9 +122,9 @@ __device__ __forceinline__ accum_t gspmm_arg_grad_span(
         auto prefetch = [&](index_t it) {
             pipe.producer_acquire();
             if (it < num_b) {
-                const index_t v           = bwd_edge_idx[b_begin + it];
-                v_buf[it % NUM_STAGES]    = v;
-                index_t const *const src  = arg_eid + static_cast<size_t>(v) * d + f_c;
+                const index_t v          = bwd_edge_idx[b_begin + it];
+                v_buf[it % NUM_STAGES]   = v;
+                index_t const *const src = arg_eid + static_cast<size_t>(v) * d + f_c;
                 cuda::memcpy_async(dbuf + it % NUM_STAGES, src, cuda::aligned_size_t<sizeof(index_t)>(sizeof(index_t)), pipe);
             }
             pipe.producer_commit();
@@ -361,7 +186,7 @@ __global__ void gspmm_backward_arg_light_kernel(
 
     extern __shared__ __align__(16) uint8_t arg_light_raw[];
     constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
-    index_t *const dbuf = reinterpret_cast<index_t *>(arg_light_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
+    index_t *const dbuf         = reinterpret_cast<index_t *>(arg_light_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
 
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
     if (i >= num_light) {
@@ -428,7 +253,7 @@ __global__ void gspmm_backward_arg_heavy_kernel(
 
     extern __shared__ __align__(16) uint8_t arg_heavy_raw[];
     constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
-    index_t *const dbuf = reinterpret_cast<index_t *>(arg_heavy_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
+    index_t *const dbuf         = reinterpret_cast<index_t *>(arg_heavy_raw) + (threadIdx.y * blockDim.x + threadIdx.x) * NUM_STAGES;
 
     const size_t fid     = threadIdx.x;
     const size_t tid     = threadIdx.y;
@@ -488,203 +313,9 @@ __global__ void gspmm_backward_arg_heavy_kernel(
     }
 }
 
-// Heavy-node forward, sliced by edges.
-//
-// The unsliced heavy kernel gives one block to a node and splits its neighbors
-// across blockDim.y.  That is fine until one node holds tens of thousands of
-// edges: the block that draws it then runs long after every other block in the
-// launch has retired, and the partition meant to balance the work is what
-// creates the imbalance.  Here a node's neighbors are cut into slices of
-// SLICE_EDGES and every slice gets its own block.
-//
-// Each block writes its own slot in `partials` rather than folding into a
-// shared accumulator, so no atomics appear and the result does not depend on
-// the order the slices happen to finish -- gspmm_heavy_reduce_slices_kernel
-// then folds each node's slices in index order.  A comparison reducer carries
-// the winning edge position alongside every partial value, in `partial_args`,
-// which is what lets min/max take this path too.
-//
-// The slice a block owns comes from a binary search over `slice_offsets` (an
-// exclusive prefix sum of each heavy node's slice count, shaped exactly like a
-// CSR row pointer), whose last entry is the total slice count.  Reading the
-// bound on the device is what lets the grid be sized for occupancy instead of
-// for a count only the device knows.
-//
-// TW is 1: g-SpMM accepts any feature width, so it never takes the vectorized
-// TileOps path (see kGSpMMVectorize).
-
-// Dynamic shared-memory layout: `slots` accumulator floats, then -- only for a
-// reducer that reports an argument -- `slots` index_t, then -- only with the
-// pipeline on -- STAGES prefetch slots per thread.  Each region is padded to 16
-// bytes so the next one stays aligned for any (tiles_y, features_per_block).
-// The launcher sizes its allocation with this same function, so the two cannot
-// disagree.
-template <FloatingNum cuda_t, typename index_t, bool TRACKS_ARG, int STAGES>
-__host__ __device__ inline size_t gspmm_sliced_shmem_bytes(size_t slots) {
-    size_t bytes = ((slots * sizeof(float) + 15) / 16) * 16;
-    if constexpr (TRACKS_ARG) {
-        bytes += ((slots * sizeof(index_t) + 15) / 16) * 16;
-    }
-    if constexpr (STAGES > 0) {
-        bytes += ((slots * static_cast<size_t>(STAGES) * sizeof(cuda_t) + 15) / 16) * 16;
-    }
-    return bytes;
-}
-
-template <
-    FloatingNum cuda_t, typename index_t, ReductionOp ROp, BinaryOp BOp, bool RHS_BROADCAST, bool EDGE_MAP, size_t SLICE_EDGES,
-    int PIPELINE_STAGES = 0, FloatingNum accum_t = float
->
-__global__ void gspmm_heavy_sliced_kernel(
-    index_t const *const __restrict__ heavy_nodes,
-    index_t const *const __restrict__ slice_offsets,
-    index_t const *const __restrict__ edge_ptr,
-    index_t const *const __restrict__ edge_idx,
-    cuda_t const *const __restrict__ lhs,
-    cuda_t const *const __restrict__ rhs,
-    index_t const *const __restrict__ edge_map,
-    accum_t *const __restrict__ partials,
-    index_t *const __restrict__ partial_args,
-    size_t num_heavy,
-    size_t d
-) {
-    using BOps     = BinaryOps<BOp>;
-    using ROps     = ReductionOps<ROp>;
-    using Sentinel = IndexSentinel<index_t>;
-    // The reducer's own accumulate type, not accum_t: a comparison reducer
-    // compares operand-dtype values, and comparing the unrounded float message
-    // instead would pick a different winner among fp16 ties than the light and
-    // unsliced heavy kernels do.  The partial that leaves the block is float
-    // either way, which is order-preserving for both.
-    using acc_t = typename ROps::template AccumType<cuda_t, accum_t>;
-
-    constexpr bool TRACKS_ARG   = ROps::TRACKS_ARG;
-    constexpr bool USE_PIPELINE = PIPELINE_STAGES > 0 && BOps::USE_LHS;
-    constexpr int NUM_STAGES    = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
-
-    extern __shared__ __align__(16) uint8_t shared_raw[];
-
-    const size_t fid          = threadIdx.x;  // feature
-    const size_t tid          = threadIdx.y;  // edge tile within the slice
-    const size_t f_block      = blockDim.x;
-    const size_t tiles        = blockDim.y;
-    const size_t slots        = f_block * tiles;
-    const size_t slot         = tid * f_block + fid;
-    const size_t total_slices = static_cast<size_t>(slice_offsets[num_heavy]);
-
-    accum_t *const shmem_val = reinterpret_cast<accum_t *>(shared_raw);
-    index_t *const shmem_arg =
-        reinterpret_cast<index_t *>(shared_raw + gspmm_sliced_shmem_bytes<cuda_t, index_t, false, 0>(slots));
-    cuda_t *const my_pipe =
-        reinterpret_cast<cuda_t *>(shared_raw + gspmm_sliced_shmem_bytes<cuda_t, index_t, TRACKS_ARG, 0>(slots)) + slot * NUM_STAGES;
-
-    const acc_t identity_val = static_cast<acc_t>(ROps::IDENTITY);
-
-    for (size_t slice = blockIdx.x; slice < total_slices; slice += gridDim.x) {
-        const size_t i       = csr_row_of<index_t>(slice_offsets, num_heavy, slice);
-        const size_t within  = slice - static_cast<size_t>(slice_offsets[i]);
-        const index_t v      = heavy_nodes[i];
-        const index_t r_end  = edge_ptr[v + 1];
-        const index_t s_from = edge_ptr[v] + static_cast<index_t>(within * SLICE_EDGES);
-        const index_t s_to   = (s_from + static_cast<index_t>(SLICE_EDGES) < r_end) ? s_from + static_cast<index_t>(SLICE_EDGES) : r_end;
-
-        // Split the slice across blockDim.y the same way the unsliced kernel
-        // splits a whole row.
-        const size_t span     = static_cast<size_t>(s_to - s_from);
-        const size_t per_tile = (span + tiles - 1) / tiles;
-        const index_t begin   = s_from + static_cast<index_t>(tid * per_tile);
-        const index_t end_c   = begin + static_cast<index_t>(per_tile);
-        const index_t end     = (end_c < s_to) ? end_c : s_to;
-
-        // Trip count over the feature tiles is deliberately block-uniform, and
-        // threads past d idle instead of exiting the loop early: the tree
-        // reduction below is a barrier, and a barrier reached by only some of
-        // the block is undefined behaviour.  Striding `f < d` directly would
-        // do exactly that whenever d is not a multiple of blockDim.x.
-        const size_t f_iters = (d + f_block - 1) / f_block;
-
-        for (size_t it = 0; it < f_iters; ++it) {
-            const size_t f      = it * f_block + fid;
-            const bool in_range = f < d;
-
-            acc_t acc        = identity_val;
-            index_t best_arg = Sentinel::INVALID;
-
-            auto visit = [&](index_t /*src*/, index_t eid, cuda_t const *uslice) {
-                accum_t msg[1];
-                const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
-                aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(uslice, rhs, e_pos, f, d, msg);
-                bool upgrade_index = false;
-                acc                = ROps::reduce(static_cast<acc_t>(msg[0]), acc, upgrade_index);
-                if constexpr (TRACKS_ARG) {
-                    if (upgrade_index) {
-                        best_arg = eid;
-                    }
-                }
-            };
-
-            if (in_range) {
-                if constexpr (USE_PIPELINE) {
-                    pipelined_thread_edge_scan<1, static_cast<size_t>(NUM_STAGES), cuda_t, index_t>(
-                        begin, end, edge_idx, lhs, d, f, my_pipe, visit
-                    );
-                } else {
-                    for (index_t eid = begin; eid < end; ++eid) {
-                        cuda_t u_val{};
-                        cuda_t const *uslice = nullptr;
-                        if constexpr (BOps::USE_LHS) {
-                            u_val  = lhs[static_cast<size_t>(edge_idx[eid]) * d + f];
-                            uslice = &u_val;
-                        }
-                        visit(index_t{}, eid, uslice);
-                    }
-                }
-            }
-
-            shmem_val[slot] = static_cast<accum_t>(acc);
-            if constexpr (TRACKS_ARG) {
-                shmem_arg[slot] = best_arg;
-            }
-            __syncthreads();
-
-            for (size_t offset = tiles / 2; offset > 0; offset /= 2) {
-                if (tid < offset) {
-                    const size_t a = slot;
-                    const size_t b = slot + offset * f_block;
-                    if constexpr (TRACKS_ARG) {
-                        // Tie-break on the smaller edge position, so the arg a
-                        // slice reports does not depend on how its edges split
-                        // across tiles.
-                        const accum_t val_b = shmem_val[b];
-                        const index_t arg_b = shmem_arg[b];
-                        bool take_b         = false;
-                        ROps::reduce(val_b, shmem_val[a], take_b);
-                        if (take_b ||
-                            (val_b == shmem_val[a] && Sentinel::is_valid(arg_b) &&
-                             (!Sentinel::is_valid(shmem_arg[a]) || arg_b < shmem_arg[a]))) {
-                            shmem_val[a] = val_b;
-                            shmem_arg[a] = arg_b;
-                        }
-                    } else {
-                        shmem_val[a] += shmem_val[b];
-                    }
-                }
-                __syncthreads();
-            }
-
-            if (tid == 0 && in_range) {
-                partials[slice * d + f] = shmem_val[fid];
-                if constexpr (TRACKS_ARG) {
-                    partial_args[slice * d + f] = shmem_arg[fid];
-                }
-            }
-            __syncthreads();
-        }
-    }
-}
-
-// Folds each heavy node's slices in index order and writes the node's output
-// row (and, for a comparison reducer, the winning edge position).
+// Folds each heavy node's slices in index order and writes the node's output row (and, for a
+// comparison reducer, the winning edge position): the min/max backward's sliced heavy kernel folds its
+// node-gradient partials with the sum reducer.
 // Deterministic by construction, which an atomic fold would not be.
 template <FloatingNum cuda_t, typename index_t, ReductionOp ROp, FloatingNum accum_t = float>
 __global__ void gspmm_heavy_reduce_slices_kernel(

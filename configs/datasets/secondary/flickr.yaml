@@ -1,4 +1,5 @@
 dataset:
   source: pyg
   name: Flickr
-  root: data
+  # Own root: shares <root>/processed/data.pt with Reddit/FacebookPagePage/LastFMAsia otherwise.
+  root: data/Flickr

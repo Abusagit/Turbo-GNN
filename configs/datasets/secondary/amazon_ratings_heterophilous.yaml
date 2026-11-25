@@ -1,0 +1,7 @@
+dataset:
+  # Amazon-ratings of Platonov et al. (ICLR 2023), read from the authors' npz release without PyG
+  # (src/data/heterophilous_datasets.py); downloaded to data/amazon-ratings/raw/ on first use.
+  # Not to be confused with amazon_ratings.yaml, which loads PyG's AmazonBook.
+  source: heterophilous
+  name: amazon-ratings
+  root: data

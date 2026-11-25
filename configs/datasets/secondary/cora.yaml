@@ -3,4 +3,4 @@ dataset:
   name: cora
   root: data
 kernel_related_kwargs:
-  huge_degree_threshold_quantile: none
+  huge_degree_threshold_quantile: -1  # -1 disables the heavy-node bucket; `none` parsed as the string "none"

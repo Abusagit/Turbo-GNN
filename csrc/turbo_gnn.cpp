@@ -4,7 +4,6 @@
 
 namespace py = pybind11;
 
-
 // Default for the optional edge-slice table arguments. An undefined at::Tensor would register
 // as a `None` default, and pybind cannot convert None back to at::Tensor, which makes every
 // call that omits these arguments fail overload resolution. A real empty tensor is convertible
@@ -20,7 +19,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "reduction_aggr_forward_partitioned", &reduction_aggr_forward_partitioned_torch, "Reduction aggregation forward (partitioned)",
         py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("X"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("max_degree"),
         py::arg("warps_per_block") = 8, py::arg("edges_per_block_heavy_nodes") = 128, py::arg("use_2d_kernel") = false,
-        py::arg("features_per_block") = 32, py::arg("tiles_y") = 8, py::arg("reduce") = "min", py::arg("pipeline_stages") = 0
+        py::arg("features_per_block") = 32, py::arg("tiles_y") = 8, py::arg("reduce") = "min", py::arg("pipeline_stages") = 0,
+        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(), py::arg("node_chunk_offset") = kEmptyI32()
     );
 
     m.def(
@@ -38,8 +38,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gsddmm_forward_edge", &gsddmm_forward_edge_blocks, "Generalized Sampled Dense-Dense matrix multiplication implemented by edges",
         py::arg("l"), py::arg("r"), py::arg("edge_list"), py::arg("op"), py::arg("lhs_target"), py::arg("rhs_target"), py::arg("N"),
-        py::arg("pipeline_stages"), py::arg("edges_per_warp"), py::arg("warps_per_block"),
-        py::arg("canonical_edge_idx") = py::none()
+        py::arg("pipeline_stages"), py::arg("edges_per_warp"), py::arg("warps_per_block"), py::arg("canonical_edge_idx") = py::none()
     );
 
     m.def(
@@ -61,43 +60,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gatv2_forward", &gatv2_forward_cuda, "GATv2 forward pass (CUDA)", py::arg("l"), py::arg("r"), py::arg("row_ptr"), py::arg("col_idx"),
         py::arg("attn_vec"), py::arg("negative_slope") = 0.2f, py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 3,
-        py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
-        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
-        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0, py::arg("heavy_pipeline_stages") = 0
+        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 0, py::arg("blocks_per_sm") = 8,
+        py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0, py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0, py::arg("pipeline_stages") = 0,
+        py::arg("heavy_pipeline_stages") = 0
     );
 
     m.def(
         "gatv2_backward", &gatv2_backward_cuda, "GATv2 backward pass (CUDA)", py::arg("grad_h"), py::arg("l"), py::arg("r"), py::arg("row_ptr"),
-        py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("attn_vec"), py::arg("logsumexp"),
+        py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("attn_vec"), py::arg("logsumexp"), py::arg("out"),
         py::arg("negative_slope") = 0.2f, py::arg("grad_A_reduce_row_chunk_size") = 512, py::arg("fwd_light_nodes"), py::arg("fwd_heavy_nodes"),
         py::arg("bwd_light_nodes"), py::arg("bwd_heavy_nodes"), py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8,
-        py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
-        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
-        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("backward_heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0
+        py::arg("is_directed") = true, py::arg("schedule") = 0, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1,
+        py::arg("bucket_launch") = 0, py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("backward_heavy_edge_slice") = 0, py::arg("pipeline_stages") = 0,
+        py::arg("backward_heavy_pipeline_stages") = 0
     );
 
     // Graph Transformer aggregation
     m.def(
         "gt_forward_csr_mh", &graph_attention_forward_csr_mh_cuda, "Graph Transformer forward (CSR, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"),
-        py::arg("light_warps_per_block") = 4, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 3,
-        py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
-        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
-        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0, py::arg("heavy_pipeline_stages") = 0
+        py::arg("light_warps_per_block") = 1, py::arg("heavy_warps_per_block") = 8, py::arg("schedule") = 0, py::arg("blocks_per_sm") = 8,
+        py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0, py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0, py::arg("pipeline_stages") = 0,
+        py::arg("heavy_pipeline_stages") = 0
     );
 
     m.def(
         "gt_backward_csr_mh", &graph_attention_backward_csr_mh_cuda, "Graph Transformer backward (CSR + CSR^T, multi-head)", py::arg("row_ptr"),
         py::arg("col_idx"), py::arg("row_ptr_T"), py::arg("col_idx_T"), py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("dO"),
         py::arg("logsumexp"), py::arg("scale"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("light_warps_per_block") = 1,
-        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("schedule") = 3, py::arg("blocks_per_sm") = 8, py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0,
-        py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
-        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0,
-        py::arg("pipeline_stages") = 0, py::arg("backward_heavy_pipeline_stages") = 0
+        py::arg("heavy_warps_per_block") = 8, py::arg("is_directed") = true, py::arg("schedule") = 0, py::arg("blocks_per_sm") = 8,
+        py::arg("sched_chunk") = 1, py::arg("bucket_launch") = 0, py::arg("chunk_node") = kEmptyI32(), py::arg("chunk_start") = kEmptyI32(),
+        py::arg("node_chunk_offset") = kEmptyI32(), py::arg("heavy_edge_slice") = 0, py::arg("pipeline_stages") = 0,
+        py::arg("backward_heavy_pipeline_stages") = 0
     );
 
     // SpMM
@@ -129,24 +126,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Generalized SpMM (DGL dgl.ops.gspmm family)
     m.def(
         "gspmm_forward", &gspmm_forward, "Generalized SpMM forward: reduce_{(u,e) in in(v)} op(lhs[u], rhs[e])", py::arg("edge_ptr"),
-        py::arg("edge_idx"), py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"),
-        py::arg("reduce"), py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32, py::arg("tiles_y") = 8,
-        py::arg("pipeline_stages") = 0, py::arg("edge_map") = torch::empty({0}, torch::kInt), py::arg("max_degree") = -1
+        py::arg("edge_idx"), py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"), py::arg("reduce"),
+        py::arg("warps_per_block") = 8, py::arg("slice_size") = 128, py::arg("chunk_node") = torch::empty({0}, torch::kInt),
+        py::arg("chunk_start") = torch::empty({0}, torch::kInt), py::arg("node_chunk_offset") = torch::empty({0}, torch::kInt),
+        py::arg("light_degree_bound") = -1, py::arg("edge_map") = torch::empty({0}, torch::kInt)
     );
 
     m.def(
-        "gspmm_backward_arg", &gspmm_backward_arg, "Generalized SpMM backward for min/max (gather over the transposed CSR, or a scatter over the winning edges on a dense graph)",
+        "gspmm_backward_arg", &gspmm_backward_arg,
+        "Generalized SpMM backward for min/max (gather over the transposed CSR, or a scatter over the winning edges on a dense graph)",
         py::arg("grad_out"), py::arg("arg_eid"), py::arg("edge_idx"), py::arg("bwd_edge_ptr"), py::arg("bwd_edge_idx"), py::arg("bwd_edge_map"),
-        py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"),
-        py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32, py::arg("tiles_y") = 8, py::arg("max_degree") = -1,
-        py::arg("pipeline_stages") = 0
+        py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"), py::arg("warps_per_block") = 8,
+        py::arg("features_per_block") = 32, py::arg("tiles_y") = 8, py::arg("max_degree") = -1, py::arg("pipeline_stages") = 0
     );
 
     m.def(
-        "gspmm_backward_edge", &gspmm_backward_edge, "Generalized SpMM backward for sum: gradient w.r.t. edge data",
-        py::arg("edge_ptr"), py::arg("edge_idx"), py::arg("grad_out"), py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"),
-        py::arg("heavy_nodes"), py::arg("op"), py::arg("warps_per_block") = 8, py::arg("features_per_block") = 32,
-        py::arg("tiles_y") = 8, py::arg("max_degree") = -1, py::arg("pipeline_stages") = 0
+        "gspmm_backward_edge", &gspmm_backward_edge, "Generalized SpMM backward for sum: gradient w.r.t. edge data", py::arg("edge_ptr"),
+        py::arg("edge_idx"), py::arg("grad_out"), py::arg("lhs"), py::arg("rhs"), py::arg("light_nodes"), py::arg("heavy_nodes"), py::arg("op"),
+        py::arg("warps_per_block") = 8, py::arg("slice_size") = 128, py::arg("chunk_node") = torch::empty({0}, torch::kInt),
+        py::arg("chunk_start") = torch::empty({0}, torch::kInt), py::arg("node_chunk_offset") = torch::empty({0}, torch::kInt)
     );
 
     // Edge normalization
