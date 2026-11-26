@@ -75,3 +75,35 @@ def test_seed_batches_cover_once():
     allseeds = torch.cat(batches)
     assert allseeds.numel() == 1000 and torch.equal(allseeds.sort().values, idx)
     assert [b.numel() for b in batches][:-1] == [128] * 7
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_adaptive_frontier_dedup_sparse_and_dense_regimes(device):
+    """Both branches (E_batch << N sparse unique vs E_batch >= N/8 dense mark scan) produce exact blocks."""
+    # Sparse mini-batch regime: N=5000, non-hub seed set -> E_batch * 8 < N
+    indptr_s, indices_s, adj_s = random_graph(num_nodes=5000, num_edges=25000, device=device, seed=1)
+    seeds_s = torch.arange(4000, 4016, device=device)
+    b_s = GPUNeighborSampler(indptr_s, indices_s, [-1]).sample(seeds_s)
+    blk_s = b_s.blocks[0]
+    assert blk_s.num_edges > 0 and blk_s.num_edges * 8 < 5000
+    g_s = b_s.input_nodes
+    assert torch.unique(g_s).numel() == g_s.numel()
+    # New sources past dst must be strictly ascending
+    assert torch.equal(g_s[16:], g_s[16:].sort().values)
+    for row in range(16):
+        v = int(seeds_s[row])
+        nbrs = g_s[blk_s.indices[blk_s.indptr[row] : blk_s.indptr[row + 1]].long()].tolist()
+        assert set(nbrs) == adj_s[v]
+
+    # Dense full-neighbor regime: N=200, large seed set -> E_batch * 8 >= N
+    indptr_d, indices_d, adj_d = random_graph(num_nodes=200, num_edges=6000, device=device, seed=2)
+    seeds_d = torch.arange(64, device=device)
+    b_d = GPUNeighborSampler(indptr_d, indices_d, [-1]).sample(seeds_d)
+    blk_d = b_d.blocks[0]
+    assert blk_d.num_edges * 8 >= 200
+    g_d = b_d.input_nodes
+    assert torch.unique(g_d).numel() == g_d.numel()
+    assert torch.equal(g_d[64:], g_d[64:].sort().values)
+    for row in range(64):
+        nbrs = g_d[blk_d.indices[blk_d.indptr[row] : blk_d.indptr[row + 1]].long()].tolist()
+        assert set(nbrs) == adj_d[row]

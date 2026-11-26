@@ -244,8 +244,9 @@ class OursBatchMaker:
 
     def __init__(self, sampler: GPUNeighborSampler, x, y, backend: str, args) -> None:
         self.sampler, self.x, self.y, self.backend, self.args = sampler, x, y, backend, args
+        self.kernel_kwargs = json.loads(args.kernel_kwargs)
 
-    def graph_for(self, b):
+    def graph_for(self, b, _eids_out: list[torch.Tensor] | None = None):
         """One sampled block -> the graph object the backend's conv consumes."""
         if self.backend == "cuda":
             from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
@@ -264,16 +265,18 @@ class OursBatchMaker:
             # Heavy edge-slice tables need a device->host read (the slice count). Build them
             # here, in the producer thread, so the kernel launch finds them cached and the
             # training thread never blocks on it.
-            kw = json.loads(self.args.kernel_kwargs)
             for direction in ("forward", "backward"):
-                size = kw.get(f"{direction}_heavy_edge_slice", 0)
+                size = self.kernel_kwargs.get(f"{direction}_heavy_edge_slice", 0)
                 if size > 0:
                     g.heavy_edge_slices(direction, size)
             return g
         import dgl
 
+        eids = torch.arange(b.num_edges, dtype=b.indptr.dtype, device=b.indptr.device)
+        if _eids_out is not None:
+            _eids_out.append(eids)
         return dgl.create_block(
-            ("csc", (b.indptr, b.indices, torch.arange(b.num_edges, dtype=b.indptr.dtype, device=b.indptr.device))),
+            ("csc", (b.indptr, b.indices, eids)),
             num_src_nodes=b.num_src,
             num_dst_nodes=b.num_dst,
             idtype=b.indptr.dtype,
@@ -284,10 +287,18 @@ class OursBatchMaker:
         batch = self.sampler.sample(seeds)
         x = self.x[batch.input_nodes]
         y = self.y[batch.seeds]
-        graphs = [self.graph_for(b) for b in batch.blocks]
+        dgl_eids: list[torch.Tensor] = []
+        graphs = [self.graph_for(b, dgl_eids) for b in batch.blocks]
         stats = [(b.num_dst, b.num_src, b.num_edges) for b in batch.blocks]
-        # Keep the raw CSR tensors in the batch: for DGL blocks they are what record_stream must see.
-        return {"x": x, "y": y, "graphs": graphs, "stats": stats, "_csr": [(b.indptr, b.indices) for b in batch.blocks]}
+        # Keep the raw CSR + eid tensors in the batch: for DGL blocks they are what record_stream must see.
+        return {
+            "x": x,
+            "y": y,
+            "graphs": graphs,
+            "stats": stats,
+            "_csr": [(b.indptr, b.indices) for b in batch.blocks],
+            "_dgl_eids": dgl_eids,
+        }
 
 
 class AsyncBatchMaker:
@@ -298,17 +309,18 @@ class AsyncBatchMaker:
     (fanout, num_dst) and is_directed=True, so its __post_init__ reads nothing from the GPU.
     """
 
-    def __init__(self, sampler: AsyncNeighborSampler, x, y, backend: str) -> None:
+    def __init__(self, sampler: AsyncNeighborSampler, x, y, backend: str, kernel_kwargs: dict | None = None) -> None:
         self.sampler, self.x, self.y, self.backend = sampler, x, y, backend
+        self.kernel_kwargs = kernel_kwargs or {}
 
     def launch(self, seeds):
         return self.sampler.launch(seeds)
 
-    def graph_for(self, b):
+    def graph_for(self, b, _eids_out: list[torch.Tensor] | None = None):
         if self.backend == "cuda":
             from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
 
-            return G(
+            g = G(
                 forward_indptr=b.indptr,
                 forward_indices=b.indices,
                 backward_indptr=b.bwd_indptr,
@@ -321,10 +333,18 @@ class AsyncBatchMaker:
                 backward_max_degree=b.num_dst,
                 is_directed=True,
             )
+            for direction in ("forward", "backward"):
+                size = self.kernel_kwargs.get(f"{direction}_heavy_edge_slice", 0)
+                if size > 0:
+                    g.heavy_edge_slices(direction, size)
+            return g
         import dgl
 
+        eids = torch.arange(b.num_edges, dtype=b.indptr.dtype, device=b.indptr.device)
+        if _eids_out is not None:
+            _eids_out.append(eids)
         return dgl.create_block(
-            ("csc", (b.indptr, b.indices, torch.arange(b.num_edges, dtype=b.indptr.dtype, device=b.indptr.device))),
+            ("csc", (b.indptr, b.indices, eids)),
             num_src_nodes=b.num_src,
             num_dst_nodes=b.num_dst,
             idtype=b.indptr.dtype,
@@ -332,12 +352,14 @@ class AsyncBatchMaker:
         )
 
     def finalize(self, pending) -> dict[str, Any]:
-        fb = self.sampler.finalize(pending)
+        # Clone exact slices so queued batches never retain full padded E_cap/src_cap buffers.
+        fb = self.sampler.finalize(pending, clone=True)
         x = self.x[fb.input_nodes]
         y = self.y[fb.seeds]
-        graphs = [self.graph_for(b) for b in fb.blocks]
+        dgl_eids: list[torch.Tensor] = []
+        graphs = [self.graph_for(b, dgl_eids) for b in fb.blocks]
         stats = [(b.num_dst, b.num_src, b.num_edges) for b in fb.blocks]
-        return {"x": x, "y": y, "graphs": graphs, "stats": stats, "_parts": fb.blocks}
+        return {"x": x, "y": y, "graphs": graphs, "stats": stats, "_parts": fb.blocks, "_dgl_eids": dgl_eids}
 
 
 def ours_epoch(maker, idx, args, device, shuffle=True, prefetch=None, max_steps=0):
@@ -479,14 +501,16 @@ def run_epoch(model, optimizer, scaler, batches, args, dtype, task: Task, train=
             if scaler is not None:
                 scaler.scale(loss).backward()
                 ev[2].record(compute)
+                if profiling:
+                    prof.end("bwd")
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 ev[2].record(compute)
+                if profiling:
+                    prof.end("bwd")
                 optimizer.step()
-            if profiling:
-                prof.end("bwd")
             if prof is not None:
                 prof.seen += 1
         else:
@@ -763,7 +787,7 @@ def main() -> None:
             if args.sampler_impl == "auto":
                 args.sampler_impl = "async"
                 if args.full_neighbor:
-                    cap = AsyncNeighborSampler(indptr, indices, args.fanout_list).padded_edge_capacity(args.batch_size)
+                    cap = AsyncNeighborSampler.estimate_padded_edge_capacity(indptr, args.fanout_list, args.batch_size)
                     args.padded_edge_capacity = cap
                     if cap > FULL_NEIGHBOR_ASYNC_MAX_EDGES:
                         args.sampler_impl = "exact"
@@ -783,7 +807,7 @@ def main() -> None:
                 if args.sampler_graphs == "on":
                     # stage 1 replayed from CUDA graphs: ~0.7 ms of CPU per batch instead of ~9 ms
                     async_sampler = GraphedNeighborSampler(async_sampler, args.batch_size)
-                train_maker = AsyncBatchMaker(async_sampler, x, y, args.backend)
+                train_maker = AsyncBatchMaker(async_sampler, x, y, args.backend, kernel_kwargs=kernel_kw)
             else:
                 sampler = GPUNeighborSampler(indptr, indices, args.fanout_list, index_dtype=INDEX_DTYPES[args.index_dtype])
                 train_maker = OursBatchMaker(sampler, x, y, args.backend, args)

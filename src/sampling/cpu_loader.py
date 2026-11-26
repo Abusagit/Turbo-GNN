@@ -28,6 +28,7 @@ Timing keys match `PrefetchLoader` and `resolve_gpu_ms` (all milliseconds):
 from __future__ import annotations
 
 import copy
+import ctypes
 import dataclasses
 import os
 import queue
@@ -44,6 +45,136 @@ import torch.multiprocessing as mp
 from src.sampling.loader import iter_tensors
 
 _SENTINEL = object()
+
+
+def _estimate_cpu_bytes(obj: Any) -> int:
+    total = 64  # headroom for initial 64B alignment
+    seen: set[int] = set()
+    for t in iter_tensors(obj):
+        tid = id(t)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        if t.device.type == "cpu" and t.numel() > 0 and not t.is_pinned():
+            total += (t.numel() * t.element_size() + 63) & ~63
+    return total
+
+
+class _PinnedSlab:
+    """Reusable page-locked host memory slab with bump allocation and H2D completion tracking.
+
+    Eliminates per-batch ``cudaHostAlloc`` / ``cudaFreeHost`` kernel syscalls and multi-core
+    TLB shootdowns when mini-batch tensor shapes vary slightly from step to step.
+    """
+
+    def __init__(self) -> None:
+        self.buf: torch.Tensor | None = None
+        self.offset: int = 0
+        self.ready: torch.cuda.Event | None = None
+
+    def begin(self, required_bytes: int) -> None:
+        if self.ready is not None:
+            # Poll rather than calling event.synchronize() to stay compatible with
+            # torch.cuda.set_sync_debug_mode("error") and release the GIL if still in flight.
+            while not self.ready.query():
+                time.sleep(50e-6)
+            self.ready = None
+        if self.buf is None or self.buf.numel() < required_bytes:
+            # 1.25x headroom on initial alloc prevents growth reallocs on minor batch-size jitter.
+            cap = max(int(required_bytes * 1.25), 4 * 1024 * 1024)
+            if self.buf is not None:
+                cap = max(cap, int(self.buf.numel() * 1.5))
+            cap = (cap + 4095) & ~4095
+            self.buf = torch.empty(cap, dtype=torch.uint8, pin_memory=True)
+        self.offset = 0
+
+    def alloc(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        numel = 1
+        for d in shape:
+            numel *= d
+        if numel == 0:
+            return torch.empty(shape, dtype=dtype)
+        elem_size = torch.empty((), dtype=dtype).element_size()
+        nbytes = numel * elem_size
+        start = (self.offset + 63) & ~63
+        end = start + nbytes
+        assert self.buf is not None and end <= self.buf.numel()
+        self.offset = end
+        return self.buf[start:end].view(dtype).reshape(shape)
+
+
+class _PinnedSlabRing:
+    """Round-robin ring of ``num_slots`` reusable pinned slabs (``depth + 2``)."""
+
+    def __init__(self, num_slots: int) -> None:
+        self._slabs = [_PinnedSlab() for _ in range(max(2, num_slots))]
+        self._next = 0
+
+    def acquire(self, required_bytes: int) -> _PinnedSlab:
+        slab = self._slabs[self._next]
+        self._next = (self._next + 1) % len(self._slabs)
+        slab.begin(required_bytes)
+        return slab
+
+
+def _stage_in_slab(obj: Any, slab: _PinnedSlab, _memo: dict[int, Any] | None = None) -> Any:
+    """Copy unpinned CPU tensors in ``obj`` into views of ``slab`` (zero ``cudaHostAlloc``)."""
+    memo = _memo if _memo is not None else {}
+    oid = id(obj)
+    if oid in memo:
+        return memo[oid]
+
+    if isinstance(obj, torch.Tensor):
+        if obj.device.type == "cpu" and obj.numel() > 0 and not obj.is_pinned():
+            dst = slab.alloc(tuple(obj.shape), obj.dtype)
+            if obj.is_contiguous():
+                # Direct memcpy avoids waking PyTorch's multi-socket OpenMP pool for tiny index tensors.
+                ctypes.memmove(dst.data_ptr(), obj.data_ptr(), obj.numel() * obj.element_size())
+            else:
+                dst.copy_(obj)
+            res = dst
+        else:
+            res = obj
+        memo[oid] = res
+        return res
+    if hasattr(obj, "forward_indptr") and hasattr(obj, "_edge_slice_cache"):
+        obj.forward_indptr = _stage_in_slab(obj.forward_indptr, slab, memo)
+        obj.forward_indices = _stage_in_slab(obj.forward_indices, slab, memo)
+        if obj.is_directed:
+            obj.backward_indptr = _stage_in_slab(obj.backward_indptr, slab, memo)
+            obj.backward_indices = _stage_in_slab(obj.backward_indices, slab, memo)
+        else:
+            obj.backward_indptr = obj.forward_indptr
+            obj.backward_indices = obj.forward_indices
+        obj.forward_light_nodes = _stage_in_slab(obj.forward_light_nodes, slab, memo)
+        obj.forward_heavy_nodes = _stage_in_slab(obj.forward_heavy_nodes, slab, memo)
+        obj.backward_light_nodes = _stage_in_slab(obj.backward_light_nodes, slab, memo)
+        obj.backward_heavy_nodes = _stage_in_slab(obj.backward_heavy_nodes, slab, memo)
+        if obj.forward_edge_perm is not None:
+            obj.forward_edge_perm = _stage_in_slab(obj.forward_edge_perm, slab, memo)
+        if obj._edge_slice_cache:
+            obj._edge_slice_cache = {k: _stage_in_slab(v, slab, memo) for k, v in obj._edge_slice_cache.items()}
+        memo[oid] = obj
+        return obj
+    if isinstance(obj, dict):
+        res = {k: _stage_in_slab(v, slab, memo) for k, v in obj.items()}
+        memo[oid] = res
+        return res
+    if isinstance(obj, list):
+        res = [_stage_in_slab(v, slab, memo) for v in obj]
+        memo[oid] = res
+        return res
+    if isinstance(obj, tuple):
+        items = [_stage_in_slab(v, slab, memo) for v in obj]
+        res = type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
+        memo[oid] = res
+        return res
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        kwargs = {f.name: _stage_in_slab(getattr(obj, f.name), slab, memo) for f in dataclasses.fields(obj)}
+        res = type(obj)(**kwargs)
+        memo[oid] = res
+        return res
+    return obj
 
 
 def pin_batch(obj: Any, _memo: dict[int, Any] | None = None) -> Any:
@@ -141,11 +272,13 @@ def _put_interruptible(q: queue.Queue, item: Any, stop: threading.Event, timeout
 
 
 def _default_worker_threads(num_workers: int) -> int:
-    """Choose PyTorch intra-op CPU threads per worker to avoid OpenMP oversubscription."""
+    """Choose intra-worker CPU threads to saturate cores without barrier preemption jitter."""
     cpus = os.cpu_count() or 1
-    if num_workers <= 1:
-        return min(4, cpus)
-    return max(1, min(2, cpus // (num_workers * 2)))
+    if num_workers <= 0:
+        return min(16, cpus)
+    if num_workers == 1:
+        return min(8, cpus)
+    return max(1, min(4, min(16, cpus) // num_workers))
 
 
 def _cpu_worker_loop(
@@ -293,15 +426,36 @@ class CPUPrefetchLoader:
         self.post_transfer = post_transfer if post_transfer is not None else getattr(produce, "post_transfer", None)
         self.seed = seed
 
-        # In single-process mode, align CPUBatchMaker.pin_memory with self.pin_memory so:
-        # - pin_memory=True gathers directly into pinned memory (one host copy instead of two);
-        # - pin_memory=False (or device="cpu") never calls .pin_memory().
-        if self.num_workers == 0 and hasattr(produce, "pin_memory") and bool(produce.pin_memory) != self.pin_memory:
+        self._split_worker_gather = hasattr(produce, "for_worker") and hasattr(produce, "finalize_cpu_batch")
+
+        # Keep CPUBatchMaker.pin_memory=False on producer copies: when self.pin_memory=True,
+        # CPUPrefetchLoader stages tensors directly into its reusable _PinnedSlabRing instead of
+        # triggering per-batch cudaHostAlloc syscalls.
+        need_single_copy = (
+            self.num_workers == 0
+            and (
+                getattr(produce, "pin_memory", False)
+                or (hasattr(produce, "sampler") and getattr(produce.sampler, "num_threads", None) is None)
+            )
+        )
+        if need_single_copy:
             self._single_produce = copy.copy(produce)
-            self._single_produce.pin_memory = self.pin_memory
+            if hasattr(self._single_produce, "pin_memory"):
+                self._single_produce.pin_memory = False
+            if hasattr(self._single_produce, "sampler") and getattr(self._single_produce.sampler, "num_threads", None) is None:
+                self._single_produce.sampler = copy.copy(self._single_produce.sampler)
+                self._single_produce.sampler.num_threads = self.worker_threads
         else:
             self._single_produce = produce
 
+        # In single-process mode targeting CUDA, use the topology worker + GPU-side block transpose
+        # (and direct slab gather when pin_memory=True) to skip CPU CSR transpose and extra copies.
+        if self.num_workers == 0 and self._use_cuda and self._split_worker_gather:
+            self._single_topo_worker: Any = self._single_produce.for_worker(build_cuda_graphs=False, pack_ipc=False)
+        else:
+            self._single_topo_worker = None
+
+        self._pinned_ring: _PinnedSlabRing | None = _PinnedSlabRing(self.depth + 2) if self.pin_memory else None
         self._workers: list[Any] = []
         self._task_q: Any = None
         self._result_q: Any = None
@@ -367,7 +521,15 @@ class CPUPrefetchLoader:
             )
 
         self._split_worker_gather = hasattr(self.produce, "for_worker") and hasattr(self.produce, "finalize_cpu_batch")
-        worker_produce = self.produce.for_worker() if self._split_worker_gather else self.produce
+        if self._split_worker_gather:
+            # When targeting CUDA, ship only packed forward CSRs (1 IPC FD) and build transposed
+            # CSR + buckets asynchronously on the GPU H2D stream (~0.25 ms on H100).
+            worker_produce = self.produce.for_worker(
+                build_cuda_graphs=not self._use_cuda,
+                pack_ipc=self._use_cuda,
+            )
+        else:
+            worker_produce = self.produce
         # Workers must never touch CUDA, so ensure pin_memory is off on the worker copy.
         if getattr(worker_produce, "pin_memory", False):
             worker_produce = copy.copy(worker_produce)
@@ -407,24 +569,49 @@ class CPUPrefetchLoader:
 
     # ----------------------------------------------------------- H2D transfer
     def _pin_and_transfer(
-        self, batch_cpu: Any, stream: torch.cuda.Stream | None
+        self,
+        batch_cpu: Any,
+        stream: torch.cuda.Stream | None,
+        *,
+        needs_gather: bool = False,
     ) -> tuple[Any, torch.cuda.Event | None, tuple[torch.cuda.Event, torch.cuda.Event] | None]:
         if not self._use_cuda:
+            if needs_gather:
+                batch_cpu = self.produce.finalize_cpu_batch(batch_cpu, pin_memory=False)
             batch_out = self.post_transfer(batch_cpu) if self.post_transfer is not None else batch_cpu
             return batch_out, None, None
 
-        batch_host = pin_batch(batch_cpu) if self.pin_memory else batch_cpu
+        slab: _PinnedSlab | None = None
+        if self.pin_memory and self._pinned_ring is not None:
+            extra = self.produce.estimate_gather_bytes(batch_cpu) if (needs_gather and hasattr(self.produce, "estimate_gather_bytes")) else 0
+            align_pad = 64 * len(batch_cpu.get("_packed_offsets", ())) if isinstance(batch_cpu, dict) else 0
+            req = _estimate_cpu_bytes(batch_cpu) + extra + align_pad + 128
+            slab = self._pinned_ring.acquire(req)
+            if needs_gather:
+                batch_cpu = self.produce.finalize_cpu_batch(batch_cpu, pin_memory=False, alloc=slab.alloc)
+            batch_host = _stage_in_slab(batch_cpu, slab)
+        else:
+            if needs_gather:
+                batch_cpu = self.produce.finalize_cpu_batch(batch_cpu, pin_memory=False)
+            batch_host = batch_cpu
+
         assert stream is not None
-        with torch.cuda.stream(stream):
-            start_ev = torch.cuda.Event(enable_timing=True)
-            end_ev = torch.cuda.Event(enable_timing=True)
-            start_ev.record(stream)
-            batch_dev = transfer_batch_to_device(batch_host, self.device, non_blocking=self.pin_memory)
-            if self.post_transfer is not None:
-                batch_dev = self.post_transfer(batch_dev)
-            end_ev.record(stream)
-            ready = torch.cuda.Event()
+        ready = torch.cuda.Event()
+        try:
+            with torch.cuda.stream(stream):
+                start_ev = torch.cuda.Event(enable_timing=True)
+                end_ev = torch.cuda.Event(enable_timing=True)
+                start_ev.record(stream)
+                batch_dev = transfer_batch_to_device(batch_host, self.device, non_blocking=self.pin_memory)
+                if self.post_transfer is not None:
+                    batch_dev = self.post_transfer(batch_dev)
+                end_ev.record(stream)
+        finally:
+            # Always record completion on the stream so a partially queued DMA cannot be
+            # overwritten if an exception occurs mid-transfer or in post_transfer.
             ready.record(stream)
+            if slab is not None:
+                slab.ready = ready
         del batch_host
         return batch_dev, ready, (start_ev, end_ev)
 
@@ -432,11 +619,13 @@ class CPUPrefetchLoader:
     def _iter_inline(self, seed_list: list[torch.Tensor]) -> Iterator[tuple[Any, dict[str, Any]]]:
         dev = self._resolve_device()
         stream = torch.cuda.current_stream(dev) if self._use_cuda else None
+        use_topo = self._single_topo_worker is not None
+        prod = self._single_topo_worker if use_topo else self._single_produce
         for s in seed_list:
             t0 = time.perf_counter()
-            batch_cpu = self._single_produce(s)
+            batch_cpu = prod(s)
             t1 = time.perf_counter()
-            batch_dev, _, gpu_events = self._pin_and_transfer(batch_cpu, stream)
+            batch_dev, _, gpu_events = self._pin_and_transfer(batch_cpu, stream, needs_gather=use_topo)
             del batch_cpu
             t2 = time.perf_counter()
             produce_ms = (t1 - t0) * 1e3
@@ -459,6 +648,8 @@ class CPUPrefetchLoader:
         compute = torch.cuda.current_stream(dev) if self._use_cuda else None
         out: queue.Queue = queue.Queue(maxsize=self.depth)
         stop = threading.Event()
+        use_topo = self._single_topo_worker is not None
+        prod = self._single_topo_worker if use_topo else self._single_produce
 
         def worker() -> None:
             try:
@@ -468,9 +659,9 @@ class CPUPrefetchLoader:
                     if stop.is_set():
                         break
                     t0 = time.perf_counter()
-                    batch_cpu = self._single_produce(s)
+                    batch_cpu = prod(s)
                     t1 = time.perf_counter()
-                    batch_dev, ready, gpu_events = self._pin_and_transfer(batch_cpu, h2d_stream)
+                    batch_dev, ready, gpu_events = self._pin_and_transfer(batch_cpu, h2d_stream, needs_gather=use_topo)
                     del batch_cpu
                     t2 = time.perf_counter()
                     timing: dict[str, Any] = {
@@ -570,9 +761,9 @@ class CPUPrefetchLoader:
                     emitted += 1
                     dispatch()
                     t_xfer = time.perf_counter()
-                    if self._split_worker_gather:
-                        batch_cpu = self.produce.finalize_cpu_batch(batch_cpu, pin_memory=self.pin_memory)
-                    batch_dev, ready, gpu_events = self._pin_and_transfer(batch_cpu, h2d_stream)
+                    batch_dev, ready, gpu_events = self._pin_and_transfer(
+                        batch_cpu, h2d_stream, needs_gather=self._split_worker_gather
+                    )
                     del batch_cpu
                     timing: dict[str, Any] = {
                         "produce_host_ms": produce_ms,

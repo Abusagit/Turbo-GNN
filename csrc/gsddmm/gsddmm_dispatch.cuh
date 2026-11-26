@@ -59,8 +59,8 @@ void gsddmm_dispatch(const GsddmmLaunchArgs& args) {
                 constexpr size_t W         = decltype(warp_c)::value;
                 // Stage axis value 4 = multi-head operands, which run unpipelined: the multi-head
                 // instantiations stay a +1/4 of the grid instead of doubling it.
-                constexpr int STAGES_V       = decltype(stages_c)::value;
-                constexpr bool MH       = STAGES_V == 4;
+                constexpr int STAGES_V     = decltype(stages_c)::value;
+                constexpr bool MH          = STAGES_V == 4;
                 constexpr int STAGES       = MH ? 0 : STAGES_V;
 
                 cuda_t const *L_ptr = reinterpret_cast<const cuda_t *>(args.L.data_ptr<torch_t>());
@@ -144,10 +144,10 @@ void gsddmm_dispatch_edge_block(const GsddmmLaunchArgsEdge& args) {
             using cuda_t               = typename decltype(typeInfo)::CudaType;
             constexpr size_t DC        = decltype(d_c)::value;
             // Stage axis value 4 = multi-head operands, which run unpipelined: the multi-head
-                // instantiations stay a +1/4 of the grid instead of doubling it.
-                constexpr int STAGES_V       = decltype(stages_c)::value;
-                constexpr bool MH       = STAGES_V == 4;
-                constexpr int STAGES       = MH ? 0 : STAGES_V;
+            // instantiations stay a +1/4 of the grid instead of doubling it.
+            constexpr int STAGES_V     = decltype(stages_c)::value;
+            constexpr bool MH          = STAGES_V == 4;
+            constexpr int STAGES       = MH ? 0 : STAGES_V;
             // The remap flag as a template parameter: the no-remap instantiation
             // compiles the canonical-id select away entirely. See the kernel body
             // for why a runtime flag here cost 20%+ of the whole kernel.
@@ -307,10 +307,10 @@ void gsddmm_backward_dispatch_edge_block(const GsddmmBackwardLaunchArgsEdge& arg
                     using cuda_t          = typename decltype(typeInfo)::CudaType;
                     constexpr size_t DC   = decltype(d_c)::value;
                     // Stage axis value 4 = multi-head operands, which run unpipelined: the multi-head
-                // instantiations stay a +1/4 of the grid instead of doubling it.
-                constexpr int STAGES_V  = decltype(stages_c)::value;
-                constexpr bool MH  = STAGES_V == 4;
-                constexpr int STAGES  = MH ? 0 : STAGES_V;
+                    // instantiations stay a +1/4 of the grid instead of doubling it.
+                    constexpr int STAGES_V = decltype(stages_c)::value;
+                    constexpr bool MH      = STAGES_V == 4;
+                    constexpr int STAGES   = MH ? 0 : STAGES_V;
                     // The remap flag as a template parameter; see the forward dispatch.
                     constexpr bool REMAP_IDS = decltype(remap_c)::value != 0;
 

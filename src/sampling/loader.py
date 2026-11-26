@@ -78,7 +78,10 @@ class PrefetchLoader:
         self.seeds = list(seeds)
         self.prefetch = prefetch
         self.depth = max(1, depth)
-        self.device = torch.device(device)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self.device = dev
 
     def __len__(self) -> int:
         return len(self.seeds)
@@ -122,12 +125,15 @@ class PrefetchLoader:
     def _finish(self, launched, stream) -> tuple[Any, dict[str, Any]]:
         pending, launch_events, launch_ms = launched
         t0 = time.perf_counter()
-        end = torch.cuda.Event(enable_timing=True)
+        fin_start = torch.cuda.Event(enable_timing=True)
+        fin_end = torch.cuda.Event(enable_timing=True)
+        fin_start.record(stream)
         batch = self.produce.finalize(pending)
-        end.record(stream)
+        fin_end.record(stream)
         host_ms = launch_ms + (time.perf_counter() - t0) * 1e3
-        # GPU time: from the launch start to the end of the finalize work (gather, graph views).
-        return batch, {"produce_host_ms": host_ms, "_gpu_events": (launch_events[0], end)}
+        # Sum the two non-overlapping GPU spans (launch + finalize) rather than spanning
+        # launch_start -> fin_end, which would double-count batch i+1's pipelined launch.
+        return batch, {"produce_host_ms": host_ms, "_gpu_events": [launch_events, (fin_start, fin_end)]}
 
     # ------------------------------------------------------------------ inline
     def _iter_inline(self) -> Iterator[tuple[Any, dict[str, float]]]:
@@ -162,12 +168,14 @@ class PrefetchLoader:
         stop = threading.Event()
         worker = threading.Thread(target=self._producer, args=(side, out, stop), daemon=True)
         worker.start()
+        finished = False
         try:
             while True:
                 t0 = time.perf_counter()
                 item = out.get()
                 wait_ms = (time.perf_counter() - t0) * 1e3
                 if item is _SENTINEL:
+                    finished = True
                     break
                 if isinstance(item, BaseException):
                     raise item
@@ -187,15 +195,20 @@ class PrefetchLoader:
                 except queue.Empty:
                     pass
             worker.join()
+            if not finished:
+                # Wait for any already-issued side-stream work (e.g. touching shared sampler
+                # scratch buffers) before returning after an early break or exception.
+                side.synchronize()
 
     def __iter__(self) -> Iterator[tuple[Any, dict[str, float]]]:
         return self._iter_prefetch() if self.prefetch else self._iter_inline()
 
 
 def resolve_gpu_ms(timing: dict[str, Any]) -> dict[str, float]:
-    """Turn the recorded event pair into ``produce_gpu_ms`` (call after a sync)."""
+    """Turn the recorded event pair(s) into ``produce_gpu_ms`` (call after a sync)."""
     out = {k: v for k, v in timing.items() if not k.startswith("_")}
     events = timing.get("_gpu_events")
     if events is not None:
-        out["produce_gpu_ms"] = events[0].elapsed_time(events[1])
+        pairs = [events] if isinstance(events, tuple) else events
+        out["produce_gpu_ms"] = sum(start.elapsed_time(end) for start, end in pairs)
     return out

@@ -181,3 +181,31 @@ def test_full_neighbor_matches_exact_sampler():
         for v in range(r.num_dst):
             s, e = int(r.indptr[v]), int(r.indptr[v + 1])
             assert sorted(g.indices[s:e].tolist()) == sorted(r.indices[s:e].tolist())
+
+
+def test_async_sampler_edge_cases_and_compact_indices():
+    # 1) Compact int32 indices stay int32 on GPU (no 2x upcast).
+    indptr, indices, _ = random_graph(num_nodes=200, num_edges=2000)
+    idx32 = indices.to(torch.int32)
+    s = AsyncNeighborSampler(indptr, idx32, [5, 3])
+    assert s.indices.dtype == torch.int32
+    assert AsyncNeighborSampler.estimate_padded_edge_capacity(indptr, [5, 3], 64) == s.padded_edge_capacity(64)
+
+    # 2) Empty seeds batch.
+    empty = s.finalize(s.launch(torch.empty(0, dtype=torch.int64, device="cuda")))
+    assert empty.input_nodes.numel() == 0
+    assert all(b.num_dst == 0 and b.num_src == 0 and b.num_edges == 0 for b in empty.blocks)
+
+    # 3) Empty graph (0 edges).
+    z_indptr = torch.zeros(51, dtype=torch.int64, device="cuda")
+    z_indices = torch.empty(0, dtype=torch.int32, device="cuda")
+    s_empty = AsyncNeighborSampler(z_indptr, z_indices, [4, 2])
+    b_empty = s_empty.finalize(s_empty.launch(torch.arange(10, device="cuda")))
+    assert torch.equal(b_empty.input_nodes, torch.arange(10, device="cuda"))
+    assert all(b.num_edges == 0 and b.num_dst == 10 and b.num_src == 10 for b in b_empty.blocks)
+
+    # 4) GraphedNeighborSampler with batch_size > num_nodes (e.g. small graph with large batch_size).
+    small_ip, small_ix, _ = random_graph(num_nodes=40, num_edges=120)
+    gs = GraphedNeighborSampler(AsyncNeighborSampler(small_ip, small_ix.to(torch.int32), [2]), batch_size=128)
+    b_small = gs.finalize(gs.launch(torch.arange(16, device="cuda")))
+    assert b_small.blocks[0].num_dst == 16 and b_small.input_nodes.numel() == b_small.blocks[0].num_src

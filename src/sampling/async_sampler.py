@@ -90,7 +90,7 @@ class AsyncNeighborSampler:
 
     Args:
         indptr, indices: in-neighbor CSR of the full graph on the GPU.
-        fanouts: per-layer fanouts, outermost first; all must be positive.
+        fanouts: per-layer fanouts, outermost first; each must be positive or -1 (all neighbors).
         index_dtype: dtype of the emitted CSR / bucket lists.
         fwd_heavy_threshold / bwd_heavy_threshold: rows with in-degree (forward) or source
             out-degree (backward) >= threshold go to the heavy bucket; None = all light.
@@ -121,7 +121,8 @@ class AsyncNeighborSampler:
         if any(f == 0 or f < -1 for f in fanouts):
             raise ValueError(f"fanouts must be positive or -1 (all neighbors), got {fanouts}")
         self.indptr = indptr.to(torch.int64)
-        self.indices = indices.to(torch.int64)
+        # Keep indices in its compact input dtype (e.g. int32); only sampled slices are cast to int64.
+        self.indices = indices
         # -1 (full neighborhood) = fanout max in-degree: every row then has deg <= fanout, so it
         # keeps all its in-edges, Floyd never runs (no row is over-full), and the static edge
         # bound is the sum of the n_cap largest degrees. One host read, here, before training.
@@ -153,6 +154,29 @@ class AsyncNeighborSampler:
             top = torch.sort(deg.clamp(max=f), descending=True).values
             self._edge_bound[f] = torch.cat([top.new_zeros(1), torch.cumsum(top, 0)]).cpu()
             self._big_bound[f] = int((deg > f).sum())
+
+    @staticmethod
+    def estimate_padded_edge_capacity(indptr: torch.Tensor, fanouts: list[int], batch_size: int) -> int:
+        """Compute `padded_edge_capacity(batch_size)` without allocating sampler scratch buffers."""
+        if any(f == 0 or f < -1 for f in fanouts):
+            raise ValueError(f"fanouts must be positive or -1 (all neighbors), got {fanouts}")
+        ip = indptr.to(torch.int64)
+        num_nodes = ip.numel() - 1
+        if num_nodes == 0:
+            return len(fanouts)
+        deg = ip[1:] - ip[:-1]
+        max_deg = max(1, int(deg.max()))
+        resolved = [max_deg if f == -1 else int(f) for f in fanouts]
+        bounds: dict[int, torch.Tensor] = {}
+        for f in set(resolved):
+            top = torch.sort(deg.clamp(max=f), descending=True).values
+            bounds[f] = torch.cat([top.new_zeros(1), torch.cumsum(top, 0)]).cpu()
+        total, n_cap = 0, batch_size
+        for f in reversed(resolved):
+            e = max(1, int(bounds[f][min(n_cap, num_nodes)]))
+            total += e
+            n_cap = min(n_cap + e, num_nodes)
+        return total
 
     def padded_edge_capacity(self, batch_size: int) -> int:
         """Edge slots one batch of `batch_size` seeds is padded to, summed over layers (host-side)."""
@@ -210,8 +234,21 @@ class AsyncNeighborSampler:
     def launch(self, seeds: torch.Tensor) -> PendingBatch:
         """Issue every GPU op for one batch on the current stream; no host sync."""
         dst = seeds.to(device=self.device, dtype=torch.int64)
-        n = torch.full((), dst.numel(), dtype=torch.int64, device=self.device)
         sizes_host = torch.empty((len(self.fanouts), 5), dtype=torch.int64, pin_memory=True)
+        if dst.numel() == 0:
+            # Empty seed batch: build empty zero-sized layers without touching device indexing.
+            dev, idt = self.device, self.index_dtype
+            sizes_host.zero_()
+            z0 = torch.zeros(1, dtype=idt, device=dev)
+            e0 = torch.empty(0, dtype=idt, device=dev)
+            layers = [
+                _PaddedLayer(fanout=f, n_cap=0, src_cap=0, indptr=z0, indices=e0, bwd_indptr=z0, bwd_indices=e0, fwd_order=e0, bwd_order=e0)
+                for f in reversed(self.fanouts)
+            ]
+            ready = torch.cuda.Event()
+            ready.record()
+            return PendingBatch(seeds=seeds, layers=layers, src_nodes=torch.empty(0, dtype=torch.int64, device=dev), sizes_host=sizes_host, ready=ready)
+        n = torch.full((), dst.numel(), dtype=torch.int64, device=self.device)
         layers, src_nodes = self._launch_core(dst, n, sizes_host)
         ready = torch.cuda.Event()
         ready.record()
@@ -263,8 +300,14 @@ class AsyncNeighborSampler:
                 ebig = big[erow] & evalid
                 pick = picks[bidx[erow].clamp(0, H_cap - 1), rank.clamp(0, f - 1)]
                 inrow = torch.where(ebig, pick, rank)
-            edge_pos = (start[erow] + inrow).clamp(0, self.num_edges - 1)
-            src = torch.where(evalid, self.indices[edge_pos], N)  # padding -> N
+            if self.num_edges == 0:
+                src = torch.full((E_cap,), N, dtype=torch.int64, device=dev)
+            else:
+                edge_pos = (start[erow] + inrow).clamp(0, self.num_edges - 1)
+                sampled_src = self.indices[edge_pos]
+                if sampled_src.dtype != torch.int64:
+                    sampled_src = sampled_src.to(torch.int64)
+                src = torch.where(evalid, sampled_src, N)  # padding -> N
 
             # ---- frontier: destinations first, then new sources in id order. Sort-based, so the
             # work is O(E_cap log E_cap) in the sampled edges, not O(N) in the graph: on a 111M-node
@@ -277,17 +320,17 @@ class AsyncNeighborSampler:
             isnew = first & ~mark[s_sorted]  # mark[N] is set, so padding is never new
             nrank = torch.cumsum(isnew, 0) - 1  # duplicates of a new node share its rank
             num_new = nrank[-1] + 1
-            ingroup = ~mark[s_sorted]  # entries whose value is a new node (first or duplicate)
             mark.index_fill_(0, dst, False)
             mark[N:].fill_(False)
             local.index_copy_(0, dst, rows)  # padding all lands on the dummy slot
-            # New nodes get n + rank; every other entry writes to a private slot past N + 1 (one
-            # each), never to one shared dump address: many writes to one address serialise.
-            local.scatter_(0, torch.where(ingroup, s_sorted, N + 1 + self._e_slots[:E_cap]), n + nrank)
+            # Each unique new node is written once (via `isnew`); duplicates and non-new entries
+            # write to private slots past N + 1 so concurrent writes never contend on one address.
+            local.scatter_(0, torch.where(isnew, s_sorted, N + 1 + self._e_slots[:E_cap]), n + nrank)
             col = local[src]  # padding slots read the dummy; masked below
             src_cap = min(n_cap + E_cap, N)
             src_nodes = torch.full((src_cap + E_cap,), N, dtype=torch.int64, device=dev)
-            src_nodes[:n_cap] = dst
+            k = min(n_cap, src_cap)
+            src_nodes[:k] = dst[:k]
             src_nodes.scatter_(0, torch.where(isnew, n + nrank, src_cap + self._e_slots[:E_cap]), s_sorted)
             src_nodes = src_nodes[:src_cap]
             num_src = n + num_new
@@ -386,7 +429,8 @@ class GraphedNeighborSampler:
 
     def __init__(self, sampler: AsyncNeighborSampler, batch_size: int, instances: int = 3) -> None:
         self.s = sampler
-        self.batch_size = batch_size
+        # A batch of unique seed nodes can never exceed num_nodes; capping keeps n_cap <= N.
+        self.batch_size = min(int(batch_size), max(1, sampler.num_nodes))
         self.instances = instances
         self._graphs: list[tuple] = []
         self._next = 0
@@ -432,5 +476,6 @@ class GraphedNeighborSampler:
         ready.record()
         return PendingBatch(seeds=seeds, layers=layers, src_nodes=src_nodes, sizes_host=sizes_host, ready=ready)
 
-    def finalize(self, pending: PendingBatch) -> FinalBatch:
+    def finalize(self, pending: PendingBatch, clone: bool = True) -> FinalBatch:
+        # Always clone out of graphed buffers because later replays overwrite them.
         return self.s.finalize(pending, clone=True)

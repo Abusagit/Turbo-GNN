@@ -28,10 +28,13 @@ Key CPU-specific choices:
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Any
 
 import torch
 
+from src.sampling._cpu_sampler_cpp import NativeSamplerState, native_gather_rows
 from src.sampling.neighbor_sampler import SampledBatch, SampledBlock
 
 
@@ -40,8 +43,42 @@ def _ensure_cpu(t: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be a CPU tensor, got {t.device}")
 
 
+def _default_gather_threads() -> int:
+    return min(16, max(1, os.cpu_count() or 1))
+
+
+def _pack_tensors(tensors: list[torch.Tensor]) -> tuple[torch.Tensor, list[tuple[int, int, torch.dtype]]]:
+    """Pack multiple 1-D CPU tensors into one contiguous uint8 buffer (1 IPC FD instead of N)."""
+    offsets: list[tuple[int, int, torch.dtype]] = []
+    pos = 0
+    for t in tensors:
+        nbytes = t.numel() * t.element_size()
+        pos = (pos + 7) & ~7
+        offsets.append((pos, nbytes, t.dtype))
+        pos += nbytes
+    buf = torch.empty(pos, dtype=torch.uint8)
+    for t, (start, nbytes, _) in zip(tensors, offsets):
+        if nbytes > 0:
+            tc = t if t.is_contiguous() else t.contiguous()
+            buf[start : start + nbytes].copy_(tc.view(torch.uint8))
+    return buf, offsets
+
+
+def _unpack_tensors(buf: torch.Tensor, offsets: list[tuple[int, int, torch.dtype]]) -> list[torch.Tensor]:
+    out = []
+    for start, nbytes, dt in offsets:
+        if nbytes == 0:
+            out.append(torch.empty(0, dtype=dt))
+        else:
+            out.append(buf[start : start + nbytes].view(dt))
+    return out
+
+
 class CPUNeighborSampler:
     """Samples multi-hop blocks from an in-neighbor CSR held on the CPU.
+
+    Uses a C++17 + OpenMP native backend (`src/sampling/_cpu_sampler.cpp`) when a C++
+    compiler is available, with an automatic pure-PyTorch fallback.
 
     Args:
         indptr: ``[N + 1]`` CPU in-CSR row pointers (row v lists the sources of edges u->v).
@@ -49,6 +86,7 @@ class CPUNeighborSampler:
         fanouts: per-layer fanouts, outermost layer first; ``-1`` = all neighbors.
         index_dtype: dtype of the emitted block CSR (int32 is fastest for our CUDA kernels).
         generator: optional CPU ``torch.Generator`` for reproducible sampling.
+        num_threads: optional OpenMP thread count for the native CPU backend (auto if ``None``).
     """
 
     def __init__(
@@ -58,6 +96,7 @@ class CPUNeighborSampler:
         fanouts: list[int],
         index_dtype: torch.dtype = torch.int32,
         generator: torch.Generator | None = None,
+        num_threads: int | None = None,
     ) -> None:
         _ensure_cpu(indptr, "indptr")
         _ensure_cpu(indices, "indices")
@@ -66,23 +105,61 @@ class CPUNeighborSampler:
         if generator is not None and generator.device.type != "cpu":
             raise ValueError(f"generator must be on CPU, got {generator.device}")
 
-        self.indptr = indptr if indptr.dtype == torch.int64 else indptr.to(torch.int64)
-        self.indices = indices
+        self.indptr = (indptr if indptr.dtype == torch.int64 else indptr.to(torch.int64)).contiguous()
+        self.indices = indices.contiguous()
         self.fanouts = [int(f) for f in fanouts]
         self.index_dtype = index_dtype
         self.generator = generator
+        self.num_threads = int(num_threads) if num_threads is not None else None
         self.num_nodes = indptr.numel() - 1
+        self._native: NativeSamplerState | None = None
+        self._native_checked: bool = False
+        self._rng_counter: int = 0
 
     @property
     def device(self) -> torch.device:
         return self.indptr.device
 
+    def __copy__(self) -> CPUNeighborSampler:
+        # Shallow copies must never share a mutable C++ CpuSamplerState*.
+        dup = object.__new__(type(self))
+        dup.__dict__.update(self.__dict__)
+        dup._native = None
+        dup._native_checked = False
+        return dup
+
     def __getstate__(self) -> dict[str, Any]:
-        # torch.Generator is not safely picklable across spawn processes; workers seed
-        # their own independent generators in CPUBatchMaker.set_worker_seed.
+        # Drop non-picklable C++ pointer and torch.Generator; workers recreate them lazily.
         state = self.__dict__.copy()
         state["generator"] = None
+        state["_native"] = None
+        state["_native_checked"] = False
         return state
+
+    def _effective_threads(self) -> int:
+        if self.num_threads is not None:
+            return max(1, self.num_threads)
+        return min(16, max(1, torch.get_num_threads()))
+
+    def _get_native(self) -> NativeSamplerState | None:
+        if not self._native_checked:
+            self._native_checked = True
+            if (
+                self.indices.dtype in (torch.int32, torch.int64)
+                and self.index_dtype in (torch.int32, torch.int64)
+                and self.indptr.is_contiguous()
+                and self.indices.is_contiguous()
+            ):
+                st = NativeSamplerState(self.num_nodes)
+                if st.available:
+                    self._native = st
+        return self._native
+
+    def _next_seed(self) -> int:
+        if self.generator is not None:
+            return int(torch.randint(0, 2**62, (1,), generator=self.generator).item())
+        self._rng_counter += 1
+        return (time.perf_counter_ns() ^ (os.getpid() * 0x9E3779B97F4A7C15) ^ (self._rng_counter * 0xBF58476D1CE4E5B9)) & 0xFFFFFFFFFFFFFFFF
 
     def share_memory_(self) -> CPUNeighborSampler:
         """Move read-only CSR arrays into shared memory for zero-copy worker processes."""
@@ -172,9 +249,36 @@ class CPUNeighborSampler:
 
     def sample(self, seeds: torch.Tensor) -> SampledBatch:
         """Sample one multi-hop mini-batch for ``seeds`` on the CPU."""
-        seeds_cpu = seeds.to(device="cpu", dtype=torch.int64)
+        seeds_cpu = seeds.to(device="cpu", dtype=torch.int64).contiguous()
+        native = self._get_native()
+        if native is not None:
+            dst = seeds_cpu
+            threads = self._effective_threads()
+            blocks: list[SampledBlock] = []
+            for fanout in reversed(self.fanouts):
+                indptr, col, src_nodes = native.sample_layer(
+                    self.indptr,
+                    self.indices,
+                    dst,
+                    fanout,
+                    self.index_dtype,
+                    self._next_seed(),
+                    threads,
+                )
+                blocks.append(
+                    SampledBlock(
+                        indptr=indptr,
+                        indices=col,
+                        num_src=src_nodes.numel(),
+                        fanout=fanout,
+                    )
+                )
+                dst = src_nodes
+            blocks.reverse()
+            return SampledBatch(seeds=seeds_cpu, input_nodes=dst, blocks=blocks)
+
         dst = seeds_cpu
-        blocks: list[SampledBlock] = []
+        blocks = []
         for fanout in reversed(self.fanouts):
             n = dst.numel()
             counts, src = self._sample_edges(dst, fanout)
@@ -196,6 +300,69 @@ class CPUNeighborSampler:
 
         blocks.reverse()
         return SampledBatch(seeds=seeds_cpu, input_nodes=dst, blocks=blocks)
+
+    def build_cuda_graph(
+        self,
+        blk: SampledBlock,
+        *,
+        fwd_heavy_threshold: int | None = None,
+        bwd_heavy_threshold: int | None = None,
+        quantile: float | None = None,
+        fwd_order: str = "natural",
+        bwd_order: str = "natural",
+    ):
+        """Build a CPU `AdjacencyForwardBackwardWithNodeBuckets` for a sampled block."""
+        from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
+
+        for name, mode in (("fwd_order", fwd_order), ("bwd_order", bwd_order)):
+            if mode not in ("natural", "degree"):
+                raise ValueError(f"{name} must be 'natural' or 'degree', got {mode!r}")
+
+        native = self._get_native() if quantile is None else None
+        if (
+            native is not None
+            and blk.indptr.device.type == "cpu"
+            and blk.indices.device.type == "cpu"
+            and blk.indptr.dtype == blk.indices.dtype
+            and blk.indptr.dtype in (torch.int32, torch.int64)
+        ):
+            fip = blk.indptr if blk.indptr.is_contiguous() else blk.indptr.contiguous()
+            fix = blk.indices if blk.indices.is_contiguous() else blk.indices.contiguous()
+            bwd_indptr, bwd_indices, fwd_light, fwd_heavy, bwd_light, bwd_heavy = native.transpose_and_bucket(
+                fip,
+                fix,
+                blk.num_src,
+                fwd_threshold=fwd_heavy_threshold,
+                bwd_threshold=bwd_heavy_threshold,
+                fwd_order=fwd_order,
+                bwd_order=bwd_order,
+                num_threads=self._effective_threads(),
+            )
+            return G(
+                forward_indptr=blk.indptr,
+                forward_indices=blk.indices,
+                backward_indptr=bwd_indptr,
+                backward_indices=bwd_indices,
+                forward_light_nodes=fwd_light,
+                forward_heavy_nodes=fwd_heavy,
+                backward_light_nodes=bwd_light,
+                backward_heavy_nodes=bwd_heavy,
+                max_degree=blk.fanout if blk.fanout > 0 else -1,
+                backward_max_degree=blk.num_dst,
+                is_directed=True,
+            )
+
+        return G.from_block_csr(
+            blk.indptr,
+            blk.indices,
+            blk.num_src,
+            max_in_degree=blk.fanout if blk.fanout > 0 else None,
+            forward_heavy_threshold=fwd_heavy_threshold,
+            backward_heavy_threshold=bwd_heavy_threshold,
+            quantile=quantile,
+            forward_order=fwd_order,
+            backward_order=bwd_order,
+        )
 
 
 class _CPUTopologyWorker:
@@ -219,6 +386,8 @@ class _CPUTopologyWorker:
         bwd_order: str,
         heavy_edge_slices: dict[str, int],
         seed: int | None,
+        build_cuda_graphs: bool = True,
+        pack_ipc: bool = False,
     ) -> None:
         self.sampler = sampler
         self.backend = backend
@@ -229,6 +398,8 @@ class _CPUTopologyWorker:
         self.bwd_order = bwd_order
         self.heavy_edge_slices = heavy_edge_slices
         self.seed = seed
+        self.build_cuda_graphs = build_cuda_graphs
+        self.pack_ipc = pack_ipc
 
     def share_memory_(self) -> _CPUTopologyWorker:
         self.sampler.share_memory_()
@@ -245,18 +416,13 @@ class _CPUTopologyWorker:
         self.sampler.generator = gen
 
     def _cuda_graph_for(self, blk: SampledBlock):
-        from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
-
-        g = G.from_block_csr(
-            blk.indptr,
-            blk.indices,
-            blk.num_src,
-            max_in_degree=blk.fanout if blk.fanout > 0 else None,
-            forward_heavy_threshold=self.fwd_heavy_threshold,
-            backward_heavy_threshold=self.bwd_heavy_threshold,
+        g = self.sampler.build_cuda_graph(
+            blk,
+            fwd_heavy_threshold=self.fwd_heavy_threshold,
+            bwd_heavy_threshold=self.bwd_heavy_threshold,
             quantile=self.quantile,
-            forward_order=self.fwd_order,
-            backward_order=self.bwd_order,
+            fwd_order=self.fwd_order,
+            bwd_order=self.bwd_order,
         )
         for direction, size in self.heavy_edge_slices.items():
             g.heavy_edge_slices(direction, size)
@@ -265,7 +431,7 @@ class _CPUTopologyWorker:
     def __call__(self, seeds: torch.Tensor) -> dict[str, Any]:
         batch = self.sampler.sample(seeds)
         stats = [(b.num_dst, b.num_src, b.num_edges) for b in batch.blocks]
-        if self.backend == "cuda":
+        if self.backend == "cuda" and self.build_cuda_graphs:
             graphs = [self._cuda_graph_for(b) for b in batch.blocks]
             return {
                 "_input_nodes": batch.input_nodes,
@@ -273,12 +439,28 @@ class _CPUTopologyWorker:
                 "graphs": graphs,
                 "stats": stats,
             }
+        # Raw forward-CSR blocks (transposed on GPU on the H2D stream, or wrapped into DGL blocks).
+        if self.pack_ipc:
+            tensors = [batch.input_nodes, batch.seeds]
+            block_meta = []
+            for b in batch.blocks:
+                tensors.append(b.indptr)
+                tensors.append(b.indices)
+                block_meta.append((b.num_src, b.fanout))
+            packed, offsets = _pack_tensors(tensors)
+            return {
+                "_packed_buf": packed,
+                "_packed_offsets": offsets,
+                "_packed_block_meta": block_meta,
+                "graphs": None,
+                "stats": stats,
+            }
         return {
             "_input_nodes": batch.input_nodes,
             "_seeds": batch.seeds,
             "graphs": None,
             "stats": stats,
-            "_dgl_blocks": batch.blocks,
+            "_raw_blocks": batch.blocks,
         }
 
 
@@ -328,8 +510,8 @@ class CPUBatchMaker:
             gen.manual_seed(int(seed))
 
         self.sampler = CPUNeighborSampler(indptr, indices, fanouts, index_dtype=index_dtype, generator=gen)
-        self.x = x
-        self.y = y
+        self.x = x.contiguous()
+        self.y = y.contiguous()
         self.backend = backend
         self.x_dtype = x_dtype
         self.fwd_heavy_threshold = fwd_heavy_threshold
@@ -365,7 +547,7 @@ class CPUBatchMaker:
             gen.seed()
         self.sampler.generator = gen
 
-    def for_worker(self) -> _CPUTopologyWorker:
+    def for_worker(self, *, build_cuda_graphs: bool = True, pack_ipc: bool = False) -> _CPUTopologyWorker:
         """Return a topology-only worker callable (omits ``x``/``y`` from worker IPC)."""
         return _CPUTopologyWorker(
             self.sampler,
@@ -377,6 +559,8 @@ class CPUBatchMaker:
             bwd_order=self.bwd_order,
             heavy_edge_slices=self.heavy_edge_slices,
             seed=self.seed,
+            build_cuda_graphs=build_cuda_graphs,
+            pack_ipc=pack_ipc,
         )
 
     def _gather(
@@ -386,41 +570,77 @@ class CPUBatchMaker:
         out_dtype: torch.dtype | None = None,
         *,
         pin_memory: bool | None = None,
+        alloc: Any | None = None,
     ) -> torch.Tensor:
         pin = self.pin_memory if pin_memory is None else pin_memory
-        if pin and (out_dtype is None or tensor.dtype == out_dtype):
-            out = torch.empty((idx.numel(), *tensor.shape[1:]), dtype=tensor.dtype, pin_memory=True)
+        if out_dtype is None or tensor.dtype == out_dtype:
+            shape = (idx.numel(), *tensor.shape[1:])
+            if alloc is not None:
+                out = alloc(shape, tensor.dtype)
+            else:
+                out = torch.empty(shape, dtype=tensor.dtype, pin_memory=pin)
             if idx.numel() > 0:
-                torch.index_select(tensor, 0, idx, out=out)
+                if not native_gather_rows(tensor, idx, out, _default_gather_threads()):
+                    torch.index_select(tensor, 0, idx, out=out)
             return out
         out = torch.index_select(tensor, 0, idx)
-        if out_dtype is not None and out.dtype != out_dtype:
+        if out.dtype != out_dtype:
             out = out.to(out_dtype)
+        if alloc is not None:
+            dst = alloc(tuple(out.shape), out.dtype)
+            dst.copy_(out)
+            return dst
         if pin:
             out = out.pin_memory()
         return out
 
-    def finalize_cpu_batch(self, raw: dict[str, Any], *, pin_memory: bool = False) -> dict[str, Any]:
-        """Gather ``x``/``y`` in the main process (directly into pinned memory when enabled)."""
-        input_nodes = raw.pop("_input_nodes")
-        seeds = raw.pop("_seeds")
-        raw["x"] = self._gather(self.x, input_nodes, out_dtype=self.x_dtype, pin_memory=pin_memory)
-        raw["y"] = self._gather(self.y, seeds, pin_memory=pin_memory)
+    def estimate_gather_bytes(self, raw: dict[str, Any]) -> int:
+        """Bytes needed in a pinned staging slab for ``x`` and ``y`` of a topology-worker batch."""
+        if "_packed_offsets" in raw:
+            offsets = raw["_packed_offsets"]
+            n_in = offsets[0][1] // 8
+            n_seeds = offsets[1][1] // 8
+        else:
+            n_in = int(raw["_input_nodes"].numel())
+            n_seeds = int(raw["_seeds"].numel())
+        x_dt = self.x_dtype if self.x_dtype is not None else self.x.dtype
+        x_row = (self.x.numel() // self.x.shape[0]) if self.x.shape[0] > 0 else 0
+        y_row = (self.y.numel() // self.y.shape[0]) if self.y.shape[0] > 0 else 0
+        x_bytes = n_in * x_row * torch.empty((), dtype=x_dt).element_size()
+        y_bytes = n_seeds * y_row * self.y.element_size()
+        return ((x_bytes + 63) & ~63) + ((y_bytes + 63) & ~63)
+
+    def finalize_cpu_batch(
+        self, raw: dict[str, Any], *, pin_memory: bool = False, alloc: Any | None = None
+    ) -> dict[str, Any]:
+        """Unpack IPC buffer if needed and gather ``x``/``y`` in the main process."""
+        if "_packed_buf" in raw:
+            buf = raw.pop("_packed_buf")
+            offsets = raw.pop("_packed_offsets")
+            block_meta = raw.pop("_packed_block_meta")
+            tensors = _unpack_tensors(buf, offsets)
+            input_nodes, seeds = tensors[0], tensors[1]
+            blocks = []
+            for idx, (num_src, fanout) in enumerate(block_meta):
+                ip = tensors[2 + 2 * idx]
+                ix = tensors[3 + 2 * idx]
+                blocks.append(SampledBlock(indptr=ip, indices=ix, num_src=num_src, fanout=fanout))
+            raw["_raw_blocks"] = blocks
+        else:
+            input_nodes = raw.pop("_input_nodes")
+            seeds = raw.pop("_seeds")
+        raw["x"] = self._gather(self.x, input_nodes, out_dtype=self.x_dtype, pin_memory=pin_memory, alloc=alloc)
+        raw["y"] = self._gather(self.y, seeds, pin_memory=pin_memory, alloc=alloc)
         return raw
 
     def _cuda_graph_for(self, blk: SampledBlock):
-        from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
-
-        g = G.from_block_csr(
-            blk.indptr,
-            blk.indices,
-            blk.num_src,
-            max_in_degree=blk.fanout if blk.fanout > 0 else None,
-            forward_heavy_threshold=self.fwd_heavy_threshold,
-            backward_heavy_threshold=self.bwd_heavy_threshold,
+        g = self.sampler.build_cuda_graph(
+            blk,
+            fwd_heavy_threshold=self.fwd_heavy_threshold,
+            bwd_heavy_threshold=self.bwd_heavy_threshold,
             quantile=self.quantile,
-            forward_order=self.fwd_order,
-            backward_order=self.bwd_order,
+            fwd_order=self.fwd_order,
+            bwd_order=self.bwd_order,
         )
         for direction, size in self.heavy_edge_slices.items():
             g.heavy_edge_slices(direction, size)
@@ -465,11 +685,32 @@ class CPUBatchMaker:
         }
 
     def post_transfer(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Finalize a transferred batch on the target device (builds DGL blocks when needed)."""
-        if self.backend != "dgl":
-            return batch
-        raw_blocks = batch.pop("_dgl_blocks", None)
+        """Finalize a transferred batch on the target device (GPU transpose/buckets or DGL blocks)."""
+        raw_blocks = batch.pop("_raw_blocks", None)
         if raw_blocks is None:
+            raw_blocks = batch.pop("_dgl_blocks", None)
+        if raw_blocks is None:
+            return batch
+        if self.backend == "cuda":
+            from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
+
+            graphs = []
+            for b in raw_blocks:
+                g = G.from_block_csr(
+                    b.indptr,
+                    b.indices,
+                    b.num_src,
+                    max_in_degree=b.fanout if b.fanout > 0 else None,
+                    forward_heavy_threshold=self.fwd_heavy_threshold,
+                    backward_heavy_threshold=self.bwd_heavy_threshold,
+                    quantile=self.quantile,
+                    forward_order=self.fwd_order,
+                    backward_order=self.bwd_order,
+                )
+                for direction, size in self.heavy_edge_slices.items():
+                    g.heavy_edge_slices(direction, size)
+                graphs.append(g)
+            batch["graphs"] = graphs
             return batch
         import dgl
 

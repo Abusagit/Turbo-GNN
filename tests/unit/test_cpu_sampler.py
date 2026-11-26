@@ -131,11 +131,52 @@ def test_cpu_sampler_matches_gpu_sampler_full_neighbor():
     seeds = torch.randperm(indptr.numel() - 1)[:64]
     cpu_b = CPUNeighborSampler(indptr, indices, [-1, -1]).sample(seeds)
     ref_b = GPUNeighborSampler(indptr, indices, [-1, -1]).sample(seeds)
-    assert torch.equal(cpu_b.input_nodes, ref_b.input_nodes)
-    for g, r in zip(cpu_b.blocks, ref_b.blocks):
-        assert g.num_src == r.num_src
-        assert torch.equal(g.indptr, r.indptr)
-        assert torch.equal(g.indices, r.indices)
+
+    # Identical global node sets and per-destination global neighbor sets at every layer
+    # (newly discovered non-destination nodes may appear in different order).
+    assert torch.equal(cpu_b.input_nodes.sort().values, ref_b.input_nodes.sort().values)
+    cpu_gids, ref_gids = [cpu_b.input_nodes], [ref_b.input_nodes]
+    for blk in cpu_b.blocks[:-1]:
+        cpu_gids.append(cpu_gids[-1][: blk.num_dst])
+    for blk in ref_b.blocks[:-1]:
+        ref_gids.append(ref_gids[-1][: blk.num_dst])
+    assert torch.equal(cpu_gids[-1][: cpu_b.blocks[-1].num_dst], seeds)
+
+    for g, r, cg, rg in zip(cpu_b.blocks, ref_b.blocks, cpu_gids, ref_gids):
+        assert g.num_dst == r.num_dst and g.num_src == r.num_src and g.num_edges == r.num_edges
+        cpu_map = {}
+        for row in range(g.num_dst):
+            v = int(cg[row])
+            s, e = int(g.indptr[row]), int(g.indptr[row + 1])
+            cpu_map[v] = sorted(cg[g.indices[s:e].long()].tolist())
+        ref_map = {}
+        for row in range(r.num_dst):
+            v = int(rg[row])
+            s, e = int(r.indptr[row]), int(r.indptr[row + 1])
+            ref_map[v] = sorted(rg[r.indices[s:e].long()].tolist())
+        assert cpu_map == ref_map
+
+
+def test_cpu_sampler_parallel_partitioned_path():
+    """Exercise the >= 16384-edge parallel 32-way zero-atomic partitioned dedup path in C++."""
+    indptr, indices, _, _, adj = make_random_graph(num_nodes=4000, num_edges=120000, feat_dim=8, seed=11)
+    sampler = CPUNeighborSampler(indptr, indices, [15, 10, 5], index_dtype=torch.int32, num_threads=8)
+    seeds = torch.randperm(4000)[:256]
+    batch = sampler.sample(seeds)
+    # Confirm outermost layer exceeded the 16384 parallel threshold.
+    assert batch.blocks[0].num_edges >= 16384
+    gids = [batch.input_nodes]
+    for blk in batch.blocks[:-1]:
+        gids.append(gids[-1][: blk.num_dst])
+    assert torch.equal(gids[-1][: batch.blocks[-1].num_dst], seeds)
+    for blk, g in zip(batch.blocks, gids):
+        assert g.numel() == blk.num_src and torch.unique(g).numel() == g.numel()
+        for row in range(min(blk.num_dst, 200)):
+            v = int(g[row])
+            s, e = int(blk.indptr[row]), int(blk.indptr[row + 1])
+            nbrs = g[blk.indices[s:e].long()].tolist()
+            k = min(len(adj[v]), blk.fanout)
+            assert len(nbrs) == k and len(set(nbrs)) == k and set(nbrs) <= adj[v]
 
 
 def test_cpu_sampler_reproducible_with_generator():

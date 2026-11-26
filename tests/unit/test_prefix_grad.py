@@ -54,3 +54,17 @@ def test_num_dst_of():
     assert num_dst_of(Square()) is None
     assert num_dst_of(Block()) == 3
     assert num_dst_of(object()) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for AMP autocast")
+def test_mixed_precision_none_grad_right():
+    """fp32 input under bf16 autocast with grad_right=None must not fail with dtype mismatch."""
+    torch.manual_seed(0)
+    fc_dst = torch.nn.Linear(8, 12).cuda()
+    fc_src = torch.nn.Linear(8, 12).cuda()
+    x = torch.randn(20, 8, device="cuda", dtype=torch.float32, requires_grad=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        left, _right, skip = dst_src_project(x, fc_dst, fc_src, 6)
+        loss = left.sum() + skip.sum()
+    loss.backward()
+    assert x.grad is not None and x.grad.shape == x.shape and torch.isfinite(x.grad).all()

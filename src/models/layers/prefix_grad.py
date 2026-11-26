@@ -66,12 +66,17 @@ class _DstSrcProject(torch.autograd.Function):
             if grad_right is not None:
                 grad_x = torch.mm(grad_right, w_src.to(grad_right.dtype))
             else:
-                grad_x = torch.zeros_like(x)
+                out_dtype = (
+                    grad_left.dtype
+                    if grad_left is not None
+                    else (grad_skip.dtype if grad_skip is not None else x.dtype)
+                )
+                grad_x = torch.zeros(x.shape, device=x.device, dtype=out_dtype)
             head = grad_x.narrow(0, 0, n)
             if grad_left is not None:
-                head.addmm_(grad_left, w_dst.to(grad_left.dtype))
+                head.addmm_(grad_left.to(head.dtype), w_dst.to(head.dtype))
             if grad_skip is not None:
-                head.add_(grad_skip)
+                head.add_(grad_skip.to(head.dtype))
 
         if grad_left is not None:
             if ctx.needs_input_grad[1]:

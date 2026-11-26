@@ -130,9 +130,11 @@ class GPUNeighborSampler:
             pick_rank = torch.empty_like(brank)
             pick_rank[order] = brank
             chosen = pick_rank < fanout
-            # Scatter chosen edges into their row's output slots; the rest go to a dump slot.
-            out_slot = torch.where(chosen, row_start[brow] + pick_rank, torch.full_like(brank, total))
-            buf = torch.empty(total + 1, dtype=edge_pos.dtype, device=self.device)
+            # Scatter chosen edges into their row's output slots; unchosen edges go to private
+            # tail slots so high-degree hubs never contend on a single shared dump address.
+            dump_slots = total + torch.arange(big_total, dtype=brank.dtype, device=self.device)
+            out_slot = torch.where(chosen, row_start[brow] + pick_rank, dump_slots)
+            buf = torch.empty(total + big_total, dtype=edge_pos.dtype, device=self.device)
             buf[:total] = edge_pos
             buf.scatter_(0, out_slot, start[brow] + brank)
             edge_pos = buf[:total]
@@ -149,17 +151,22 @@ class GPUNeighborSampler:
             src = src.to(torch.int64)
 
             # Destinations first (local ids 0..n-1), then sources not already present, numbered
-            # n, n+1, ... in id order. Mark sampled sources in a global table, unmark the
-            # destinations, and one nonzero (the layer's only other sync) yields the new nodes
-            # sorted and deduplicated -- cheaper than torch.unique (sort + a size read + a count).
-            mark = self._mark
-            # index_fill_, not `mark[idx] = True`: assigning a Python scalar copies it host->device
-            # first, and that copy blocks the host.
-            mark.index_fill_(0, src, True)
-            mark.index_fill_(0, dst, False)
-            new = mark.nonzero(as_tuple=False).view(-1)
-            mark.index_fill_(0, new, False)  # reset only what we touched
+            # n, n+1, ... in ascending id order. Choose between O(E_batch log E_batch) unique
+            # (when E_batch << N, e.g. mini-batches on web-scale graphs) and O(N) dense mark scan
+            # (when E_batch approaches/exceeds N, e.g. full-neighbor blocks on dense graphs).
             local[dst] = torch.arange(n, device=self.device)
+            if src.numel() == 0:
+                new = torch.empty(0, dtype=torch.int64, device=self.device)
+            elif src.numel() * 8 < self.num_nodes:
+                new = torch.unique(src[local[src] < 0], sorted=True)
+            else:
+                mark = self._mark
+                # index_fill_, not `mark[idx] = True`: assigning a Python scalar copies it host->device
+                # first, and that copy blocks the host.
+                mark.index_fill_(0, src, True)
+                mark.index_fill_(0, dst, False)
+                new = mark.nonzero(as_tuple=False).view(-1)
+                mark.index_fill_(0, new, False)  # reset only what we touched
             local[new] = torch.arange(n, n + new.numel(), device=self.device)
             col = local[src]
             src_nodes = torch.cat([dst, new])
