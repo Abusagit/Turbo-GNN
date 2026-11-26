@@ -17,6 +17,28 @@ class EdgeSliceTable:
     node_chunk_offset: torch.Tensor  # [num_heavy + 1] int32, prefix sum of slices per node
     num_slices: int
 
+    def pin_memory(self) -> EdgeSliceTable:
+        """Return a copy whose CPU tensors reside in page-locked (pinned) host memory."""
+        return EdgeSliceTable(
+            chunk_node=self.chunk_node.pin_memory() if self.chunk_node.device.type == "cpu" else self.chunk_node,
+            chunk_start=self.chunk_start.pin_memory() if self.chunk_start.device.type == "cpu" else self.chunk_start,
+            node_chunk_offset=(
+                self.node_chunk_offset.pin_memory()
+                if self.node_chunk_offset.device.type == "cpu"
+                else self.node_chunk_offset
+            ),
+            num_slices=self.num_slices,
+        )
+
+    def to(self, device, non_blocking: bool = False) -> EdgeSliceTable:
+        """Move slice-table tensors to ``device``."""
+        return EdgeSliceTable(
+            chunk_node=self.chunk_node.to(device, non_blocking=non_blocking),
+            chunk_start=self.chunk_start.to(device, non_blocking=non_blocking),
+            node_chunk_offset=self.node_chunk_offset.to(device, non_blocking=non_blocking),
+            num_slices=self.num_slices,
+        )
+
 
 def _bucket_nodes_by_degree(
     degree_counts: torch.Tensor,
@@ -33,6 +55,11 @@ def _bucket_nodes_by_degree(
     Returns:
         (light_node_indices, heavy_node_indices)
     """
+    if degree_counts.numel() == 0:
+        dt = index_dtype if index_dtype is not None else torch.int64
+        empty = torch.empty(0, dtype=dt, device=degree_counts.device)
+        return empty, empty
+
     if quantile != -1:
         thresh = torch.quantile(degree_counts.float(), quantile).item()
     else:
@@ -539,31 +566,61 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             is_directed=self.is_directed,
         )
 
-    def to(self, device) -> AdjacencyForwardBackwardWithNodeBuckets:
-        self._edge_slice_cache = {}
-        self._min_heavy_degree_cache = {}
-        self._heavy_edge_count_cache = {}
-        self.forward_indptr = self.forward_indptr.to(device)
-        self.forward_indices = self.forward_indices.to(device)
+    def pin_memory(self) -> AdjacencyForwardBackwardWithNodeBuckets:
+        """Move CPU index and bucket tensors into page-locked (pinned) host memory."""
+        if self._device.type != "cpu":
+            return self
+        self.forward_indptr = self.forward_indptr.pin_memory()
+        self.forward_indices = self.forward_indices.pin_memory()
         if self.is_directed:
-            self.backward_indptr = self.backward_indptr.to(device)
-            self.backward_indices = self.backward_indices.to(device)
+            self.backward_indptr = self.backward_indptr.pin_memory()
+            self.backward_indices = self.backward_indices.pin_memory()
+        else:
+            self.backward_indptr = self.forward_indptr
+            self.backward_indices = self.forward_indices
+        self.forward_light_nodes = self.forward_light_nodes.pin_memory()
+        self.forward_heavy_nodes = self.forward_heavy_nodes.pin_memory()
+        self.backward_light_nodes = self.backward_light_nodes.pin_memory()
+        self.backward_heavy_nodes = self.backward_heavy_nodes.pin_memory()
+        if self.forward_edge_perm is not None:
+            self.forward_edge_perm = self.forward_edge_perm.pin_memory()
+        bwd_edge_map = getattr(self, "_backward_edge_map", None)
+        if bwd_edge_map is not None:
+            self._backward_edge_map = bwd_edge_map.pin_memory()
+        if self._edge_slice_cache:
+            self._edge_slice_cache = {k: v.pin_memory() for k, v in self._edge_slice_cache.items()}
+        return self
+
+    def to(self, device, non_blocking: bool = False) -> AdjacencyForwardBackwardWithNodeBuckets:
+        old_device = self._device
+        if self._edge_slice_cache:
+            self._edge_slice_cache = {
+                k: v.to(device, non_blocking=non_blocking) for k, v in self._edge_slice_cache.items()
+            }
+        self.forward_indptr = self.forward_indptr.to(device, non_blocking=non_blocking)
+        self.forward_indices = self.forward_indices.to(device, non_blocking=non_blocking)
+        if self.is_directed:
+            self.backward_indptr = self.backward_indptr.to(device, non_blocking=non_blocking)
+            self.backward_indices = self.backward_indices.to(device, non_blocking=non_blocking)
         else:
             # Preserve aliasing: backward CSR shares tensors with forward CSR
             self.backward_indptr = self.forward_indptr
             self.backward_indices = self.forward_indices
-        self.forward_light_nodes = self.forward_light_nodes.to(device)
-        self.forward_heavy_nodes = self.forward_heavy_nodes.to(device)
-        self.backward_light_nodes = self.backward_light_nodes.to(device)
-        self.backward_heavy_nodes = self.backward_heavy_nodes.to(device)
+        self.forward_light_nodes = self.forward_light_nodes.to(device, non_blocking=non_blocking)
+        self.forward_heavy_nodes = self.forward_heavy_nodes.to(device, non_blocking=non_blocking)
+        self.backward_light_nodes = self.backward_light_nodes.to(device, non_blocking=non_blocking)
+        self.backward_heavy_nodes = self.backward_heavy_nodes.to(device, non_blocking=non_blocking)
         if self.forward_edge_perm is not None:
-            self.forward_edge_perm = self.forward_edge_perm.to(device)
+            self.forward_edge_perm = self.forward_edge_perm.to(device, non_blocking=non_blocking)
         # Drop the lazily built edge map: it lives on the old device.
         self._backward_edge_map = None
         # `_device` backs the `device` property; without this it keeps reporting the device the
         # graph was built on, however many times the tensors have been moved since.
         self._device = self.forward_indptr.device
-        torch.cuda.empty_cache()
+        # Only release CUDA caching-allocator blocks when vacating a CUDA device synchronously;
+        # CPU -> GPU transfers (and non-blocking transfers) must never stall on empty_cache().
+        if not non_blocking and old_device.type == "cuda" and self._device != old_device:
+            torch.cuda.empty_cache()
         return self
 
     @classmethod
@@ -687,6 +744,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         forward_heavy_threshold: int | None = None,
         backward_heavy_threshold: int | None = None,
         quantile: float | None = None,
+        forward_order: str = "natural",
+        backward_order: str = "natural",
     ) -> AdjacencyForwardBackwardWithNodeBuckets:
         """Build a bipartite (sampled mini-batch) block from its destination-row CSR.
 
@@ -697,8 +756,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
 
         Built for the per-batch path, so it avoids host syncs where it can:
         ``repeat_interleave`` gets an explicit ``output_size``, out-degrees come from
-        ``scatter_add_`` rather than ``bincount``, and directedness is fixed (a block is
-        always directed). Bucketing:
+        ``scatter_add_`` rather than ``bincount`` on CUDA (and ``bincount`` on CPU),
+        and directedness is fixed (a block is always directed). Bucketing:
 
         - ``*_heavy_threshold=None`` (default): every node light, built with ``arange``,
           no sync. Under fixed-fanout sampling no in-degree exceeds the fanout, so the
@@ -708,10 +767,18 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         - ``quantile``: the full-graph rule (``_bucket_nodes_by_degree``) on both
           directions, for ablations; overrides the thresholds.
 
+        ``forward_order`` / ``backward_order`` control row order inside each bucket:
+        ``"natural"`` keeps ascending node-id order; ``"degree"`` sorts by descending
+        sampled degree (ties preserve node-id order).
+
         ``max_in_degree`` (e.g. the fanout) skips the forward max-degree sync; the
         backward bound is set to ``num_dst``, which caps any source's out-degree in a
         simple block.
         """
+        for name, mode in (("forward_order", forward_order), ("backward_order", backward_order)):
+            if mode not in ("natural", "degree"):
+                raise ValueError(f"{name} must be 'natural' or 'degree', got {mode!r}")
+
         idx_dt = indptr.dtype
         assert indices.dtype == idx_dt, "indptr and indices must share a dtype"
         device = indptr.device
@@ -727,8 +794,11 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         # the same order from_edge_list produces for the transposed CSR.
         src_sorted, perm = torch.sort(src, stable=True)
         bwd_indices = dst[perm].to(idx_dt)
-        bwd_counts = torch.zeros(num_src, device=device, dtype=torch.int64)
-        bwd_counts.scatter_add_(0, src_sorted, torch.ones_like(src_sorted))
+        if device.type == "cpu":
+            bwd_counts = torch.bincount(src_sorted, minlength=num_src)
+        else:
+            bwd_counts = torch.zeros(num_src, device=device, dtype=torch.int64)
+            bwd_counts.scatter_add_(0, src_sorted, torch.ones_like(src_sorted))
         bwd_indptr = torch.cat([bwd_counts.new_zeros(1), bwd_counts.cumsum(0)]).to(idx_dt)
 
         def bucket(counts: torch.Tensor, n: int, threshold: int | None):
@@ -740,12 +810,24 @@ class AdjacencyForwardBackwardWithNodeBuckets:
                 heavy_mask.nonzero(as_tuple=False).view(-1).to(idx_dt),
             )
 
+        def order_bucket(nodes: torch.Tensor, counts: torch.Tensor, mode: str) -> torch.Tensor:
+            if mode == "natural" or nodes.numel() <= 1:
+                return nodes
+            # Stable sort on negated degree preserves ascending node-id order on ties.
+            perm_ord = torch.argsort(-counts[nodes.to(torch.int64)], stable=True)
+            return nodes[perm_ord].contiguous()
+
         if quantile is not None:
             fwd_light, fwd_heavy = _bucket_nodes_by_degree(fwd_counts, quantile, index_dtype=idx_dt)
             bwd_light, bwd_heavy = _bucket_nodes_by_degree(bwd_counts, quantile, index_dtype=idx_dt)
         else:
             fwd_light, fwd_heavy = bucket(fwd_counts, num_dst, forward_heavy_threshold)
             bwd_light, bwd_heavy = bucket(bwd_counts, num_src, backward_heavy_threshold)
+
+        fwd_light = order_bucket(fwd_light, fwd_counts, forward_order)
+        fwd_heavy = order_bucket(fwd_heavy, fwd_counts, forward_order)
+        bwd_light = order_bucket(bwd_light, bwd_counts, backward_order)
+        bwd_heavy = order_bucket(bwd_heavy, bwd_counts, backward_order)
 
         return cls(
             forward_indptr=indptr,

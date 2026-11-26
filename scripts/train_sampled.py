@@ -49,8 +49,10 @@ from src.models.config import classifier_spec_from_config  # noqa: E402
 from src.models.layers.blocks import ResidualBlock  # noqa: E402
 from src.models.layers.prefix_grad import PREFIX_GRAD_MODES  # noqa: E402
 from src.models.registry import build as build_registered  # noqa: E402
-from src.sampling.loader import PrefetchLoader, resolve_gpu_ms  # noqa: E402
 from src.sampling.async_sampler import AsyncNeighborSampler, GraphedNeighborSampler  # noqa: E402
+from src.sampling.cpu_loader import CPUPrefetchLoader  # noqa: E402
+from src.sampling.cpu_sampler import CPUBatchMaker, CPUNeighborSampler  # noqa: E402
+from src.sampling.loader import PrefetchLoader, resolve_gpu_ms  # noqa: E402
 from src.sampling.neighbor_sampler import GPUNeighborSampler, seed_batches  # noqa: E402
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -140,7 +142,8 @@ def load_csr_npy(ds: dict, device: torch.device, dtype: torch.dtype):
     d = Path(os.environ.get("TURBO_GNN_DATA_ROOT") or ds.get("root", "data")) / ds["dir"]
     t0 = time.perf_counter()
     indptr = torch.from_numpy(np.load(d / "indptr.npy")).to(device)
-    indices = torch.from_numpy(np.load(d / "indices.npy")).to(device=device, dtype=torch.int64)
+    indices_np = torch.from_numpy(np.load(d / "indices.npy"))
+    indices = indices_np if device.type == "cpu" else indices_np.to(device=device, dtype=torch.int64)
     x = torch.from_numpy(np.load(d / "feat.npy")).to(device=device, dtype=dtype)
     y = torch.from_numpy(np.load(d / "label.npy")).to(device)
     y = torch.where(y < 0, torch.zeros_like(y), y)  # unlabeled nodes never enter a loss or a metric
@@ -255,6 +258,8 @@ class OursBatchMaker:
                 forward_heavy_threshold=self.args.fwd_heavy_threshold,
                 backward_heavy_threshold=self.args.bwd_heavy_threshold,
                 quantile=self.args.quantile,
+                forward_order=self.args.fwd_order,
+                backward_order=self.args.bwd_order,
             )
             # Heavy edge-slice tables need a device->host read (the slice count). Build them
             # here, in the producer thread, so the kernel launch finds them cached and the
@@ -343,6 +348,13 @@ def ours_epoch(maker, idx, args, device, shuffle=True, prefetch=None, max_steps=
         maker, seeds, prefetch=args.prefetch == "on" if prefetch is None else prefetch, depth=args.prefetch_depth, device=device
     )
     yield from loader
+
+
+def cpu_epoch(loader: CPUPrefetchLoader, idx: torch.Tensor, args, shuffle: bool = True, max_steps: int = 0):
+    seeds = seed_batches(idx, args.batch_size, shuffle=shuffle)
+    if max_steps > 0:
+        seeds = seeds[:max_steps]
+    yield from loader.epoch(seeds)
 
 
 def dgl_native_loader(graph, idx, args, device, shuffle=True):
@@ -475,8 +487,8 @@ def run_epoch(model, optimizer, scaler, batches, args, dtype, task: Task, train=
                 optimizer.step()
             if profiling:
                 prof.end("bwd")
-        if prof is not None:
-            prof.seen += 1
+            if prof is not None:
+                prof.seen += 1
         else:
             ev[2].record(compute)
             outs.append(logits.float())
@@ -511,6 +523,8 @@ def layerwise_inference(model, x, task: Task, splits, args, dtype, make_full_blo
     maps a chunk of node ids to (input_nodes, graph) for one full-neighbor layer.
     """
     num_nodes = x.shape[0]
+    compute_dev = next(model.parameters()).device
+    pin = x.device.type == "cpu" and compute_dev.type == "cuda" and getattr(args, "pin_memory", "on") == "on"
     autocast = torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32)
     chunks = list(torch.arange(num_nodes, device=x.device).split(args.infer_batch_size))
     h = x
@@ -522,26 +536,58 @@ def layerwise_inference(model, x, task: Task, splits, args, dtype, make_full_blo
         out = None
         for chunk in chunks:
             input_nodes, graph = make_full_blocks(chunk)
+            h_in = h[input_nodes]
+            if h_in.device != compute_dev:
+                if pin and not h_in.is_pinned():
+                    h_in = h_in.pin_memory()
+                h_in = h_in.to(compute_dev, non_blocking=pin)
+            if hasattr(graph, "to") and getattr(graph, "device", compute_dev) != compute_dev:
+                if pin and hasattr(graph, "pin_memory"):
+                    graph = graph.pin_memory()
+                try:
+                    graph = graph.to(compute_dev, non_blocking=pin)
+                except TypeError:
+                    graph = graph.to(compute_dev)
             with autocast:
-                hb = block_module(h[input_nodes], graph)
+                hb = block_module(h_in, graph)
             if out is None:
                 out = torch.empty(num_nodes, hb.shape[1], device=x.device, dtype=hb.dtype)
-            out[chunk] = hb
+            out[chunk] = hb.to(out.device)
         h = out
         torch.cuda.synchronize()
         layer_ms.append((time.perf_counter() - t_layer) * 1e3)
-    with autocast:
-        logits = model.head(model.dropout(h))
-    torch.cuda.synchronize()
-    total_s = time.perf_counter() - t0
-    out: dict[str, Any] = {"wall_s": total_s, "layer_ms": layer_ms, "chunks": len(chunks), "metric": task.metric}
+    if h.device == compute_dev:
+        with autocast:
+            logits = model.head(model.dropout(h))
+        torch.cuda.synchronize()
+        total_s = time.perf_counter() - t0
+        out_rec: dict[str, Any] = {"wall_s": total_s, "layer_ms": layer_ms, "chunks": len(chunks), "metric": task.metric}
+        for k, idx in splits.items():
+            if k == "train":
+                continue
+            m = task.metrics(logits[idx], task.labels[idx])
+            out_rec.update({f"{k}_{name}": v for name, v in m.items()})
+            out_rec[f"{k}_metric"] = m[task.metric]
+        return out_rec
+
+    # CPU-resident h: evaluate head per split chunk on GPU so large graphs never OOM GPU VRAM.
+    split_logits: dict[str, torch.Tensor] = {}
     for k, idx in splits.items():
         if k == "train":
             continue
-        m = task.metrics(logits[idx], task.labels[idx])
-        out.update({f"{k}_{name}": v for name, v in m.items()})
-        out[f"{k}_metric"] = m[task.metric]
-    return out
+        parts = []
+        for sub in idx.split(args.infer_batch_size):
+            with autocast:
+                parts.append(model.head(model.dropout(h[sub].to(compute_dev))).float())
+        split_logits[k] = torch.cat(parts, dim=0)
+    torch.cuda.synchronize()
+    total_s = time.perf_counter() - t0
+    out_rec = {"wall_s": total_s, "layer_ms": layer_ms, "chunks": len(chunks), "metric": task.metric}
+    for k, logits_k in split_logits.items():
+        m = task.metrics(logits_k, task.labels[splits[k]].to(compute_dev))
+        out_rec.update({f"{k}_{name}": v for name, v in m.items()})
+        out_rec[f"{k}_metric"] = m[task.metric]
+    return out_rec
 
 
 def summarize(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -584,30 +630,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefix-grad", choices=PREFIX_GRAD_MODES, default="autograd")
     p.add_argument(
         "--sampler-impl",
-        choices=["auto", "async", "exact"],
+        choices=["auto", "async", "exact", "cpu"],
         default="auto",
-        help="async: no host syncs while training (padded static shapes); exact: data-dependent sizes, syncs; "
-        "auto: async, except full-neighbor (-1) runs whose padded edge capacity exceeds "
-        "FULL_NEIGHBOR_ASYNC_MAX_EDGES",
+        help="async: GPU sampler with no host syncs (padded static shapes); exact: GPU sampler with "
+        "data-dependent sizes; cpu: CPU-resident graph/features with pinned H2D and optional worker "
+        "processes (--num-workers); auto: async, except full-neighbor (-1) runs whose padded edge "
+        "capacity exceeds FULL_NEIGHBOR_ASYNC_MAX_EDGES",
     )
     p.add_argument("--sampler-graphs", choices=["on", "off"], default="on", help="capture the async sampler in CUDA graphs")
+    p.add_argument("--pin-memory", choices=["on", "off"], default="on", help="pin CPU mini-batches before H2D copy (--sampler-impl cpu)")
+    p.add_argument("--worker-threads", type=int, default=None, help="PyTorch CPU threads per worker (--sampler-impl cpu)")
+    p.add_argument("--mp-context", choices=["spawn", "forkserver"], default="spawn",
+                   help="multiprocessing start method for CPU sampling workers (--sampler-impl cpu)")
     p.add_argument("--prefetch", choices=["on", "off"], default="on")
     p.add_argument("--prefetch-depth", type=int, default=2)
     p.add_argument("--fwd-heavy-threshold", type=int, default=None, help="in-degree >= T is heavy (default: all light)")
     p.add_argument("--bwd-heavy-threshold", type=int, default=None, help="out-degree >= T is heavy (default: all light)")
     p.add_argument("--fwd-order", choices=["natural", "degree"], default="natural",
-                   help="async sampler: order forward rows by sampled in-degree (desc) inside each bucket")
+                   help="async/cpu sampler: order forward rows by sampled in-degree (desc) inside each bucket")
     p.add_argument("--bwd-order", choices=["natural", "degree"], default="natural",
-                   help="async sampler: order backward (transposed) rows by sampled out-degree (desc) inside each bucket")
+                   help="async/cpu sampler: order backward (transposed) rows by sampled out-degree (desc) inside each bucket")
     p.add_argument("--quantile", type=float, default=None, help="full-graph bucketing rule instead of thresholds")
     p.add_argument("--full-neighbor-buckets", choices=["on", "off"], default="on",
                    help=f"fanouts with -1: default both heavy thresholds to {FULL_NEIGHBOR_HEAVY_THRESHOLD} (explicit thresholds win)")
     p.add_argument("--profile-steps", type=int, default=0,
                    help="profile fwd/bwd of N training steps (from step 20 of the first timed epoch) with torch.profiler")
     p.add_argument("--kernel-kwargs", default="{}", help="JSON forwarded to GATv2AggrKernel (warps, bucket launch, ...)")
-    # dgl native
+    # dgl native / CPU worker count
     p.add_argument("--dgl-sampling", choices=["gpu", "uva", "cpu"], default="gpu")
-    p.add_argument("--num-workers", type=int, default=8, help="CPU sampling workers (--dgl-sampling cpu)")
+    p.add_argument("--num-workers", type=int, default=8,
+                   help="CPU sampling worker processes (--sampler-impl cpu or --dgl-sampling cpu; 0 = single process)")
     p.add_argument(
         "--eval",
         choices=["none", "val", "end"],
@@ -646,13 +698,18 @@ def main() -> None:
     torch.manual_seed(args.seed)
     dtype = DTYPES[args.dtype]
 
-    name, edge_index, x, task, splits = load_data(args.dataset, device, dtype, args.task, args.targets)
+    cpu_graph = (args.sampler == "ours" and args.sampler_impl == "cpu") or (
+        args.sampler == "dgl" and args.dgl_sampling in ("cpu", "uva")
+    )
+    data_device = torch.device("cpu") if cpu_graph else device
+    name, edge_index, x, task, splits = load_data(args.dataset, data_device, dtype, args.task, args.targets)
     y = task.labels
     num_nodes = x.shape[0]
     print(f"[{name}] task {task.kind} (metric {task.metric}), output dim {task.out_dim}", flush=True)
 
+    kernel_kw = json.loads(args.kernel_kwargs)
     model = build_model(
-        args.model, len(args.fanout_list), args.backend, x.shape[1], task.out_dim, json.loads(args.kernel_kwargs)
+        args.model, len(args.fanout_list), args.backend, x.shape[1], task.out_dim, kernel_kw
     ).to(device)
     for m in model.modules():
         if isinstance(m, ResidualBlock):
@@ -662,38 +719,76 @@ def main() -> None:
 
     csr = edge_index if isinstance(edge_index, tuple) else None  # ("csr", indptr, indices) from load_csr_npy
     num_edges = int(csr[2].numel()) if csr else int(edge_index.shape[1])
+    cpu_loader: CPUPrefetchLoader | None = None
     if args.sampler == "ours":
         indptr, indices = (csr[1], csr[2]) if csr else in_csr(edge_index, num_nodes)
-        sampler = GPUNeighborSampler(indptr, indices, args.fanout_list, index_dtype=INDEX_DTYPES[args.index_dtype])
-        maker = OursBatchMaker(sampler, x, y, args.backend, args)
-        if args.sampler_impl == "auto":
-            args.sampler_impl = "async"
-            if args.full_neighbor:
-                cap = AsyncNeighborSampler(indptr, indices, args.fanout_list).padded_edge_capacity(args.batch_size)
-                args.padded_edge_capacity = cap
-                if cap > FULL_NEIGHBOR_ASYNC_MAX_EDGES:
-                    args.sampler_impl = "exact"
-                print(f"full-neighbor: padded edge capacity {cap:,} per batch -> {args.sampler_impl} sampler", flush=True)
-        if args.sampler_impl == "async":
-            assert args.quantile is None, "--quantile needs --sampler-impl exact (a quantile is a host-side value)"
-            async_sampler = AsyncNeighborSampler(
+        if args.sampler_impl == "cpu":
+            heavy_edge_slices = {
+                direction: int(kernel_kw[f"{direction}_heavy_edge_slice"])
+                for direction in ("forward", "backward")
+                if kernel_kw.get(f"{direction}_heavy_edge_slice", 0) > 0
+            }
+            cpu_maker = CPUBatchMaker(
                 indptr,
                 indices,
+                x,
+                y,
                 args.fanout_list,
+                backend=args.backend,
                 index_dtype=INDEX_DTYPES[args.index_dtype],
                 fwd_heavy_threshold=args.fwd_heavy_threshold,
                 bwd_heavy_threshold=args.bwd_heavy_threshold,
+                quantile=args.quantile,
                 fwd_order=args.fwd_order,
                 bwd_order=args.bwd_order,
+                heavy_edge_slices=heavy_edge_slices,
+                pin_memory=False,
+                seed=args.seed,
             )
-            if args.sampler_graphs == "on":
-                # stage 1 replayed from CUDA graphs: ~0.7 ms of CPU per batch instead of ~9 ms
-                async_sampler = GraphedNeighborSampler(async_sampler, args.batch_size)
-            train_maker = AsyncBatchMaker(async_sampler, x, y, args.backend)
+            cpu_loader = CPUPrefetchLoader(
+                cpu_maker,
+                num_workers=args.num_workers,
+                prefetch=args.prefetch == "on",
+                depth=args.prefetch_depth,
+                pin_memory=args.pin_memory == "on",
+                device=device,
+                persistent_workers=args.num_workers > 0,
+                worker_threads=args.worker_threads,
+                mp_context=args.mp_context,
+                seed=args.seed,
+            )
+            train_batches = lambda: cpu_epoch(cpu_loader, splits["train"], args, shuffle=True, max_steps=args.max_steps)  # noqa: E731
+            eval_batches = lambda split: cpu_epoch(cpu_loader, splits[split], args, shuffle=False)  # noqa: E731
         else:
-            train_maker = maker
-        train_batches = lambda: ours_epoch(train_maker, splits["train"], args, device, max_steps=args.max_steps)  # noqa: E731
-        eval_batches = lambda split: ours_epoch(train_maker, splits[split], args, device, shuffle=False, prefetch=False)  # noqa: E731
+            if args.sampler_impl == "auto":
+                args.sampler_impl = "async"
+                if args.full_neighbor:
+                    cap = AsyncNeighborSampler(indptr, indices, args.fanout_list).padded_edge_capacity(args.batch_size)
+                    args.padded_edge_capacity = cap
+                    if cap > FULL_NEIGHBOR_ASYNC_MAX_EDGES:
+                        args.sampler_impl = "exact"
+                    print(f"full-neighbor: padded edge capacity {cap:,} per batch -> {args.sampler_impl} sampler", flush=True)
+            if args.sampler_impl == "async":
+                assert args.quantile is None, "--quantile needs --sampler-impl exact (a quantile is a host-side value)"
+                async_sampler = AsyncNeighborSampler(
+                    indptr,
+                    indices,
+                    args.fanout_list,
+                    index_dtype=INDEX_DTYPES[args.index_dtype],
+                    fwd_heavy_threshold=args.fwd_heavy_threshold,
+                    bwd_heavy_threshold=args.bwd_heavy_threshold,
+                    fwd_order=args.fwd_order,
+                    bwd_order=args.bwd_order,
+                )
+                if args.sampler_graphs == "on":
+                    # stage 1 replayed from CUDA graphs: ~0.7 ms of CPU per batch instead of ~9 ms
+                    async_sampler = GraphedNeighborSampler(async_sampler, args.batch_size)
+                train_maker = AsyncBatchMaker(async_sampler, x, y, args.backend)
+            else:
+                sampler = GPUNeighborSampler(indptr, indices, args.fanout_list, index_dtype=INDEX_DTYPES[args.index_dtype])
+                train_maker = OursBatchMaker(sampler, x, y, args.backend, args)
+            train_batches = lambda: ours_epoch(train_maker, splits["train"], args, device, max_steps=args.max_steps)  # noqa: E731
+            eval_batches = lambda split: ours_epoch(train_maker, splits[split], args, device, shuffle=False, prefetch=False)  # noqa: E731
     else:
         assert args.backend == "dgl", "--sampler dgl needs --backend dgl"
         import dgl
@@ -715,7 +810,11 @@ def main() -> None:
             g = g.to("cpu")
             # contiguous: DGL pins in place (UVA) and shares with workers only contiguous storage
             g.ndata["feat"], g.ndata["label"] = x.cpu().contiguous(), y.cpu().contiguous()
-            idx = {k: v.cpu() for k, v in splits.items()} if args.dgl_sampling == "cpu" else splits
+            idx = (
+                {k: v.cpu() for k, v in splits.items()}
+                if args.dgl_sampling == "cpu"
+                else {k: v.to(device) for k, v in splits.items()}
+            )
             if args.dgl_sampling == "uva":
                 g.pin_memory_()  # features pinned too; gathered by the GPU over UVA
         else:
@@ -729,81 +828,89 @@ def main() -> None:
 
     full_steps = -(-splits["train"].numel() // args.batch_size)
     epochs = []
-    for epoch in range(args.warmup_epochs + args.epochs):
-        model.train()
-        args._profiler = StepProfiler(args.profile_steps) if args.profile_steps and epoch == args.warmup_epochs else None
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        rows, loss, _ = run_epoch(model, optimizer, scaler, train_batches(), args, dtype, task, train=True)
-        wall = time.perf_counter() - t0
-        rec = {"epoch": epoch, "warmup": epoch < args.warmup_epochs, "wall_s": wall, "steps": len(rows), "loss": loss}
-        rec["full_epoch_steps"] = full_steps
-        rec["projected_epoch_s"] = wall / max(len(rows), 1) * full_steps
-        rec.update(summarize(rows))
-        if args._profiler is not None:
-            rec["profile"] = args._profiler.result()
-            print(json.dumps(rec["profile"]["fwd_ms_by_category"]), json.dumps(rec["profile"]["bwd_ms_by_category"]), flush=True)
-        epochs.append(rec)
-        print(
-            f"[{name} {args.backend}/{args.sampler}] epoch {epoch} wall {wall:.3f}s loss {loss:.4f} "
-            f"wait {rec.get('wait_host_ms_sum', 0) / 1e3:.3f}s fwd {rec['fwd_ms_sum'] / 1e3:.3f}s "
-            f"bwd {rec['bwd_ms_sum'] / 1e3:.3f}s",
-            flush=True,
-        )
+    try:
+        for epoch in range(args.warmup_epochs + args.epochs):
+            model.train()
+            args._profiler = StepProfiler(args.profile_steps) if args.profile_steps and epoch == args.warmup_epochs else None
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            rows, loss, _ = run_epoch(model, optimizer, scaler, train_batches(), args, dtype, task, train=True)
+            wall = time.perf_counter() - t0
+            rec = {"epoch": epoch, "warmup": epoch < args.warmup_epochs, "wall_s": wall, "steps": len(rows), "loss": loss}
+            rec["full_epoch_steps"] = full_steps
+            rec["projected_epoch_s"] = wall / max(len(rows), 1) * full_steps
+            rec.update(summarize(rows))
+            if args._profiler is not None:
+                rec["profile"] = args._profiler.result()
+                print(json.dumps(rec["profile"]["fwd_ms_by_category"]), json.dumps(rec["profile"]["bwd_ms_by_category"]), flush=True)
+            epochs.append(rec)
+            print(
+                f"[{name} {args.backend}/{args.sampler}] epoch {epoch} wall {wall:.3f}s loss {loss:.4f} "
+                f"wait {rec.get('wait_host_ms_sum', 0) / 1e3:.3f}s fwd {rec['fwd_ms_sum'] / 1e3:.3f}s "
+                f"bwd {rec['bwd_ms_sum'] / 1e3:.3f}s",
+                flush=True,
+            )
 
-    result: dict[str, Any] = {
-        "dataset": name,
-        "task": task.kind,
-        "metric": task.metric,
-        "args": {k: v for k, v in vars(args).items() if not k.startswith("_")},
-        "torch": torch.__version__,
-        "gpu": torch.cuda.get_device_name(),
-        "num_nodes": num_nodes,
-        "num_edges": num_edges,
-        "epochs": epochs,
-        "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30,
-    }
-    timed = [e["wall_s"] for e in epochs if not e["warmup"]]
-    result["epoch_wall_s_median"] = statistics.median(timed) if timed else None
-    proj = [e["projected_epoch_s"] for e in epochs if not e["warmup"]]
-    result["projected_epoch_s_median"] = statistics.median(proj) if proj else None
-    if args.eval != "none":
-        model.eval()
-        for split in ("val", "test") if args.eval == "end" else ("val",):
-            _, _, m = run_epoch(model, None, None, eval_batches(split), args, dtype, task, train=False)
-            result.update({f"{split}_{k}": v for k, v in m.items()})  # multiclass keeps val_acc / test_acc
-            result[f"{split}_metric"] = m[task.metric]
-        print(
-            f"val {task.metric} {result['val_metric']:.4f}"
-            + (f" test {task.metric} {result['test_metric']:.4f}" if "test_metric" in result else "")
-        )
+        result: dict[str, Any] = {
+            "dataset": name,
+            "task": task.kind,
+            "metric": task.metric,
+            "args": {k: v for k, v in vars(args).items() if not k.startswith("_")},
+            "torch": torch.__version__,
+            "gpu": torch.cuda.get_device_name(),
+            "num_nodes": num_nodes,
+            "num_edges": num_edges,
+            "epochs": epochs,
+            "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30,
+        }
+        timed = [e["wall_s"] for e in epochs if not e["warmup"]]
+        result["epoch_wall_s_median"] = statistics.median(timed) if timed else None
+        proj = [e["projected_epoch_s"] for e in epochs if not e["warmup"]]
+        result["projected_epoch_s_median"] = statistics.median(proj) if proj else None
+        if args.eval != "none":
+            model.eval()
+            for split in ("val", "test") if args.eval == "end" else ("val",):
+                _, _, m = run_epoch(model, None, None, eval_batches(split), args, dtype, task, train=False)
+                result.update({f"{split}_{k}": v for k, v in m.items()})  # multiclass keeps val_acc / test_acc
+                result[f"{split}_metric"] = m[task.metric]
+            print(
+                f"val {task.metric} {result['val_metric']:.4f}"
+                + (f" test {task.metric} {result['test_metric']:.4f}" if "test_metric" in result else "")
+            )
 
-    if args.inference == "layerwise":
-        model.eval()
-        if args.sampler == "ours":
-            full = GPUNeighborSampler(indptr, indices, [-1], index_dtype=INDEX_DTYPES[args.index_dtype])
-            full_maker = OursBatchMaker(full, x, y, args.backend, args)
+        if args.inference == "layerwise":
+            model.eval()
+            if args.sampler == "ours":
+                if args.sampler_impl == "cpu":
+                    full = CPUNeighborSampler(indptr, indices, [-1], index_dtype=INDEX_DTYPES[args.index_dtype])
+                    full_maker = OursBatchMaker(full, x, y, args.backend, args)
+                else:
+                    full = GPUNeighborSampler(indptr, indices, [-1], index_dtype=INDEX_DTYPES[args.index_dtype])
+                    full_maker = OursBatchMaker(full, x, y, args.backend, args)
 
-            # The layer input is the previous layer's output, not x, so only the block is built here.
-            def make_full_blocks(chunk):
-                batch = full.sample(chunk)
-                blk = batch.blocks[0]
-                return batch.input_nodes, full_maker.graph_for(blk)
-        else:
-            import dgl
+                # The layer input is the previous layer's output, not x, so only the block is built here.
+                def make_full_blocks(chunk):
+                    batch = full.sample(chunk)
+                    blk = batch.blocks[0]
+                    return batch.input_nodes, full_maker.graph_for(blk)
+            else:
+                import dgl
 
-            full_sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
-            g_dev = g.to(device) if g.device != device else g
+                full_sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
+                g_dev = g if g.device == x.device else g.to(x.device)
 
-            def make_full_blocks(chunk):
-                input_nodes, _, blocks = full_sampler.sample(g_dev, chunk.to(g_dev.idtype))
-                return input_nodes.long(), blocks[0]
+                def make_full_blocks(chunk):
+                    input_nodes, _, blocks = full_sampler.sample(g_dev, chunk.to(device=g_dev.device, dtype=g_dev.idtype))
+                    return input_nodes.to(x.device).long(), blocks[0]
 
-        runs = [layerwise_inference(model, x, task, splits, args, dtype, make_full_blocks) for _ in range(args.infer_repeats)]
-        result["inference"] = runs[-1]
-        result["inference_wall_s_all"] = [r["wall_s"] for r in runs]
-        print(f"layerwise inference {runs[-1]['wall_s']:.3f}s layers {[round(t) for t in runs[-1]['layer_ms']]} ms "
-              f"test {task.metric} {runs[-1].get('test_metric', float('nan')):.4f}")
+            runs = [layerwise_inference(model, x, task, splits, args, dtype, make_full_blocks) for _ in range(args.infer_repeats)]
+            result["inference"] = runs[-1]
+            result["inference_wall_s_all"] = [r["wall_s"] for r in runs]
+            print(f"layerwise inference {runs[-1]['wall_s']:.3f}s layers {[round(t) for t in runs[-1]['layer_ms']]} ms "
+                  f"test {task.metric} {runs[-1].get('test_metric', float('nan')):.4f}")
+    finally:
+        if cpu_loader is not None:
+            cpu_loader.close()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
