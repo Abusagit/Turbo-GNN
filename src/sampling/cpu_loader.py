@@ -8,12 +8,17 @@ Mirrors `PrefetchLoader` (`src/sampling/loader.py`) for CPU-resident graphs and 
   - ``prefetch=True`` prepares batches on a background thread, pins them, and copies them to GPU
     on a dedicated H2D CUDA stream so CPU sampling and PCIe transfers overlap with GPU training.
 - **Parallel processes (``num_workers>=1``)**:
-  - Worker processes (pure CPU, zero CUDA calls) sample neighbors, gather features/labels, and
-    build block CSR + buckets in parallel without contending on the Python GIL.
-  - A main-process transfer thread pulls completed CPU batches from the worker queue, pins their
-    tensors in the main process's CUDA context, and launches ``non_blocking=True`` H2D DMA on a
-    dedicated CUDA stream, handing off to the compute stream via a CUDA event + ``record_stream``
-    (zero host syncs in the training loop).
+  - Worker processes (pure CPU, zero CUDA calls) sample neighbors in parallel without contending
+    on the Python GIL. For `CPUBatchMaker` (via ``for_worker()`` / ``finalize_cpu_batch()``),
+    workers ship only compact packed topology tensors (1 IPC FD per batch, keeping large
+    ``x``/``y`` feature matrices out of ``/dev/shm``; forward CSRs only when targeting CUDA).
+    Arbitrary custom ``produce`` callables are also supported directly.
+  - A main-process transfer thread unpacks worker results, gathers ``x``/``y`` directly into a
+    reusable page-locked staging ring (``_PinnedSlabRing``, avoiding per-batch ``cudaHostAlloc``
+    syscalls), stages index tensors, and launches ``non_blocking=True`` H2D DMA + ``post_transfer``
+    (e.g. GPU-side CSR transpose/bucketing or DGL block wrapping) on a dedicated CUDA stream,
+    handing off to the compute stream via a CUDA event + ``record_stream`` (zero host syncs in
+    the training loop).
   - Workers are kept alive across epochs by default (``persistent_workers=True``) so process
     startup is paid once.
 
@@ -378,7 +383,10 @@ class CPUPrefetchLoader:
             (effective when targeting a CUDA device).
         device: target device for yielded batches (``"cuda"`` / ``"cuda:i"`` / ``"cpu"``).
         persistent_workers: keep worker processes alive across calls to ``epoch()`` / ``__iter__()``.
-        worker_threads: PyTorch intra-op CPU threads per worker process (auto-chosen if ``None``).
+        worker_threads: CPU thread count per worker process (sets both ``torch.set_num_threads``
+            and ``sampler.num_threads`` for the native C++17 thread pool; also applies to
+            ``num_workers=0`` when explicitly provided or when ``sampler.num_threads`` is ``None``;
+            auto-chosen if ``None``).
         mp_context: multiprocessing start method (``"spawn"`` default: safe after CUDA init; also
             accepts ``"fork"`` or ``"forkserver"``).
         preserve_order: emit batches in input seed-batch order even when parallel workers finish
@@ -431,27 +439,30 @@ class CPUPrefetchLoader:
         # Keep CPUBatchMaker.pin_memory=False on producer copies: when self.pin_memory=True,
         # CPUPrefetchLoader stages tensors directly into its reusable _PinnedSlabRing instead of
         # triggering per-batch cudaHostAlloc syscalls.
-        need_single_copy = (
-            self.num_workers == 0
-            and (
-                getattr(produce, "pin_memory", False)
-                or (hasattr(produce, "sampler") and getattr(produce.sampler, "num_threads", None) is None)
-            )
+        has_sampler = hasattr(produce, "sampler")
+        override_single_threads = has_sampler and (
+            worker_threads is not None or getattr(produce.sampler, "num_threads", None) is None
+        )
+        need_single_copy = self.num_workers == 0 and (
+            getattr(produce, "pin_memory", False) or override_single_threads
         )
         if need_single_copy:
             self._single_produce = copy.copy(produce)
             if hasattr(self._single_produce, "pin_memory"):
                 self._single_produce.pin_memory = False
-            if hasattr(self._single_produce, "sampler") and getattr(self._single_produce.sampler, "num_threads", None) is None:
+            if override_single_threads:
                 self._single_produce.sampler = copy.copy(self._single_produce.sampler)
                 self._single_produce.sampler.num_threads = self.worker_threads
         else:
             self._single_produce = produce
 
         # In single-process mode targeting CUDA, use the topology worker + GPU-side block transpose
-        # (and direct slab gather when pin_memory=True) to skip CPU CSR transpose and extra copies.
+        # (and direct slab gather when pin_memory=True) to skip CPU CSR transpose and extra copies,
+        # sharing self._single_produce.sampler so sampling and feature gather reuse one ThreadPool.
         if self.num_workers == 0 and self._use_cuda and self._split_worker_gather:
-            self._single_topo_worker: Any = self._single_produce.for_worker(build_cuda_graphs=False, pack_ipc=False)
+            self._single_topo_worker: Any = self._single_produce.for_worker(
+                build_cuda_graphs=False, pack_ipc=False, share_sampler=True
+            )
         else:
             self._single_topo_worker = None
 
@@ -495,7 +506,7 @@ class CPUPrefetchLoader:
         self._active_threads.clear()
 
     def close(self) -> None:
-        """Stop active transfer threads, terminate persistent workers, and close IPC queues."""
+        """Stop active transfer threads, terminate persistent workers, reclaim C++ pools, and close IPC queues."""
         self._stop_active_threads()
         if self._finalizer is not None:
             self._finalizer.detach()
@@ -506,6 +517,10 @@ class CPUPrefetchLoader:
         self._task_q = None
         self._result_q = None
         self._active_epoch = None
+        if hasattr(self._single_produce, "shutdown_pools"):
+            self._single_produce.shutdown_pools()
+        if self._split_worker_gather and self.produce is not self._single_produce and hasattr(self.produce, "shutdown_pools"):
+            self.produce.shutdown_pools()
 
     # ------------------------------------------------------------ worker pool
     def _ensure_workers(self) -> None:
@@ -519,21 +534,34 @@ class CPUPrefetchLoader:
                 "CPUPrefetchLoader: mp_context='fork' cannot be used safely after CUDA has been initialized "
                 "(forking a CUDA/multi-threaded process can deadlock); use mp_context='spawn' or 'forkserver'."
             )
+        if self.mp_context == "fork" and hasattr(self.produce, "shutdown_pools"):
+            # Shut down any live parent C++ thread pools before os.fork() so children never inherit
+            # active mutexes or dead pthread handles across epochs / prior single-process calls.
+            self.produce.shutdown_pools()
 
         self._split_worker_gather = hasattr(self.produce, "for_worker") and hasattr(self.produce, "finalize_cpu_batch")
         if self._split_worker_gather:
-            # When targeting CUDA, ship only packed forward CSRs (1 IPC FD) and build transposed
-            # CSR + buckets asynchronously on the GPU H2D stream (~0.25 ms on H100).
+            # Always pack worker tensors into 1 contiguous buffer (1 IPC FD instead of ~26).
+            # When targeting CUDA, ship forward CSRs only and transpose on the GPU H2D stream.
             worker_produce = self.produce.for_worker(
                 build_cuda_graphs=not self._use_cuda,
-                pack_ipc=self._use_cuda,
+                pack_ipc=True,
             )
         else:
             worker_produce = self.produce
-        # Workers must never touch CUDA, so ensure pin_memory is off on the worker copy.
+        # Workers must never touch CUDA, so ensure pin_memory is off on the worker copy,
+        # and enforce self.worker_threads on an isolated sampler copy so we never mutate
+        # self.produce.sampler or share its parent C++ NativeSamplerState across fork().
         if getattr(worker_produce, "pin_memory", False):
-            worker_produce = copy.copy(worker_produce)
+            if worker_produce is self.produce:
+                worker_produce = copy.copy(worker_produce)
             worker_produce.pin_memory = False
+        if hasattr(worker_produce, "sampler"):
+            if worker_produce is self.produce:
+                worker_produce = copy.copy(worker_produce)
+            if worker_produce.sampler is getattr(self.produce, "sampler", None):
+                worker_produce.sampler = copy.copy(worker_produce.sampler)
+            worker_produce.sampler.num_threads = self.worker_threads
 
         if self.mp_context != "fork" and hasattr(worker_produce, "share_memory_"):
             worker_produce.share_memory_()
@@ -574,25 +602,27 @@ class CPUPrefetchLoader:
         stream: torch.cuda.Stream | None,
         *,
         needs_gather: bool = False,
+        finalizer: Any | None = None,
     ) -> tuple[Any, torch.cuda.Event | None, tuple[torch.cuda.Event, torch.cuda.Event] | None]:
+        fin = self.produce if finalizer is None else finalizer
         if not self._use_cuda:
             if needs_gather:
-                batch_cpu = self.produce.finalize_cpu_batch(batch_cpu, pin_memory=False)
+                batch_cpu = fin.finalize_cpu_batch(batch_cpu, pin_memory=False)
             batch_out = self.post_transfer(batch_cpu) if self.post_transfer is not None else batch_cpu
             return batch_out, None, None
 
         slab: _PinnedSlab | None = None
         if self.pin_memory and self._pinned_ring is not None:
-            extra = self.produce.estimate_gather_bytes(batch_cpu) if (needs_gather and hasattr(self.produce, "estimate_gather_bytes")) else 0
+            extra = fin.estimate_gather_bytes(batch_cpu) if (needs_gather and hasattr(fin, "estimate_gather_bytes")) else 0
             align_pad = 64 * len(batch_cpu.get("_packed_offsets", ())) if isinstance(batch_cpu, dict) else 0
             req = _estimate_cpu_bytes(batch_cpu) + extra + align_pad + 128
             slab = self._pinned_ring.acquire(req)
             if needs_gather:
-                batch_cpu = self.produce.finalize_cpu_batch(batch_cpu, pin_memory=False, alloc=slab.alloc)
+                batch_cpu = fin.finalize_cpu_batch(batch_cpu, pin_memory=False, alloc=slab.alloc)
             batch_host = _stage_in_slab(batch_cpu, slab)
         else:
             if needs_gather:
-                batch_cpu = self.produce.finalize_cpu_batch(batch_cpu, pin_memory=False)
+                batch_cpu = fin.finalize_cpu_batch(batch_cpu, pin_memory=False)
             batch_host = batch_cpu
 
         assert stream is not None
@@ -625,7 +655,9 @@ class CPUPrefetchLoader:
             t0 = time.perf_counter()
             batch_cpu = prod(s)
             t1 = time.perf_counter()
-            batch_dev, _, gpu_events = self._pin_and_transfer(batch_cpu, stream, needs_gather=use_topo)
+            batch_dev, _, gpu_events = self._pin_and_transfer(
+                batch_cpu, stream, needs_gather=use_topo, finalizer=self._single_produce
+            )
             del batch_cpu
             t2 = time.perf_counter()
             produce_ms = (t1 - t0) * 1e3
@@ -661,7 +693,9 @@ class CPUPrefetchLoader:
                     t0 = time.perf_counter()
                     batch_cpu = prod(s)
                     t1 = time.perf_counter()
-                    batch_dev, ready, gpu_events = self._pin_and_transfer(batch_cpu, h2d_stream, needs_gather=use_topo)
+                    batch_dev, ready, gpu_events = self._pin_and_transfer(
+                        batch_cpu, h2d_stream, needs_gather=use_topo, finalizer=self._single_produce
+                    )
                     del batch_cpu
                     t2 = time.perf_counter()
                     timing: dict[str, Any] = {

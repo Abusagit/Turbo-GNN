@@ -1,4 +1,4 @@
-"""Uniform neighbor sampler and mini-batch builder on the CPU, in plain torch.
+"""Uniform neighbor sampler and mini-batch builder on the CPU.
 
 Mirrors `GPUNeighborSampler` (`src/sampling/neighbor_sampler.py`) and `OursBatchMaker`
 (`scripts/train_sampled.py`) for graphs whose CSR, node features and labels reside in host
@@ -14,20 +14,26 @@ RAM rather than GPU VRAM:
 
 Key CPU-specific choices:
 
-- **No O(N) scratch buffers**: frontier deduplication and relabeling run in
-  ``O((n + E) log(n + E))`` using ``unique`` + ``searchsorted`` instead of scanning an
-  ``N``-element mark array, so workers stay stateless and use zero graph-sized scratch RAM
-  even on 100M-node graphs.
-- **Hub-safe sampling without replacement**: over-full rows (``deg > fanout``) use vectorized
-  Floyd sampling in ``O(H * fanout^2)`` rather than expanding and sorting all ``deg`` edges of
-  high-degree hubs.
-- **Zero-copy multiprocessing**: ``CPUBatchMaker`` is plain picklable Python/torch; calling
-  ``share_memory_()`` puts the read-only graph and feature tensors in shared memory so
-  parallel worker processes share a single copy without touching CUDA.
+- **Native C++17 backend (no OpenMP) with pure-PyTorch fallback**: uses a lightweight per-state
+  ``std::thread`` pool (``src/sampling/_cpu_sampler.cpp``) loaded via ``ctypes``. For graphs
+  with ``N <= 4,000,000``, frontier deduplication uses zero-atomic 32-way partitioned dedup
+  over a compact ``int32`` direct table (resetting only the ``num_src`` touched entries); for
+  larger graphs (e.g. ``ogbn-papers100M``), it switches automatically to a generation-stamped
+  ``O(n + E_batch)`` hash table with zero ``O(N)`` memory. If no C++ compiler is available (or
+  ``TURBO_GNN_CPU_SAMPLER_PYTORCH=1``), it falls back to stateless pure-PyTorch ``unique`` +
+  ``searchsorted``.
+- **Hub-safe sampling without replacement**: over-full rows (``deg > fanout``) use Floyd's
+  algorithm (in-stack for ``fanout <= 64``, small hash set for ``fanout > 64``) rather than
+  expanding and sorting all ``deg`` edges of high-degree hubs.
+- **Topology-only packed multiprocessing IPC**: ``CPUPrefetchLoader`` splits ``CPUBatchMaker``
+  into ``_CPUTopologyWorker`` (sharing only compact ``indptr``/``indices`` and packing each
+  batch's index tensors into one buffer / single IPC FD) and main-process feature gathering
+  (keeping large ``x``/``y`` matrices out of ``/dev/shm``).
 """
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 from typing import Any
@@ -77,7 +83,7 @@ def _unpack_tensors(buf: torch.Tensor, offsets: list[tuple[int, int, torch.dtype
 class CPUNeighborSampler:
     """Samples multi-hop blocks from an in-neighbor CSR held on the CPU.
 
-    Uses a C++17 + OpenMP native backend (`src/sampling/_cpu_sampler.cpp`) when a C++
+    Uses a C++17 native backend with a lightweight std::thread pool (no OpenMP) when a C++
     compiler is available, with an automatic pure-PyTorch fallback.
 
     Args:
@@ -86,7 +92,7 @@ class CPUNeighborSampler:
         fanouts: per-layer fanouts, outermost layer first; ``-1`` = all neighbors.
         index_dtype: dtype of the emitted block CSR (int32 is fastest for our CUDA kernels).
         generator: optional CPU ``torch.Generator`` for reproducible sampling.
-        num_threads: optional OpenMP thread count for the native CPU backend (auto if ``None``).
+        num_threads: optional thread count for the native C++17 thread pool (auto if ``None``).
     """
 
     def __init__(
@@ -433,6 +439,29 @@ class _CPUTopologyWorker:
         stats = [(b.num_dst, b.num_src, b.num_edges) for b in batch.blocks]
         if self.backend == "cuda" and self.build_cuda_graphs:
             graphs = [self._cuda_graph_for(b) for b in batch.blocks]
+            if self.pack_ipc and not self.heavy_edge_slices:
+                tensors = [batch.input_nodes, batch.seeds]
+                g_meta = []
+                for g in graphs:
+                    tensors.extend([
+                        g.forward_indptr,
+                        g.forward_indices,
+                        g.backward_indptr,
+                        g.backward_indices,
+                        g.forward_light_nodes,
+                        g.forward_heavy_nodes,
+                        g.backward_light_nodes,
+                        g.backward_heavy_nodes,
+                    ])
+                    g_meta.append((g.max_degree, g.backward_max_degree))
+                packed, offsets = _pack_tensors(tensors)
+                return {
+                    "_packed_graph_buf": packed,
+                    "_packed_offsets": offsets,
+                    "_packed_graph_meta": g_meta,
+                    "graphs": None,
+                    "stats": stats,
+                }
             return {
                 "_input_nodes": batch.input_nodes,
                 "_seeds": batch.seeds,
@@ -522,6 +551,41 @@ class CPUBatchMaker:
         self.heavy_edge_slices = {k: int(v) for k, v in (heavy_edge_slices or {}).items() if int(v) > 0}
         self.pin_memory = pin_memory
         self.seed = seed
+        self._gather_state: NativeSamplerState | None = None
+        self._gather_state_checked: bool = False
+
+    def __copy__(self) -> CPUBatchMaker:
+        dup = object.__new__(type(self))
+        dup.__dict__.update(self.__dict__)
+        dup._gather_state = None
+        dup._gather_state_checked = False
+        return dup
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_gather_state"] = None
+        state["_gather_state_checked"] = False
+        return state
+
+    def _get_gather_state(self) -> NativeSamplerState | None:
+        # Reuse the sampler's existing C++ ThreadPool when running in-process (nw=0) so we never
+        # spawn a second competing thread pool; allocate a 0-node pool only for main-process gather
+        # with multiprocess workers.
+        if self.sampler._native is not None and self.sampler._native.available:
+            return self.sampler._native
+        if not self._gather_state_checked:
+            self._gather_state_checked = True
+            st = NativeSamplerState(0)  # 0 nodes: allocates thread pool only, no map32
+            if st.available:
+                self._gather_state = st
+        return self._gather_state
+
+    def shutdown_pools(self) -> None:
+        """Join any live C++ thread pools owned by this batch maker (safe prior to os.fork())."""
+        if self.sampler._native is not None:
+            self.sampler._native.shutdown_pool()
+        if self._gather_state is not None:
+            self._gather_state.shutdown_pool()
 
     def share_memory_(self) -> CPUBatchMaker:
         """Share the read-only graph, features and labels across spawned worker processes."""
@@ -547,10 +611,19 @@ class CPUBatchMaker:
             gen.seed()
         self.sampler.generator = gen
 
-    def for_worker(self, *, build_cuda_graphs: bool = True, pack_ipc: bool = False) -> _CPUTopologyWorker:
-        """Return a topology-only worker callable (omits ``x``/``y`` from worker IPC)."""
+    def for_worker(
+        self, *, build_cuda_graphs: bool = True, pack_ipc: bool = False, share_sampler: bool = False
+    ) -> _CPUTopologyWorker:
+        """Return a topology-only worker callable (omits ``x``/``y`` from worker IPC).
+
+        By default (``share_sampler=False``) makes a shallow copy of ``self.sampler`` whose
+        C++ ``NativeSamplerState`` is cleared so forked/spawned worker processes never inherit
+        parent thread-pool state. Single-process loaders pass ``share_sampler=True`` to share
+        one C++ thread pool between sampling and feature gathering.
+        """
+        sampler = self.sampler if share_sampler else copy.copy(self.sampler)
         return _CPUTopologyWorker(
-            self.sampler,
+            sampler,
             backend=self.backend,
             fwd_heavy_threshold=self.fwd_heavy_threshold,
             bwd_heavy_threshold=self.bwd_heavy_threshold,
@@ -580,7 +653,12 @@ class CPUBatchMaker:
             else:
                 out = torch.empty(shape, dtype=tensor.dtype, pin_memory=pin)
             if idx.numel() > 0:
-                if not native_gather_rows(tensor, idx, out, _default_gather_threads()):
+                g_threads = (
+                    max(1, self.sampler.num_threads)
+                    if self.sampler.num_threads is not None
+                    else _default_gather_threads()
+                )
+                if not native_gather_rows(tensor, idx, out, g_threads, state=self._get_gather_state()):
                     torch.index_select(tensor, 0, idx, out=out)
             return out
         out = torch.index_select(tensor, 0, idx)
@@ -614,7 +692,34 @@ class CPUBatchMaker:
         self, raw: dict[str, Any], *, pin_memory: bool = False, alloc: Any | None = None
     ) -> dict[str, Any]:
         """Unpack IPC buffer if needed and gather ``x``/``y`` in the main process."""
-        if "_packed_buf" in raw:
+        if "_packed_graph_buf" in raw:
+            from turbo_gnn.graph import AdjacencyForwardBackwardWithNodeBuckets as G
+
+            buf = raw.pop("_packed_graph_buf")
+            offsets = raw.pop("_packed_offsets")
+            g_meta = raw.pop("_packed_graph_meta")
+            tensors = _unpack_tensors(buf, offsets)
+            input_nodes, seeds = tensors[0], tensors[1]
+            graphs = []
+            for idx, (max_deg, bwd_max_deg) in enumerate(g_meta):
+                base = 2 + 8 * idx
+                graphs.append(
+                    G(
+                        forward_indptr=tensors[base],
+                        forward_indices=tensors[base + 1],
+                        backward_indptr=tensors[base + 2],
+                        backward_indices=tensors[base + 3],
+                        forward_light_nodes=tensors[base + 4],
+                        forward_heavy_nodes=tensors[base + 5],
+                        backward_light_nodes=tensors[base + 6],
+                        backward_heavy_nodes=tensors[base + 7],
+                        max_degree=max_deg,
+                        backward_max_degree=bwd_max_deg,
+                        is_directed=True,
+                    )
+                )
+            raw["graphs"] = graphs
+        elif "_packed_buf" in raw:
             buf = raw.pop("_packed_buf")
             offsets = raw.pop("_packed_offsets")
             block_meta = raw.pop("_packed_block_meta")

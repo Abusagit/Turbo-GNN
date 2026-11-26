@@ -158,13 +158,13 @@ def test_cpu_sampler_matches_gpu_sampler_full_neighbor():
 
 
 def test_cpu_sampler_parallel_partitioned_path():
-    """Exercise the >= 16384-edge parallel 32-way zero-atomic partitioned dedup path in C++."""
-    indptr, indices, _, _, adj = make_random_graph(num_nodes=4000, num_edges=120000, feat_dim=8, seed=11)
-    sampler = CPUNeighborSampler(indptr, indices, [15, 10, 5], index_dtype=torch.int32, num_threads=8)
-    seeds = torch.randperm(4000)[:256]
+    """Exercise the >= 65536-edge parallel 32-way zero-atomic partitioned dedup path in C++."""
+    indptr, indices, _, _, adj = make_random_graph(num_nodes=8000, num_edges=320000, feat_dim=8, seed=11)
+    sampler = CPUNeighborSampler(indptr, indices, [20, 15, 10], index_dtype=torch.int32, num_threads=8)
+    seeds = torch.randperm(8000)[:256]
     batch = sampler.sample(seeds)
-    # Confirm outermost layer exceeded the 16384 parallel threshold.
-    assert batch.blocks[0].num_edges >= 16384
+    # Confirm outermost layer exceeded the 65536 parallel threshold (choose_threads(..., 32768) >= 2).
+    assert batch.blocks[0].num_edges >= 65536
     gids = [batch.input_nodes]
     for blk in batch.blocks[:-1]:
         gids.append(gids[-1][: blk.num_dst])
@@ -177,6 +177,26 @@ def test_cpu_sampler_parallel_partitioned_path():
             nbrs = g[blk.indices[s:e].long()].tolist()
             k = min(len(adj[v]), blk.fanout)
             assert len(nbrs) == k and len(set(nbrs)) == k and set(nbrs) <= adj[v]
+
+
+def test_cpu_sampler_parallel_duplicate_seeds():
+    """Duplicate destination seeds must work cleanly and race-free in the parallel dense path."""
+    indptr, indices, _, _, adj = make_random_graph(num_nodes=8000, num_edges=320000, feat_dim=8, seed=17)
+    sampler = CPUNeighborSampler(indptr, indices, [20], index_dtype=torch.int32, num_threads=8)
+    base = torch.arange(3500)
+    # Place duplicates across distant chunks so multiple threads see them.
+    seeds = torch.cat([base, base[:1000]])
+    batch = sampler.sample(seeds)
+    blk = batch.blocks[0]
+    assert blk.num_edges >= 65536
+    g = batch.input_nodes
+    assert torch.equal(g[: seeds.numel()], seeds)
+    for row in (0, 10, 3500, 3510):
+        v = int(seeds[row])
+        s, e = int(blk.indptr[row]), int(blk.indptr[row + 1])
+        nbrs = g[blk.indices[s:e].long()].tolist()
+        k = min(len(adj[v]), 20)
+        assert len(nbrs) == k and len(set(nbrs)) == k and set(nbrs) <= adj[v]
 
 
 def test_cpu_sampler_reproducible_with_generator():
@@ -565,11 +585,153 @@ def test_close_stops_active_iterator_cleanly():
 def test_single_process_clears_pin_memory_when_disabled():
     indptr, indices, x, y, _ = make_random_graph(num_nodes=100, num_edges=500, feat_dim=8, seed=0)
     maker = CPUBatchMaker(indptr, indices, x, y, [4], pin_memory=True, seed=0)
+    maker.sampler.num_threads = 8
     seeds = seed_batches(torch.arange(32), batch_size=16, shuffle=False)
-    loader = CPUPrefetchLoader(maker, seeds, num_workers=0, prefetch=False, pin_memory=False, device="cpu")
-    assert loader._single_produce.pin_memory is False
-    for batch, _ in loader:
-        assert not batch["x"].is_pinned()
+    with CPUPrefetchLoader(
+        maker, seeds, num_workers=0, prefetch=False, pin_memory=False, device="cpu", worker_threads=2
+    ) as loader:
+        assert loader._single_produce.pin_memory is False
+        assert loader._single_produce.sampler.num_threads == 2
+        assert maker.sampler.num_threads == 8
+        for batch, _ in loader:
+            assert not batch["x"].is_pinned()
+
+
+def test_cpu_sampler_large_fanout_and_hash_path_and_copy_isolation():
+    import copy
+
+    # 1) fanout > 64 exercises the heap hash-set Floyd path (sample_row_large_fanout).
+    indptr = torch.tensor([0, 150] + [150] * 149, dtype=torch.int64)
+    indices = torch.arange(150, dtype=torch.int32)
+    s_big_f = CPUNeighborSampler(indptr, indices, [80], num_threads=4)
+    b = s_big_f.sample(torch.tensor([0]))
+    blk = b.blocks[0]
+    assert blk.num_edges == 80
+    nbrs = b.input_nodes[blk.indices.long()].tolist()
+    assert len(set(nbrs)) == 80 and min(nbrs) >= 0 and max(nbrs) < 150
+
+    # 2) Shallow copy must not share mutable C++ CpuSamplerState*.
+    s_copy = copy.copy(s_big_f)
+    assert s_copy._native is None
+    _ = s_copy.sample(torch.tensor([0]))
+    if s_big_f._native is not None and s_copy._native is not None:
+        assert s_big_f._native._ptr != s_copy._native._ptr
+
+    # 3) Hash-table frontier path (N > 4_000_000): verify exactness with zero O(N) table.
+    big_n = 4_000_010
+    big_ip = torch.zeros(big_n + 1, dtype=torch.int64)
+    big_ip[1:] = 20  # node 0 has 20 neighbors; all others have degree 0
+    big_ix = torch.tensor([big_n - 1 - k for k in range(20)], dtype=torch.int32)
+    s_hash = CPUNeighborSampler(big_ip, big_ix, [10], num_threads=4)
+    bh = s_hash.sample(torch.tensor([0, 5]))
+    assert bh.blocks[0].num_edges == 10
+    picked = set(bh.input_nodes[bh.blocks[0].indices.long()].tolist())
+    assert len(picked) == 10 and picked <= set(big_ix.tolist())
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_parallel_transpose_exact_sorted_order(index_dtype):
+    """Exercise the >= 65536-edge 32-way zero-atomic parallel CSR transpose in C++."""
+    indptr, indices, _, _, _ = make_random_graph(num_nodes=4000, num_edges=200000, feat_dim=8, seed=13)
+    sampler = CPUNeighborSampler(indptr, indices, [20, 15, 10], index_dtype=index_dtype, num_threads=8)
+    seeds = torch.randperm(4000)[:256]
+    batch = sampler.sample(seeds)
+    blk = batch.blocks[0]
+    assert blk.num_edges >= 65536
+
+    g = sampler.build_cuda_graph(blk, fwd_heavy_threshold=15, bwd_heavy_threshold=10, fwd_order="degree", bwd_order="degree")
+    ip, ix = g.forward_indptr.long(), g.forward_indices.long()
+    bp, bx = g.backward_indptr.long(), g.backward_indices.long()
+    assert bp.numel() == blk.num_src + 1 and int(bp[-1]) == blk.num_edges
+    dst_of = torch.repeat_interleave(torch.arange(blk.num_dst), ip[1:] - ip[:-1])
+    src_of = torch.repeat_interleave(torch.arange(blk.num_src), bp[1:] - bp[:-1])
+    # Exact (src, dst) sorted order must match forward pairs.
+    assert list(zip(src_of.tolist(), bx.tolist())) == sorted(zip(ix.tolist(), dst_of.tolist()))
+
+
+def test_native_cpu_sampler_has_no_openmp_dependency():
+    import subprocess
+    from src.sampling._cpu_sampler_cpp import _so_path, load_native_lib
+
+    lib = load_native_lib()
+    if lib is None:
+        pytest.skip("native C++ backend disabled or unavailable")
+    out = subprocess.check_output(["ldd", str(_so_path())], text=True)
+    assert "libgomp" not in out and "libiomp" not in out
+
+
+def test_parallel_large_fanout_hash_indptr_and_gather():
+    """Exercise parallel large fanout (>64), parallel hash path (N > 4M), parallel indptr (n >= 131072), and parallel gather (>= 2 MiB)."""
+    # 1) Parallel large fanout (>64) with >= 65536 sampled edges.
+    n_lf, deg_lf = 1000, 120
+    ip_lf = torch.arange(0, (n_lf + 1) * deg_lf, deg_lf, dtype=torch.int64)
+    ix_lf = (torch.arange(n_lf * deg_lf, dtype=torch.int32) % n_lf).contiguous()
+    s_lf = CPUNeighborSampler(ip_lf, ix_lf, [80], num_threads=4)
+    b_lf = s_lf.sample(torch.arange(n_lf))
+    assert b_lf.blocks[0].num_edges == n_lf * 80 >= 65536
+
+    # 2) Parallel hash-table path (N > 4_000_000) with >= 32768 sampled edges.
+    big_n = 4_000_050
+    deg_h = 16
+    active_h = 2500
+    ip_h = torch.zeros(big_n + 1, dtype=torch.int64)
+    ip_h[1 : active_h + 1] = torch.arange(1, active_h + 1, dtype=torch.int64) * deg_h
+    ip_h[active_h + 1 :] = active_h * deg_h
+    ix_h = (big_n - 1 - (torch.arange(active_h * deg_h, dtype=torch.int32) % 50000)).contiguous()
+    s_h = CPUNeighborSampler(ip_h, ix_h, [14], num_threads=4)
+    b_h = s_h.sample(torch.arange(active_h))
+    assert b_h.blocks[0].num_edges == active_h * 14 >= 32768
+    assert torch.unique(b_h.input_nodes).numel() == b_h.input_nodes.numel()
+
+    # 3) Parallel cpu_sample_layer_indptr (n >= 131072) + parallel cpu_gather_rows (>= 2 MiB).
+    n_big = 140_000
+    ip_big = torch.arange(n_big + 1, dtype=torch.int64)
+    ix_big = torch.arange(n_big, dtype=torch.int32)
+    x_big = torch.randn(n_big, 16, dtype=torch.float32)  # 140K * 64B = ~9 MiB (> 2 MiB parallel gather)
+    y_big = torch.arange(n_big, dtype=torch.int64)
+    maker = CPUBatchMaker(ip_big, ix_big, x_big, y_big, [1], seed=0)
+    maker.sampler.num_threads = 4
+    out = maker(torch.arange(n_big))
+    assert out["graphs"][0].num_dst == n_big and out["graphs"][0].forward_indices.numel() == n_big
+    assert torch.equal(out["x"], x_big) and torch.equal(out["y"], y_big)
+    # Single-process maker must reuse sampler._native's pool rather than creating a second _gather_state.
+    assert maker._gather_state is None
+
+
+def test_fork_after_parent_threadpool_active():
+    """mp_context='fork' must not deadlock or SIGABRT even after parent ThreadPool threads were spawned."""
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "import torch\n"
+        "torch.set_num_threads(1)\n"  # keep PyTorch's own OpenMP inactive; our C++17 ThreadPool runs with 4 threads
+        "from src.sampling import CPUBatchMaker, CPUPrefetchLoader, seed_batches\n"
+        "N, deg = 4000, 30\n"
+        "ip = torch.arange(0, (N + 1) * deg, deg, dtype=torch.int64)\n"
+        "ix = (torch.arange(N * deg, dtype=torch.int32) % N).contiguous()\n"
+        "x = torch.randn(N, 256, dtype=torch.float32)\n"  # 4000*1KB = 4MB -> triggers parallel gather
+        "y = torch.arange(N, dtype=torch.int64)\n"
+        "maker = CPUBatchMaker(ip, ix, x, y, [20], seed=0)\n"
+        "maker.sampler.num_threads = 4\n"
+        "# Case A: spawn parent sampler ThreadPool BEFORE forking.\n"
+        "_ = maker(torch.arange(3500))\n"
+        "seeds = seed_batches(torch.arange(2000), 500, shuffle=False)\n"
+        "# Case B: run 2 consecutive epochs with persistent_workers=False (forks again after gather pool).\n"
+        "with CPUPrefetchLoader(maker, num_workers=2, device='cpu', persistent_workers=False, mp_context='fork', worker_threads=2, seed=0) as loader:\n"
+        "    for ep in range(2):\n"
+        "        ys = [b['y'] for b, _ in loader.epoch(seeds)]\n"
+        "        assert torch.equal(torch.cat(ys), torch.arange(2000))\n"
+        "print('FORK_OK')\n"
+    )
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    res = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=60, check=False)
+    assert res.returncode == 0, f"fork test failed ({res.returncode}):\n{res.stderr}\n{res.stdout}"
+    assert "FORK_OK" in res.stdout
+
+
 
 
 

@@ -1,4 +1,4 @@
-"""C++17 + OpenMP backend for `CPUNeighborSampler` and `CPUBatchMaker`, loaded via ctypes.
+"""C++17 native backend (std::thread pool, no OpenMP) for `CPUNeighborSampler` and `CPUBatchMaker`, loaded via ctypes.
 
 Uses a plain ``extern "C"`` ABI so a single compiled shared library works across any Python
 and PyTorch version (e.g. both the main env and the torch-2.4 DGL baseline env) with zero
@@ -46,7 +46,7 @@ def _compile_if_needed(so_path: Path) -> bool:
     fd, tmp_name = tempfile.mkstemp(prefix=".cpu_sampler_", suffix=".so", dir=str(so_path.parent))
     os.close(fd)
     try:
-        flags = ["-O3", "-std=c++17", "-march=native", "-fopenmp", "-shared", "-fPIC", str(_SRC), "-o", tmp_name]
+        flags = ["-O3", "-std=c++17", "-march=native", "-pthread", "-shared", "-fPIC", str(_SRC), "-o", tmp_name]
         try:
             res = subprocess.run([*cxx_cmd, *flags], capture_output=True, text=True, check=False)
             if res.returncode != 0:
@@ -67,7 +67,7 @@ def _compile_if_needed(so_path: Path) -> bool:
 
 
 def load_native_lib() -> ctypes.CDLL | None:
-    """Return the compiled C++ OpenMP library, or None if disabled / unavailable."""
+    """Return the compiled C++17 native library (no OpenMP), or None if disabled / unavailable."""
     global _LIB, _TRIED
     if os.environ.get("TURBO_GNN_CPU_SAMPLER_PYTORCH", "").lower() in ("1", "true", "yes"):
         return None
@@ -100,7 +100,10 @@ def load_native_lib() -> ctypes.CDLL | None:
         lib.cpu_sampler_state_destroy.argtypes = [c_vp]
         lib.cpu_sampler_state_destroy.restype = None
 
-        lib.cpu_sample_layer_indptr.argtypes = [c_vp, c_vp, c_i64, c_i64, c_vp, c_i32, c_vp, c_i32]
+        lib.cpu_sampler_state_shutdown_pool.argtypes = [c_vp]
+        lib.cpu_sampler_state_shutdown_pool.restype = None
+
+        lib.cpu_sample_layer_indptr.argtypes = [c_vp, c_vp, c_vp, c_i64, c_i64, c_vp, c_i32, c_vp, c_i32]
         lib.cpu_sample_layer_indptr.restype = c_i64
 
         lib.cpu_sample_layer_edges.argtypes = [
@@ -119,7 +122,7 @@ def load_native_lib() -> ctypes.CDLL | None:
         lib.cpu_copy_buckets.argtypes = [c_vp, c_vp, c_vp, c_vp, c_vp, c_i32]
         lib.cpu_copy_buckets.restype = None
 
-        lib.cpu_gather_rows.argtypes = [c_vp, c_vp, c_vp, c_i64, c_i64, c_i32]
+        lib.cpu_gather_rows.argtypes = [c_vp, c_vp, c_vp, c_vp, c_i64, c_i64, c_i32]
         lib.cpu_gather_rows.restype = None
 
         _LIB = lib
@@ -134,12 +137,18 @@ class NativeSamplerState:
         self._lib = load_native_lib()
         self._ptr: int | None = None
         self.num_nodes = int(num_nodes)
+        self._indptr_i64_buf: torch.Tensor | None = None
         if self._lib is not None:
             self._ptr = self._lib.cpu_sampler_state_create(self.num_nodes)
 
     @property
     def available(self) -> bool:
         return self._lib is not None and self._ptr is not None
+
+    def shutdown_pool(self) -> None:
+        """Stop and join worker threads owned by this state (e.g. before os.fork())."""
+        if self._ptr is not None and self._lib is not None:
+            self._lib.cpu_sampler_state_shutdown_pool(self._ptr)
 
     def close(self) -> None:
         if self._ptr is not None and self._lib is not None:
@@ -163,10 +172,13 @@ class NativeSamplerState:
         n = dst.numel()
         out_is_i32 = 1 if index_dtype == torch.int32 else 0
         out_indptr = torch.empty(n + 1, dtype=index_dtype)
-        indptr_i64_buf = torch.empty(n + 1, dtype=torch.int64)
+        if self._indptr_i64_buf is None or self._indptr_i64_buf.numel() < n + 1:
+            self._indptr_i64_buf = torch.empty(max(n + 1, 4096), dtype=torch.int64)
+        indptr_i64_buf = self._indptr_i64_buf
 
         total_edges = int(
             self._lib.cpu_sample_layer_indptr(
+                self._ptr,
                 indptr.data_ptr(),
                 dst.data_ptr(),
                 n,
@@ -253,8 +265,14 @@ class NativeSamplerState:
         return bwd_indptr, bwd_indices, fwd_light, fwd_heavy, bwd_light, bwd_heavy
 
 
-def native_gather_rows(src: torch.Tensor, idx: torch.Tensor, dst: torch.Tensor, num_threads: int) -> bool:
-    """Gather ``dst[i] = src[idx[i]]`` via OpenMP memcpy when native backend is available."""
+def native_gather_rows(
+    src: torch.Tensor,
+    idx: torch.Tensor,
+    dst: torch.Tensor,
+    num_threads: int,
+    state: NativeSamplerState | None = None,
+) -> bool:
+    """Gather ``dst[i] = src[idx[i]]`` via C++17 ThreadPool memcpy (no OpenMP)."""
     lib = load_native_lib()
     if (
         lib is None
@@ -274,5 +292,6 @@ def native_gather_rows(src: torch.Tensor, idx: torch.Tensor, dst: torch.Tensor, 
     idx_c = idx if (idx.dtype == torch.int64 and idx.is_contiguous()) else idx.to(torch.int64).contiguous()
     row_elems = src.numel() // src.shape[0] if src.shape[0] > 0 else 0
     row_bytes = row_elems * src.element_size()
-    lib.cpu_gather_rows(src.data_ptr(), idx_c.data_ptr(), dst.data_ptr(), n, row_bytes, num_threads)
+    state_ptr = state._ptr if (state is not None and state.available) else None
+    lib.cpu_gather_rows(state_ptr, src.data_ptr(), idx_c.data_ptr(), dst.data_ptr(), n, row_bytes, num_threads)
     return True
