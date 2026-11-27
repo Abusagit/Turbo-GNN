@@ -32,7 +32,7 @@
 // the stores of one warp land on d consecutive elements of one edge row.
 template <
     BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t, FloatingNum accum_t,
-    int PIPELINE_STAGES = 0
+    int PIPELINE_STAGES = 0, bool RHS_GROUPED = false
 >
 __device__ __forceinline__ void gspmm_edge_grad_span(
     size_t v,
@@ -46,7 +46,8 @@ __device__ __forceinline__ void gspmm_edge_grad_span(
     cuda_t const *const __restrict__ rhs,
     grad_t *const __restrict__ grad_rhs,
     size_t d,
-    cuda_t *const dbuf = nullptr
+    cuda_t *const dbuf = nullptr,
+    RhsGroup grp       = {}
 ) {
     using BOps        = BinaryOps<BOp>;
     const size_t base = v * d;
@@ -56,26 +57,68 @@ __device__ __forceinline__ void gspmm_edge_grad_span(
     constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
 
     if constexpr (RHS_BROADCAST) {
-        // f_stride == kWarpSize and the callers are one full warp.
-        for (index_t eid = e_begin; eid < e_end; ++eid) {
-            size_t u_base = 0;
-            if constexpr (BOps::GRAD_USES_OPERANDS) {
-                u_base = static_cast<size_t>(edge_idx[eid]) * d;
-            }
-            accum_t partial{};
-            for (size_t f = fid; f < d; f += kWarpSize) {
-                const accum_t g = static_cast<accum_t>(grad_out[base + f]);
-                accum_t u_val{};
-                accum_t e_val{};
+        if constexpr (RHS_GROUPED) {
+            // f_stride == kWarpSize and the callers are one full warp.  The fold sums
+            // an edge's features into its slot -- one per head with a per-head rhs
+            // ([E, cols]): each 32-wide step lies in one head (f - fid is a multiple of
+            // 32, the per-head width a multiple of 32), so the running sum is flushed
+            // whenever the step's head changes. With cols > 1, d = cols * 2^shift is a
+            // multiple of 32, so every lane runs the same steps and the in-loop
+            // shuffles stay full-warp; a plain broadcast (shift 31) never flushes early.
+            for (index_t eid = e_begin; eid < e_end; ++eid) {
+                size_t u_base = 0;
                 if constexpr (BOps::GRAD_USES_OPERANDS) {
-                    u_val = static_cast<accum_t>(lhs[u_base + f]);
-                    e_val = static_cast<accum_t>(rhs[static_cast<size_t>(eid)]);
+                    u_base = static_cast<size_t>(edge_idx[eid]) * d;
                 }
-                partial += BOps::grad_rhs(u_val, e_val, g);
+                const size_t e_row = static_cast<size_t>(eid) * grp.cols;
+                accum_t partial{};
+                size_t head = 0;
+                for (size_t f = fid; f < d; f += kWarpSize) {
+                    const size_t step_head = (f - fid) >> grp.shift;
+                    if (step_head != head) {
+                        const accum_t total = warp_reduce_sum(partial);
+                        if (fid == 0) {
+                            grad_rhs[e_row + head] = static_cast<grad_t>(total);
+                        }
+                        partial = accum_t{};
+                        head    = step_head;
+                    }
+                    const accum_t g = static_cast<accum_t>(grad_out[base + f]);
+                    accum_t u_val{};
+                    accum_t e_val{};
+                    if constexpr (BOps::GRAD_USES_OPERANDS) {
+                        u_val = static_cast<accum_t>(lhs[u_base + f]);
+                        e_val = static_cast<accum_t>(rhs[e_row + head]);
+                    }
+                    partial += BOps::grad_rhs(u_val, e_val, g);
+                }
+                partial = warp_reduce_sum(partial);
+                if (fid == 0) {
+                    grad_rhs[e_row + head] = static_cast<grad_t>(partial);
+                }
             }
-            partial = warp_reduce_sum(partial);
-            if (fid == 0) {
-                grad_rhs[static_cast<size_t>(eid)] = static_cast<grad_t>(partial);
+        } else {
+            // f_stride == kWarpSize and the callers are one full warp.
+            for (index_t eid = e_begin; eid < e_end; ++eid) {
+                size_t u_base = 0;
+                if constexpr (BOps::GRAD_USES_OPERANDS) {
+                    u_base = static_cast<size_t>(edge_idx[eid]) * d;
+                }
+                accum_t partial{};
+                for (size_t f = fid; f < d; f += kWarpSize) {
+                    const accum_t g = static_cast<accum_t>(grad_out[base + f]);
+                    accum_t u_val{};
+                    accum_t e_val{};
+                    if constexpr (BOps::GRAD_USES_OPERANDS) {
+                        u_val = static_cast<accum_t>(lhs[u_base + f]);
+                        e_val = static_cast<accum_t>(rhs[static_cast<size_t>(eid)]);
+                    }
+                    partial += BOps::grad_rhs(u_val, e_val, g);
+                }
+                partial = warp_reduce_sum(partial);
+                if (fid == 0) {
+                    grad_rhs[static_cast<size_t>(eid)] = static_cast<grad_t>(partial);
+                }
             }
         }
     } else {
@@ -116,7 +159,7 @@ __host__ __device__ inline size_t gspmm_edge_grad_shmem_bytes(size_t threads) {
 
 template <
     BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, FloatingNum grad_t = cuda_t, FloatingNum accum_t = float,
-    int PIPELINE_STAGES = 0
+    int PIPELINE_STAGES = 0, bool RHS_GROUPED = false
 >
 __global__ void gspmm_backward_edge_light_kernel(
     index_t const *const __restrict__ light_nodes,
@@ -127,7 +170,8 @@ __global__ void gspmm_backward_edge_light_kernel(
     cuda_t const *const __restrict__ rhs,
     grad_t *const __restrict__ grad_rhs,
     size_t num_light,
-    size_t d
+    size_t d,
+    RhsGroup rhs_group = {}
 ) {
     extern __shared__ __align__(16) uint8_t edge_light_raw[];
     constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
@@ -138,14 +182,14 @@ __global__ void gspmm_backward_edge_light_kernel(
         return;  // a whole y-row leaves together, so the broadcast shuffles below stay full-warp
     }
     const index_t v = light_nodes[i];
-    gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES>(
-        static_cast<size_t>(v), edge_ptr[v], edge_ptr[v + 1], threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf
+    gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES, RHS_GROUPED>(
+        static_cast<size_t>(v), edge_ptr[v], edge_ptr[v + 1], threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf, rhs_group
     );
 }
 
 template <
     BinaryOp BOp, bool RHS_BROADCAST, FloatingNum cuda_t, typename index_t, size_t CHUNK_EDGES, FloatingNum grad_t = cuda_t,
-    FloatingNum accum_t = float, int PIPELINE_STAGES = 0
+    FloatingNum accum_t = float, int PIPELINE_STAGES = 0, bool RHS_GROUPED = false
 >
 __global__ void gspmm_backward_edge_heavy_kernel(
     index_t const *const __restrict__ heavy_nodes,
@@ -157,7 +201,8 @@ __global__ void gspmm_backward_edge_heavy_kernel(
     cuda_t const *const __restrict__ rhs,
     grad_t *const __restrict__ grad_rhs,
     size_t num_heavy,
-    size_t d
+    size_t d,
+    RhsGroup rhs_group = {}
 ) {
     extern __shared__ __align__(16) uint8_t edge_heavy_raw[];
     constexpr size_t NUM_STAGES = PIPELINE_STAGES > 0 ? PIPELINE_STAGES : 1;
@@ -173,9 +218,9 @@ __global__ void gspmm_backward_edge_heavy_kernel(
         const size_t per_tile   = (c_len + tiles - 1) / tiles;
         const size_t t_begin    = min(tid * per_tile, c_len);
         const size_t t_end      = min(t_begin + per_tile, c_len);
-        gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES>(
+        gspmm_edge_grad_span<BOp, RHS_BROADCAST, cuda_t, index_t, grad_t, accum_t, PIPELINE_STAGES, RHS_GROUPED>(
             static_cast<size_t>(v), row_start + static_cast<index_t>(c_begin + t_begin), row_start + static_cast<index_t>(c_begin + t_end),
-            threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf
+            threadIdx.x, blockDim.x, edge_idx, grad_out, lhs, rhs, grad_rhs, d, dbuf, rhs_group
         );
     };
 
@@ -533,7 +578,7 @@ __host__ __device__ inline size_t gspmm_sliced_shmem_bytes(size_t slots) {
 
 template <
     FloatingNum cuda_t, typename index_t, ReductionOp ROp, BinaryOp BOp, bool RHS_BROADCAST, bool EDGE_MAP, size_t SLICE_EDGES,
-    int PIPELINE_STAGES = 0, FloatingNum accum_t = float
+    int PIPELINE_STAGES = 0, FloatingNum accum_t = float, bool RHS_GROUPED = false
 >
 __global__ void gspmm_heavy_sliced_kernel(
     index_t const *const __restrict__ heavy_nodes,
@@ -546,7 +591,8 @@ __global__ void gspmm_heavy_sliced_kernel(
     accum_t *const __restrict__ partials,
     index_t *const __restrict__ partial_args,
     size_t num_heavy,
-    size_t d
+    size_t d,
+    RhsGroup rhs_group = {}
 ) {
     using BOps     = BinaryOps<BOp>;
     using ROps     = ReductionOps<ROp>;
@@ -613,7 +659,7 @@ __global__ void gspmm_heavy_sliced_kernel(
             auto visit = [&](index_t /*src*/, index_t eid, cuda_t const *uslice) {
                 accum_t msg[1];
                 const index_t e_pos = aggr_edge_data_pos<EDGE_MAP, index_t>(eid, edge_map);
-                aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t>(uslice, rhs, e_pos, f, d, msg);
+                aggr_edge_message<BOp, RHS_BROADCAST, 1, cuda_t, index_t, accum_t, RHS_GROUPED>(uslice, rhs, e_pos, f, d, msg, rhs_group);
                 bool upgrade_index = false;
                 acc                = ROps::reduce(static_cast<acc_t>(msg[0]), acc, upgrade_index);
                 if constexpr (TRACKS_ARG) {

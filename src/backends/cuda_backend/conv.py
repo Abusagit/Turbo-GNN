@@ -93,7 +93,11 @@ class _CUDAGATv2Conv(BaseConvolution):
         **kwargs: Any,
     ) -> None:
         super().__init__(num_heads=heads, bias=bias, **kwargs)
-        self.left_right_projection = nn.Linear(feature_dim, 2 * feature_dim * heads, bias=bias)
+        # Separate destination/source projections, as DGL's GATv2Conv (share_weights=False):
+        # on a sampled block l is needed for the num_dst destination rows only, r for all
+        # num_src source rows, so one fused GEMM would compute l for rows it throws away.
+        self.fc_dst = nn.Linear(feature_dim, feature_dim * heads, bias=bias)
+        self.fc_src = nn.Linear(feature_dim, feature_dim * heads, bias=bias)
         self._outer_proj = torch.nn.Linear(feature_dim * heads, feature_dim, bias=bias)
 
         self.negative_slope = negative_slope
@@ -104,8 +108,19 @@ class _CUDAGATv2Conv(BaseConvolution):
 
         self.attn_weights = nn.Parameter(torch.FloatTensor(size=(heads, feature_dim)))
 
+        # Same initialisation as dgl.nn.GATv2Conv.reset_parameters, so mini-batch DGL-vs-ours
+        # comparisons start from the same distribution: xavier-normal (gain relu) projections,
+        # zero biases, and the attention vector initialised as DGL's [1, H, D] tensor -- its
+        # fan-in is H*D, not D, so initialising the [H, D] view directly would be ~2x too wide.
         gain = nn.init.calculate_gain("relu")
-        nn.init.xavier_normal_(self.attn_weights, gain=gain)
+        for lin in (self.fc_src, self.fc_dst):
+            nn.init.xavier_normal_(lin.weight, gain=gain)
+            if lin.bias is not None:
+                nn.init.zeros_(lin.bias)
+        attn = torch.empty(1, heads, feature_dim)
+        nn.init.xavier_normal_(attn, gain=gain)
+        with torch.no_grad():
+            self.attn_weights.copy_(attn[0])
 
         self.kernel = GATv2AggrKernel(**kwargs)
         self.register_kernel(self.kernel)
@@ -118,7 +133,21 @@ class _CUDAGATv2Conv(BaseConvolution):
         edge_weight: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        x_left, x_right = self.left_right_projection(x).split(self.heads * self.head_dim, -1)
+        # x holds the source nodes; destinations are its first num_dst rows (equal for a full graph).
+        x_dst = x[: graph.num_dst]
+        return self.forward_projected(self.fc_dst(x_dst), self.fc_src(x), graph)
+
+    def forward_projected(
+        self,
+        x_left: torch.Tensor,
+        x_right: torch.Tensor,
+        graph: AdjacencyForwardBackwardWithNodeBuckets,
+    ) -> torch.Tensor:
+        """Aggregate already-projected features: x_left [num_dst, H*D], x_right [num_src, H*D].
+
+        Split out so a caller can produce both projections itself (the fused
+        `prefix_grad="inplace"` path in ResidualBlock).
+        """
         x_left = x_left.view(-1, self.heads, self.head_dim)
         x_right = x_right.view(-1, self.heads, self.head_dim)
 
@@ -126,12 +155,12 @@ class _CUDAGATv2Conv(BaseConvolution):
             graph,
             x_left,
             x_neighbors=x_right,
-            attention_weights=self.attn_weights.data,
+            # Not `.data`: the kernel returns grad_attention and the vector must train.
+            attention_weights=self.attn_weights,
             negative_slope=self.negative_slope,
         ).view(-1, self.heads * self.head_dim)
 
-        out = self._outer_proj(out)
-        return out
+        return self._outer_proj(out)
 
 
 class _CudaGraphTransformerConv(BaseConvolution):

@@ -55,11 +55,17 @@ class GNNEncoder(nn.Module):
 
         Args:
             x (torch.Tensor): Node features [N, Fin].
-            graph (Any): Graph container accepted by backend blocks.
+            graph (Any): Graph container accepted by backend blocks, or -- for mini-batch
+                training -- a list with one sampled block per layer (outermost first).
 
         Returns:
             torch.Tensor: Node embeddings after final block [N, Fout].
         """
+        if isinstance(graph, (list, tuple)):
+            assert len(graph) == len(self.blocks), f"{len(graph)} blocks for {len(self.blocks)} layers"
+            for block, g in zip(self.blocks, graph):
+                x = block(x, g)
+            return x
         for block in self.blocks:
             x = block(x, graph)
         return x

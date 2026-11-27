@@ -50,6 +50,56 @@ void check_rows(int64_t N, int64_t E, const torch::Tensor& t, GSDDMM_MEMBER memb
     }
 }
 
+// Operand layout shared by all four entry points: [rows, D] (heads = 1) or the
+// multi-head [rows, heads, D], heads contiguous, D the per-head width the kernels
+// are instantiated for. R must match L's layout whenever the op reads it; Copy's
+// R is a never-read stand-in and is not checked. Shape errors are reported here,
+// before any kernel is selected, so they never surface as "no kernel".
+struct HeadLayout {
+    int64_t heads;
+    int64_t D;
+    bool multi;  // the operands are 3-D
+};
+
+HeadLayout check_head_layout(const torch::Tensor& L, const torch::Tensor& R, bool uses_r, const char *ctx) {
+    TORCH_CHECK(L.dim() == 2 || L.dim() == 3, ctx, ": L must be [rows, D] or [rows, heads, D], got shape ", L.sizes());
+    const bool multi    = L.dim() == 3;
+    const int64_t heads = multi ? L.size(1) : 1;
+    const int64_t D     = L.size(-1);
+    // Within a row the [heads, D] block must be dense (the kernels address head h
+    // at h * D); the row stride itself is the caller's (contiguous rows, or the
+    // stride-0 stand-ins the Python layer passes for operands it never reads).
+    auto dense_row = [&](const torch::Tensor& t) { return t.stride(-1) == 1 && (!multi || t.size(1) == 1 || t.stride(1) == D); };
+    TORCH_CHECK(dense_row(L), ctx, ": L's [heads, D] block must be dense within a row, got strides ", L.strides());
+    if (uses_r) {
+        TORCH_CHECK(
+            R.dim() == L.dim() && R.size(-1) == D && (!multi || R.size(1) == heads), ctx, ": L and R must share the [heads, D] layout, got L ",
+            L.sizes(), " and R ", R.sizes()
+        );
+        TORCH_CHECK(dense_row(R), ctx, ": R's [heads, D] block must be dense within a row, got strides ", R.strides());
+    }
+    TORCH_CHECK(heads >= 1 && heads <= 65535, ctx, ": heads must be in [1, 65535], got ", heads);
+    TORCH_CHECK(
+        D == 32 || D == 64 || D == 128 || D == 256, ctx, ": unsupported per-head feature dim D=", D, "; supported: 32, 64, 128, 256",
+        multi ? " (a [rows, heads, D] operand may have any number of heads)" : " (pass [rows, heads, D] for wider multi-head rows)"
+    );
+    return {heads, D, multi};
+}
+
+// Shape of a per-edge tensor (the forward output, dO) for `rows` rows: one value
+// per row and head for dot, a feature row otherwise.
+std::vector<int64_t> edge_shape(int64_t rows, const HeadLayout& lay, bool is_dot) {
+    if (is_dot) {
+        return lay.multi ? std::vector<int64_t>{rows, lay.heads} : std::vector<int64_t>{rows};
+    }
+    return lay.multi ? std::vector<int64_t>{rows, lay.heads, lay.D} : std::vector<int64_t>{rows, lay.D};
+}
+
+// Shape of an operand-shaped tensor (a gradient) with `rows` rows.
+std::vector<int64_t> operand_shape(int64_t rows, const HeadLayout& lay) {
+    return lay.multi ? std::vector<int64_t>{rows, lay.heads, lay.D} : std::vector<int64_t>{rows, lay.D};
+}
+
 // [E, 2] (src, dst) pair list in one of the supported index dtypes, contiguous
 // so it can be reinterpreted as index_pair_t<index_t> rows: is_contiguous also
 // pins stride(0) to 2, which those one-pair-per-lane vector loads rely on --
@@ -129,12 +179,11 @@ torch::Tensor gsddmm_forward_cuda(
     TORCH_CHECK(L.is_cuda() && R.is_cuda(), "L and R must be CUDA");
     TORCH_CHECK(row_ptr.is_cuda() && col_idx.is_cuda(), "CSR indices must be CUDA");
     TORCH_CHECK(light_nodes.is_cuda() && heavy_nodes.is_cuda(), "node buckets must be CUDA");
-    TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
     );
     TORCH_CHECK(R.dtype() == L.dtype(), "L and R must have the same dtype");
-    TORCH_CHECK(L.stride(1) == 1 && R.stride(1) == 1, "Feature dim (D) must be contiguous for L and R");
+    const HeadLayout lay = check_head_layout(L, R, op_enum != GSDDMM_OP::Copy, "GSDDMM forward");
 
     const auto idx_dtype = row_ptr.scalar_type();
     TORCH_CHECK(is_supported_index_type(idx_dtype), "row_ptr must be int32, int64, uint32, or uint64");
@@ -151,15 +200,12 @@ torch::Tensor gsddmm_forward_cuda(
 
     const int64_t N = row_ptr.size(0) - 1;
     const int64_t E = col_idx.size(0);
-    const int64_t D = L.size(1);
-    TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
+    const int64_t D = lay.D;
 
     check_rows(N, E, L, lhs_member, "L");
     check_rows(N, E, R, rhs_member, "R");
 
-    torch::Tensor O = is_dot ? torch::empty({E}, L.options()) : torch::empty({E, D}, L.options());
-
-    TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
+    torch::Tensor O = torch::empty(edge_shape(E, lay, is_dot), L.options());
 
     const bool chunked = heavy_block_parts.has_value() && heavy_block_parts->numel() > 0;
     if (chunked) {
@@ -192,6 +238,7 @@ torch::Tensor gsddmm_forward_cuda(
         .heavy_block_parts     = chunked ? &*heavy_block_parts : nullptr,
         .heavy_edges_per_block = chunked ? heavy_edges_per_block : 0u,
         .overlap_buckets       = overlap_buckets,
+        .heads = static_cast<uint32_t>(lay.heads),
     };
 
     // One call per op, each resolved in its own translation unit.
@@ -249,27 +296,20 @@ torch::Tensor gsddmm_forward_edge_blocks(
     TORCH_CHECK(is_supported_index_type(edge_list.scalar_type()), "edge_list must be int32, uint32, int64 or uint64");
     const at::ScalarType edge_idx_dtype = edge_list.scalar_type();
     check_edge_list(edge_list, edge_idx_dtype, "edge_list");
-    TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
     );
     TORCH_CHECK(R.dtype() == L.dtype(), "L and R must have the same dtype");
-    TORCH_CHECK(L.stride(1) == 1 && R.stride(1) == 1, "Feature dim (D) must be contiguous for L and R");
+    const HeadLayout lay = check_head_layout(L, R, op_enum != GSDDMM_OP::Copy, "GSDDMM forward (edge blocks)");
 
     const uint64_t E = edge_list.size(0);
     TORCH_CHECK(E <= (1ull << 63ull) - 1ull, "Too many edges. This kernel supports only up to 2^63 - 1 edges.");
-    const uint64_t D = L.size(1);
-    TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
+    const uint64_t D = static_cast<uint64_t>(lay.D);
 
     check_rows(static_cast<int64_t>(N), static_cast<int64_t>(E), L, lhs_member, "L");
     check_rows(static_cast<int64_t>(N), static_cast<int64_t>(E), R, rhs_member, "R");
 
-    torch::Tensor O = is_dot ? torch::empty({static_cast<int64_t>(E)}, L.options())
-                             : torch::empty({static_cast<int64_t>(E), static_cast<int64_t>(D)}, L.options());
-
-    TORCH_CHECK(
-        D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM forward (edge blocks): unsupported feature dim D=", D, "; supported: 32, 64, 128, 256"
-    );
+    torch::Tensor O = torch::empty(edge_shape(static_cast<int64_t>(E), lay, is_dot), L.options());
 
     TORCH_CHECK(pipeline_stages <= 3, "GSDDMM forward (edge blocks): pipeline_stages must be in [0, 3], got ", pipeline_stages);
     TORCH_CHECK(
@@ -302,6 +342,7 @@ torch::Tensor gsddmm_forward_edge_blocks(
         .pipeline_stages    = static_cast<uint8_t>(pipeline_stages),
         .edges_per_warp     = static_cast<uint8_t>(edges_per_warp),
         .warps_per_block    = static_cast<uint8_t>(warps_per_block),
+        .heads = static_cast<uint32_t>(lay.heads),
     };
 
     // One call per op, each resolved in its own translation unit.
@@ -336,36 +377,27 @@ BackwardPasses backward_passes(GSDDMM_OP op, GSDDMM_MEMBER lhs, GSDDMM_MEMBER rh
     return {reads(GSDDMM_MEMBER::Dst_V), reads(GSDDMM_MEMBER::Src_V), uses_rhs && reads(GSDDMM_MEMBER::Edge)};
 }
 
-// Shared validation for both backward entry points. Returns the feature dim.
-int64_t check_backward_operands(
+// Shared validation for both backward entry points. Returns the operand layout.
+HeadLayout check_backward_operands(
     const torch::Tensor& L, const torch::Tensor& R, const torch::Tensor& dO, GSDDMM_OP op_enum, GSDDMM_MEMBER lhs_member,
     GSDDMM_MEMBER rhs_member, int64_t N, int64_t E
 ) {
     TORCH_CHECK(L.is_cuda() && R.is_cuda() && dO.is_cuda(), "L, R and dO must be CUDA");
-    TORCH_CHECK(L.dim() == 2 && R.dim() == 2, "L and R must be [*, D]");
     TORCH_CHECK(
         L.dtype() == torch::kFloat32 || L.dtype() == torch::kFloat16 || L.dtype() == torch::kBFloat16, "L must be float32, float16, or bfloat16"
     );
     TORCH_CHECK(R.dtype() == L.dtype() && dO.dtype() == L.dtype(), "L, R and dO must share a dtype");
-    TORCH_CHECK(L.stride(1) == 1 && R.stride(1) == 1, "Feature dim (D) must be contiguous for L and R");
-
-    const int64_t D = L.size(1);
-    TORCH_CHECK(R.size(1) == D, "L and R must have the same feature dim D");
-    TORCH_CHECK(D == 32 || D == 64 || D == 128 || D == 256, "GSDDMM backward: unsupported feature dim D=", D, "; supported: 32, 64, 128, 256");
+    const HeadLayout lay = check_head_layout(L, R, op_enum != GSDDMM_OP::Copy, "GSDDMM backward");
 
     check_rows(N, E, L, lhs_member, "L");
     check_rows(N, E, R, rhs_member, "R");
 
-    // dot reduces the feature axis, so its output -- and its gradient -- is [E].
-    if (op_enum == GSDDMM_OP::Dot) {
-        TORCH_CHECK(dO.dim() == 1 && dO.size(0) == E, "GSDDMM backward: dO for 'dot' must be [E=", E, "], got ", dO.sizes());
-    } else {
-        TORCH_CHECK(
-            dO.dim() == 2 && dO.size(0) == E && dO.size(1) == D, "GSDDMM backward: dO must be [E=", E, ", D=", D, "], got ", dO.sizes()
-        );
-    }
+    // dot reduces each head's feature axis, so its output -- and its gradient --
+    // is [E] ([E, heads] for multi-head operands); the others are operand-shaped rows.
+    const std::vector<int64_t> want = edge_shape(E, lay, op_enum == GSDDMM_OP::Dot);
+    TORCH_CHECK(dO.sizes() == c10::IntArrayRef(want), "GSDDMM backward: dO must have shape ", c10::IntArrayRef(want), ", got ", dO.sizes());
     TORCH_CHECK(dO.is_contiguous(), "GSDDMM backward: dO must be contiguous");
-    return D;
+    return lay;
 }
 
 }  // namespace
@@ -421,7 +453,8 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
 
     const int64_t N = row_ptr.size(0) - 1;
     const int64_t E = col_idx.size(0);
-    const int64_t D = check_backward_operands(L, R, dO, op_enum, lhs_member, rhs_member, N, E);
+    const HeadLayout lay = check_backward_operands(L, R, dO, op_enum, lhs_member, rhs_member, N, E);
+    const int64_t D      = lay.D;
 
     if (passes.src) {
         TORCH_CHECK(row_ptr_T.is_cuda() && col_idx_T.is_cuda(), "GSDDMM backward: the backward CSR must be CUDA for a source-side gradient");
@@ -447,9 +480,9 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
     }
 
     auto rows_of     = [&](GSDDMM_MEMBER member) { return member == GSDDMM_MEMBER::Edge ? E : N; };
-    torch::Tensor dL = torch::empty({rows_of(lhs_member), D}, L.options());
+    torch::Tensor dL = torch::empty(operand_shape(rows_of(lhs_member), lay), L.options());
     // Copy never reads R, so it has no gradient to return.
-    torch::Tensor dR = (op_enum == GSDDMM_OP::Copy) ? torch::empty({0}, L.options()) : torch::empty({rows_of(rhs_member), D}, L.options());
+    torch::Tensor dR = (op_enum == GSDDMM_OP::Copy) ? torch::empty({0}, L.options()) : torch::empty(operand_shape(rows_of(rhs_member), lay), L.options());
 
     GsddmmBackwardLaunchArgs args{
         .L       = L,
@@ -475,6 +508,7 @@ std::vector<torch::Tensor> gsddmm_backward_cuda(
         .key                   = LRO{lhs_member, rhs_member, op_enum},
         .light_warps_per_block = static_cast<uint16_t>(light_warps_per_block),
         .heavy_warps_per_block = static_cast<uint16_t>(heavy_warps_per_block),
+        .heads = static_cast<uint32_t>(lay.heads),
     };
 
     switch (op_enum) {
@@ -538,7 +572,8 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     check_edge_list(edge_list_dst, edge_idx_dtype, "edge_list_dst");
 
     const int64_t E = edge_list_dst.size(0);
-    const int64_t D = check_backward_operands(L, R, dO, op_enum, lhs_member, rhs_member, static_cast<int64_t>(N), E);
+    const HeadLayout lay = check_backward_operands(L, R, dO, op_enum, lhs_member, rhs_member, static_cast<int64_t>(N), E);
+    const int64_t D      = lay.D;
 
     TORCH_CHECK(
         edges_per_warp >= 1 && edges_per_warp <= kGsddmmEdgeMaxEdgesPerWarp, "GSDDMM backward (edge blocks): edges_per_warp must be in [1, ",
@@ -575,14 +610,14 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
     auto rows_of           = [&](GSDDMM_MEMBER member) { return member == GSDDMM_MEMBER::Edge ? E : static_cast<int64_t>(N); };
     const auto f32_options = L.options().dtype(torch::kFloat32);
 
-    torch::Tensor dL = torch::empty({rows_of(lhs_member), D}, L.options());
-    torch::Tensor dR = (op_enum == GSDDMM_OP::Copy) ? torch::empty({0}, L.options()) : torch::empty({rows_of(rhs_member), D}, L.options());
+    torch::Tensor dL = torch::empty(operand_shape(rows_of(lhs_member), lay), L.options());
+    torch::Tensor dR = (op_enum == GSDDMM_OP::Copy) ? torch::empty({0}, L.options()) : torch::empty(operand_shape(rows_of(rhs_member), lay), L.options());
     // Node gradients are accumulated atomically, so they start at zero and live
     // in fp32; an edge operand's gradient is a plain store into dL / dR directly.
     const bool lhs_is_node = lhs_member != GSDDMM_MEMBER::Edge;
     const bool rhs_is_node = op_enum != GSDDMM_OP::Copy && rhs_member != GSDDMM_MEMBER::Edge;
-    torch::Tensor dL_f32   = lhs_is_node ? torch::zeros({rows_of(lhs_member), D}, f32_options) : torch::empty({0}, f32_options);
-    torch::Tensor dR_f32   = rhs_is_node ? torch::zeros({rows_of(rhs_member), D}, f32_options) : torch::empty({0}, f32_options);
+    torch::Tensor dL_f32   = lhs_is_node ? torch::zeros(operand_shape(rows_of(lhs_member), lay), f32_options) : torch::empty({0}, f32_options);
+    torch::Tensor dR_f32   = rhs_is_node ? torch::zeros(operand_shape(rows_of(rhs_member), lay), f32_options) : torch::empty({0}, f32_options);
 
     GsddmmBackwardLaunchArgsEdge args{
         .L                  = L,
@@ -603,6 +638,7 @@ std::vector<torch::Tensor> gsddmm_backward_edge_blocks(
         .pipeline_stages    = static_cast<uint8_t>(pipeline_stages),
         .edges_per_warp     = static_cast<uint8_t>(edges_per_warp),
         .warps_per_block    = static_cast<uint8_t>(warps_per_block),
+        .heads = static_cast<uint32_t>(lay.heads),
     };
 
     switch (op_enum) {

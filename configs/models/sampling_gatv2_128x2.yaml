@@ -1,0 +1,20 @@
+# Mini-batch neighbor-sampling rebuttal model (scripts/train_sampled.py).
+# One layer template; the runner repeats it len(--fanouts) times.
+# GATv2 here: out_channels is the per-head width (our kernel needs 32/64/128/256),
+# 2 heads x 128 (rebuttal full-graph variant: half the per-edge state of the 4x128 setup).
+architecture: node_classifier
+dropout: 0.0
+
+encoder:
+  layers:
+    - layer_type: residual_block
+      conv_type: null  # set by the runner (gat_v2)
+      backend: null    # set by the runner (cuda | dgl)
+      in_channels: auto
+      out_channels: 128
+      heads: 2
+      norm: layer
+      activation: silu
+      dropout: 0.0
+      residual: true
+      conv_kwargs: {}

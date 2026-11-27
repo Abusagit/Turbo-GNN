@@ -73,6 +73,7 @@ __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
     cuda_t const *__restrict__ const (&row_bases)[NUM_ROWS],
     bool const (&row_edge_indexed)[NUM_ROWS],
     cuda_t *__restrict__ dbuf,
+    size_t row_stride,  // elements between consecutive rows: heads * D_CONST
     ConsumeFn&& consume
 ) {
     const uint32_t loop_iters = static_cast<uint32_t>((num_edges > warp_id) ? ceil_div(num_edges - warp_id, N_PER_BLOCK) : size_t{0});
@@ -84,13 +85,13 @@ __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
         return edge_start + static_cast<index_t>(k);
     };
 
-    auto addr = [edge_of, row_bases, col_idx, row_edge_indexed](uint32_t it, cuda_t const *(&srcs)[NUM_ROWS]) {
+    auto addr = [edge_of, row_bases, col_idx, row_edge_indexed, row_stride](uint32_t it, cuda_t const *(&srcs)[NUM_ROWS]) {
         const index_t e = edge_of(it);
         const index_t j = col_idx[e];
 #pragma unroll
         for (size_t r = 0; r < NUM_ROWS; ++r) {
             const size_t row_id = row_edge_indexed[r] ? static_cast<size_t>(e) : static_cast<size_t>(j);
-            srcs[r]             = row_bases[r] + row_id * D_CONST;
+            srcs[r]             = row_bases[r] + row_id * row_stride;
         }
     };
     auto consume_it = [edge_of, &consume](uint32_t it, cuda_t const *const (&rows)[NUM_ROWS]) {
@@ -103,13 +104,14 @@ __device__ __forceinline__ void gsddmm_pipelined_edge_loop(
 // =============================================================================
 // GSDDMM forward kernel. See gsddmm.cuh for semantics and conventions.
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES, bool MULTI_HEAD>
 __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
     index_t const *__restrict__ node_indices,
-    index_t const *__restrict__ block_part, uint32_t edges_per_block
+    index_t const *__restrict__ block_part, uint32_t edges_per_block,
+    uint32_t heads
 ) {
     using Plan  = GsddmmPlan<op, ll, rr>;
     using Shape = GsddmmRowShape<D_CONST, cuda_t, accum_t>;
@@ -139,6 +141,22 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
 
     if (node_i >= N) [[unlikely]] {
         return;
+    }
+
+    // Multi-head operands ([rows, heads, D_CONST], heads contiguous): head blockIdx.y
+    // works on its own D_CONST-wide slice of every row, so the kernel body is the
+    // single-head one with row stride heads * D_CONST. The 2-D instantiation
+    // (MULTI_HEAD false) keeps the compile-time stride D_CONST and no offsets: its
+    // code is the pre-multi-head kernel's.
+    const size_t RS = MULTI_HEAD ? static_cast<size_t>(heads) * D_CONST : D_CONST;
+    const size_t HD = MULTI_HEAD ? static_cast<size_t>(heads) : size_t{1};  // dot output stride
+    if constexpr (MULTI_HEAD) {
+        const size_t head = blockIdx.y;
+        L += head * D_CONST;
+        if constexpr (Plan::USE_R) {
+            R += head * D_CONST;
+        }
+        O += Plan::IS_DOT ? head : head * D_CONST;
     }
 
     index_t edge_start = row_ptr[node_i];
@@ -176,14 +194,14 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
         constexpr size_t NUM_THREADS  = N_PER_BLOCK * kWarpSize;
 
         if constexpr (Plan::L_DST) {
-            float4 const *const src = reinterpret_cast<float4 const *>(L + node_i * D_CONST);
+            float4 const *const src = reinterpret_cast<float4 const *>(L + node_i * RS);
             float4 *const dst       = reinterpret_cast<float4 *>(dst_sh);
             for (size_t i = tid; i < NUM_LOADS; i += NUM_THREADS) {
                 dst[i] = src[i];
             }
         }
         if constexpr (Plan::R_DST) {
-            float4 const *const src = reinterpret_cast<float4 const *>(R + node_i * D_CONST);
+            float4 const *const src = reinterpret_cast<float4 const *>(R + node_i * RS);
             float4 *const dst       = reinterpret_cast<float4 *>(dst_sh + (Plan::L_DST ? D_CONST : 0));
             for (size_t i = tid; i < NUM_LOADS; i += NUM_THREADS) {
                 dst[i] = src[i];
@@ -200,9 +218,9 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
     // consume(e, rows): apply the op for edge e. rows[] holds the per-edge
     // operand rows (shared-memory slots when pipelined, global rows otherwise);
     // Dst_V operands are taken from the staged shared rows instead.
-    auto consume = [lane_id, sh_l, sh_r, &O](size_t e, cuda_t const *const(&rows)[ROWS_CAP]) {
+    auto consume = [lane_id, sh_l, sh_r, &O, RS, HD](size_t e, cuda_t const *const(&rows)[ROWS_CAP]) {
         if constexpr (!Plan::IS_DOT) {
-            cuda_t *const o_row = O + e * D_CONST;
+            cuda_t *const o_row = O + e * RS;
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
                 const size_t v = lane_id + kWarpSize * t;
@@ -229,7 +247,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
             }
             partial = warp_reduce_sum(partial);
             if (lane_id == 0) {
-                O[e] = static_cast<cuda_t>(partial);
+                O[e * HD] = static_cast<cuda_t>(partial);
             }
         }
     };
@@ -246,7 +264,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
             row_edge_indexed[Plan::R_SLOT] = Plan::R_EDGE_INDEXED;
         }
         gsddmm_pipelined_edge_loop<N_PER_BLOCK, D_CONST, NUM_STAGES, Plan::NUM_EDGE_ROWS, cuda_t, index_t>(
-            warp_id, lane_id, num_edges, edge_start, col_idx, row_bases, row_edge_indexed, my_dbuf, consume
+            warp_id, lane_id, num_edges, edge_start, col_idx, row_bases, row_edge_indexed, my_dbuf, RS, consume
         );
     } else {
         // Exact per-warp trip count (no early break) so the loop can be unrolled:
@@ -270,10 +288,10 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
 
             cuda_t const *rows[ROWS_CAP];
             if constexpr (!Plan::L_DST) {
-                rows[Plan::L_SLOT] = L + (Plan::L_EDGE_INDEXED ? static_cast<size_t>(e) : static_cast<size_t>(j)) * D_CONST;
+                rows[Plan::L_SLOT] = L + (Plan::L_EDGE_INDEXED ? static_cast<size_t>(e) : static_cast<size_t>(j)) * RS;
             }
             if constexpr (Plan::R_EDGE_ROW) {
-                rows[Plan::R_SLOT] = R + (Plan::R_EDGE_INDEXED ? static_cast<size_t>(e) : static_cast<size_t>(j)) * D_CONST;
+                rows[Plan::R_SLOT] = R + (Plan::R_EDGE_INDEXED ? static_cast<size_t>(e) : static_cast<size_t>(j)) * RS;
             }
             consume(static_cast<size_t>(e), rows);
         }
@@ -289,14 +307,15 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_forward_normal(
 // size_t, so the multiply widens before it can overflow a 32-bit id.
 template <GSDDMM_MEMBER m, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t>
 __device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(
-    cuda_t const *__restrict__ base, const index_pair_t<index_t>& my_pair, uint32_t k, std::make_unsigned_t<index_t> e
+    cuda_t const *__restrict__ base, const index_pair_t<index_t>& my_pair, uint32_t k, std::make_unsigned_t<index_t> e,
+    size_t row_stride  // elements between rows: heads * D_CONST
 ) {
     if constexpr (m == GSDDMM_MEMBER::Src_V) {
-        return base + D_CONST * static_cast<size_t>(__shfl_sync(FULL_WARP_MASK, my_pair.x, static_cast<int>(k)));
+        return base + row_stride * static_cast<size_t>(__shfl_sync(FULL_WARP_MASK, my_pair.x, static_cast<int>(k)));
     } else if constexpr (m == GSDDMM_MEMBER::Dst_V) {
-        return base + D_CONST * static_cast<size_t>(__shfl_sync(FULL_WARP_MASK, my_pair.y, static_cast<int>(k)));
+        return base + row_stride * static_cast<size_t>(__shfl_sync(FULL_WARP_MASK, my_pair.y, static_cast<int>(k)));
     } else if constexpr (m == GSDDMM_MEMBER::Edge) {
-        return base + D_CONST * static_cast<size_t>(e);
+        return base + row_stride * static_cast<size_t>(e);
     } else {
         static_assert(!sizeof(cuda_t), "Unreachable branch");
         __builtin_unreachable();
@@ -333,13 +352,14 @@ __device__ __forceinline__ cuda_t const *gsddmm_edge_member_row(
 // shuffle. nullptr means the traversal order already IS the canonical order, and
 // the id degenerates to the slot index (no load, no shuffle).
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES, bool REMAP_IDS>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES, bool REMAP_IDS, bool MULTI_HEAD>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_forward_edge_block( // no-format
     index_t E, // total edge count
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t *__restrict__ O,
     index_pair_t<index_t> const * __restrict__ edge_nodes_idx,
     index_t const *__restrict__ canonical_edge_idx,
-    uint32_t edges_per_warp
+    uint32_t edges_per_warp,
+    uint32_t heads
 ) {
     // Node and edge ids are non-negative, so they ride in index_t's unsigned form:
     // that is what index_pair_t already holds, and it keeps the id arithmetic one
@@ -373,13 +393,28 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     // The grid is sized to ceil(E / edges_per_warp) warps, so a warp index fits
     // index_t whenever E does -- the whole chunk walk is therefore index_t-wide,
     // not unconditionally 64-bit.
-    const eidx_t block_linear = static_cast<eidx_t>((static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x);
+    // Multi-head operands ([rows, heads, D_CONST]): the grid holds `heads` blocks per
+    // edge block, the head in the low digit of the linear block index; each head
+    // works on its own D_CONST-wide slice with row stride heads * D_CONST.
+    // (MULTI_HEAD false: heads == 1, the original compile-time-stride kernel.)
+    const uint64_t block_flat = (static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+    const size_t head         = MULTI_HEAD ? static_cast<size_t>(block_flat % heads) : size_t{0};
+    const eidx_t block_linear = static_cast<eidx_t>(MULTI_HEAD ? block_flat / heads : block_flat);
+    const size_t RS           = MULTI_HEAD ? static_cast<size_t>(heads) * D_CONST : D_CONST;
+    const size_t HD           = MULTI_HEAD ? static_cast<size_t>(heads) : size_t{1};  // dot output stride
     const eidx_t global_warp  = block_linear * static_cast<eidx_t>(blockDim.y) + static_cast<eidx_t>(warp_id);
     const eidx_t edge_base    = global_warp * static_cast<eidx_t>(edges_per_warp);
     // Warp-uniform exit: there is no block-level synchronization in this kernel.
     const eidx_t num_total = static_cast<eidx_t>(E);
     if (edge_base >= num_total) [[unlikely]] {
         return;
+    }
+    if constexpr (MULTI_HEAD) {
+        L += head * D_CONST;
+        if constexpr (Plan::USE_R) {
+            R += head * D_CONST;
+        }
+        O += Plan::IS_DOT ? head : head * D_CONST;
     }
     // At most kGsddmmEdgeMaxEdgesPerWarp (32), so the chunk-local counter and
     // every loop over it are 32-bit no matter how wide index_t is -- the rule
@@ -433,11 +468,11 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     };
 
     // Global row addresses of the operands for edge k of the chunk (warp-uniform).
-    auto edge_rows = [canonical_of, my_pair, L, R](uint32_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
+    auto edge_rows = [canonical_of, my_pair, L, R, RS](uint32_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
         const eidx_t e = canonical_of(k);
-        srcs[L_SLOT]   = gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e);
+        srcs[L_SLOT]   = gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e, RS);
         if constexpr (Plan::USE_R) {
-            srcs[R_SLOT] = gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e);
+            srcs[R_SLOT] = gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e, RS);
         }
     };
 
@@ -447,10 +482,10 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     // O is written once and never read back here, so the stores are streaming
     // (evict-first): the [E, D] output must not push the gathered node rows,
     // which ARE re-read by other edges, out of L2.
-    auto consume = [lane_id, canonical_of, O](uint32_t k, cuda_t const *const(&rows)[NUM_ROWS]) {
+    auto consume = [lane_id, canonical_of, O, RS, HD](uint32_t k, cuda_t const *const(&rows)[NUM_ROWS]) {
         const eidx_t e = canonical_of(k);
         if constexpr (!Plan::IS_DOT) {
-            cuda_t *const O_row = O + static_cast<size_t>(e) * D_CONST;  // elementwise ops write the edge's own row
+            cuda_t *const O_row = O + static_cast<size_t>(e) * RS;  // elementwise ops write the edge's own row
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
                 const size_t tile_idx = lane_id + kWarpSize * t;
@@ -477,8 +512,8 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
             }
             partial = warp_reduce_sum(partial);
             if (lane_id == 0) {
-                // Dot output is [E] (one scalar per edge), not an [E, D] row.
-                O[e] = static_cast<cuda_t>(partial);
+                // Dot output is [E, heads] (one scalar per edge and head), not a feature row.
+                O[static_cast<size_t>(e) * HD] = static_cast<cuda_t>(partial);
             }
         }
     };
@@ -517,7 +552,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         // shared_tiles is captured BY REFERENCE: it is filled below, after this
         // closure is created, so a by-value capture would compute on the copy
         // taken while the array was still uninitialized.
-        auto edge_body = [L, R, O, canonical_of, &shared_tiles, my_pair, lane_id](auto cache_c, uint32_t k,
+        auto edge_body = [L, R, O, canonical_of, &shared_tiles, my_pair, lane_id, RS, HD](auto cache_c, uint32_t k,
                               cuda_t const *const edge_row, cuda_t *const o_row) {
             constexpr bool USE_CACHE = decltype(cache_c)::value;
             const eidx_t e           = canonical_of(k);
@@ -526,16 +561,16 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
             if constexpr (!(USE_CACHE && L_SHARED)) {
                 l_row = (!REMAP_IDS && ll == GSDDMM_MEMBER::Edge)
                             ? edge_row
-                            : gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e);
+                            : gsddmm_edge_member_row<ll, D_CONST, cuda_t, index_t>(L, my_pair, k, e, RS);
             }
             if constexpr (Plan::USE_R && !(USE_CACHE && R_SHARED)) {
                 r_row = (!REMAP_IDS && rr == GSDDMM_MEMBER::Edge)
                             ? edge_row
-                            : gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e);
+                            : gsddmm_edge_member_row<rr, D_CONST, cuda_t, index_t>(R, my_pair, k, e, RS);
             }
 
             // elementwise ops write the edge's own row
-            [[maybe_unused]] cuda_t *const O_row = REMAP_IDS ? O + static_cast<size_t>(e) * D_CONST : o_row;
+            [[maybe_unused]] cuda_t *const O_row = REMAP_IDS ? O + static_cast<size_t>(e) * RS : o_row;
             [[maybe_unused]] accum_t partial{};
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
@@ -569,7 +604,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                 if (lane_id == 0) {
                     // Dot output is [E] (one scalar per edge), not an [E, D] row.
                     if constexpr (REMAP_IDS) {
-                        O[e] = static_cast<cuda_t>(partial);
+                        O[static_cast<size_t>(e) * HD] = static_cast<cuda_t>(partial);
                     } else {
                         *o_row = static_cast<cuda_t>(partial);
                     }
@@ -590,12 +625,12 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         // ~1% on uniform random graphs, which are DRAM-bound. REMAP_IDS ids are
         // arbitrary, so there the per-slot form stays and the cursors stay null.
         constexpr bool HAS_EDGE_OPERAND = (ll == GSDDMM_MEMBER::Edge) || (Plan::USE_R && rr == GSDDMM_MEMBER::Edge);
-        constexpr size_t O_STRIDE       = Plan::IS_DOT ? 1 : D_CONST;
+        const size_t O_STRIDE           = Plan::IS_DOT ? HD : RS;
         cuda_t const *edge_row_cursor   = nullptr;
         cuda_t *o_cursor                = nullptr;
         if constexpr (!REMAP_IDS) {
             if constexpr (HAS_EDGE_OPERAND) {
-                edge_row_cursor = (ll == GSDDMM_MEMBER::Edge ? L : R) + D_CONST * static_cast<size_t>(edge_base);
+                edge_row_cursor = (ll == GSDDMM_MEMBER::Edge ? L : R) + RS * static_cast<size_t>(edge_base);
             }
             o_cursor = O + O_STRIDE * static_cast<size_t>(edge_base);
         }
@@ -611,14 +646,14 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                 edge_body(cache_c, k, edge_row_cursor, o_cursor);
                 if constexpr (!REMAP_IDS) {
                     if constexpr (HAS_EDGE_OPERAND) {
-                        edge_row_cursor += D_CONST;
+                        edge_row_cursor += RS;
                     }
                     o_cursor += O_STRIDE;
                 }
             }
         };
         if (chunk_shared) {
-            cuda_t const *const row = (L_SHARED ? L : R) + D_CONST * static_cast<size_t>(key0);
+            cuda_t const *const row = (L_SHARED ? L : R) + RS * static_cast<size_t>(key0);
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
                 const size_t tile_idx = lane_id + kWarpSize * t;
@@ -720,9 +755,10 @@ __device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_accum_to_vec(accum_t cons
 // six Dot kernels than store_zero_() followed by scalar_add_(), which pays an
 // add per element to reach a value already known.
 template <bool IS_DOT, size_t TW, FloatingNum cuda_t>
-__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_splat(cuda_t const *__restrict__ dO, size_t edge_id) {
+__device__ __forceinline__ VecFloat<TW, cuda_t> gsddmm_grad_out_splat(cuda_t const *__restrict__ dO, size_t edge_id, size_t heads = 1) {
     if constexpr (IS_DOT) {
-        return VecFloat<TW, cuda_t>(dO[edge_id]);
+        // Dot's dO is [E, heads]; dO already points at this block's head column.
+        return VecFloat<TW, cuda_t>(dO[edge_id * heads]);
     } else {
         VecFloat<TW, cuda_t> v;
         v.store_zero_();
@@ -844,14 +880,15 @@ __device__ __forceinline__ void gsddmm_accum_sub_prod_div_sq(
 // forward's load imbalance (a block per node, runtime set by the largest degree),
 // which heavy-node chunking bounds via block_part.
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t N_PER_BLOCK, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, bool MULTI_HEAD>
 __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal( // no-format
     size_t N,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
     cuda_t *__restrict__ d_self, cuda_t *__restrict__ d_edge,
     index_t const *__restrict__ row_ptr, index_t const *__restrict__ col_idx,
     index_t const *__restrict__ node_indices,
-    index_t const *__restrict__ canonical_edge_idx
+    index_t const *__restrict__ canonical_edge_idx,
+    uint32_t heads
 ) {
     using Plan = GsddmmBackwardPlan<op, ll, rr, reduce>;
     static_assert(Plan::HAS_SELF, "this pass has no operand to reduce; the host must not launch it");
@@ -876,6 +913,24 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
         return;
     }
 
+    // Multi-head operands: head blockIdx.y reduces its own D_CONST-wide slice of every
+    // row (row stride heads * D_CONST); see GSDDMM_forward_normal.
+    // (MULTI_HEAD false: the original compile-time-stride kernel.)
+    const size_t RS = MULTI_HEAD ? static_cast<size_t>(heads) * D_CONST : D_CONST;
+    const size_t HD = MULTI_HEAD ? static_cast<size_t>(heads) : size_t{1};  // dot dO stride
+    if constexpr (MULTI_HEAD) {
+        const size_t head = blockIdx.y;
+        L += head * D_CONST;
+        if constexpr (Plan::Fwd::USE_R) {
+            R += head * D_CONST;
+        }
+        dO += Plan::IS_DOT ? head : head * D_CONST;
+        d_self += head * D_CONST;
+        if (d_edge != nullptr) {
+            d_edge += head * D_CONST;
+        }
+    }
+
     const index_t edge_start = row_ptr[node_i];
     const index_t edge_end   = row_ptr[node_i + 1];
     const size_t num_edges   = static_cast<size_t>(edge_end - edge_start);
@@ -894,7 +949,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
         for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
             const size_t v = lane_id + kWarpSize * t;
             if (v < TILES) [[likely]] {
-                self_tiles[t] = Tile::read(self_base + node_i * D_CONST, v);
+                self_tiles[t] = Tile::read(self_base + node_i * RS, v);
             }
         }
     }
@@ -932,8 +987,8 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
 
         // Dot's d_out is one broadcast scalar for the whole edge: build it once
         // here rather than per tile. The elementwise ops read a row per tile.
-        const vec_t d_out_splat   = gsddmm_grad_out_splat<Plan::IS_DOT, TW, cuda_t>(dO, edge_id);
-        cuda_t const *const dO_row = Plan::IS_DOT ? nullptr : dO + edge_id * D_CONST;
+        const vec_t d_out_splat   = gsddmm_grad_out_splat<Plan::IS_DOT, TW, cuda_t>(dO, edge_id, HD);
+        cuda_t const *const dO_row = Plan::IS_DOT ? nullptr : dO + edge_id * RS;
 
 #pragma unroll
         for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
@@ -950,7 +1005,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
                 // value passed to apply() defined and to keep the build quiet.
                 vec_t other;
                 if constexpr (Plan::READS_OTHER) {
-                    other = Tile::read(other_base + other_row * D_CONST, v);
+                    other = Tile::read(other_base + other_row * RS, v);
                 } else {
                     other.store_zero_();
                 }
@@ -984,7 +1039,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
                     } else if constexpr (op == GSDDMM_OP::Sub && Plan::OTHER == rr) {
                         g_edge.neg_();
                     }
-                    Tile::template write<Tile::MemoryHint::Streaming>(d_edge + edge_id * D_CONST, v, g_edge);
+                    Tile::template write<Tile::MemoryHint::Streaming>(d_edge + edge_id * RS, v, g_edge);
                 }
             }
         }
@@ -1040,7 +1095,7 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
             if constexpr (Plan::NEGATE_SELF && !Plan::NEEDS_SELF_ROW) {
                 out.neg_();
             }
-            Tile::template write<Tile::MemoryHint::Streaming>(d_self + node_i * D_CONST, v, out);
+            Tile::template write<Tile::MemoryHint::Streaming>(d_self + node_i * RS, v, out);
         }
     }
 }
@@ -1084,14 +1139,15 @@ __global__ void __launch_bounds__(N_PER_BLOCK *kWarpSize) GSDDMM_backward_normal
 // the forward edge kernel does. The reduced node's row is deliberately not in the
 // ring: it is a per-RUN constant, so it belongs in registers.
 // =============================================================================
-template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES, bool REMAP_IDS>
+template <GSDDMM_OP op, GSDDMM_MEMBER ll, GSDDMM_MEMBER rr, GSDDMM_REDUCE reduce, size_t D_CONST, FloatingNum cuda_t, IntegralNum index_t, FloatingNum accum_t, uint8_t PIPELINE_STAGES, bool REMAP_IDS, bool MULTI_HEAD>
 __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM_backward_edge_block( // no-format
     index_t E,
     cuda_t const *__restrict__ L, cuda_t const *__restrict__ R, cuda_t const *__restrict__ dO,
     accum_t *__restrict__ d_self_f32, cuda_t *__restrict__ d_edge,
     index_pair_t<index_t> const *__restrict__ edge_nodes_idx,
     index_t const *__restrict__ canonical_edge_idx,
-    uint32_t edges_per_warp
+    uint32_t edges_per_warp,
+    uint32_t heads
 ) {
     // See GSDDMM_forward_edge_block: ids ride in index_t's unsigned form.
     using eidx_t = std::make_unsigned_t<index_t>;
@@ -1127,14 +1183,31 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
     const size_t lane_id = threadIdx.x;
     const size_t warp_id = threadIdx.y;
 
-    // Chunk arithmetic in index_t: the grid covers ceil(E / edges_per_warp) warps,
-    // so a warp index fits index_t whenever E does.
-    const eidx_t block_linear = static_cast<eidx_t>((static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x);
+    // Chunk arithmetic in index_t: the grid covers ceil(E / edges_per_warp) warps
+    // per head, so a warp index fits index_t whenever E does. The head is the low
+    // digit of the linear block index (see GSDDMM_forward_edge_block).
+    // (MULTI_HEAD false: heads == 1, the original compile-time-stride kernel.)
+    const uint64_t block_flat = (static_cast<uint64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+    const size_t head         = MULTI_HEAD ? static_cast<size_t>(block_flat % heads) : size_t{0};
+    const eidx_t block_linear = static_cast<eidx_t>(MULTI_HEAD ? block_flat / heads : block_flat);
+    const size_t RS           = MULTI_HEAD ? static_cast<size_t>(heads) * D_CONST : D_CONST;
+    const size_t HD           = MULTI_HEAD ? static_cast<size_t>(heads) : size_t{1};  // dot dO stride
     const eidx_t global_warp  = block_linear * static_cast<eidx_t>(blockDim.y) + static_cast<eidx_t>(warp_id);
     const eidx_t edge_base    = global_warp * static_cast<eidx_t>(edges_per_warp);
     const eidx_t num_total = static_cast<eidx_t>(E);
     if (edge_base >= num_total) [[unlikely]] {
         return;
+    }
+    if constexpr (MULTI_HEAD) {
+        L += head * D_CONST;
+        if constexpr (Plan::Fwd::USE_R) {
+            R += head * D_CONST;
+        }
+        dO += Plan::IS_DOT ? head : head * D_CONST;
+        d_self_f32 += head * D_CONST;
+        if (d_edge != nullptr) {
+            d_edge += head * D_CONST;
+        }
     }
     // <= kGsddmmEdgeMaxEdgesPerWarp (32): chunk-local counters stay 32-bit.
     const uint32_t num_edges = static_cast<uint32_t>((num_total - edge_base < edges_per_warp) ? (num_total - edge_base) : edges_per_warp);
@@ -1186,9 +1259,9 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
 
     // The run's reduced node row, constant for the whole run (see KEEP_SELF_ROW).
     vec_t self_tiles[TILES_PER_THREAD];
-    auto load_self_tiles = [&self_tiles, lane_id, L, R](eidx_t node) {
+    auto load_self_tiles = [&self_tiles, lane_id, L, R, RS](eidx_t node) {
         if constexpr (Plan::KEEP_SELF_ROW) {
-            cuda_t const *const row = (Plan::SELF_IS_LHS ? L : R) + static_cast<size_t>(node) * D_CONST;
+            cuda_t const *const row = (Plan::SELF_IS_LHS ? L : R) + static_cast<size_t>(node) * RS;
 #pragma unroll
             for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
                 const size_t v = lane_id + kWarpSize * t;
@@ -1215,7 +1288,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         // Order this run's stores before the reads below, and -- on the way out --
         // the reads before the next run's stores into the same buffer.
         __syncwarp();
-        accum_t *const dst = d_self_f32 + static_cast<size_t>(node) * D_CONST;
+        accum_t *const dst = d_self_f32 + static_cast<size_t>(node) * RS;
 #pragma unroll
         for (size_t s = 0; s < FLUSH_STEPS; ++s) {
             const size_t f = s * kWarpSize + lane_id;
@@ -1232,7 +1305,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         const eidx_t edge_id = canonical_of(k);
 
         // Dot's d_out is one broadcast scalar per edge: built once, not per tile.
-        const vec_t d_out_splat = gsddmm_grad_out_splat<Plan::IS_DOT, TW, cuda_t>(dO, static_cast<size_t>(edge_id));
+        const vec_t d_out_splat = gsddmm_grad_out_splat<Plan::IS_DOT, TW, cuda_t>(dO, static_cast<size_t>(edge_id), HD);
 
 #pragma unroll
         for (size_t t = 0; t < TILES_PER_THREAD; ++t) {
@@ -1286,7 +1359,7 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
                     } else if constexpr (op == GSDDMM_OP::Sub && Plan::OTHER == rr) {
                         g_edge.neg_();
                     }
-                    Tile::template write<Tile::MemoryHint::Streaming>(d_edge + static_cast<size_t>(edge_id) * D_CONST, v, g_edge);
+                    Tile::template write<Tile::MemoryHint::Streaming>(d_edge + static_cast<size_t>(edge_id) * RS, v, g_edge);
                 }
             }
         }
@@ -1315,11 +1388,11 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
         auto addr = [&](uint32_t k, cuda_t const *(&srcs)[NUM_ROWS]) {
             const eidx_t e = canonical_of(k);
             if constexpr (!Plan::IS_DOT) {
-                srcs[DO_SLOT] = dO + static_cast<size_t>(e) * D_CONST;
+                srcs[DO_SLOT] = dO + static_cast<size_t>(e) * RS;
             }
             if constexpr (Plan::READS_OTHER) {
                 const eidx_t other_row = Plan::OTHER_IS_EDGE ? e : other_node_of(k);
-                srcs[OTHER_SLOT]       = (Plan::SELF_IS_LHS ? R : L) + static_cast<size_t>(other_row) * D_CONST;
+                srcs[OTHER_SLOT]       = (Plan::SELF_IS_LHS ? R : L) + static_cast<size_t>(other_row) * RS;
             }
         };
         gsddmm_pipe::pipelined_row_loop<D_CONST, NUM_STAGES, NUM_ROWS, cuda_t>(lane_id, num_edges, my_ring, addr, consume);
@@ -1328,11 +1401,11 @@ __global__ void __launch_bounds__(kWarpSize *kGsddmmEdgeMaxWarpsPerBlock) GSDDMM
             const eidx_t e = canonical_of(k);
             cuda_t const *rows[NUM_ROWS];
             if constexpr (!Plan::IS_DOT) {
-                rows[DO_SLOT] = dO + static_cast<size_t>(e) * D_CONST;
+                rows[DO_SLOT] = dO + static_cast<size_t>(e) * RS;
             }
             if constexpr (Plan::READS_OTHER) {
                 const eidx_t other_row = Plan::OTHER_IS_EDGE ? e : other_node_of(k);
-                rows[OTHER_SLOT]       = (Plan::SELF_IS_LHS ? R : L) + static_cast<size_t>(other_row) * D_CONST;
+                rows[OTHER_SLOT]       = (Plan::SELF_IS_LHS ? R : L) + static_cast<size_t>(other_row) * RS;
             }
             consume(k, rows);
         }

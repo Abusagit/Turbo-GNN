@@ -1,0 +1,5 @@
+dataset:
+  source: csr_npy        # preprocessed by benchmarks/rebuttal/papers/prep_papers100m.py
+  name: ogbn-papers100M
+  root: data
+  dir: papers100m_csr

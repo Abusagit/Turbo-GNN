@@ -424,7 +424,8 @@ def test_gsddmm_unsupported_dim_rejected():
     graph = _make_graph()
     num_nodes = graph.forward_indptr.numel() - 1
     x = torch.randn(num_nodes, 16, device=DEVICE)  # D must be in {32, 64, 128, 256}
-    with pytest.raises(RuntimeError):
+    # Rejected as a shape error before any kernel is chosen (not as "no kernel could be launched").
+    with pytest.raises(ValueError, match="unsupported per-head feature dim D=16"):
         gsddmm(graph, x, x, op="add", lhs_target="src", rhs_target="dst")
 
 

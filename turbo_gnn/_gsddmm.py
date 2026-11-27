@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Union
 
+import math
+
 import torch
 
 from turbo_gnn._extension import _C
@@ -53,6 +55,31 @@ GSDDMM_MEMBERS = ("src", "dst", "edge")
 
 # Feature widths the kernels are instantiated for (see gsddmm_dispatch.cuh).
 GSDDMM_FEATURE_DIMS = (32, 64, 128, 256)
+
+
+def _row_width(t: torch.Tensor) -> int:
+    """Elements per row: ``D``, or ``heads * D`` for a multi-head operand."""
+    return int(math.prod(t.shape[1:])) if t.ndim > 1 else 1
+
+
+def validate_operands(spec: "GsddmmSpec", lhs: torch.Tensor, rhs: torch.Tensor | None) -> tuple[int, int]:
+    """Check the operand layout before any kernel is chosen; return ``(heads, D)``.
+
+    Operands are ``[rows, D]`` or multi-head ``[rows, heads, D]`` (DGL's layout),
+    ``D`` per head in :data:`GSDDMM_FEATURE_DIMS`; a multi-head call runs every
+    head in one launch. Raising here keeps a shape error from surfacing as the
+    variant probe's "no kernel could be launched".
+    """
+    if lhs.ndim not in (2, 3):
+        raise ValueError(f"gsddmm: lhs must be [rows, D] or [rows, heads, D], got shape {tuple(lhs.shape)}")
+    heads = lhs.shape[1] if lhs.ndim == 3 else 1
+    feat = lhs.shape[-1]
+    if feat not in GSDDMM_FEATURE_DIMS:
+        hint = "" if lhs.ndim == 3 else "; for multi-head rows pass lhs/rhs as [rows, heads, D]"
+        raise ValueError(f"gsddmm: unsupported per-head feature dim D={feat} (lhs shape {tuple(lhs.shape)}); supported: {GSDDMM_FEATURE_DIMS}{hint}")
+    if spec.uses_rhs and rhs is not None and tuple(rhs.shape[1:]) != tuple(lhs.shape[1:]):
+        raise ValueError(f"gsddmm: lhs and rhs must share the per-row layout, got lhs {tuple(lhs.shape)} and rhs {tuple(rhs.shape)}")
+    return heads, feat
 
 # Timing budget for the variant probe when the caller supplied no AutotuneConfig.
 _PROBE_WARMUP = 3
@@ -699,8 +726,8 @@ def _backward_operand(
         return tensor
     target = spec.lhs_target if which == "lhs" else spec.rhs_target
     rows = graph.forward_indices.numel() if target == "edge" else graph.forward_indptr.numel() - 1
-    feat_dim = like.shape[-1]
-    return like.new_empty((1, feat_dim)).expand(rows, feat_dim)
+    row_shape = tuple(like.shape[1:])  # (D,) or (heads, D): the stand-in keeps the operand layout
+    return like.new_empty((1, *row_shape)).expand(rows, *row_shape)
 
 
 def _launch_backward_node(
@@ -829,7 +856,7 @@ def _default_traversal(spec: GsddmmSpec, feat_dim: int, canonical_output: bool =
     return spec.preferred_traversal if feat_dim > 32 else TraversalOrder.CSR
 
 
-def _time_plan(plan: GsddmmLaunchPlan, graph, lhs, rhs, warmup: int, iters: int) -> float:
+def _time_plan(plan: GsddmmLaunchPlan, graph, lhs, rhs, warmup: int, iters: int, failures: list | None = None) -> float:
     """Time one candidate in ms/iter; a candidate that cannot launch scores +inf.
 
     A candidate can legitimately fail to launch (a deep pipeline at ``D=256``
@@ -840,6 +867,8 @@ def _time_plan(plan: GsddmmLaunchPlan, graph, lhs, rhs, warmup: int, iters: int)
         return time_callable(lambda: plan.launch(graph, lhs, rhs), warmup=warmup, iters=iters).ms_per_iter
     except RuntimeError as exc:  # includes torch.OutOfMemoryError
         logger.debug("gsddmm: %s candidate did not launch (%s)", plan.variant, exc)
+        if failures is not None:
+            failures.append(exc)
         return float("inf")
 
 
@@ -918,7 +947,7 @@ def select_variant(
     """
     node_params = node_params or NodeBlockParams()
     edge_params = edge_params or EdgeBlockParams()
-    feat_dim = lhs.shape[-1] if lhs.ndim > 1 else 1
+    feat_dim = _row_width(lhs)  # heads * D: what a row costs to move, and part of the memo key
 
     share = bool(getattr(config, "share_variant_probe", False))
     key = (spec.shape_class if share else spec, feat_dim, lhs.dtype)
@@ -1018,16 +1047,25 @@ def _measure_variant(
     # the next, so clock drift or a neighbouring job cannot systematically
     # penalize whichever candidate is timed later (see _PROBE_REPEATS).
     best_per_candidate = [float("inf")] * len(candidates)
+    failures: list[RuntimeError] = []
     for _ in range(_PROBE_REPEATS):
         for index, (plan, _variant, _traversal) in enumerate(candidates):
-            best_per_candidate[index] = min(best_per_candidate[index], _time_plan(plan, graph, lhs, rhs, warmup, iters))
+            best_per_candidate[index] = min(best_per_candidate[index], _time_plan(plan, graph, lhs, rhs, warmup, iters, failures))
 
     timings = [(ms, plan, variant, traversal) for ms, (plan, variant, traversal) in zip(best_per_candidate, candidates)]
     best_ms, best_plan, best_variant, best_traversal = min(timings, key=lambda row: row[0])
 
     if best_ms == float("inf"):
+        shape = f"operand shape {tuple(lhs.shape)}"
+        if failures and all(isinstance(e, torch.OutOfMemoryError) for e in failures):
+            # Every candidate ran out of memory: report it as what it is, not as a launch problem.
+            raise torch.OutOfMemoryError(
+                f"gsddmm: out of GPU memory for op={spec.op!r}, {shape} on a graph with {num_nodes} nodes / "
+                f"{num_edges} edges (the per-edge output alone is {num_edges} x {tuple(lhs.shape[1:])}); "
+                f"first error: {str(failures[0]).splitlines()[0]}"
+            )
         raise RuntimeError(
-            f"gsddmm: no kernel could be launched for op={spec.op!r} with D={feat_dim} on a graph with "
+            f"gsddmm: no kernel could be launched for op={spec.op!r}, {shape} (D={feat_dim}) on a graph with "
             f"{num_nodes} nodes / {num_edges} edges; see the logged reasons"
         )
 
@@ -1063,6 +1101,7 @@ def resolve_plan(
     ``variant="node"`` / ``"edge"`` pin a kernel and measure nothing;
     ``"auto"`` delegates to :func:`select_variant`.
     """
+    validate_operands(spec, lhs, rhs)
     if variant == "node":
         return GsddmmLaunchPlan(spec, "node", node_params or NodeBlockParams())
     if variant == "edge":
@@ -1070,9 +1109,7 @@ def resolve_plan(
             spec,
             "edge",
             edge_params or EdgeBlockParams(),
-            traversal=_default_traversal(
-                spec, lhs.shape[-1] if lhs.ndim > 1 else 1, canonical_output=canonical_output
-            ),
+            traversal=_default_traversal(spec, _row_width(lhs), canonical_output=canonical_output),
             canonical_output=canonical_output,
         )
     if variant != "auto":

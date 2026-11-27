@@ -481,7 +481,9 @@ def gsddmm(
     Args:
         graph: CSR graph with forward adjacency and light/heavy node buckets.
         lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
-            ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
+            ``[E, D]`` for ``"edge"`` -- or multi-head ``[N, H, D]`` / ``[E, H, D]``
+            (DGL's layout), every head computed in the same launch. D (the
+            per-head width) must be in {32, 64, 128, 256}; H is free.
         rhs: Right operand, same layout rules as ``lhs``. Ignored (and may be
             omitted) for ``op="copy"``, which never reads it.
         op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
@@ -526,13 +528,18 @@ def gsddmm(
             block, 1-8.
 
     Returns:
-        ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"``, in CSR edge order.
+        ``[E, D]`` for elementwise ops, ``[E]`` for ``"dot"`` (multi-head:
+        ``[E, H, D]`` and ``[E, H]``, a per-head dot), in CSR edge order.
 
     Raises:
         ValueError: If a parameter belongs to a kernel other than the pinned
             ``variant``, or if ``rhs`` is missing for an op that reads it.
     """
     spec = GsddmmSpec(op=op, lhs_target=lhs_target, rhs_target=rhs_target)
+    # The kernels address rows densely (row stride = heads * D); a strided view
+    # (e.g. a column slice) would otherwise be read with the wrong stride.
+    lhs = lhs.contiguous()
+    rhs = rhs.contiguous() if rhs is not None else None
     node_params, edge_params = _gsddmm_launch_params(
         variant,
         {
@@ -595,7 +602,9 @@ def gsddmm_edge(
         graph: CSR graph; its forward (dst-grouped) or backward (src-grouped)
             adjacency is read to build the cached edge list.
         lhs: Left operand, ``[N, D]`` for ``"src"``/``"dst"`` targets or
-            ``[E, D]`` for ``"edge"``. D must be in {32, 64, 128, 256}.
+            ``[E, D]`` for ``"edge"`` -- or multi-head ``[N, H, D]`` / ``[E, H, D]``
+            (DGL's layout), every head computed in the same launch. D (the
+            per-head width) must be in {32, 64, 128, 256}; H is free.
         rhs: Right operand, same layout rules as ``lhs``. May be omitted for
             ``op="copy"`` (it is never read by the kernel).
         op: ``"add"``, ``"sub"``, ``"mul"``, ``"div"``, ``"dot"``, or ``"copy"``.
@@ -789,10 +798,14 @@ def gspmm(
     Args:
         graph: CSR graph with forward and backward adjacency plus light/heavy
             node buckets.
-        lhs: Node data, shape ``[N, d]``. Pass ``None`` for ``op="copy_e"``.
+        lhs: Node data, shape ``[N, d]`` -- or multi-head ``[N, H, D]``. Pass
+            ``None`` for ``op="copy_e"``.
         rhs: Edge data, shape ``[E, d]`` (element-wise) or ``[E]`` / ``[E, 1]``
-            (broadcast over the feature dimension). Pass ``None`` for
-            ``op="copy_u"``.
+            (broadcast over the feature dimension). With multi-head node data
+            also ``[E, H, D]`` (element-wise) or ``[E, H]`` / ``[E, H, 1]`` -- one
+            scalar per edge and head, broadcast over that head's ``D`` features
+            in the same launch (``reduce="sum"`` only; ``D`` a power of two >= 32).
+            Pass ``None`` for ``op="copy_u"``.
         op: One of ``"copy_u"``, ``"copy_e"``, ``"add"``, ``"sub"``, ``"mul"``,
             ``"div"``.
         reduce: One of ``"sum"``, ``"min"``, ``"max"``.
@@ -824,7 +837,39 @@ def gspmm(
     if op == "copy_e" and lhs is not None:
         raise ValueError("gspmm(op='copy_e') ignores node data; pass lhs=None")
 
-    return _gspmm_apply(graph, lhs, rhs, op, reduce, warps_per_block, features_per_block, tiles_y, pipeline_stages)
+    lhs, rhs, out_heads = _gspmm_flatten_heads(lhs, rhs)
+    out = _gspmm_apply(graph, lhs, rhs, op, reduce, warps_per_block, features_per_block, tiles_y, pipeline_stages)
+    return out if out_heads is None else out.reshape(out.shape[0], *out_heads)
+
+
+def _gspmm_flatten_heads(lhs, rhs):
+    """Map DGL's multi-head layouts onto the kernels' 2-D rows (no data copies).
+
+    Node data ``[N, H, D]`` becomes ``[N, H*D]``. The edge operand then is
+    ``[E, H, D]`` (elementwise, flattened the same way), ``[E, H]`` / ``[E, H, 1]``
+    (one scalar per edge and head -- a per-head broadcast the kernels apply in a
+    single launch), or ``[E]`` / ``[E, 1]`` (one scalar for every head). For
+    ``copy_e`` a 3-D edge operand is flattened and the output gets its head shape
+    back. Returns ``(lhs, rhs, out_row_shape or None)``.
+    """
+    if lhs is not None and lhs.ndim == 3:
+        n, h, d = lhs.shape
+        lhs = lhs.reshape(n, h * d)
+        if rhs is not None:
+            if rhs.ndim == 3 and tuple(rhs.shape[1:]) == (h, d):
+                rhs = rhs.reshape(rhs.shape[0], h * d)
+            elif rhs.ndim == 3 and tuple(rhs.shape[1:]) == (h, 1):
+                rhs = rhs.reshape(rhs.shape[0], h)
+            elif not (rhs.ndim == 1 or (rhs.ndim == 2 and rhs.shape[1] in (1, h))):
+                raise ValueError(
+                    f"gspmm: node data {tuple(lhs.shape[:1]) + (h, d)} needs edge data [E, {h}, {d}], [E, {h}], [E, {h}, 1], [E] or [E, 1]; "
+                    f"got {tuple(rhs.shape)}"
+                )
+        return lhs, rhs, (h, d)
+    if lhs is None and rhs is not None and rhs.ndim == 3:
+        e, h, d = rhs.shape
+        return lhs, rhs.reshape(e, h * d), (h, d)
+    return lhs, rhs, None
 
 
 def copy_u_sum(graph, x, **kwargs):

@@ -69,6 +69,8 @@ def _read_csv_pairs(path: Path, skip_header: bool) -> np.ndarray:
 
 def load_graphland(name: str, root: str) -> tuple[np.ndarray, int]:
     d = Path(root) / name
+    if not (d / "edgelist.csv").exists() and (d / "raw" / name / "edgelist.csv").exists():
+        d = d / "raw" / name  # the repo's data/ layout (configs/datasets loaders): data/<name>/raw/<name>/
     edgelist = d / "edgelist.csv"
     if not edgelist.exists():
         raise SystemExit(f"{name}: no {edgelist}. Unpack the Zenodo archive for it under {root}.")
@@ -150,7 +152,14 @@ def prepare(name: str, args) -> Path:
         return out
 
     if name in PLANETOID:
-        edge_index, num_nodes = load_planetoid(name)
+        try:
+            edge_index, num_nodes = load_planetoid(name)
+        except Exception as exc:  # no route to data.dgl.ai: PyG's copy of the same Planetoid split
+            print(f"{name}: DGL download failed ({type(exc).__name__}); using PyG Planetoid under {args.pyg_root}")
+            from torch_geometric.datasets import Planetoid
+
+            g = Planetoid(args.pyg_root, name)[0]  # data/<name>/raw/ind.<name>.*
+            edge_index, num_nodes = g.edge_index.numpy().astype(np.int64), int(g.num_nodes)
     elif name.startswith("ogbn-"):
         edge_index, num_nodes = load_ogb(name, args.ogb_root)
     elif name in GRAPHLAND:
